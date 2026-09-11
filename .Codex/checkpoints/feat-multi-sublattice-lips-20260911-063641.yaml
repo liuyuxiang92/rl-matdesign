@@ -1,0 +1,99 @@
+checkpoint_version: '3.0.0'
+created_at: 2026-09-11T06:36:41Z
+branch: feat/multi-sublattice-lips
+
+phase:
+  current: full_space_magpie_pca
+  completed:
+    - exact_33_cation_space_enumeration
+    - cation_fraction_pca_and_hexbin
+    - exhaustive_soap_fps
+    - deepmd_embedding_feasibility_review
+  next:
+    - benchmark_magpie_featurization
+    - implement_resumable_full_space_magpie
+    - fit_pca_and_run_multidimensional_fps
+    - render_and_validate_magpie_figures
+
+state:
+  parameters:
+    - name: design_space_size
+      value: 768935
+      unit: compositions
+      source: "Exact enumeration stored in runs/ooh_design_space_analysis/pca_coordinates.npz"
+      confidence: high
+    - name: cation_species_count
+      value: 33
+      unit: elements
+      source: "configs/ooh.yaml groups[0].species_set"
+      confidence: high
+    - name: magpie_feature_family
+      value: "Stoichiometry + ElementProperty(magpie) + ValenceOrbital + IonProperty"
+      unit: composition descriptors
+      source: "src/rl_matdesign/featurization.py and scripts/baselines/property_benchmark/featurize.py"
+      confidence: high
+    - name: experimental_rows
+      value: 198
+      unit: formulas
+      source: "../../new_experiment_data/iter1.xlsx through iter7.xlsx"
+      confidence: high
+    - name: pca_distance_target_variance
+      value: 0.95
+      unit: cumulative explained variance
+      source: "Chosen to retain the established multidimensional FPS policy used in the cation-fraction analysis"
+      confidence: high
+
+  experiments:
+    - name: cation_fraction_pca
+      status: completed
+      progress: 1.0
+      results_path: runs/ooh_design_space_analysis
+      next_step: "Retain as the composition-grid baseline"
+    - name: exhaustive_soap
+      status: completed
+      progress: 1.0
+      results_path: runs/ooh_design_space_analysis/soap_full_metadata.json
+      next_step: "Retain as the structure-based comparison"
+    - name: full_space_magpie
+      status: pending
+      progress: 0.0
+      results_path: runs/ooh_design_space_analysis/magpie_metadata.json
+      next_step: "Implement batched resumable features, PCA, plots, coordinates, and FPS"
+
+  decisions:
+    - question: "Should DeepMD embeddings represent every design-space formula?"
+      decision: "No; use Magpie for exhaustive composition-space representation"
+      rationale: "DeepMD embeddings require explicit atomic structures, introduce site-occupation choices, and the verified local DPA3 path costs about 5.14 seconds per 350-atom structure."
+      alternatives_considered:
+        - "One arbitrary structure per formula"
+        - "Three or more site occupations per formula"
+        - "DeepMD only on a reduced candidate pool"
+      confidence: high
+    - question: "How should farthest points be selected?"
+      decision: "Use FPS in enough standardized Magpie PCA components to explain at least 95% variance"
+      rationale: "The two-dimensional plot is for visualization only and should not define scientific distance."
+      alternatives_considered:
+        - "Euclidean distance in PC1-PC2 only"
+        - "FPS directly in all raw correlated Magpie features"
+      confidence: high
+
+blockers: []
+
+artifacts:
+  - path: runs/ooh_design_space_analysis/pca_coordinates.npz
+    role: exact point ordering, formulas encoded as element/fraction arrays, and baseline coordinates
+  - path: runs/ooh_design_space_analysis/experimental_pca_coordinates.csv
+    role: experimental formulas and iteration labels
+  - path: scripts/baselines/property_benchmark/featurize.py
+    role: established Magpie composition feature wrapper
+  - path: scripts/baselines/property_benchmark/iterk_chronological/pick_ood_points.py
+    role: earlier sampled Magpie-PCA precedent
+
+resume_instructions: |
+  1. Validate the design cache: python -c "import numpy as np; z=np.load('runs/ooh_design_space_analysis/pca_coordinates.npz'); print(z['elem_idx'].shape)"
+  2. Benchmark serial and parallel Magpie featurization on a deterministic small slice.
+  3. Add scripts/analyze_ooh_magpie.py with disk-backed feature/projection caches and resumable sidecars.
+  4. Run against all 768935 point IDs and all 198 experiment formulas.
+  5. Fit preprocessing and PCA on the complete valid design space; select enough PCs for >=95% cumulative variance.
+  6. Export scatter, logarithmic hexbin, all-point coordinates, experimental coordinates, FPS top 20, model, NPZ, and metadata.
+  7. Confirm coordinate row count, hexbin count sum, FPS uniqueness/distance monotonicity, and visually inspect every figure.
