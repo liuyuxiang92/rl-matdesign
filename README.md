@@ -2,7 +2,10 @@
 
 Config-driven RL runner for materials composition discovery.
 Supports multiple material systems (OOH catalyst, HEA, perovskite, oxides) via YAML configs.
-Three RL algorithms: **DQN** (online, target-network), **REINFORCE**, and **A2C**.
+Three RL algorithms: **DQN** (online, target-network, or MC targets), **REINFORCE**, and **A2C**.
+
+See [code layout and compatibility](docs/code_layout.md) for maintained entry
+points, module responsibilities, and regression checks.
 
 
 ---
@@ -53,14 +56,16 @@ operational flags (seeds, resume, checkpoint). This means:
 
 | Config | Material system | Default method |
 |---|---|---|
-| `configs/ooh.yaml` | 5-cation ABCDEOOH oxyhydroxide (28 cation set) | reinforce |
-| `configs/ooh_dqn.yaml` | Same as `ooh.yaml`, DQN-tuned hyperparameters | dqn |
 | `configs/hea.yaml` | High-entropy alloy formation energy | reinforce |
-| `configs/perovskite.yaml` | Perovskite oxide stability | reinforce |
+| `configs/lips_sse.yaml` | Multi-sublattice LiPS solid electrolyte | Configured in YAML |
 | `configs/oxides_sinter.yaml` | Oxide sintering temperature | reinforce |
 | `configs/oxides_calcine.yaml` | Oxide calcination temperature | reinforce |
-| `configs/ti_alloy.yaml` | 11-element titanium alloy, per-element fraction bounds (Tier-1 example) | a2c |
 | `configs/test_dummy.yaml` | Fast smoke test (no real predictor) | dqn |
+| `configs/test_multigroup_dummy.yaml` | Multi-sublattice smoke test (no real predictor) | CLI selection |
+
+OOH, Ti-alloy, and perovskite scenario YAML files are intentionally local and
+gitignored. Examples below using those paths require your existing local configs
+and model/structure files. They are not included in a fresh checkout.
 
 ---
 
@@ -68,9 +73,9 @@ operational flags (seeds, resume, checkpoint). This means:
 
 ```bash
 python scripts/run_experiment.py \
-    --config configs/ooh.yaml \
-    --method reinforce \
-    --out runs/ooh_reinforce_seed0 \
+    --config configs/test_dummy.yaml \
+    --method a2c \
+    --out runs/smoke_a2c_seed0 \
     --dp-seed 321 --train-seed 123 --gen-seed 213
 ```
 

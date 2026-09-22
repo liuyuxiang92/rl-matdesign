@@ -24,6 +24,8 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from .composition import composition_key
+
 
 def candidate_key(candidate: Any) -> tuple:
     """Hashable canonical key for a predictor input.
@@ -45,20 +47,7 @@ def candidate_key(candidate: Any) -> tuple:
     if not isinstance(candidate, dict):
         return ("__repr__", repr(candidate))
 
-    def _leaf(v: Any) -> Any:
-        try:
-            return round(float(v), 6)
-        except (TypeError, ValueError):
-            return str(v)
-
-    items = []
-    for el, v in candidate.items():
-        if isinstance(v, dict):
-            items.append((str(el), tuple(sorted(
-                (str(e), _leaf(f)) for e, f in v.items()))))
-        else:
-            items.append((str(el), _leaf(v)))
-    return tuple(sorted(items, key=lambda t: t[0]))
+    return composition_key(candidate, decimals=6)
 
 
 class PredictorTimer:

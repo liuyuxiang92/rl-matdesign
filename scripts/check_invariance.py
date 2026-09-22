@@ -279,10 +279,10 @@ def _max_delta_scalar(values: Sequence[float]) -> Tuple[float, float]:
 def main() -> None:
     args = parse_args()
 
-    # Reuse load_config + build_env + build_predictor from run_experiment.py so
+    # Reuse the package's shared configuration/environment factories so
     # user FQN plug-ins, the groups: schema, and single-group flat-env collapse
     # all resolve identically to a real training/generation run.
-    from run_experiment import load_config, build_env, build_predictor
+    from rl_matdesign.configuration import load_config, build_env, build_predictor
     from rl_matdesign.training import _precompute_elem_features, _detect_last_position_pin
 
     cfg = load_config(args.config)

@@ -1,8 +1,8 @@
+"""Installed command entry point, including non-editable wheel installs."""
 from __future__ import annotations
-import pathlib
-import runpy
 
 
 def main() -> None:
-    script = pathlib.Path(__file__).resolve().parent.parent.parent / "scripts" / "run_experiment.py"
-    runpy.run_path(str(script), run_name="__main__")
+    from .experiment import main as run_experiment
+
+    run_experiment()

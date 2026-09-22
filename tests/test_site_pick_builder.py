@@ -117,23 +117,44 @@ def test_lattice_and_atom_count_unchanged(tmp_path):
     assert (out.get_cell()[:] == orig.get_cell()[:]).all()
 
 
-@pytest.mark.skipif(not os.path.exists(_PEROVSKITE_POSCAR), reason="perovskite.vasp not present")
-def test_perovskite_a_b_site_substitution():
+@pytest.fixture(params=[1, 4, "local"])
+def perovskite_poscar(request, tmp_path):
+    """Check a unit cell, a 320-atom supercell, and the optional local template."""
+    if request.param == "local":
+        if not os.path.exists(_PEROVSKITE_POSCAR):
+            pytest.skip("perovskite.vasp not present")
+        return _PEROVSKITE_POSCAR
+    from ase import Atoms
+    from ase.io import write
+
+    atoms = Atoms("SrFeO3", cell=[4, 4, 4], pbc=True, scaled_positions=[
+        (0, 0, 0), (0.5, 0.5, 0.5), (0.5, 0.5, 0),
+        (0.5, 0, 0.5), (0, 0.5, 0.5),
+    ]).repeat((request.param,) * 3)
+    path = str(tmp_path / "perovskite.vasp")
+    write(path, atoms, format="vasp")
+    return path
+
+
+def test_perovskite_a_b_site_substitution(perovskite_poscar):
     """Real fixture: perovskite.vasp is SrFeO3 with Sr=A-site, Fe=B-site placeholders."""
     from ase.io import read as ase_read
     from rl_matdesign.predictors.builders.site_pick import SitePickBuilder
 
-    orig = ase_read(_PEROVSKITE_POSCAR)
+    orig = ase_read(perovskite_poscar)
     b = SitePickBuilder({
-        "base_poscar": _PEROVSKITE_POSCAR, "site_map": {"A_site": "Sr", "B_site": "Fe"},
+        "base_poscar": perovskite_poscar, "site_map": {"A_site": "Sr", "B_site": "Fe"},
     })
     candidate = {"A_site": {"A": "Ba"}, "B_site": {"B": "Nb"}}
     out = b.build(candidate, n_configs=2, rng=np.random.default_rng(0))
 
+    source_counts = Counter(orig.get_chemical_symbols())
+    assert set(source_counts) == {"Sr", "Fe", "O"}
     assert len(out) == 2
     for st in out:
         cnt = Counter(st.get_chemical_symbols())
-        assert cnt == {"Ba": 1, "Nb": 1, "O": 3}
+        assert cnt == {"Ba": source_counts["Sr"], "Nb": source_counts["Fe"],
+                       "O": source_counts["O"]}
         assert len(st) == len(orig)
     assert (out[0].get_cell()[:] == orig.get_cell()[:]).all()
 
@@ -152,14 +173,18 @@ def test_composition_formula_places_picks_at_real_site_counts(tmp_path):
     assert parsed == {"Fe": "3", "Ni": "2", "O": "2"}
 
 
-@pytest.mark.skipif(not os.path.exists(_PEROVSKITE_POSCAR), reason="perovskite.vasp not present")
-def test_perovskite_composition_formula():
+def test_perovskite_composition_formula(perovskite_poscar):
     from rl_matdesign.predictors.builders.site_pick import SitePickBuilder
     import re
 
     b = SitePickBuilder({
-        "base_poscar": _PEROVSKITE_POSCAR, "site_map": {"A_site": "Sr", "B_site": "Fe"},
+        "base_poscar": perovskite_poscar, "site_map": {"A_site": "Sr", "B_site": "Fe"},
     })
     formula = b.composition_formula({"A_site": {"A": "Ba"}, "B_site": {"B": "Nb"}})
     parsed = dict(re.findall(r"([A-Z][a-z]?)([0-9.]+)", formula))
-    assert parsed == {"Ba": "1", "Nb": "1", "O": "3"}
+    from ase.io import read as ase_read
+    source_counts = Counter(ase_read(perovskite_poscar).get_chemical_symbols())
+    assert set(source_counts) == {"Sr", "Fe", "O"}
+    assert {el: float(n) for el, n in parsed.items()} == {
+        "Ba": source_counts["Sr"], "Nb": source_counts["Fe"], "O": source_counts["O"],
+    }

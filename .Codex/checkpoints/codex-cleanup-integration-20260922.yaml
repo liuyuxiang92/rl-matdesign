@@ -1,0 +1,37 @@
+checkpoint_version: 3.0.0
+created_at: '2026-09-22T06:05:27.590078+00:00'
+branch: codex/cleanup-integration
+phase:
+  current: cleanup_validated
+  completed:
+  - branch_audit
+  - isolated_cleanup
+  - baseline_tests
+  - numeric_equivalence
+  - local_overlay_tests
+  - wheel_validation
+  - reflection
+  next:
+  - user_review
+state:
+  worktree: /private/tmp/rl-matdesign-cleanup-20260922
+  base_commit: 08bb24a
+  user_constraint: Clean and validate only; do not merge main.
+  experiments:
+  - name: local overlay regression
+    status: completed
+    results_path: docs/validation/cleanup_20260922.json
+    detail: 372 passed; 8 RL plus 4 baseline numerical comparisons identical.
+  decisions:
+  - decision: Preserve existing algorithms and compatibility entry points
+    rationale: User explicitly requires previous programs to continue working.
+blockers: []
+artifacts:
+- path: docs/code_layout.md
+  role: code responsibilities and compatibility scope
+- path: docs/validation/cleanup_20260922.md
+  role: validation report
+resume_instructions: 'Do not merge main: user chose cleanup/validation only. Work
+  in the isolated cleanup worktree. Read the validation report and git status. The
+  original feature checkout still contains unrelated uncommitted work. Real-model
+  reruns and old-main config migration were not performed.'

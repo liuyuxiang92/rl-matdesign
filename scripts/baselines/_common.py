@@ -43,18 +43,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import yaml
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-_SCRIPTS_DIR = os.path.join(_REPO_ROOT, "scripts")
-
 # Reused by replay: we never read the stored material features, so swap in a
 # trivial featurizer to skip the (Magpie) featurization cost on every step.
 _ZERO_FEATS = np.zeros(1, dtype=float)
-
-
-def _ensure_import_path() -> None:
-    """Make ``run_experiment`` importable (mirrors run_ga.py)."""
-    if _SCRIPTS_DIR not in os.sys.path:
-        os.sys.path.insert(0, _SCRIPTS_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -73,8 +64,7 @@ def make_predictor_and_env(cfg: dict, seed: Optional[int] = None):
     with a no-op so replaying trajectories does not trigger predictor calls;
     callers score explicitly via :func:`score_composition`.
     """
-    _ensure_import_path()
-    from run_experiment import build_predictor, build_env
+    from rl_matdesign.configuration import build_predictor, build_env
 
     predictor = build_predictor(cfg, seed=seed)
     env, env_type, _flat_cfg = build_env(cfg, predictor)
@@ -173,12 +163,9 @@ def _comp_cache_key(comp) -> object:
     string like ``"oxide"``, see ``env_multigroup.py:133,230``), so a leaf that
     doesn't parse as a float falls back to its string form rather than raising.
     """
-    if isinstance(comp, dict):
-        return tuple(sorted((str(k), _comp_cache_key(v)) for k, v in comp.items()))
-    try:
-        return round(float(comp), 6)
-    except (TypeError, ValueError):
-        return str(comp)
+    from rl_matdesign.utils.composition import composition_key
+
+    return composition_key(comp, decimals=6)
 
 
 def score_composition(predictor, comp, cache: dict,

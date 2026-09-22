@@ -2587,3 +2587,10 @@ ghost-padded cKDTree (plain Euclidean dedup on wrapped positions alone
 would miss cross-boundary duplicates near opposite cell faces). Next:
 smoke-test this against a real structure, add scipy to requirements.txt,
 update defect_site.py's docstring, then write the new test file.
+
+### Cleanup and compatibility validation — 2026-09-22
+<!-- concepts: behavior-preserving-refactoring, checkpoint-compatibility, regression-validation -->
+- User requested cleanup and then explicitly chose not to merge main. Isolated codex/cleanup-integration from 08bb24a; original dirty experiment work retained.
+- Package experiment/configuration split retains legacy CLI/imports; shared encoding and canonicalization retain cache precision. Seven moved runner functions are AST-identical.
+- Original suite: 359 pass/2 fixture failures; clean checkout: 348 pass/4 optional skips; original local-work overlay: 372 pass. Eight RL before/after plus four BO/GA comparisons identical, including old checkpoint generation and RL resume. Wheel A2C smoke passes.
+- Reflection: validate both tracked and dirty-overlay states; derive fixture assertions from actual supercell site counts. Pattern recorded in original .Codex/memory/patterns.yaml. Details: docs/validation/cleanup_20260922.md.

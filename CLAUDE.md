@@ -1,5 +1,12 @@
 # CLAUDE.md
 
+Current code map: [docs/code_layout.md](docs/code_layout.md). The OOH-specific
+`run_ABCDEOOH_experiment.py` examples below describe the historical pipeline;
+that script was already absent before the September 2026 cleanup. Use
+`scripts/run_experiment.py` or `rl-matdesign` with `--config` for the current
+runner. Shared config/environment factories live in `rl_matdesign.configuration`;
+the experiment driver lives in `rl_matdesign.experiment`.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What This Repo Does
@@ -271,7 +278,8 @@ It reconstructs episodes (splitting buffer rows on `done=True`), decodes each co
 pip install -r requirements.txt
 ```
 
-There is no test suite, linter configuration, or build step.
+Run the regression suite with `python -m pytest`. Build the package with
+`python -m pip wheel --no-deps --no-build-isolation .`. There is no configured linter.
 
 ## Architecture
 
