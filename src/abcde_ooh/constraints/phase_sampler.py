@@ -14,6 +14,10 @@ Phase rules mirror check_primary_phase in primary_phase.py:
 
 Multiple target phases may be passed; an action is kept if its partial
 composition can be completed into *any* of the listed phases.
+
+``require_primary_presence=False`` allows named primary elements to be absent.
+Absent elements consume neither a component slot nor composition budget; the
+environment still selects exactly five distinct, positive-fraction cations.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ class PhaseActionFilter:
         allowed_units: List[int],
         possible_sums_by_k: List[set],
         total_units: int = 20,
+        require_primary_presence: bool = True,
     ) -> None:
         if isinstance(target_phase, str):
             phases: List[str] = [target_phase]
@@ -51,6 +56,8 @@ class PhaseActionFilter:
         self._allowed_units_set: Set[int] = set(allowed_units)
         self._possible_sums_by_k = possible_sums_by_k
         self._total_units = total_units
+        self.require_primary_presence = require_primary_presence
+        self._primary_units = self._allowed_units if require_primary_presence else [0, *self._allowed_units]
 
         # Phase thresholds are defined as *fractions* and derived from
         # total_units so the chemistry is identical at any grid resolution.
@@ -80,10 +87,10 @@ class PhaseActionFilter:
     # ------------------------------------------------------------------
 
     def _compute_binary_pairs(self, pred) -> List[Tuple[int, int]]:
-        """Valid (p1_units, p2_units) terminal allocations, with 3 dopants each ≥1."""
+        """Primary allocations plus enough positive dopants for five cations."""
         pairs: List[Tuple[int, int]] = []
-        for p1 in self._allowed_units:
-            for p2 in self._allowed_units:
+        for p1 in self._primary_units:
+            for p2 in self._primary_units:
                 if p1 + p2 > self._total_units:
                     continue
                 dopant_total = self._total_units - p1 - p2
@@ -91,19 +98,19 @@ class PhaseActionFilter:
                     continue
                 if dopant_total < 0:
                     continue
-                # Must accommodate 3 more distinct elements each ≥ 1 unit
-                if dopant_total not in self._possible_sums_by_k[3]:
+                n_dopants = 5 - int(p1 > 0) - int(p2 > 0)
+                if dopant_total not in self._possible_sums_by_k[n_dopants]:
                     continue
                 if pred(p1, p2):
                     pairs.append((p1, p2))
         return pairs
 
     def _compute_ternary_triples(self, pred) -> List[Tuple[int, int, int]]:
-        """Valid (p1, p2, p3) terminal allocations, with 2 dopants each ≥1."""
+        """Primary allocations plus enough positive dopants for five cations."""
         triples: List[Tuple[int, int, int]] = []
-        for p1 in self._allowed_units:
-            for p2 in self._allowed_units:
-                for p3 in self._allowed_units:
+        for p1 in self._primary_units:
+            for p2 in self._primary_units:
+                for p3 in self._primary_units:
                     total_primary = p1 + p2 + p3
                     if total_primary > self._total_units:
                         continue
@@ -112,8 +119,8 @@ class PhaseActionFilter:
                         continue
                     if dopant_total < 0:
                         continue
-                    # Must accommodate 2 more distinct elements each ≥ 1 unit
-                    if dopant_total not in self._possible_sums_by_k[2]:
+                    n_dopants = 5 - sum(p > 0 for p in (p1, p2, p3))
+                    if dopant_total not in self._possible_sums_by_k[n_dopants]:
                         continue
                     if pred(p1, p2, p3):
                         triples.append((p1, p2, p3))
@@ -251,6 +258,32 @@ class PhaseActionFilter:
                         return True
             return False
 
+    def _is_completable_optional_primary(
+        self,
+        primary_names: Sequence[str],
+        allocations: Iterable[Tuple[int, ...]],
+        units_map: Dict[str, int],
+        steps_left: int,
+        budget_left: int,
+    ) -> bool:
+        """An unchosen primary may remain absent rather than consume a step."""
+        other_units = sum(v for k, v in units_map.items() if k not in primary_names)
+        if other_units > self._max_dopant_units:
+            return False
+        for final in allocations:
+            if any(name in units_map and units_map[name] != amount
+                   for name, amount in zip(primary_names, final)):
+                continue
+            additions = [amount for name, amount in zip(primary_names, final)
+                         if name not in units_map and amount > 0]
+            dopant_steps = steps_left - len(additions)
+            dopant_budget = budget_left - sum(additions)
+            if (0 <= dopant_steps < len(self._possible_sums_by_k)
+                    and 0 <= dopant_budget <= self._max_dopant_units - other_units
+                    and dopant_budget in self._possible_sums_by_k[dopant_steps]):
+                return True
+        return False
+
     def _is_completable_binary(
         self,
         phase: str,
@@ -265,6 +298,10 @@ class PhaseActionFilter:
         else:  # CoFe
             p1, p2 = "Co", "Fe"
             valid_pairs = self._valid_cofe_pairs
+
+        if not self.require_primary_presence:
+            return self._is_completable_optional_primary(
+                (p1, p2), valid_pairs, units_map, steps_left, budget_left)
 
         p1_units = units_map.get(p1, 0)
         p2_units = units_map.get(p2, 0)
@@ -316,6 +353,10 @@ class PhaseActionFilter:
         budget_left: int,
     ) -> bool:
         """Can the partial composition be completed into a valid NiFeCo phase?"""
+        if not self.require_primary_presence:
+            return self._is_completable_optional_primary(
+                ("Ni", "Fe", "Co"), self._valid_nifeco_triples,
+                units_map, steps_left, budget_left)
         ni_units = units_map.get("Ni", 0)
         fe_units = units_map.get("Fe", 0)
         co_units = units_map.get("Co", 0)

@@ -275,6 +275,7 @@ def _make_ooh_phase(cfg: dict, *, env=None, **_):
         allowed_units=env._allowed_units,
         possible_sums_by_k=env._possible_sums_by_k,
         total_units=env._total_units,
+        require_primary_presence=cfg.get("require_primary_presence", True),
     )
 
 

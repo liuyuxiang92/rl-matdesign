@@ -1,0 +1,75 @@
+{
+  "date": "2026-10-14",
+  "branch": "codex/cleanup-integration",
+  "parent_commit": "1231b0550fd9f5c7786c2f9e742285fc7a823ac0",
+  "feature_commit": "08bb24ae2cf25874da77cf221ecd0bd8581a2a21",
+  "main_unchanged": "39227da88a3450c126dfa52e094e308eb27fbb79",
+  "already_inherited_commits": [
+    "9c9186085e45ed1d96e748ea5700d49247377b07",
+    "08bb24ae2cf25874da77cf221ecd0bd8581a2a21"
+  ],
+  "python": "3.11.8",
+  "python_executable": "/opt/anaconda3/bin/python",
+  "targeted": {
+    "tests": 24,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 24,
+    "seconds": 18.562,
+    "skips": []
+  },
+  "full_suite": {
+    "tests": 376,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 4,
+    "passed": 372,
+    "seconds": 303.08,
+    "skips": [
+      {
+        "test": "tests.test_order_invariance.test_rf_magpie_predictor_is_order_invariant[optimal_sinter_RF.joblib]",
+        "reason": "model file not found at /private/tmp/rl-matdesign-cleanup-20261014/models/sinter_calcine/optimal_sinter_RF.joblib"
+      },
+      {
+        "test": "tests.test_order_invariance.test_rf_magpie_predictor_is_order_invariant[optimal_calcine_RF.joblib]",
+        "reason": "model file not found at /private/tmp/rl-matdesign-cleanup-20261014/models/sinter_calcine/optimal_calcine_RF.joblib"
+      },
+      {
+        "test": "tests.test_site_pick_builder.test_perovskite_a_b_site_substitution[local]",
+        "reason": "perovskite.vasp not present"
+      },
+      {
+        "test": "tests.test_site_pick_builder.test_perovskite_composition_formula[local]",
+        "reason": "perovskite.vasp not present"
+      }
+    ]
+  },
+  "commands": [
+    "python -m pytest tests/test_ooh_primary_phase.py tests/test_ooh_phase_sampler.py",
+    "python -m pytest",
+    "git diff --check"
+  ],
+  "source_and_test_sha256": {
+    "src/abcde_ooh/constraints/phase_sampler.py": "5209c5a08ec0147daa4d066ab767bd262797055458a75604962b56aae078c632",
+    "src/abcde_ooh/constraints/primary_phase.py": "bc0492543d1414c0a0abed554fbcbd9b9a54d67dc6321fb5dcc9600eddc4be30",
+    "src/rl_matdesign/registry.py": "29b83cd0183845d8cd3affcc4cbaa2df6dcaa0706d42f4abeb14b7e8f822b8a7",
+    "tests/test_ooh_primary_phase.py": "a534856b121fd4ce76a211de82ae7e6955a98501c593206324586340bf4203e0",
+    "tests/test_ooh_phase_sampler.py": "6639a50841dba83b10d00dddc063a15bf2ab34db5659576640c0e39d97db89c5"
+  },
+  "independent_review": {
+    "blocking_findings": 0,
+    "terminal_phase_cases": 44016,
+    "checks": [
+      "Default strict filter agrees with feature-branch committed implementation.",
+      "Optional filter agrees with independent integer phase rules."
+    ],
+    "evidence_type": "Reviewer-executed temporary inline script; script not retained."
+  },
+  "scope": "Port the three local OOH core fixes byte-for-byte; add portable core tests and docs. No analysis scripts, results, local configs or compatibility symlinks added.",
+  "limitations": [
+    "Four optional local-file tests skipped (two RF models and two perovskite-template tests).",
+    "Real DeepMD/MGTransformer long experiments and old-main configuration migration were not rerun.",
+    "Original feature checkout retained; no main merge or remote push."
+  ]
+}

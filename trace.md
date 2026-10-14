@@ -2594,3 +2594,10 @@ update defect_site.py's docstring, then write the new test file.
 - Package experiment/configuration split retains legacy CLI/imports; shared encoding and canonicalization retain cache precision. Seven moved runner functions are AST-identical.
 - Original suite: 359 pass/2 fixture failures; clean checkout: 348 pass/4 optional skips; original local-work overlay: 372 pass. Eight RL before/after plus four BO/GA comparisons identical, including old checkpoint generation and RL resume. Wheel A2C smoke passes.
 - Reflection: validate both tracked and dirty-overlay states; derive fixture assertions from actual supercell site counts. Pattern recorded in original .Codex/memory/patterns.yaml. Details: docs/validation/cleanup_20260922.md.
+
+### 2026-10-14 — Integrate existing OOH fixes into the cleanup branch
+<!-- concepts: phase-constraint-semantics, compatibility-validation, branch-integration -->
+- User requested that the two unpushed feature commits and local phase fixes be included in `codex/cleanup-integration`. Both commits were already ancestors of `1231b055`; restored an isolated checkout at `/private/tmp/rl-matdesign-cleanup-20261014` and applied only the three core diffs.
+- Added portable primary-phase/sampler tests with inline configuration, leaving analysis scripts, private configs and results out of the commit. Default strict presence is preserved; explicit false permits absent primary members. Every outside-primary cation counts toward the dopant cap.
+- Validation: 24 targeted tests passed; full tracked-source suite 372 passed, 4 optional-file skips, one SMACT deprecation warning. Independent review found no blocking issue. Evidence: `docs/validation/ooh_phase_integration_20261014.{md,json}`. No real-model long rerun, main merge or push.
+- Reflect: source checkout memory already records dynamic dopant sums and explicit presence semantics (pitfalls 008/016); no duplicate memory entry added. The same portable-test boundary was checked across all six phase targets and both presence modes. Original feature checkout retained unchanged.

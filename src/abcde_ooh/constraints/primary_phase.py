@@ -15,11 +15,13 @@ DOPANTS_BASE = {
     "Sr",
     "Al",
     "Sc",
+    "Ti",
     "V",
     "Cr",
     "Mn",
     "Ga",
     "In",
+    "Zr",
     "La",
     "Nd",
     "Sm",
@@ -34,11 +36,18 @@ DOPANTS_BASE = {
     "Ce",
     "Pr",
     "Tb",
+    "Bi",
 }
 
 
-def _sum(comp: Dict[str, float], elems) -> float:
-    return float(sum(comp.get(e, 0.0) for e in elems))
+def _sum_except(comp: Dict[str, float], primary_elems) -> float:
+    """Sum every cation outside a phase's primary set.
+
+    Deriving dopants from the composition keeps the phase cap correct when a
+    configured species is added before the compatibility set above is updated.
+    """
+    primary = set(primary_elems)
+    return float(sum(v for e, v in comp.items() if e not in primary))
 
 
 def _fe_not_dominant(comp: Dict[str, float], include_ni: bool, include_co: bool) -> bool:
@@ -80,35 +89,30 @@ def check_primary_phase(comp: Dict[str, float]) -> Tuple[bool, Optional[str]]:
     co = comp.get("Co", 0.0)
 
     # --- NiFeCo primary phase ---
-    dopants_ni_fe_co = DOPANTS_BASE
-    dop_sum = _sum(comp, dopants_ni_fe_co)
+    dop_sum = _sum_except(comp, {"Ni", "Fe", "Co"})
     tri_sum = ni + fe + co
     if dop_sum < 0.25 and tri_sum >= 0.75 and _fe_not_dominant(comp, include_ni=True, include_co=True):
         return True, "NiFeCo"
 
     # --- NiFe primary phase ---
-    dopants_ni_fe = DOPANTS_BASE | {"Co"}
-    dop_sum = _sum(comp, dopants_ni_fe)
+    dop_sum = _sum_except(comp, {"Ni", "Fe"})
     bi_sum = ni + fe
     if dop_sum < 0.25 and bi_sum >= 0.75 and _fe_not_dominant(comp, include_ni=True, include_co=False) and _ni_fe_ratio_ok(comp):
         return True, "NiFe"
 
     # --- CoFe primary phase ---
-    dopants_co_fe = DOPANTS_BASE | {"Ni"}
-    dop_sum = _sum(comp, dopants_co_fe)
+    dop_sum = _sum_except(comp, {"Co", "Fe"})
     bi_sum = co + fe
     if dop_sum < 0.25 and bi_sum >= 0.75 and _fe_not_dominant(comp, include_ni=False, include_co=True):
         return True, "CoFe"
 
     # --- Ni primary phase ---
-    dopants_ni_only = DOPANTS_BASE | {"Co", "Fe"}
-    dop_sum = _sum(comp, dopants_ni_only)
+    dop_sum = _sum_except(comp, {"Ni"})
     if dop_sum < 0.25 and ni >= 0.75:
         return True, "Ni"
 
     # --- Co primary phase ---
-    dopants_co_only = DOPANTS_BASE | {"Ni", "Fe"}
-    dop_sum = _sum(comp, dopants_co_only)
+    dop_sum = _sum_except(comp, {"Co"})
     if dop_sum < 0.25 and co >= 0.75:
         return True, "Co"
 
