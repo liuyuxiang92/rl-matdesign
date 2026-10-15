@@ -1,7 +1,7 @@
 # HEA case study configuration
 # Usage:
 #   python scripts/run_experiment.py --config configs/hea.yaml --method a2c \
-#       --out runs/hea_a2c_seed0 --seed 0
+#       --out runs/hea_a2c_seed0 --dp-seed 0 --train-seed 0 --gen-seed 0
 
 
 # ---- Environment ----
