@@ -112,7 +112,8 @@ class CategoricalGroup:
     Presents the minimal inner-group interface ``MultiGroupEnv`` drives.
     """
 
-    def __init__(self, choices: Sequence[Dict[str, Any]], *, phase_filter=None) -> None:
+    def __init__(self, choices: Sequence[Dict[str, Any]], *, phase_filter=None,
+                 index_codes: bool = False) -> None:
         # (name, element, values) — name is the unique slot id used for encoding
         # and as the terminal key; element is the real chemistry for the builder.
         self.slots: List[Tuple[str, str, List[Any]]] = [
@@ -137,9 +138,11 @@ class CategoricalGroup:
         self._code_to_value: List[Dict[str, Any]] = []
         codes: set[str] = set()
         for _name, _el, values in self.slots:
+            if index_codes and (not values or len({(type(v).__name__, str(v)) for v in values}) != len(values)):
+                raise ValueError("categorical choices must have non-empty, unique values")
             sc, c2v = [], {}
             for i, v in enumerate(values):
-                code = self._encode_value(v, i)
+                code = f"{float(i):.2f}" if index_codes else self._encode_value(v, i)
                 sc.append((v, code))
                 c2v[code] = v
                 codes.add(code)
@@ -204,6 +207,15 @@ class CategoricalGroup:
     def cation_fractions(self) -> Dict[str, Any]:
         return dict(self._picked)
 
+    def current_state_features(self) -> np.ndarray:
+        """One-hot chosen values per slot, with zeros for unfilled slots."""
+        features = []
+        for name, _element, values in self.slots:
+            picked = self._picked.get(name)
+            features.extend(float(name in self._picked and type(v) is type(picked) and v == picked)
+                            for v in values)
+        return np.asarray(features, dtype=float)
+
     def terminal_comp_key(self) -> tuple:
         return tuple(sorted((k, str(v)) for k, v in self._picked.items()))
 
@@ -225,6 +237,8 @@ class MultiGroupEnv:
         self.state_featurizer = state_featurizer
         self.episode_style = "multi_group"
         self._constraints_enabled = True
+        self.has_sequences = any(g.get("kind") == "sequence" for g in groups)
+        self.order_sensitive = self.has_sequences
 
         # Build one inner CompositionEnv per group. Inner reward is a no-op — this
         # env computes the single terminal reward over all groups.
@@ -235,13 +249,20 @@ class MultiGroupEnv:
         for i, g in enumerate(groups):
             name = str(g.get("name", f"group{i}"))
             kind = g.get("kind", "composition")
+            if name in self.group_names:
+                raise ValueError(f"Duplicate group name {name!r}")
             self.group_names.append(name)
             self._sites.append(int(g.get("sites", 1)))
             self._kinds.append(kind)
             if kind == "categorical":
                 inner = CategoricalGroup(
                     g["choices"], phase_filter=g.get("constraint_filter"),
+                    index_codes=self.has_sequences,
                 )
+            elif kind == "sequence":
+                from .sequence import SequenceGroup
+
+                inner = SequenceGroup(g)
             elif kind == "integer":
                 inner = IntegerRatioEnv(
                     species_set=g["species_set"],
@@ -250,7 +271,7 @@ class MultiGroupEnv:
                     state_featurizer=state_featurizer,
                     phase_filter=g.get("constraint_filter"),
                 )
-            else:
+            elif kind == "composition":
                 inner = CompositionEnv(
                     species_set=g["species_set"],
                     fraction_set=g.get("fraction_set") or None,
@@ -263,6 +284,8 @@ class MultiGroupEnv:
                     element_bounds=g.get("element_bounds"),
                     episode_style=g.get("episode_style", "element_then_amount"),
                 )
+            else:
+                raise ValueError(f"Unknown group kind {kind!r}")
             self._inners.append(inner)
 
         # Union alphabets (first-seen order, deduplicated). Exact strings/symbols
@@ -314,8 +337,35 @@ class MultiGroupEnv:
     def _concat_features(self) -> np.ndarray:
         """Per-step state = concat of each group's partial-composition features."""
         return np.concatenate(
-            [np.asarray(self.state_featurizer(inner.state), dtype=float) for inner in self._inners]
+            [inner.current_state_features()
+             if self.has_sequences and kind in ("sequence", "categorical")
+             else np.asarray(self.state_featurizer(inner.state), dtype=float)
+             for kind, inner in zip(self._kinds, self._inners)]
         )
+
+    def action_features(self) -> np.ndarray | None:
+        """Explicit token identity features for domains with ordered sequences.
+
+        Returning None retains the existing elemental feature path for materials.
+        Tokens are identifiers, so parsing them as chemical formulas is invalid.
+        """
+        return np.eye(len(self.species_set), dtype=float) if self.has_sequences else None
+
+    def design_schema(self) -> dict:
+        """Persist feature/decision semantics so checkpoint reuse cannot reorder IDs."""
+        groups = []
+        for name, kind, inner in zip(self.group_names, self._kinds, self._inners):
+            spec = {"name": name, "kind": kind}
+            if kind == "sequence":
+                spec.update(inner.design_schema())
+            elif kind == "categorical":
+                spec["slots"] = inner.slots
+            else:
+                spec.update(species=inner.species_set, fractions=inner.fraction_set,
+                            length=inner.n_components)
+            groups.append(spec)
+        return {"version": 1, "groups": groups, "actions": self.species_set,
+                "amount_codes": self.fraction_set}
 
     def current_state_features(self) -> np.ndarray:
         """Material features of the current state (uniform accessor; see CompositionEnv)."""
@@ -349,6 +399,8 @@ class MultiGroupEnv:
         # CompositionEnv.step's ordering.
         s_material = self._concat_features()
         current_allowed = self.allowed_actions()
+        if self.has_sequences and action not in current_allowed:
+            raise ValueError("Action is not allowed in the current sequence design state")
 
         # Decode the union action and re-encode into the active group's alphabet.
         elem = decode_one_hot(action[0], self.species_set)
@@ -398,8 +450,8 @@ class MultiGroupEnv:
     def _is_terminal(self) -> bool:
         return self.counter == self.n_components
 
-    def terminal_cation_fractions(self) -> Dict[str, Dict[str, float]]:
-        """Structured ``{group_name: {element: fraction}}`` for the predictor."""
+    def terminal_cation_fractions(self) -> Dict[str, Any]:
+        """Structured candidate: group mappings or ordered lists of token IDs."""
         if not self._is_terminal():
             raise RuntimeError("terminal_cation_fractions called before terminal step")
         return {
@@ -409,6 +461,10 @@ class MultiGroupEnv:
 
     def terminal_comp_key(self) -> tuple:
         """Canonical hashable key over all groups for dedup/visit-tracking."""
+        if self.has_sequences:
+            from .utils.composition import composition_key
+
+            return composition_key(self.terminal_cation_fractions())
         return tuple(
             (name, inner.terminal_comp_key())
             for name, inner in zip(self.group_names, self._inners)
@@ -422,6 +478,8 @@ class MultiGroupEnv:
         with ``sites=1`` this is just the fractions — consistent with a plain
         ``fraction`` env.
         """
+        if self.has_sequences:
+            raise TypeError("Sequence tokens are not an elemental composition")
         out: Dict[str, float] = {}
         for inner, sites, kind in zip(self._inners, self._sites, self._kinds):
             for el, val in inner.cation_fractions().items():
@@ -439,6 +497,11 @@ class MultiGroupEnv:
         """Readable assembled chemical formula (per formula unit), for generated.csv."""
         if not self._is_terminal():
             return ""
+        if self.has_sequences:
+            import json
+
+            return json.dumps(self.terminal_cation_fractions(), ensure_ascii=False,
+                              sort_keys=True, separators=(",", ":"))
         items = sorted(
             ((el, n) for el, n in self.assembled_composition().items() if n > 1e-9),
             key=lambda t: (-t[1], t[0]),

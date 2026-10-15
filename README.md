@@ -4,6 +4,12 @@ Config-driven RL runner for materials composition discovery.
 Supports multiple material systems (OOH catalyst, HEA, perovskite, oxides) via YAML configs.
 Three RL algorithms: **DQN** (online, target-network, or MC targets), **REINFORCE**, and **A2C**.
 
+Ordered token/monomer sequences are also supported through `kind: sequence`,
+with repeatable choices, hard count bounds and categorical processing actions.
+See [sequence design and GP adapters](docs/sequence_design.md) for the reusable
+interface and the 11-position synthetic example, and
+[gp_physchem integration](docs/gp_physchem_integration.md) for the real peptide GP setup.
+
 See [code layout and compatibility](docs/code_layout.md) for maintained entry
 points, module responsibilities, and regression checks.
 

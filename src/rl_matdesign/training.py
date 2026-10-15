@@ -333,6 +333,9 @@ def _augment_episode_in_buffer(
     """
     global _AUG_WARNED_NO_ALTS, _AUG_WARNED_FIXED_ORDER
 
+    if K > 0 and getattr(env, "order_sensitive", False):
+        raise ValueError("Permutation augmentation cannot reuse rewards for ordered sequences; set dqn_augment_permutations=0")
+
     # Always insert the original path first (zero risk when K == 0).
     add_episode_to_buffer(original_path, buffer, elem_feats_scaled, fraction_set)
     if K <= 0:
@@ -581,6 +584,9 @@ def train_dqn_online(
         plottable after the run.
     """
     from .model import QRegressor
+
+    if augment_permutations > 0 and getattr(env, "order_sensitive", False):
+        raise ValueError("Permutation augmentation cannot reuse rewards for ordered sequences; set dqn_augment_permutations=0")
 
     # --- BEGIN mc-target experiment (removable) ---
     if dqn_target_mode == "mc":
@@ -1635,6 +1641,10 @@ def generate_candidates(
                 else:
                     raw_mean, std = predictor.predict(comp)
                     predictor_raw_cache[comp_key] = (raw_mean, std)
+                metadata_hook = getattr(predictor, "candidate_metadata", None)
+                candidate_metadata = metadata_hook(comp) if callable(metadata_hook) else {}
+                if not isinstance(candidate_metadata, dict):
+                    raise ValueError("candidate_metadata must return a mapping")
             except Exception as exc:  # noqa: BLE001 - any predictor/builder failure
                 print(f"[WARN] generation candidate failed fetching raw stats, "
                       f"skipping: {type(exc).__name__}: {exc}")
@@ -1660,6 +1670,17 @@ def generate_candidates(
                 "reward": reward,
                 "dp_mean": raw_mean,
             }
+            if getattr(env, "has_sequences", False):
+                import json
+
+                row["candidate_json"] = json.dumps(comp, ensure_ascii=False, sort_keys=True)
+            if candidate_metadata:
+                import json
+
+                row["metadata_json"] = json.dumps(candidate_metadata, ensure_ascii=False, sort_keys=True)
+                for key, value in candidate_metadata.items():
+                    if value is None or isinstance(value, (str, bool, int, float)):
+                        row[f"meta_{key}"] = value
             if use_per_obj_stats:
                 # Composite predictor: each property keeps its own std in
                 # native physical units. A joint dp_std across mixed units

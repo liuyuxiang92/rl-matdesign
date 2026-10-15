@@ -27,6 +27,8 @@ configs/cs2agbicl6_level3.yaml
 configs/ooh.yaml
 configs/ooh_dqn.yaml
 configs/ooh_fine.yaml
+configs/peptide_gp.yaml
+configs/test_sequence_dummy.yaml
 configs/hpo/ooh_a2c.yaml
 configs/hpo/ooh_dqn.yaml
 configs/hpo/cs2agbicl6_a2c.yaml

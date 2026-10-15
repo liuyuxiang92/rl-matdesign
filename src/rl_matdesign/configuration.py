@@ -54,6 +54,16 @@ def _apply_flag_aliases(cfg: dict) -> dict:
 def load_config(path: str) -> dict:
     with open(path) as f:
         cfg = yaml.safe_load(f)
+    # A sequence catalog travels with its YAML; existing material/model path
+    # conventions remain unchanged. Direct build_env callers pass resolved paths.
+    from pathlib import Path
+    for group in cfg.get("groups", []):
+        tokens = group.get("tokens")
+        if group.get("kind") == "sequence" and isinstance(tokens, dict) and tokens.get("csv"):
+            catalog = Path(tokens["csv"]).expanduser()
+            if not catalog.is_absolute():
+                catalog = Path(path).resolve().parent / catalog
+            tokens["csv"] = str(catalog.resolve())
     return _apply_flag_aliases(cfg)
 
 
@@ -106,7 +116,7 @@ def build_env(cfg: dict, predictor):
         raise ValueError(
             "Config has no 'groups:' — every scenario is expressed as one or "
             "more sublattice groups now (kind: composition / categorical / "
-            "integer). See CLAUDE.md's proposed schema / any configs/*.yaml "
+            "integer / sequence). See CLAUDE.md's proposed schema / any configs/*.yaml "
             "for examples."
         )
 

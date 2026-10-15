@@ -87,6 +87,7 @@ Config keys
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -384,6 +385,7 @@ class StructureScorePredictor:
         from collections import OrderedDict
 
         self._stats_cache: "OrderedDict[tuple, Dict[str, Tuple[float, float]]]" = OrderedDict()
+        self._metadata_cache: Dict[tuple, dict] = {}
         self._stats_cache_size: int = int(cfg.get("predict_cache_size", 200000))
 
     # ------------------------------------------------------------------
@@ -434,6 +436,39 @@ class StructureScorePredictor:
     def per_objective_stats(self, candidate: Any) -> Dict[str, Tuple[float, float]]:
         """Return ``{name: (mean, std)}`` per objective, for CSV logging."""
         return dict(self._raw_stats(candidate))
+
+    def candidate_metadata(self, candidate: Any) -> dict:
+        """Return diagnostics captured with the cached prediction.
+
+        A single leaf keeps its field names. Multiple objectives/models are
+        nested by property name and model index, avoiding ambiguous flat names.
+        A leaf cache may be smaller than ours, so never query it for metadata on
+        a stats-cache hit: doing so could describe a different random prediction.
+        """
+        self._raw_stats(candidate)
+        return deepcopy(self._metadata_cache[self._key(candidate)])
+
+    def _collect_candidate_metadata(self, candidate: Any) -> dict:
+        result = {}
+        for prop in self.properties:
+            leaves = prop.get("instance") or []
+            model_metadata = []
+            has_metadata = False
+            for leaf in leaves:
+                hook = getattr(leaf, "candidate_metadata", None)
+                if not callable(hook):
+                    model_metadata.append({})
+                    continue
+                metadata = hook(candidate)
+                if not isinstance(metadata, dict):
+                    raise ValueError("candidate_metadata must return a mapping")
+                if len(self.properties) == 1 and len(leaves) == 1:
+                    return deepcopy(metadata)
+                model_metadata.append(metadata)
+                has_metadata = True
+            if has_metadata:
+                result[prop["name"]] = model_metadata
+        return deepcopy(result)
 
     def batch_predict(self, candidates: List[Any]) -> List[Tuple[float, float]]:
         return [self.predict(c) for c in candidates]
@@ -574,10 +609,12 @@ class StructureScorePredictor:
                 p["name"]: self._score(p, prop_structures[p["name"]])
                 for p in self.properties
             }
+            metadata = self._collect_candidate_metadata(candidate)
         else:
             best_stats: Optional[Dict[str, Tuple[float, float]]] = None
             best_reward: Optional[float] = None
             best_value: Optional[float] = None
+            metadata = {}
             for v in self.sweep["values"]:
                 trial = {
                     p["name"]: self._score(
@@ -588,6 +625,7 @@ class StructureScorePredictor:
                 r = self._combine(trial)
                 if best_reward is None or r > best_reward:
                     best_reward, best_stats, best_value = r, trial, v
+                    metadata = self._collect_candidate_metadata(candidate)
             stats = dict(best_stats)  # type: ignore[arg-type]
             stats[self.sweep["name"]] = (float(best_value), 0.0)
 
@@ -595,10 +633,12 @@ class StructureScorePredictor:
         # exactly once for the predictor's lifetime; all later occurrences (across
         # training episodes / duplicate generation rollouts) are hits.
         self._stats_cache[key] = stats
+        self._metadata_cache[key] = metadata
         cap = self._stats_cache_size
         if cap and cap > 0:
             while len(self._stats_cache) > cap:
-                self._stats_cache.popitem(last=False)   # evict least-recently used
+                old_key, _ = self._stats_cache.popitem(last=False)
+                self._metadata_cache.pop(old_key, None)
         return stats
 
     @staticmethod
@@ -681,6 +721,12 @@ class StructureScorePredictor:
             # passes straight through, preserving its uncertainty exactly.
             self_folded = getattr(leaf, "predict_structures" if is_struct else "predict")
             mean, std = self_folded(payload)
+            if (np.asarray(mean).ndim != 0 or np.asarray(std).ndim != 0 or
+                    not np.isfinite(float(mean)) or not np.isfinite(float(std)) or float(std) < 0):
+                raise ValueError(
+                    f"{type(leaf).__name__}.predict must return finite scalar (mean, std) "
+                    "with std >= 0; convert variance to standard deviation in the adapter."
+                )
             if len(prop["instance"]) == 1:
                 return float(mean), float(std)
             per_model.append(float(mean))

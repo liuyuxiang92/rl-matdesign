@@ -198,14 +198,34 @@ def main() -> None:
     step_dim     = env.n_components
     fraction_set = list(env.fraction_set)
 
-    # Precompute Magpie element features (replaces one-hot element encoding).
-    elem_feats_scaled, _elem_scaler = _precompute_elem_features(
-        env.species_set, env.state_featurizer
-    )
+    # Domains may supply token/action features independently of state features.
+    # The existing materials path retains its Magpie encoding unchanged.
+    feature_hook = getattr(env, "action_features", None)
+    explicit_features = feature_hook() if callable(feature_hook) else None
+    if explicit_features is None:
+        elem_feats_scaled, _elem_scaler = _precompute_elem_features(
+            env.species_set, env.state_featurizer
+        )
+    else:
+        elem_feats_scaled = np.asarray(explicit_features, dtype=float)
+        if (elem_feats_scaled.ndim != 2 or
+                elem_feats_scaled.shape[0] != len(env.species_set) or
+                elem_feats_scaled.shape[1] == 0 or not np.isfinite(elem_feats_scaled).all()):
+            raise ValueError("Environment action_features must be a finite matrix with one row per action token")
+
+    if getattr(env, "has_sequences", False):
+        from .utils.design_schema import save_or_check_design_schema
+
+        load_paths = []
+        if args.only_generate or args.resume_training:
+            weights = (args.load_qnet or os.path.join(args.out, "qnet.pt")) if method == "dqn" else (
+                args.load_policy or os.path.join(args.out, "policy.pt"))
+            load_paths = [weights, args.load_scaler or os.path.join(args.out, "std_scaler.bin")]
+        save_or_check_design_schema(env.design_schema(), args.out, load_paths=load_paths)
     elem_dim = int(elem_feats_scaled.shape[1])
     frac_dim = 1
 
-    print(f"[INFO] step_dim={step_dim}, elem_dim(Magpie)={elem_dim}, frac_dim={frac_dim}")
+    print(f"[INFO] step_dim={step_dim}, action_feature_dim={elem_dim}, frac_dim={frac_dim}")
 
     metrics = RunMetrics()
 
@@ -523,6 +543,8 @@ def main() -> None:
                 if value_net is not None:
                     if not os.path.exists(vnet_path):
                         raise SystemExit(f"--resume-training (a2c) requires {vnet_path} (use --load-value-net to override)")
+                    if getattr(env, "has_sequences", False):
+                        save_or_check_design_schema(env.design_schema(), args.out, load_paths=[vnet_path])
                     value_net.load_state_dict(torch.load(vnet_path, map_location=device))
                     print(f"[INFO] Loaded value_net from {vnet_path}", flush=True)
 

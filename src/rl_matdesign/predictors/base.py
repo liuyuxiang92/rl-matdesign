@@ -5,7 +5,7 @@ this interface via structural subtyping.  No inheritance required.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Protocol, Tuple, runtime_checkable
+from typing import Any, List, Protocol, Tuple, runtime_checkable
 
 
 @runtime_checkable
@@ -22,6 +22,9 @@ class PropertyPredictor(Protocol):
         Dict mapping element symbol → fractional occupancy, e.g.
         ``{"Co": 0.20, "Cr": 0.20, "Fe": 0.20, "Mn": 0.20, "Ni": 0.20}``.
         Fractions must sum to 1.0 (guaranteed by :class:`CompositionEnv`).
+        Multi-group inputs map group names to composition/categorical mappings
+        or ordered lists of token IDs for sequence groups. External adapters own
+        domain-specific encodings, molecular assembly and position conventions.
 
     Returns
     -------
@@ -30,11 +33,11 @@ class PropertyPredictor(Protocol):
         ``std`` is used for uncertainty-driven exploration and Pareto tracking.
     """
 
-    def predict(self, composition: Dict[str, float]) -> Tuple[float, float]:
+    def predict(self, composition: Any) -> Tuple[float, float]:
         ...
 
     def batch_predict(
-        self, compositions: List[Dict[str, float]]
+        self, compositions: List[Any]
     ) -> List[Tuple[float, float]]:
         """Batch variant.  Default loops over ``predict``; override for speed."""
         return [self.predict(c) for c in compositions]
