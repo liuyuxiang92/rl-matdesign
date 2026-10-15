@@ -1,0 +1,11 @@
+- id: decision-cleanup-001
+  date: 2026-10-15
+  expires: 2027-04-15
+  title: "Keep cleanup behavior-preserving and review constraint extensions separately"
+  choice: "For codex/cleanup-integration, withdraw require_primary_presence and restore the existing strict action sampler. Retain complete outside-primary dopant accounting. New parameters must express reusable capabilities; scenario-specific rules belong in explicit constraint modules/configs and require a separate behavior/design review."
+  alternatives_considered:
+    - "Keep the optional-presence flag with default true — user explicitly rejected adding this behavior to the cleanup branch."
+    - "Redesign generic constraints during this cleanup — deferred to avoid mixing scientific search-space changes with maintenance."
+  trade_off: "The legacy sampler and standalone phase checker still differ in presence semantics. Historical analysis results and the original feature checkout retain their original code/data; they do not authorize reintroducing the toggle into the cleanup branch. Old main YAML still requires groups-schema migration before merge compatibility can be claimed."
+  files: [src/abcde_ooh/constraints/phase_sampler.py, src/abcde_ooh/constraints/primary_phase.py, src/rl_matdesign/registry.py, docs/validation/ooh_phase_revert_20261015.md]
+  tags: [cleanup-scope, constraint-design, compatibility]

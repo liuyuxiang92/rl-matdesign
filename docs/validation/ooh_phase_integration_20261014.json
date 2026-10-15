@@ -71,5 +71,8 @@
     "Four optional local-file tests skipped (two RF models and two perovskite-template tests).",
     "Real DeepMD/MGTransformer long experiments and old-main configuration migration were not rerun.",
     "Original feature checkout retained; no main merge or remote push."
-  ]
+  ],
+  "validated_commit": "27af53ef435ca12d745486fff5f374097ab28908",
+  "status": "historical_optional_extension_withdrawn",
+  "superseded_by": "ooh_phase_revert_20261015.json"
 }

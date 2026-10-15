@@ -1,5 +1,9 @@
 # OOH phase fixes integrated into the cleanup branch — 2026-10-14
 
+> Historical validation for commit `27af53ef`. The optional-primary extension
+> was subsequently withdrawn at the user's request. See
+> [the 2026-10-15 revalidation](ooh_phase_revert_20261015.md) for the final scope.
+
 `codex/cleanup-integration` already inherited both local feature commits
 `9c918608` and `08bb24ae` through its cleanup commit `1231b055`.
 No duplicate cherry-pick was needed. This update ports the three OOH core-file

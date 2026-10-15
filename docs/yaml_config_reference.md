@@ -104,26 +104,18 @@ the O slot by the P-site metal's category).
 | `smact_charge` | Keep only compositions that can be charge-neutral (SMACT oxidation states) | `smact_anions: [{symbol, charge, stoich}]` (or `smact_anion` / `smact_anion_charge` / `smact_anion_stoich`) |
 | `last_step_element` | Force the last step to a required element | `required_elements`; `nonzero_ratio_at_last` (true); `reserve_for_last` (true) |
 | `phase_pattern` | Keep compositions matching phase patterns | `phase_patterns` |
-| `ooh_phase` | OOH oxyhydroxide phase screen | `target_phases` (default `[any]`); `require_primary_presence` (default `true`) |
+| `ooh_phase` | OOH oxyhydroxide phase screen | `target_phases` (default `[any]`) |
 | `chain` | Apply several filters in sequence | `filters: [ {constraint_filter: …, …}, … ]` |
 | `host_complement` | Dopants at a level, host takes the rest (wired automatically by a composition group's `host` knob) | `host_element`, `levels` |
 | `sse_doping` | Mask the LiPS S-site O-form slot by the metal's category | `o_element` (`O`), `host_P` (`P`), `metal_only`, `oxide_only` |
 | `"pkg.mod:Class"` | Your own filter (FQN) | your class's keys |
 
-For `ooh_phase`, the default requires every named primary element to be present.
-Set `require_primary_presence: false` to allow zero abundance for named primary
-elements when the remaining phase rules permit it. The environment still selects
-five distinct cations with positive fractions summing to one. Dopant content must
-remain strictly below 25%; the Fe-dominance and NiFe-ratio limits still apply.
-The terminal primary-phase checker counts every cation outside each primary set
-toward the dopant limit, including species absent from the historical dopant list.
+The `ooh_phase` sampler retains its five-cation rules: named primary elements
+must be selected for the requested phase. `any` accepts the union of these phases.
 
-```yaml
-filters:
-  - type: ooh_phase
-    target_phases: [NiFeCo]
-    require_primary_presence: false
-```
+The terminal OOH primary-phase checker counts every cation outside each primary
+set toward the dopant limit, including species absent from the historical dopant
+list. The dopant fraction must remain strictly below 25%.
 
 \newpage
 
