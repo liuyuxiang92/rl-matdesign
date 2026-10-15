@@ -8,6 +8,10 @@ __pycache__/
 # Large external RF checkpoints (sinter/calcine) copied from reference repos.
 models/sinter_calcine/
 
+# Large DeepMD foundation model used as the default geometry-optimization model
+# (place the file at models/DPA-3.1-3M.pt on the GPU box; not committed).
+models/DPA-3.1-3M.pt
+
 # Note: we intentionally do NOT ignore *.npz/*.joblib globally.
 # Those may be legitimate tracked datasets/models in this clean repo.
 
@@ -16,6 +20,17 @@ models/sinter_calcine/
 # has them; see trace.md if you need to recover an older version)
 configs/ti_alloy.yaml
 configs/perovskite.yaml
+configs/perovskite_level1.yaml
+configs/cs2agbicl6_level1.yaml
+configs/cs2agbicl6_level2.yaml
+configs/cs2agbicl6_level3.yaml
+configs/ooh.yaml
+configs/ooh_dqn.yaml
+configs/ooh_fine.yaml
+configs/hpo/ooh_a2c.yaml
+configs/hpo/ooh_dqn.yaml
+configs/hpo/cs2agbicl6_a2c.yaml
+configs/hpo/cs2agbicl6_dqn.yaml
 configs/ooh.yaml
 configs/ooh_dqn.yaml
 configs/hpo/ooh_a2c.yaml

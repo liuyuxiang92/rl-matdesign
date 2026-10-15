@@ -1,0 +1,134 @@
+{
+  "date": "2026-09-22",
+  "baseline_commit": "08bb24ae2cf25874da77cf221ecd0bd8581a2a21",
+  "main_unchanged": "39227da88a3450c126dfa52e094e308eb27fbb79",
+  "original_working_tree_tests": {
+    "passed": 359,
+    "failed": 2,
+    "reason": "Perovskite tests assumed a 5-atom template; local file contains 320 atoms."
+  },
+  "clean_checkout_tests": {
+    "passed": 348,
+    "skipped": 4
+  },
+  "with_existing_local_work_tests": {
+    "passed": 372,
+    "failed": 0,
+    "overlay": [
+      "src/abcde_ooh/constraints/primary_phase.py",
+      "tests/test_ooh_primary_phase.py",
+      "tests/test_ooh_budget_sweep.py",
+      "scripts/baselines/run_ooh_budget_sweep.py",
+      "perovskite.vasp",
+      "models/sinter_calcine"
+    ]
+  },
+  "rl_comparisons": [
+    {
+      "case": "flat-dqn-bootstrap",
+      "weight_tensors": 6,
+      "training_rows": 11,
+      "generated_csv_identical": true,
+      "old_checkpoint_generation_identical": true,
+      "resume_identical": true
+    },
+    {
+      "case": "flat-dqn-mc",
+      "weight_tensors": 6,
+      "training_rows": 11,
+      "generated_csv_identical": true,
+      "old_checkpoint_generation_identical": true,
+      "resume_identical": true
+    },
+    {
+      "case": "flat-a2c-bootstrap",
+      "weight_tensors": 12,
+      "training_rows": 9,
+      "generated_csv_identical": true,
+      "old_checkpoint_generation_identical": true,
+      "resume_identical": true
+    },
+    {
+      "case": "flat-reinforce-bootstrap",
+      "weight_tensors": 6,
+      "training_rows": 9,
+      "generated_csv_identical": true,
+      "old_checkpoint_generation_identical": true,
+      "resume_identical": true
+    },
+    {
+      "case": "multi-dqn-mc",
+      "weight_tensors": 6,
+      "training_rows": 11,
+      "generated_csv_identical": true,
+      "old_checkpoint_generation_identical": true,
+      "resume_identical": true
+    },
+    {
+      "case": "multi-dqn-bootstrap",
+      "weight_tensors": 6,
+      "training_rows": 11,
+      "generated_csv_identical": true,
+      "old_checkpoint_generation_identical": true,
+      "resume_identical": true
+    },
+    {
+      "case": "multi-reinforce-bootstrap",
+      "weight_tensors": 6,
+      "training_rows": 9,
+      "generated_csv_identical": true,
+      "old_checkpoint_generation_identical": true,
+      "resume_identical": true
+    },
+    {
+      "case": "multi-a2c-bootstrap",
+      "weight_tensors": 12,
+      "training_rows": 9,
+      "generated_csv_identical": true,
+      "old_checkpoint_generation_identical": true,
+      "resume_identical": true
+    }
+  ],
+  "baseline_comparisons": [
+    {
+      "scenario": "flat",
+      "method": "bo",
+      "generated_csv_identical": true
+    },
+    {
+      "scenario": "flat",
+      "method": "ga",
+      "generated_csv_identical": true
+    },
+    {
+      "scenario": "multi",
+      "method": "bo",
+      "generated_csv_identical": true
+    },
+    {
+      "scenario": "multi",
+      "method": "ga",
+      "generated_csv_identical": true
+    }
+  ],
+  "runner_functions_ast_identical": [
+    "parse_args",
+    "_apply_flag_aliases",
+    "load_config",
+    "build_predictor",
+    "build_constraint_filter",
+    "build_env",
+    "main"
+  ],
+  "wheel": {
+    "build": true,
+    "isolated_target_import": true,
+    "help": true,
+    "a2c_train_and_generate": true
+  },
+  "limitations": [
+    "Fixed-seed numerical comparisons use CPU and dummy predictors.",
+    "Real DeepMD/MGTransformer long-running experiments were not repeated.",
+    "Older main-branch config migration remains separate; no main merge performed."
+  ]
+}

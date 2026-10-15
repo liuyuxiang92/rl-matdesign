@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import random
 import re
-from typing import Callable, Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -47,7 +47,7 @@ class IntegerRatioEnv:
 
     Parameters
     ----------
-    cation_set:
+    species_set:
         Ordered list of candidate element symbols.  Must include any element
         required by the constraint filter (e.g. ``"O"`` for oxides).
     ratio_set:
@@ -70,14 +70,14 @@ class IntegerRatioEnv:
     def __init__(
         self,
         *,
-        cation_set: Sequence[str],
+        species_set: Sequence[str],
         ratio_set: Sequence[str] = DEFAULT_RATIO_SET,
         n_components: int = 5,
         reward_fn: Callable[[str], float] | None = None,
         state_featurizer: Callable[[str], np.ndarray] = featurize_formula,
         phase_filter=None,
     ) -> None:
-        self.cation_set = list(cation_set)
+        self.species_set = list(species_set)
         # ``fraction_set`` alias so downstream code (scripts, filters) that
         # looks at ``env.fraction_set`` keeps working.
         self.fraction_set = list(ratio_set)
@@ -88,6 +88,10 @@ class IntegerRatioEnv:
         self.reward_fn = reward_fn or (lambda _formula: 0.0)
         self.state_featurizer = state_featurizer
         self.phase_filter = phase_filter
+        # When False, ``allowed_actions`` skips ``phase_filter`` — lets callers
+        # disable in-episode constraint pruning during training only (the
+        # ``constrain_training`` flag) while keeping it on for generation.
+        self.constraints_enabled = True
 
         # Sentinel: ``_total_units = None`` tells ``_comp_key`` to fall back to
         # a formula-string key (patched in ``training.py``).
@@ -114,10 +118,21 @@ class IntegerRatioEnv:
 
     @property
     def terminal_formula(self) -> str:
-        """Raw empirical formula string built so far (non-empty only at the terminal step)."""
+        """Canonical empirical formula at the terminal step (empty before it).
+
+        Built from the merged integer digits rather than the raw pick string, so
+        duplicate element picks are summed (``Bi4`` + ``Bi3`` -> ``Bi7``) and
+        zero-amount picks are dropped (``Ba0`` disappears). This matches the
+        composition that the predictor and the charge-neutrality check actually
+        see — both route the string through ``pymatgen.Composition``, which
+        merges/drops anyway — so ``generated.csv`` no longer shows phantom
+        ``X0`` elements or repeated symbols that look non-neutral/unbalanced to
+        external checkers.
+        """
         if self.counter != self.n_components:
             return ""
-        return self.state
+        digits = self.cation_digits()
+        return "".join(f"{el}{n}" for el, n in digits.items() if n > 0)
 
     def cation_digits(self) -> Dict[str, int]:
         """Return running sum of integer digits per element in the current state."""
@@ -128,6 +143,16 @@ class IntegerRatioEnv:
         for el, d in parts:
             out[el] = out.get(el, 0) + int(d)
         return out
+
+    def cation_fractions(self) -> Dict[str, int]:
+        """Raw per-element digit sums (atom counts, not normalised fractions).
+
+        Named to match the uniform inner-group interface :class:`MultiGroupEnv`
+        drives (see :meth:`~rl_matdesign.env.CompositionEnv.cation_fractions`);
+        unlike that sibling, integer digits already *are* atom counts, so there
+        is nothing to normalise.
+        """
+        return self.cation_digits()
 
     def terminal_cation_fractions(self) -> Dict[str, float]:
         """Normalised fractional composition at the terminal step.
@@ -162,31 +187,51 @@ class IntegerRatioEnv:
         items = [(el, n // g) for el, n in items]
         return tuple(sorted(items))
 
+    def current_state_features(self) -> np.ndarray:
+        """Material features of the current (partial) state, for action selection.
+
+        Uniform accessor shared with :class:`ABCDEOOHEnv` / :class:`MultiGroupEnv`
+        so training/generation code never reaches into env-specific state.
+        """
+        return np.asarray(self.state_featurizer(self.state), dtype=float)
+
     # ------------------------------------------------------------------
     # Action space
     # ------------------------------------------------------------------
 
-    def allowed_actions(self) -> List[Tuple[Tuple[float, ...], Tuple[float, ...]]]:
+    def allowed_actions(
+        self, *, prior_groups: Optional[List[Dict[str, float]]] = None
+    ) -> List[Tuple[Tuple[float, ...], Tuple[float, ...]]]:
+        """Return all (elem_onehot, digit_onehot) action pairs.
+
+        ``prior_groups`` is forwarded to the constraint filter for cross-group
+        coupling under :class:`MultiGroupEnv`; it is ``None`` (and ignored) for
+        standalone single-env use, so existing callers are unaffected — mirrors
+        :meth:`~rl_matdesign.env.CompositionEnv.allowed_actions`.
+        """
         if self.counter >= self.n_components:
             return []
 
         actions: List[Tuple[Tuple[float, ...], Tuple[float, ...]]] = []
-        for elem in self.cation_set:
-            elem_oh = tuple(encode_choice(elem, self.cation_set).tolist())
+        for elem in self.species_set:
+            elem_oh = tuple(encode_choice(elem, self.species_set).tolist())
             for d in self.ratio_set:
                 comp_oh = tuple(encode_choice(d, self.ratio_set).tolist())
                 actions.append((elem_oh, comp_oh))
 
-        if self.phase_filter is not None:
-            actions = self.phase_filter.filter_actions(
+        if self.phase_filter is not None and self.constraints_enabled:
+            kw = dict(
                 actions=actions,
                 units_map=self._digits_map,
                 steps_left=self.n_components - self.counter - 1,
                 allowed_units=[int(d) for d in self.ratio_set],
                 possible_sums_by_k=[],
-                cation_set=self.cation_set,
+                species_set=self.species_set,
                 fraction_set=self.ratio_set,
             )
+            if prior_groups is not None:
+                kw["prior_groups"] = prior_groups
+            actions = self.phase_filter.filter_actions(**kw)
         return actions
 
     def sample_random_action(self) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
@@ -201,7 +246,7 @@ class IntegerRatioEnv:
 
     def step(self, action: Tuple[Tuple[float, ...], Tuple[float, ...]]) -> None:
         elem_oh, comp_oh = action
-        elem = decode_one_hot(elem_oh, self.cation_set)
+        elem = decode_one_hot(elem_oh, self.species_set)
         digit_str = decode_one_hot(comp_oh, self.ratio_set)
 
         current_allowed = self.allowed_actions()

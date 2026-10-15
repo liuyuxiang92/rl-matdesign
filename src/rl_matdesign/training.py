@@ -42,6 +42,55 @@ from .predictors.base import PropertyPredictor
 
 
 # ---------------------------------------------------------------------------
+# Candidate-evaluation failures (build/predictor errors unrelated to whether
+# the composition itself is valid — e.g. every random MD/relax realization
+# failing for a structure builder). Raised by ``reward_fn``/``mg_reward_fn``
+# (scripts/run_experiment.py); rollout call sites below catch it and retry
+# with a fresh candidate instead of either crashing the run or burning a
+# real episode-budget slot on a candidate that was never actually scored.
+# ---------------------------------------------------------------------------
+
+class CandidateEvaluationFailed(Exception):
+    """A well-formed candidate's predictor/builder call failed; retry, don't
+    count it against the episode budget."""
+
+
+# How many consecutive candidates may fail evaluation before a rollout call
+# site gives up and lets the failure surface as a hard error. A handful of
+# retries absorbs occasional transient/geometric failures (e.g. a random
+# interstitial placement, or a random solid-solution decoration, that happens
+# to destabilize an MD run); exhausting this many in a row means something
+# systemic is wrong (a broken binary path, a missing model file, ...) that no
+# amount of retrying will fix — better to fail loudly than spend the rest of
+# the training budget on candidates that never get scored.
+_MAX_CANDIDATE_RETRIES = 10
+
+
+def _rollout_with_retry(rollout_fn: Callable[[], None]) -> None:
+    """Call ``rollout_fn()`` (which must drive one full episode via
+    ``env.initialize()`` + ``env.step()`` to a terminal reward); on
+    :class:`CandidateEvaluationFailed`, discard the attempt and retry with a
+    fresh candidate — up to :data:`_MAX_CANDIDATE_RETRIES` times — so the
+    caller's episode-budget counter never advances for a candidate that
+    failed evaluation.
+    """
+    for attempt in range(_MAX_CANDIDATE_RETRIES + 1):
+        try:
+            rollout_fn()
+            return
+        except CandidateEvaluationFailed as exc:
+            if attempt == _MAX_CANDIDATE_RETRIES:
+                raise RuntimeError(
+                    f"{_MAX_CANDIDATE_RETRIES + 1} consecutive candidates all "
+                    "failed evaluation -- giving up rather than spending the "
+                    f"rest of the run on unscored candidates. Last failure: {exc}"
+                ) from exc
+            print(f"[WARN] candidate evaluation failed (retry "
+                  f"{attempt + 1}/{_MAX_CANDIDATE_RETRIES}), discarding and "
+                  f"trying a new candidate: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Loss function factory
 # ---------------------------------------------------------------------------
 
@@ -100,7 +149,7 @@ def objective_from_mean_std(
 # ---------------------------------------------------------------------------
 
 def _precompute_elem_features(
-    cation_set: List[str],
+    species_set: List[str],
     featurizer: Callable,
 ) -> Tuple[np.ndarray, StandardScaler]:
     """Precompute and scale Magpie feature vectors for each cation.
@@ -113,9 +162,9 @@ def _precompute_elem_features(
     -------
     (elem_feats_scaled, elem_scaler):
         ``elem_feats_scaled`` has shape ``(n_elements, feature_dim)``.
-        Index ``i`` corresponds to ``cation_set[i]``.
+        Index ``i`` corresponds to ``species_set[i]``.
     """
-    raw = np.asarray([featurizer(el + "1.00") for el in cation_set], dtype=float)
+    raw = np.asarray([featurizer(el + "1.00") for el in species_set], dtype=float)
     elem_scaler = StandardScaler()
     elem_scaler.fit(raw)
     return elem_scaler.transform(raw), elem_scaler
@@ -125,11 +174,29 @@ def _precompute_elem_features(
 # Replay buffer helpers (classical DQN)
 # ---------------------------------------------------------------------------
 
+# --- BEGIN mc-target experiment (removable) ---
+def _attach_mc_returns(rows: list, path: list, gamma: float) -> None:
+    """Attach the discounted Monte-Carlo return G to each buffer row in place.
+
+    Non-bootstrap regression target, used only when ``dqn_target_mode == 'mc'``
+    (mirrors the reference npj DQN). ``rows`` are in episode order, aligned 1:1
+    with ``path``. With a terminal-only reward this reduces to
+    ``G_t = gamma**(T-1-t) * R_terminal``; the backward recursion below stays
+    correct even if a config ever emits intermediate rewards.
+    """
+    G = 0.0
+    for k in reversed(range(len(path))):
+        G = float(path[k].reward) + gamma * G   # terminal step: G = reward
+        rows[k]["mc_return"] = G
+# --- END mc-target experiment ---
+
+
 def add_episode_to_buffer(
     path: list,
     buffer: collections.deque,
     elem_feats_scaled: np.ndarray,
     fraction_set: List[str],
+    gamma: float = 0.9,
 ) -> None:
     """Convert a completed episode path into buffer rows and append.
 
@@ -139,6 +206,7 @@ def add_episode_to_buffer(
     - ``next_allowed_idx``: list of (elem_idx, comp_idx) pairs for the next
       step, used to compute the max-Q bootstrap target.
     """
+    rows: List[dict] = []
     for k, step in enumerate(path):
         done = k == len(path) - 1
         next_step = path[k + 1] if not done else None
@@ -148,7 +216,7 @@ def add_episode_to_buffer(
                 next_allowed_idx.append(
                     (int(np.argmax(elem_oh)), int(np.argmax(comp_oh)))
                 )
-        buffer.append({
+        rows.append({
             "s_mat_raw":       np.asarray(step.state_material_features, dtype=float),
             "s_step":          np.asarray(step.state_step_onehot, dtype=float),
             "a_elem_idx":      int(np.argmax(step.action_elem_onehot)),
@@ -161,6 +229,10 @@ def add_episode_to_buffer(
             "next_allowed_idx": next_allowed_idx,
             "done":            done,
         })
+    # --- BEGIN mc-target experiment (removable) ---
+    _attach_mc_returns(rows, path, gamma)
+    # --- END mc-target experiment ---
+    buffer.extend(rows)
 
 
 def _row_fingerprint(row: dict) -> tuple:
@@ -405,13 +477,24 @@ def _dqn_gradient_step(
     loss_fn: torch.nn.Module,
     device: torch.device,
     gamma: float,
+    target_mode: str = "bootstrap",
 ) -> float:
-    """One DQN gradient step: SmoothL1(Q(s,a), TD-target)."""
-    y = [
-        _compute_td_target(r, target_net, s_mat_scaler, elem_feats_scaled,
-                           fraction_set, device, gamma)
-        for r in batch
-    ]
+    """One DQN gradient step: SmoothL1(Q(s,a), target).
+
+    ``target_mode='bootstrap'`` (default) uses the one-step TD target
+    ``r + gamma*max_a' Q_target(s',a')``. ``target_mode='mc'`` regresses to the
+    fixed discounted Monte-Carlo return stored on each row (no bootstrap).
+    """
+    # --- BEGIN mc-target experiment (removable) ---
+    if target_mode == "mc":
+        y = [float(r["mc_return"]) for r in batch]
+    else:
+    # --- END mc-target experiment ---
+        y = [
+            _compute_td_target(r, target_net, s_mat_scaler, elem_feats_scaled,
+                               fraction_set, device, gamma)
+            for r in batch
+        ]
     s_mat_b  = torch.tensor(
         s_mat_scaler.transform(np.asarray([r["s_mat_raw"] for r in batch], dtype=float)),
         dtype=torch.float32, device=device,
@@ -462,6 +545,8 @@ def train_dqn_online(
     checkpoint_cfg: Optional[dict] = None,
     resume_state: Optional[dict] = None,
     augment_permutations: int = 0,
+    timer: Optional[object] = None,
+    dqn_target_mode: str = "bootstrap",
 ) -> Tuple[torch.nn.Module, StandardScaler, List[dict]]:
     """Classical online DQN with FIFO replay buffer and TD targets.
 
@@ -488,8 +573,36 @@ def train_dqn_online(
     (qnet, scaler, metrics):
         Trained Q-network, fitted s_mat scaler, and list of per-episode metric
         dicts (phase="dqn_train").
+
+    ``timer``:
+        Optional :class:`~rl_matdesign.utils.timing.PredictorTimer`. When given,
+        every per-episode row also carries cumulative wall-clock and
+        predictor-call counters, which is what makes a best-reward-vs-time curve
+        plottable after the run.
     """
     from .model import QRegressor
+
+    # --- BEGIN mc-target experiment (removable) ---
+    if dqn_target_mode == "mc":
+        print(
+            "[INFO] DQN target_mode='mc': regressing to fixed discounted "
+            "Monte-Carlo returns (no bootstrap); target network and "
+            "dqn_target_update_freq are inert.",
+            flush=True,
+        )
+        if augment_permutations > 0:
+            raise ValueError(
+                "dqn_target_mode='mc' does not support permutation augmentation "
+                "(augment_permutations>0); the mc-return field is only attached on "
+                "the non-augmented path. Set dqn_augment_permutations=0 for the "
+                "mc comparison run."
+            )
+    # --- END mc-target experiment ---
+
+    # Warmup pays one real predictor call per episode (see below), so those
+    # episodes are part of the training cost and belong in the log. Collected
+    # here because `metrics` isn't built until after the warmup branch.
+    warmup_rows: List[dict] = []
 
     if resume_state is not None:
         scaler     = resume_state["scaler"]
@@ -519,17 +632,30 @@ def train_dqn_online(
         else:
             print(f"[INFO] DQN warmup: {n_warmup_eps} random episodes with real rewards...")
         pbar = tqdm(total=n_warmup_eps, desc="DQN warmup")
-        for _ in range(n_warmup_eps):
-            _rollout_random_episode(env)
+        for _w in range(n_warmup_eps):
+            _rollout_with_retry(lambda: _rollout_random_episode(env))
+            if env.path:
+                warmup_rows.append({
+                    "phase": "dqn_warmup",
+                    "episode": _w + 1,
+                    "return": float(env.path[-1].reward),
+                    "terminal_reward": float(env.path[-1].reward),
+                    "epsilon": 1.0,          # warmup is uniformly random by definition
+                    "terminal_comp_key": str(env.terminal_comp_key()),
+                })
             if augment_permutations > 0:
                 _augment_episode_in_buffer(
                     env, env.path, buffer, elem_feats_scaled, fraction_set,
                     K=augment_permutations,
                 )
             else:
-                add_episode_to_buffer(env.path, buffer, elem_feats_scaled, fraction_set)
+                add_episode_to_buffer(env.path, buffer, elem_feats_scaled, fraction_set, gamma=gamma)
             pbar.update(1)
         pbar.close()
+        # Unlike PG warmup (which neutralises reward_fn), DQN warmup pays a real
+        # predictor call per episode. The mark makes that cost visible.
+        if timer is not None:
+            timer.mark("warmup_end")
 
         s_mat_all = np.asarray([r["s_mat_raw"] for r in buffer], dtype=float)
         scaler = StandardScaler().fit(s_mat_all)
@@ -558,6 +684,7 @@ def train_dqn_online(
         dp_cache_ref = checkpoint_cfg.get("dp_cache")
 
     metrics: List[dict] = []
+    metrics.extend(warmup_rows)
 
     if start_ep >= dqn_num_train_eps:
         print(
@@ -569,14 +696,13 @@ def train_dqn_online(
 
     pbar = tqdm(range(start_ep, dqn_num_train_eps), desc="DQN train")
 
-    for ep in pbar:
-        # 1. Collect one episode with epsilon-greedy policy.
-        qnet.eval()
+    def _rollout_eps_greedy_episode() -> None:
+        # Collect one episode with epsilon-greedy policy.
         env.initialize()
         for _t in range(env.n_components):
             _allowed = env.allowed_actions()
             _s_mat_sc = scaler.transform(
-                env.state_featurizer(env.state).reshape(1, -1))[0]
+                env.current_state_features().reshape(1, -1))[0]
             _s_step = np.zeros(env.n_components, dtype=float)
             _s_step[env.counter] = 1.0
             if float(np.random.rand()) < eps:
@@ -591,6 +717,10 @@ def train_dqn_online(
                 )
             env.step(_a)
 
+    for ep in pbar:
+        qnet.eval()
+        _rollout_with_retry(_rollout_eps_greedy_episode)
+
         episode_reward = float(env.path[-1].reward)
         if augment_permutations > 0:
             _augment_episode_in_buffer(
@@ -598,7 +728,7 @@ def train_dqn_online(
                 K=augment_permutations,
             )
         else:
-            add_episode_to_buffer(env.path, buffer, elem_feats_scaled, fraction_set)
+            add_episode_to_buffer(env.path, buffer, elem_feats_scaled, fraction_set, gamma=gamma)
 
         # 2. Gradient steps.
         mean_loss = float("nan")
@@ -610,6 +740,7 @@ def train_dqn_online(
                 losses.append(_dqn_gradient_step(
                     qnet, _batch, target_net, scaler,
                     elem_feats_scaled, fraction_set, optimizer, loss_fn, device, gamma,
+                    target_mode=dqn_target_mode,
                 ))
             mean_loss = float(np.mean(losses))
 
@@ -621,16 +752,23 @@ def train_dqn_online(
         # 4. Linear epsilon anneal.
         eps = max(dqn_eps_min, 1.0 - ep / dqn_eps_anneal_eps)
 
-        metrics.append({
+        _row = {
             "phase": "dqn_train",
             "iteration": ep + 1,
             "episode": ep + 1,
             "return": episode_reward,
+            # Identical to `return` for DQN (it already logs the undiscounted
+            # terminal reward), but present so every phase carries the column that
+            # is comparable across methods — see the PG rows, where they differ.
+            "terminal_reward": episode_reward,
             "train_loss": mean_loss,
             "mse_loss": mean_loss,
             "epsilon": eps,
             "buffer_rows": len(buffer),
-        })
+        }
+        if timer is not None:
+            _row.update(timer.snapshot())
+        metrics.append(_row)
         pbar.set_postfix(
             eps=f"{eps:.3f}",
             loss=f"{mean_loss:.4f}" if not math.isnan(mean_loss) else "warmup",
@@ -756,7 +894,7 @@ def _rollout_policy_episode(
     env.initialize()
     for _ in range(env.n_components):
         allowed = env.allowed_actions()
-        s_mat = scaler.transform(env.state_featurizer(env.state).reshape(1, -1))[0]
+        s_mat = scaler.transform(env.current_state_features().reshape(1, -1))[0]
         s_step = np.zeros(env.n_components, dtype=float)
         if env.counter < env.n_components:
             s_step[env.counter] = 1.0
@@ -812,7 +950,7 @@ def _rollout_pg_episode(
     env.initialize()
     for _ in range(env.n_components):
         allowed = env.allowed_actions()
-        s_mat = scaler.transform(env.state_featurizer(env.state).reshape(1, -1))[0]
+        s_mat = scaler.transform(env.current_state_features().reshape(1, -1))[0]
         s_step = np.zeros(env.n_components, dtype=float)
         if env.counter < env.n_components:
             s_step[env.counter] = 1.0
@@ -840,11 +978,35 @@ def _rollout_pg_episode(
 # Policy gradient training (REINFORCE / A2C)
 # ---------------------------------------------------------------------------
 
+# Entropy-floor controller. The failure it exists to prevent: with a fixed
+# coefficient, how far the policy collapses is set by the *number of gradient
+# updates*, so the same YAML that behaves at 100 updates goes deterministic at
+# 3000 (observed: entropy 0.00 with one composition sampled 31,843 times out of
+# 45,200 episodes). A proportional controller on normalised entropy removes that
+# dependence on run length, so one setting serves every budget.
+_ENTROPY_CTRL_GAIN = 2.0    # how hard coef_eff reacts to a floor violation
+_ENTROPY_CTRL_MAX  = 100.0  # coef_eff ceiling, as a multiple of pg_entropy_coef
+
+
+def entropy_coef_update(coef_eff: float, entropy_norm: float,
+                        base_coef: float, floor: float) -> float:
+    """One step of the entropy-floor controller.
+
+    ``entropy_norm`` is ``H / ln|A|`` in [0, 1]; ``floor`` is ``pg_entropy_min``.
+    Below the floor the weight grows, above it decays back toward ``base_coef``,
+    which acts as the lower clamp so the controller can only ever *add* pressure
+    to explore. ``floor <= 0`` disables it and pins the weight at ``base_coef``.
+    """
+    if floor <= 0.0:
+        return base_coef
+    coef_eff *= math.exp(_ENTROPY_CTRL_GAIN * (floor - entropy_norm))
+    return min(max(coef_eff, base_coef), base_coef * _ENTROPY_CTRL_MAX)
+
+
 def _episode_pg_terms(
     *,
     path,
     returns: List[float],
-    returns_shaped: List[float],
     policy: torch.nn.Module,
     value_net: Optional[torch.nn.Module],
     scaler: "StandardScaler",
@@ -852,16 +1014,25 @@ def _episode_pg_terms(
     fraction_set: List[str],
     device: "torch.device",
 ) -> tuple:
-    """Build per-step actor/entropy/critic loss tensors for one episode.
+    """Build per-step policy-gradient *components* for one episode.
 
-    Tensors carry autograd state so they can be stacked with terms from other
-    episodes in the same batch and backproped together.
+    Returns ``(logp_taken, advantage_raw, entropy, max_entropy, critic_loss)``
+    rather than a finished actor loss. The advantage is deliberately left
+    un-scaled and separate from ``logp`` so :func:`train_pg` can standardise it
+    across the whole batch before forming ``-logp * adv`` — folding the two
+    together here would make batch-level normalisation impossible.
+
+    ``logp_taken`` and ``entropy`` carry autograd state; ``advantage_raw`` and
+    ``max_entropy`` are plain floats (the advantage is a constant w.r.t. the
+    actor by construction — ``G`` is data and ``V`` is detached).
     """
-    actor_losses: List[torch.Tensor] = []
+    logp_taken: List[torch.Tensor] = []
+    advantages_raw: List[float] = []
     entropy_terms: List[torch.Tensor] = []
+    max_entropies: List[float] = []
     critic_losses: List[torch.Tensor] = []
 
-    for step, G_t, G_t_shaped in zip(path, returns, returns_shaped):
+    for step, G_t in zip(path, returns):
         allowed = step.allowed_actions
         if not allowed:
             continue
@@ -900,22 +1071,30 @@ def _episode_pg_terms(
         if taken_idx is None:
             continue
 
-        G_raw_t    = torch.tensor(G_t,        dtype=torch.float32, device=device)
-        G_shaped_t = torch.tensor(G_t_shaped, dtype=torch.float32, device=device)
+        G_raw_t = torch.tensor(G_t, dtype=torch.float32, device=device)
 
         if value_net is not None:
             s_mat_single  = torch.tensor(s_mat.reshape(1, -1),  dtype=torch.float32, device=device)
             s_step_single = torch.tensor(s_step.reshape(1, -1), dtype=torch.float32, device=device)
             value = value_net(s_mat_single, s_step_single).reshape(-1)[0]
-            advantage = G_shaped_t - value.detach()
+            # The critic regresses the *raw* return: it is a value function for the
+            # real objective, not for the exploration-shaped one.
             critic_losses.append((value - G_raw_t) ** 2)
+            advantage = G_t - float(value.detach().item())
         else:
-            advantage = G_shaped_t
+            # REINFORCE: no baseline. Batch standardisation in train_pg supplies
+            # the variance reduction a critic would otherwise give.
+            advantage = G_t
 
-        actor_losses.append(-log_probs[taken_idx] * advantage)
+        logp_taken.append(log_probs[taken_idx])
+        advantages_raw.append(float(advantage))
         entropy_terms.append(-(probs * log_probs).sum())
+        # Max entropy of this step's action set. |A| varies per step (the env
+        # prunes infeasible actions), so the floor has to be measured against the
+        # live action count, not a global constant.
+        max_entropies.append(math.log(n) if n > 1 else 0.0)
 
-    return actor_losses, entropy_terms, critic_losses
+    return logp_taken, advantages_raw, entropy_terms, max_entropies, critic_losses
 
 
 def train_pg(
@@ -933,19 +1112,43 @@ def train_pg(
     lr_actor: float = 1e-3,
     lr_critic: float = 1e-3,
     pg_entropy_coef: float = 0.01,
+    pg_entropy_min: float = 0.3,
     rl_method: str = "a2c",
     pg_repeat_penalty_coef: float = 0.0,
     pg_repeat_penalty_shape: str = "log",
     max_train_attempts: Optional[int] = None,
     checkpoint_cfg: Optional[dict] = None,
+    timer: Optional[object] = None,
 ) -> List[dict]:
     """Batched REINFORCE / A2C training loop (matches feat/classical-dqn).
 
     Structure:
         for it in range(num_iters):
             collect batch_eps episodes under current policy
-            accumulate per-step actor/entropy/critic terms across all of them
+            standardise advantages across the batch
             one optimizer step over the entire batch
+
+    Scale invariance
+    ----------------
+    Advantages are **standardised across the batch** before forming the actor
+    loss, unconditionally. Without it the actor term scales with the raw reward
+    (sintering temperatures are 400-700, so |advantage| is O(hundreds)) while the
+    entropy bonus is ``pg_entropy_coef * H`` with ``H <= ln|A| ~ 5.6``. The
+    entropy term is then ~2 orders of magnitude too small to influence the update
+    and the policy collapses to a single composition. After standardisation both
+    ``pg_entropy_coef`` and ``pg_repeat_penalty_coef`` are expressed in standard
+    deviations of batch return, so they mean the same thing in every scenario
+    regardless of the property's units.
+
+    ``pg_entropy_min`` is a floor on *normalised* entropy ``H / ln|A|`` in [0, 1],
+    held by a proportional controller (see ``_ENTROPY_CTRL_GAIN``). Set it to 0 to
+    disable the floor and use the bare ``pg_entropy_coef``.
+
+    .. note::
+       In the metrics rows ``repeat_penalty`` is now in σ, while ``return_shaped``
+       converts it back to the property's units so it stays comparable against
+       ``return_raw``. Logs written before this change are not comparable to
+       either.
     """
     policy.train()
     opt_actor = torch.optim.Adam(policy.parameters(), lr=lr_actor)
@@ -969,6 +1172,13 @@ def train_pg(
     if checkpoint_cfg and checkpoint_cfg.get("visit_counts"):
         visit_counts = Counter(checkpoint_cfg["visit_counts"])
 
+    # Effective entropy weight, carried across updates by the floor controller.
+    # Restored on resume so a resumed run doesn't snap back to the base weight and
+    # re-collapse the policy it had just re-opened.
+    coef_eff = float(pg_entropy_coef)
+    if checkpoint_cfg and checkpoint_cfg.get("entropy_coef_eff") is not None:
+        coef_eff = float(checkpoint_cfg["entropy_coef_eff"])
+
     metrics: List[dict] = []
     accepted = int(checkpoint_cfg.get("start_episode", 0)) if checkpoint_cfg else 0
     attempted = 0
@@ -984,21 +1194,24 @@ def train_pg(
     for it in outer_pbar:
         batch_paths: List[list] = []
         batch_returns: List[List[float]] = []
-        batch_returns_shaped: List[List[float]] = []
         batch_terminal_keys: List[tuple] = []
         batch_repeat_penalties: List[float] = []
         batch_visits_before: List[int] = []
+        # One record per *sampled episode*, so the PG training-reward distribution is
+        # comparable with DQN's (which logs every episode). The pg_train row below
+        # only carries the batch mean, which hides the low-temperature tail entirely.
+        batch_ep_rows: List[dict] = []
 
         collected = 0
         while collected < int(batch_eps):
             attempted += 1
             if max_train_attempts is not None and attempted > max_train_attempts:
                 break
-            _rollout_pg_episode(
+            _rollout_with_retry(lambda: _rollout_pg_episode(
                 env=env, policy=policy, scaler=scaler,
                 elem_feats_scaled=elem_feats_scaled, fraction_set=fraction_set,
                 device=device,
-            )
+            ))
             path = env.path
             if not path:
                 continue
@@ -1022,28 +1235,48 @@ def train_pg(
             else:
                 repeat_penalty = 0.0
             visit_counts[terminal_key] += 1
-            returns_shaped = [G_t - repeat_penalty for G_t in returns]
+            # The penalty is applied *after* advantage standardisation (below), so
+            # the coefficient is in σ of batch return rather than in the property's
+            # own units. Subtracting it from the raw return here would make it a
+            # no-op: 0.1*ln(1+4472) = 0.84 against returns of ~436 is 0.2%.
 
             batch_paths.append(path)
             batch_returns.append(returns)
-            batch_returns_shaped.append(returns_shaped)
             batch_terminal_keys.append(terminal_key)
             batch_repeat_penalties.append(repeat_penalty)
             batch_visits_before.append(n_visits_before)
             collected += 1
             accepted += 1
+            batch_ep_rows.append({
+                "phase": "pg_episode",
+                "iteration": it + 1,
+                "episode": accepted,
+                "return": returns[0],
+                "return_raw": returns[0],
+                # `return` is the *discounted* return G_0 = gamma^(n-1) * r_T for a
+                # terminal-only reward — the training signal, not a temperature.
+                # DQN's `return` column is the undiscounted terminal reward, so the
+                # two are NOT comparable without this column. Log it explicitly
+                # rather than making every reader re-derive gamma from run_config.
+                "terminal_reward": float(path[-1].reward),
+                "repeat_penalty": repeat_penalty,
+                "visit_count_before": n_visits_before,
+                "terminal_comp_key": str(terminal_key),
+            })
 
         if not batch_paths:
             continue
 
-        all_actor: List[torch.Tensor] = []
+        all_logp: List[torch.Tensor] = []
+        all_adv_raw: List[float] = []
+        all_penalty: List[float] = []
         all_entropy: List[torch.Tensor] = []
+        all_max_entropy: List[float] = []
         all_critic: List[torch.Tensor] = []
-        for path, returns, returns_shaped in zip(batch_paths, batch_returns, batch_returns_shaped):
-            a_terms, e_terms, c_terms = _episode_pg_terms(
+        for path, returns, penalty in zip(batch_paths, batch_returns, batch_repeat_penalties):
+            lp, adv, e_terms, h_max, c_terms = _episode_pg_terms(
                 path=path,
                 returns=returns,
-                returns_shaped=returns_shaped,
                 policy=policy,
                 value_net=value_net,
                 scaler=scaler,
@@ -1051,16 +1284,42 @@ def train_pg(
                 fraction_set=fraction_set,
                 device=device,
             )
-            all_actor.extend(a_terms)
+            all_logp.extend(lp)
+            all_adv_raw.extend(adv)
+            all_penalty.extend([penalty] * len(adv))
             all_entropy.extend(e_terms)
+            all_max_entropy.extend(h_max)
             all_critic.extend(c_terms)
 
-        if not all_actor:
+        if not all_logp:
             continue
 
-        actor_loss       = torch.stack(all_actor).mean()
-        entropy_bonus    = torch.stack(all_entropy).mean()
-        total_actor_loss = actor_loss - pg_entropy_coef * entropy_bonus
+        # --- advantage standardisation (the whole point; see docstring) -------
+        adv_raw = torch.tensor(all_adv_raw, dtype=torch.float32, device=device)
+        adv_mean = float(adv_raw.mean().item())
+        adv_std  = float(adv_raw.std(unbiased=False).item())
+        if adv_std > 1e-8:
+            adv = (adv_raw - adv_mean) / adv_std
+        else:
+            # Every episode in the batch scored identically — there is no signal to
+            # extract. Dividing by an epsilon here would amplify float noise into a
+            # full-magnitude gradient, so emit a zero update instead.
+            adv = torch.zeros_like(adv_raw)
+        # Repeat penalty now lives in σ units, applied to the standardised value.
+        adv = adv - torch.tensor(all_penalty, dtype=torch.float32, device=device)
+
+        logp_t        = torch.stack(all_logp)
+        entropy_t     = torch.stack(all_entropy)
+        actor_loss    = -(logp_t * adv).mean()
+        entropy_bonus = entropy_t.mean()
+
+        # --- entropy floor controller ----------------------------------------
+        mean_max_entropy = float(np.mean(all_max_entropy)) if all_max_entropy else 0.0
+        entropy_norm = (float(entropy_bonus.item()) / mean_max_entropy
+                        if mean_max_entropy > 1e-8 else 0.0)
+        coef_eff = entropy_coef_update(coef_eff, entropy_norm,
+                                       pg_entropy_coef, pg_entropy_min)
+        total_actor_loss = actor_loss - coef_eff * entropy_bonus
 
         opt_actor.zero_grad(set_to_none=True)
         total_actor_loss.backward()
@@ -1077,10 +1336,15 @@ def train_pg(
         update_idx += 1
         ep_actor_loss = float(actor_loss.item())
         ep_entropy    = float(entropy_bonus.item())
-        mean_return_raw    = float(np.mean([rs[0] for rs in batch_returns])) if batch_returns else 0.0
-        mean_return_shaped = float(np.mean([rs[0] for rs in batch_returns_shaped])) if batch_returns_shaped else 0.0
+        mean_return_raw = float(np.mean([rs[0] for rs in batch_returns])) if batch_returns else 0.0
+        # Undiscounted terminal reward, in the property's own units — the only
+        # column comparable with DQN's `return` (see the pg_episode row above).
+        mean_terminal_reward = (float(np.mean([float(p[-1].reward) for p in batch_paths]))
+                                if batch_paths else 0.0)
+        # In σ units now, like the penalty itself — see the class docstring.
+        mean_return_shaped = mean_return_raw - float(np.mean(all_penalty)) * adv_std
 
-        metrics.append({
+        _row = {
             "phase": "pg_train",
             "iteration": it + 1,
             "update": update_idx,
@@ -1089,6 +1353,7 @@ def train_pg(
             "return": mean_return_raw,
             "return_raw": mean_return_raw,
             "return_shaped": mean_return_shaped,
+            "terminal_reward": mean_terminal_reward,
             "repeat_penalty": float(np.mean(batch_repeat_penalties)) if batch_repeat_penalties else 0.0,
             "visit_count_before": int(np.max(batch_visits_before)) if batch_visits_before else 0,
             "unique_comps_seen": len(visit_counts),
@@ -1096,8 +1361,18 @@ def train_pg(
             "terminal_comp_key": str(batch_terminal_keys[-1]) if batch_terminal_keys else "",
             "actor_loss": ep_actor_loss,
             "entropy": ep_entropy,
+            # entropy_norm is directly comparable to pg_entropy_min — this is the
+            # column to watch for collapse, since raw entropy depends on |A|.
+            "entropy_norm": entropy_norm,
+            "entropy_coef_eff": coef_eff,
+            "adv_mean_raw": adv_mean,
+            "adv_std_raw": adv_std,
             "critic_loss": critic_loss_val,
-        })
+        }
+        if timer is not None:
+            _row.update(timer.snapshot())
+        metrics.append(_row)
+        metrics.extend(batch_ep_rows)
 
         outer_pbar.set_postfix(
             ret=f"{mean_return_raw:.3f}",
@@ -1118,6 +1393,7 @@ def train_pg(
                 "opt_actor_state": opt_actor.state_dict(),
                 "opt_critic_state": opt_critic.state_dict() if opt_critic is not None else None,
                 "visit_counts": dict(visit_counts),
+                "entropy_coef_eff": coef_eff,
             }, numbered_path=_numbered)
             tqdm.write(f"[INFO] PG checkpoint saved at iter {it + 1} → {_numbered}")
 
@@ -1150,7 +1426,7 @@ def _pg_single_episode_generate(
     env.initialize()
     for _ in range(env.n_components):
         allowed = env.allowed_actions()
-        s_mat = scaler.transform(env.state_featurizer(env.state).reshape(1, -1))[0]
+        s_mat = scaler.transform(env.current_state_features().reshape(1, -1))[0]
         s_step = np.zeros(env.n_components, dtype=float)
         if env.counter < env.n_components:
             s_step[env.counter] = 1.0
@@ -1207,6 +1483,8 @@ def generate_candidates(
     gen_temperature: float = 1.0,
     k: float = 1.0,
     max_attempts: Optional[int] = None,
+    charge_filter: bool = False,
+    charge_use_pauling: bool = False,
 ) -> List[dict]:
     """Generate candidate compositions in dual-phase mode.
 
@@ -1262,29 +1540,41 @@ def generate_candidates(
         accepted = 0
         attempted = 0
         dup_rejected = 0
+        charge_rejected = 0
+        seen_nonneutral: set = set()  # unique non-neutral keys, for diagnosis
         max_att = max_attempts or (n_target * 20)
 
         pbar = tqdm(total=n_target, desc=f"Generate [{purpose}]")
         while accepted < n_target and attempted < max_att:
             attempted += 1
 
-            if use_pg:
-                _pg_single_episode_generate(
-                    env=env, policy=policy, scaler=scaler,
-                    elem_feats_scaled=elem_feats_scaled, fraction_set=fraction_set,
-                    device=device,
-                    gen_epsilon=gen_epsilon,
-                    gen_top_frac=gen_top_frac,
-                    gen_temperature=gen_temperature,
-                )
-            else:
-                _rollout_policy_episode(
-                    env=env, qnet=qnet, scaler=scaler, device=device,
-                    elem_feats_scaled=elem_feats_scaled, fraction_set=fraction_set,
-                    gen_epsilon=gen_epsilon,
-                    gen_top_frac=gen_top_frac,
-                    gen_temperature=gen_temperature,
-                )
+            try:
+                if use_pg:
+                    _pg_single_episode_generate(
+                        env=env, policy=policy, scaler=scaler,
+                        elem_feats_scaled=elem_feats_scaled, fraction_set=fraction_set,
+                        device=device,
+                        gen_epsilon=gen_epsilon,
+                        gen_top_frac=gen_top_frac,
+                        gen_temperature=gen_temperature,
+                    )
+                else:
+                    _rollout_policy_episode(
+                        env=env, qnet=qnet, scaler=scaler, device=device,
+                        elem_feats_scaled=elem_feats_scaled, fraction_set=fraction_set,
+                        gen_epsilon=gen_epsilon,
+                        gen_top_frac=gen_top_frac,
+                        gen_temperature=gen_temperature,
+                    )
+            except CandidateEvaluationFailed as exc:
+                # Unlike training, generation already has a generous, separate
+                # attempts budget (max_att) distinct from `n_target` -- treat
+                # this exactly like a rejected duplicate/infeasible candidate
+                # (already counted via `attempted += 1` above) rather than
+                # retrying without counting.
+                print(f"[WARN] generation candidate failed evaluation, "
+                      f"skipping: {exc}")
+                continue
 
             comp     = env.terminal_cation_fractions()
             comp_key = env.terminal_comp_key()
@@ -1292,24 +1582,81 @@ def generate_candidates(
             if comp_key in seen_comp_keys:
                 dup_rejected += 1
                 continue
-            seen_comp_keys.add(comp_key)
+
+            # Charge-neutrality gate on the WHOLE built formula (covers
+            # builder-derived anions, e.g. SSE). Gated entirely by config: when
+            # charge_filter is False this block is skipped (no smact import).
+            # Checked BEFORE adding to seen_comp_keys and BEFORE the (cached)
+            # predictor call so that (a) repeated non-neutral picks are counted
+            # as charge rejections — not duplicates — giving a clean diagnosis of
+            # why yield is low, and (b) we don't pay a predictor call on a
+            # candidate we're about to drop.
+            if charge_filter:
+                from .constraints.charge import charge_neutral
+
+                # Prefer the builder's full composition label (host/derived
+                # anions the env never sees); fall back to the env pick-only
+                # formula. Same resolution as the accepted-row path below.
+                _formula = env.terminal_formula
+                _cf = getattr(predictor, "composition_formula", None)
+                if callable(_cf):
+                    try:
+                        _full = _cf(comp)
+                        if _full:
+                            _formula = _full
+                    except Exception:
+                        pass
+                try:
+                    neutral = charge_neutral(_formula, use_pauling=charge_use_pauling)
+                except Exception:
+                    neutral = True  # lenient: never crash generation on a bad parse
+                if not neutral:
+                    seen_nonneutral.add(comp_key)
+                    charge_rejected += 1
+                    continue
 
             # Reward from the episode (env.reward_fn already called in env.step).
             reward = float(env.path[-1].reward) if env.path else 0.0
 
             # Raw predictor values for CSV columns. OOHCatalystPredictor caches
-            # internally so this is a cache hit when env.reward_fn already ran.
-            if comp_key in predictor_raw_cache:
-                raw_mean, std = predictor_raw_cache[comp_key]
-            elif use_predict_raw:
-                raw_mean, std = predictor.predict_raw(comp)
-                predictor_raw_cache[comp_key] = (raw_mean, std)
-            else:
-                raw_mean, std = predictor.predict(comp)
-                predictor_raw_cache[comp_key] = (raw_mean, std)
+            # internally so this is usually a cache hit when env.reward_fn
+            # already ran -- but for a non-caching predictor, or a builder
+            # whose cache doesn't cover this call shape, it is a genuinely
+            # separate call and can independently fail (e.g. a re-run MD
+            # realization). Skip the candidate rather than crash generation;
+            # don't mark comp_key as seen, so a later attempt on the same
+            # composition can still succeed and be reported.
+            try:
+                if comp_key in predictor_raw_cache:
+                    raw_mean, std = predictor_raw_cache[comp_key]
+                elif use_predict_raw:
+                    raw_mean, std = predictor.predict_raw(comp)
+                    predictor_raw_cache[comp_key] = (raw_mean, std)
+                else:
+                    raw_mean, std = predictor.predict(comp)
+                    predictor_raw_cache[comp_key] = (raw_mean, std)
+            except Exception as exc:  # noqa: BLE001 - any predictor/builder failure
+                print(f"[WARN] generation candidate failed fetching raw stats, "
+                      f"skipping: {type(exc).__name__}: {exc}")
+                continue
+
+            seen_comp_keys.add(comp_key)
+
+            # Prefer the builder's full composition label (includes host/derived
+            # elements the env never sees — e.g. SSE's surviving S, derived Br,
+            # charge-balanced Li); fall back to the env's pick-only formula.
+            formula = env.terminal_formula
+            comp_formula = getattr(predictor, "composition_formula", None)
+            if callable(comp_formula):
+                try:
+                    full = comp_formula(comp)
+                    if full:
+                        formula = full
+                except Exception:
+                    pass
 
             row: dict = {
-                "formula": env.terminal_formula,
+                "formula": formula,
                 "reward": reward,
                 "dp_mean": raw_mean,
             }
@@ -1332,13 +1679,32 @@ def generate_candidates(
             rows.append(row)
             accepted += 1
             pbar.update(1)
-            pbar.set_postfix(attempts=attempted, dups=dup_rejected)
+            pbar.set_postfix(
+                attempts=attempted, dups=dup_rejected, charge=charge_rejected
+            )
 
         pbar.close()
         rate = accepted / max(attempted, 1)
         print(
             f"[INFO] Generated {accepted}/{n_target} {purpose} candidates "
-            f"({attempted} attempts, {dup_rejected} dups, rate={rate:.3f})"
+            f"({attempted} attempts, {dup_rejected} dups, "
+            f"{charge_rejected} non-neutral [{len(seen_nonneutral)} unique], "
+            f"rate={rate:.3f})"
         )
+        if charge_filter and accepted < n_target:
+            print(
+                f"[INFO] Shortfall diagnosis [{purpose}]: of {attempted} attempts, "
+                f"{dup_rejected} were duplicates and {charge_rejected} were "
+                f"non-charge-neutral. "
+                + (
+                    "Duplication dominates: the policy keeps proposing the same "
+                    "few compositions (raise gen_temperature / gen_epsilon, or the "
+                    "neutral subspace may simply be small)."
+                    if dup_rejected >= charge_rejected
+                    else "Charge-neutrality dominates: most proposed compositions "
+                    "aren't neutral on the 0.05 grid (the neutral subspace is the "
+                    "bottleneck, not exploration)."
+                )
+            )
 
     return rows

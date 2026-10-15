@@ -1,0 +1,247 @@
+{
+  "date": "2026-10-15",
+  "branch": "codex/cleanup-integration",
+  "code_commit": "dc2e7ab616a62d73113cb410355bca65109b4f5a",
+  "runtime_count": 23,
+  "hpo_count": 6,
+  "configs": [
+    {
+      "file": "configs/cs2agbicl6_level1.yaml",
+      "sha256": "c1586d51115f1abcb8065c2b448e22059c700cc0b159b425758854f5f7fdbfb5",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "multi_group",
+      "steps": 13
+    },
+    {
+      "file": "configs/cs2agbicl6_level2.yaml",
+      "sha256": "07d4f0c1795e65f9c9512e01cb950ab4649b0cfaadf301d09b950124c71fa8ce",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "multi_group",
+      "steps": 13
+    },
+    {
+      "file": "configs/cs2agbicl6_level3.yaml",
+      "sha256": "92f63c34487a1899df915ed7d75ff04900f3c58567280c208f11df24d0937e56",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "multi_group",
+      "steps": 13
+    },
+    {
+      "file": "configs/hea.yaml",
+      "sha256": "f5bdaa2960bafe9e63b8f77e2843e24ab93f613435fd0c109721371c22f199cc",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "fraction",
+      "steps": 5
+    },
+    {
+      "file": "configs/hpo/cs2agbicl6_a2c.yaml",
+      "sha256": "680a6cc8911e60dc5d003a930d4f520106449cdef69054591c26fe4d0ee5080c",
+      "kind": "hpo",
+      "status": "passed",
+      "base_config": "configs/cs2agbicl6_level1.yaml"
+    },
+    {
+      "file": "configs/hpo/cs2agbicl6_dqn.yaml",
+      "sha256": "99e4a6a1a77326f5a5557bcdc96b38cff5247f10c25043fa7027e9d00e04d728",
+      "kind": "hpo",
+      "status": "passed",
+      "base_config": "configs/cs2agbicl6_level1.yaml"
+    },
+    {
+      "file": "configs/hpo/ooh_a2c.yaml",
+      "sha256": "8e3176f390b4920812997a90bdc53b0c4c736f043130fa68e725a43b0239bf9d",
+      "kind": "hpo",
+      "status": "passed",
+      "base_config": "configs/ooh.yaml"
+    },
+    {
+      "file": "configs/hpo/ooh_dqn.yaml",
+      "sha256": "be70735a352cccf7cd31564fe84b8389071973dc034bbe417d4f1b836d91b046",
+      "kind": "hpo",
+      "status": "passed",
+      "base_config": "configs/ooh_dqn.yaml"
+    },
+    {
+      "file": "configs/hpo/oxides_sinter_a2c.yaml",
+      "sha256": "80724523ba8923baef2e28e348cb0016de7ef9f1cfdb4d2c6cf4a51bda86e7f1",
+      "kind": "hpo",
+      "status": "passed",
+      "base_config": "configs/oxides_sinter.yaml"
+    },
+    {
+      "file": "configs/hpo/oxides_sinter_dqn.yaml",
+      "sha256": "35a7c7aef963fac1e0196dc75ba12c85c1025a7ac891f9b72f62df7f72c37dab",
+      "kind": "hpo",
+      "status": "passed",
+      "base_config": "configs/oxides_sinter.yaml"
+    },
+    {
+      "file": "configs/lips_sse.yaml",
+      "sha256": "a87483b540e5b5cf56808475502140c87b5b3c8b1f716814d7242bd79adf5ded",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "multi_group",
+      "steps": 6
+    },
+    {
+      "file": "configs/ooh.yaml",
+      "sha256": "ad0d690110a296cf8adb5bdc88cefd41a1dad28e918f488f77e70c58902d8274",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "fraction",
+      "steps": 5
+    },
+    {
+      "file": "configs/ooh_dqn.yaml",
+      "sha256": "00fe7bedca7bfa5274955bad0a57545e0a6144b4ad60fc0396c098ec6c798c3e",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "fraction",
+      "steps": 5
+    },
+    {
+      "file": "configs/ooh_fine.yaml",
+      "sha256": "b670ca59e050c19368bf57b66fed0325f15de8a63bc605142cce4422c37e6212",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "fraction",
+      "steps": 5
+    },
+    {
+      "file": "configs/oxides_calcine.yaml",
+      "sha256": "9dbc76bf0549f60926a4d558c2e745741edec5f96a9c31eb9677b2f07807d452",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "integer_ratio",
+      "steps": 5
+    },
+    {
+      "file": "configs/oxides_calcine_a2c.yaml",
+      "sha256": "84985cf50826695849043a65d511d1fc9b6478cbe066fab8cab62ce5a5712a90",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "integer_ratio",
+      "steps": 5
+    },
+    {
+      "file": "configs/oxides_calcine_no_train_filter.yaml",
+      "sha256": "8625423d0335e00866ad208779a81adfc8731b962d39adacdc3a5e0b72d20d33",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "integer_ratio",
+      "steps": 5
+    },
+    {
+      "file": "configs/oxides_sinter.yaml",
+      "sha256": "8cb8379d75895469ba9191d9ac28c851dfb69359071f8fb14bbe990a7f496ea4",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "integer_ratio",
+      "steps": 5
+    },
+    {
+      "file": "configs/oxides_sinter_a2c.yaml",
+      "sha256": "9d84d49ec220ce9ef1452f7d486b74e4f4e22f55be212c16dadef654adf175db",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "integer_ratio",
+      "steps": 5
+    },
+    {
+      "file": "configs/oxides_sinter_calcine.yaml",
+      "sha256": "8fe8ac0c5cf8806440df2ccfb5fd1c75a29ec47fb6f33cb1dd1076e5340236b1",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "integer_ratio",
+      "steps": 5
+    },
+    {
+      "file": "configs/oxides_sinter_calcine_a2c.yaml",
+      "sha256": "91af47da5dbd2ac25d23c552f6fffbbb8e1782a3026112250c630f50f3f39c5c",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "integer_ratio",
+      "steps": 5
+    },
+    {
+      "file": "configs/oxides_sinter_calcine_no_train_filter.yaml",
+      "sha256": "cd59dcfc86eedab50d10b0deab6efe09bbc5f182ba37b1fbc716f2ec56562935",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "integer_ratio",
+      "steps": 5
+    },
+    {
+      "file": "configs/oxides_sinter_no_train_filter.yaml",
+      "sha256": "252a94597589b767555211d46385f7be5ffdb4706cb47e9378efb603605b2044",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "integer_ratio",
+      "steps": 5
+    },
+    {
+      "file": "configs/oxides_smoke.yaml",
+      "sha256": "52c97a56e1abf3ed38114edd8e8c2a7b490d3a1b6c24a67869139183be3966e4",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "integer_ratio",
+      "steps": 5
+    },
+    {
+      "file": "configs/perovskite.yaml",
+      "sha256": "b64156f55401b9d3638c342c94188812703af32fabd0af24266856b314d94dcd",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "multi_group",
+      "steps": 7
+    },
+    {
+      "file": "configs/perovskite_level1.yaml",
+      "sha256": "13b22085a023d04f89e50c0ee26c9588bf665fc5aaed74c0b9c57037d11f173b",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "multi_group",
+      "steps": 2
+    },
+    {
+      "file": "configs/test_dummy.yaml",
+      "sha256": "921fa66db62498c56d79c19e46c0a26154fc548e96b23065b0b2272253f447ee",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "fraction",
+      "steps": 5
+    },
+    {
+      "file": "configs/test_multigroup_dummy.yaml",
+      "sha256": "d6d3ab02b36bb8244e6a83065ece7ec2a9934a90769a601cc5f5a0efa60c51f1",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "multi_group",
+      "steps": 4
+    },
+    {
+      "file": "configs/ti_alloy.yaml",
+      "sha256": "acfa3e5059527bb5972f26b76b879f22dfc328b92fcbeec398f971a8dbfce42d",
+      "kind": "runtime",
+      "status": "passed",
+      "environment": "fraction",
+      "steps": 6
+    }
+  ],
+  "private_copy_count": 13,
+  "removed_fields": {
+    "require_primary_presence": 1,
+    "env_type": 3,
+    "composition_group_total_units": 12
+  },
+  "hpo_base_references_updated": 2,
+  "usage_comments_updated": 2,
+  "original_configs_unchanged": true,
+  "historical_analysis_configs_unchanged": true,
+  "local_snapshot": "runs/cleanup_integration_configs_20261015 (original repository checkout, Git ignored)",
+  "scope": "YAML semantic checks, effective group normalization, environment/action/terminal constant-reward smoke, HPO search-space/base-config validation; no real predictor, training, structure or model-path validation."
+}

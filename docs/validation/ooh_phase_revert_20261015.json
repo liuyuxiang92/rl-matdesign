@@ -1,0 +1,164 @@
+{
+  "date": "2026-10-15",
+  "branch": "codex/cleanup-integration",
+  "parent_commit": "27af53ef435ca12d745486fff5f374097ab28908",
+  "restored_from": "1231b0550fd9f5c7786c2f9e742285fc7a823ac0",
+  "restored_files": [
+    "src/abcde_ooh/constraints/phase_sampler.py",
+    "src/rl_matdesign/registry.py"
+  ],
+  "retained_dopant_fix": "src/abcde_ooh/constraints/primary_phase.py",
+  "algorithm_and_runner_files_unchanged": [
+    "src/rl_matdesign/model.py",
+    "src/rl_matdesign/training.py",
+    "src/rl_matdesign/configuration.py",
+    "src/rl_matdesign/experiment.py"
+  ],
+  "full_suite": {
+    "tests": 368,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 4,
+    "passed": 364,
+    "seconds": 106.728,
+    "skips": [
+      {
+        "test": "tests.test_order_invariance.test_rf_magpie_predictor_is_order_invariant[optimal_sinter_RF.joblib]",
+        "reason": "model file not found at /private/tmp/rl-matdesign-cleanup-20261014/models/sinter_calcine/optimal_sinter_RF.joblib"
+      },
+      {
+        "test": "tests.test_order_invariance.test_rf_magpie_predictor_is_order_invariant[optimal_calcine_RF.joblib]",
+        "reason": "model file not found at /private/tmp/rl-matdesign-cleanup-20261014/models/sinter_calcine/optimal_calcine_RF.joblib"
+      },
+      {
+        "test": "tests.test_site_pick_builder.test_perovskite_a_b_site_substitution[local]",
+        "reason": "perovskite.vasp not present"
+      },
+      {
+        "test": "tests.test_site_pick_builder.test_perovskite_composition_formula[local]",
+        "reason": "perovskite.vasp not present"
+      }
+    ]
+  },
+  "phase_test_cases_in_full_suite": 16,
+  "command": "python -m pytest --junitxml=/private/tmp/cleanup-revert-full-20261015.xml",
+  "python": "3.11.8",
+  "python_executable": "/opt/anaconda3/bin/python",
+  "sha256": {
+    "src/abcde_ooh/constraints/phase_sampler.py": "614fa5fd827efe97e13857008ae3a4654cfe1fa6d75e7dc63016fd99c59f7a3e",
+    "src/rl_matdesign/registry.py": "2ba120925e526775de8a4681fe0ba12b2c09ced4cf65457c4cbc4dce5d83867e",
+    "src/rl_matdesign/model.py": "15bae9f19851bfad301d10c856bf9c2745b6157210a441f8bbbccca6b38cc7ba",
+    "src/rl_matdesign/training.py": "6ac3cac598fae6419fc65bdf4b222c702dad0c1d5587e7a070715a7572e3a019",
+    "src/rl_matdesign/configuration.py": "0a29ea564a104c4b59fa12b44147e430d5a7fe4430b1293c34bc15d3c4ec1271",
+    "src/rl_matdesign/experiment.py": "107ad21de072caffa0efdcd06bfba4d87f03b61641978fb7c23274fc19dc796f",
+    "src/abcde_ooh/constraints/primary_phase.py": "bc0492543d1414c0a0abed554fbcbd9b9a54d67dc6321fb5dcc9600eddc4be30",
+    "tests/test_ooh_phase_sampler.py": "33ce46d5ca678d658bc3726bcfea354b4339978d798ce8fcabeae0aa2c0158b2",
+    "tests/test_ooh_primary_phase.py": "a534856b121fd4ce76a211de82ae7e6955a98501c593206324586340bf4203e0"
+  },
+  "checkpoint_compatibility": {
+    "main_train": {
+      "returncode": 0,
+      "command": [
+        "/opt/anaconda3/bin/python",
+        "/private/tmp/cleanup-compatibility-20261015/main_source/scripts/run_experiment.py",
+        "--config",
+        "/private/tmp/cleanup-compatibility-20261015/main_small.yaml",
+        "--method",
+        "dqn",
+        "--out",
+        "/private/tmp/cleanup-compatibility-20261015/main_trained",
+        "--device",
+        "cpu",
+        "--dp-seed",
+        "11",
+        "--train-seed",
+        "12",
+        "--gen-seed",
+        "13",
+        "--save-checkpoint-freq",
+        "2"
+      ]
+    },
+    "old_checkpoint_generate": {
+      "returncode": 0,
+      "command": [
+        "/opt/anaconda3/bin/python",
+        "-c",
+        "from rl_matdesign.cli import main; main()",
+        "--config",
+        "/private/tmp/cleanup-compatibility-20261015/groups_small.yaml",
+        "--method",
+        "dqn",
+        "--out",
+        "/private/tmp/cleanup-compatibility-20261015/loaded",
+        "--device",
+        "cpu",
+        "--dp-seed",
+        "11",
+        "--train-seed",
+        "12",
+        "--gen-seed",
+        "13",
+        "--only-generate",
+        "--load-qnet",
+        "/private/tmp/cleanup-compatibility-20261015/main_trained/qnet.pt",
+        "--load-scaler",
+        "/private/tmp/cleanup-compatibility-20261015/main_trained/std_scaler.bin"
+      ]
+    },
+    "old_checkpoint_resume": {
+      "returncode": 0,
+      "command": [
+        "/opt/anaconda3/bin/python",
+        "/private/tmp/rl-matdesign-cleanup-20261014/scripts/run_experiment.py",
+        "--config",
+        "/private/tmp/cleanup-compatibility-20261015/groups_resume.yaml",
+        "--method",
+        "dqn",
+        "--out",
+        "/private/tmp/cleanup-compatibility-20261015/resumed",
+        "--device",
+        "cpu",
+        "--dp-seed",
+        "11",
+        "--train-seed",
+        "12",
+        "--gen-seed",
+        "13",
+        "--resume-training",
+        "--save-checkpoint-freq",
+        "2"
+      ]
+    },
+    "loaded_rows": 5,
+    "resumed_rows": 5,
+    "unchanged_main_yaml": {
+      "accepted": false,
+      "error": "Config has no 'groups:' \u2014 every scenario is expressed as one or more sublattice groups now (kind: composition / categorical / integer). See CLAUDE.md's proposed schema / any configs/*.yaml for examples."
+    },
+    "main_commit": "39227da88a3450c126dfa52e094e308eb27fbb79",
+    "checkpoint_source_hashes_unchanged": {
+      "generated.csv": "4a169fd423bf6f833878ca77653347350a956d92505b652fcfee516842eb4d6f",
+      "checkpoint-ep4.pt": "3f7892b8ef024ae192947312cee7f158e428c654a0eb9cdde6d0c7cc5e559832",
+      "run_config.json": "e01087f00f2b350d80353b876d41f99770f6fb09ddf42f6faeae75344abdf9de",
+      "checkpoint-ep2.pt": "23c51ba2d9851a1f80365f08c5812fc0e8c0c480548dbec654d1a16b10d32416",
+      "checkpoint.pt": "3f7892b8ef024ae192947312cee7f158e428c654a0eb9cdde6d0c7cc5e559832",
+      "std_scaler.bin": "f6136f7c8e9b47b4d7115cb30bd73a67d9de0af23a7c545530d25c07c82d48f2",
+      "training_log.csv": "7420db1da86382712b31a584ae238467f079e72b1a21d8b0bfdf0d1d6f69f6d2",
+      "qnet.pt": "ba1a250427f47f71bb7cfa0850adbb3b8b7da3d101bc119b75c468ecd5ca08ed"
+    },
+    "limitations": [
+      "CPU dummy-predictor DQN smoke, not real-model equivalence.",
+      "Old main YAML requires explicit groups-schema migration; this predates the current OOH revert."
+    ],
+    "verified_resumed_episodes_completed": 6
+  },
+  "main_unchanged": "39227da88a3450c126dfa52e094e308eb27fbb79",
+  "source_feature_checkout_unchanged": true,
+  "limitations": [
+    "Four optional-file tests skipped; no real DeepMD/MGTransformer long rerun.",
+    "Unmodified main YAML is not accepted: it requires migration to groups schema. This predates the reverted extension.",
+    "Legacy sampler/terminal-checker presence semantics are not unified by this change.",
+    "No main merge or remote push."
+  ]
+}

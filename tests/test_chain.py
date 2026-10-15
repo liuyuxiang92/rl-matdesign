@@ -17,7 +17,7 @@ def test_chain_registered_under_short_name():
 
     cfg = {
         "filters": [
-            {"constraint_filter": "last_step_element",
+            {"type": "last_step_element",
              "required_elements": ["O"],
              "reserve_for_last": True},
         ],
@@ -33,15 +33,15 @@ def test_chain_composes_real_children_at_last_step():
     final-step action list down to (O, digit in {1, 2})."""
     from rl_matdesign.registry import resolve_constraint
 
-    cation_set = ["Fe", "Co", "Ni", "O"]
+    species_set = ["Fe", "Co", "Ni", "O"]
     fraction_set = ["0", "1", "2"]
     cfg = {
         "filters": [
-            {"constraint_filter": "last_step_element",
+            {"type": "last_step_element",
              "required_elements": ["O"],
              "nonzero_ratio_at_last": True,
              "reserve_for_last": True},
-            {"constraint_filter": "last_step_element",
+            {"type": "last_step_element",
              "required_elements": ["O"],
              "reserve_for_last": False},
         ],
@@ -53,7 +53,7 @@ def test_chain_composes_real_children_at_last_step():
     out = chain.filter_actions(
         actions=actions, units_map={"Fe": 1, "Co": 1, "Ni": 1},
         steps_left=0, allowed_units=[0, 1, 2], possible_sums_by_k=[],
-        cation_set=cation_set, fraction_set=fraction_set,
+        species_set=species_set, fraction_set=fraction_set,
     )
     assert len(out) == 2
     for elem_oh, comp_oh in out:
@@ -141,37 +141,92 @@ def test_chain_non_list_filters_raises():
         ChainConstraintFilter({"filters": {"k": "v"}}, env=None)
 
 
-def test_chain_non_dict_child_raises():
+def test_chain_bare_string_child_is_parameter_free_shorthand():
+    """A bare string entry is sugar for {type: <string>} (a parameter-free filter)."""
     from rl_matdesign.constraints.chain import ChainConstraintFilter
 
-    with pytest.raises(ValueError, match="must be a dict"):
-        ChainConstraintFilter({"filters": ["not_a_dict"]}, env=None)
+    chain = ChainConstraintFilter({"filters": ["pauling_en"]}, env=None)
+    assert len(chain.children) == 1
+    assert type(chain.children[0]).__name__ == "ElectronegativityFilter"
 
 
-def test_chain_child_missing_constraint_filter_key_raises():
+def test_chain_non_dict_non_string_child_raises():
     from rl_matdesign.constraints.chain import ChainConstraintFilter
 
-    with pytest.raises(ValueError, match=r"missing 'constraint_filter'"):
+    with pytest.raises(ValueError, match="must be a dict or a bare string"):
+        ChainConstraintFilter({"filters": [42]}, env=None)
+
+
+def test_chain_child_missing_type_key_raises():
+    from rl_matdesign.constraints.chain import ChainConstraintFilter
+
+    with pytest.raises(ValueError, match=r"missing 'type'"):
         ChainConstraintFilter(
             {"filters": [{"required_elements": ["O"]}]}, env=None,
         )
 
 
-def test_oxide_yaml_round_trip_resolves_to_chain():
-    """The shipped oxide configs (sinter + calcine) should both resolve
-    to a ChainConstraintFilter wrapping LastStepElementFilter + SMACTChargeFilter."""
+def test_oxide_yaml_round_trip_auto_chains():
+    """The shipped oxide configs' `oxide` group carries a three-entry `filters:`
+    list and should auto-resolve to a ChainConstraintFilter
+    (LastStepElementFilter + SMACTChargeFilter + ElectronegativityFilter)
+    WITHOUT an explicit `type: chain`."""
     pytest.importorskip("smact")  # SMACT-dependent test
 
     import yaml
     from pathlib import Path
-    from rl_matdesign.registry import resolve_constraint
+    from rl_matdesign.registry import build_constraints
 
     repo = Path(__file__).resolve().parent.parent
     for name in ("oxides_sinter.yaml", "oxides_calcine.yaml"):
         cfg = yaml.safe_load((repo / "configs" / name).read_text())
-        assert cfg["constraint_filter"] == "chain", name
-        chain = resolve_constraint(cfg["constraint_filter"], cfg, env=None)
+        assert "constraint_filter" not in cfg, name      # removed public key
+        group = cfg["groups"][0]
+        assert isinstance(group["filters"], list) and len(group["filters"]) == 3, name
+        chain = build_constraints(group, env=None)
         child_types = [type(c).__name__ for c in chain.children]
-        assert child_types == ["LastStepElementFilter", "SMACTChargeFilter"], (
-            f"{name}: unexpected child types {child_types}"
-        )
+        assert child_types == [
+            "LastStepElementFilter", "SMACTChargeFilter", "ElectronegativityFilter"
+        ], f"{name}: unexpected child types {child_types}"
+
+
+# --------------------------------------------------------------------------- #
+# build_constraints — shape-based auto-routing (mirrors build_reward)
+# --------------------------------------------------------------------------- #
+
+def test_build_constraints_auto_chains_filter_list():
+    from rl_matdesign.registry import build_constraints
+    cfg = {"filters": [
+        {"type": "last_step_element", "required_elements": ["O"],
+         "reserve_for_last": True},
+        {"type": "last_step_element", "required_elements": ["O"],
+         "reserve_for_last": False},
+    ]}
+    c = build_constraints(cfg, env=None)
+    assert type(c).__name__ == "ChainConstraintFilter"
+    assert len(c.children) == 2
+
+
+def test_build_constraints_single_entry_filters_still_chains():
+    from rl_matdesign.registry import build_constraints
+    cfg = {"filters": [
+        {"type": "last_step_element", "required_elements": ["O"],
+         "reserve_for_last": True},
+    ]}
+    c = build_constraints(cfg, env=None)
+    assert type(c).__name__ == "ChainConstraintFilter"
+    assert len(c.children) == 1
+
+
+def test_build_constraints_ignores_the_removed_flat_singular_key():
+    """`constraint_filter:` (the old group-level singular spelling) is no
+    longer read at all -- `filters:` is the only public spelling."""
+    from rl_matdesign.registry import build_constraints
+    cfg = {"constraint_filter": "last_step_element", "required_elements": ["O"],
+           "reserve_for_last": True}
+    assert build_constraints(cfg, env=None) is None
+
+
+def test_build_constraints_none_when_absent():
+    from rl_matdesign.registry import build_constraints
+    assert build_constraints({}, env=None) is None

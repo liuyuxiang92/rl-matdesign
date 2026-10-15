@@ -13,7 +13,7 @@ For OOH catalyst phase constraints see the ``main`` branch
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 class ConstraintFilter:
@@ -33,11 +33,31 @@ class ConstraintFilter:
         steps_left: int,
         allowed_units: Sequence[int],
         possible_sums_by_k: List[Any],
-        cation_set: List[str],
+        species_set: List[str],
         fraction_set: List[str],
+        prior_groups: Optional[List[Dict[str, Any]]] = None,
+        code_to_value: Optional[Dict[str, Any]] = None,
+        **_: Any,
     ) -> List[Tuple[Tuple[float, ...], Tuple[float, ...]]]:
         """Return the subset of *actions* consistent with this constraint.
 
         The default implementation returns *actions* unchanged.
+
+        ``prior_groups`` carries the already-completed group compositions (in
+        group order) when this filter runs inside a :class:`MultiGroupEnv`, so a
+        later sublattice can depend on an earlier pick (e.g. the S-site O range
+        bounded by the P-site metal). It is ``None`` for single-group
+        (:class:`CompositionEnv`) runs. Filters that ignore cross-group coupling
+        can simply not read it.
+
+        ``code_to_value`` is set only by :class:`~rl_matdesign.env_multigroup.
+        CategoricalGroup`: it maps this step's ``comp_oh`` code to the actual
+        picked value (e.g. an element symbol), because a categorical slot's
+        ``elem_oh`` one-hot encodes the *slot name*, not the chemistry — a
+        filter that needs the real value (e.g. a charge-neutrality check) must
+        decode through this map rather than ``allowed_units``/``units_map``,
+        which are empty (``[]`` / ``{}``) for categorical groups. ``None`` for
+        composition-style (fraction/amount) groups. The trailing ``**_`` keeps
+        subclasses forward compatible with future context kwargs.
         """
         return actions

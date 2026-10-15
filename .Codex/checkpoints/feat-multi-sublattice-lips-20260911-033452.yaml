@@ -1,0 +1,100 @@
+checkpoint_version: '3.0.0'
+created_at: 2026-09-11T03:34:52Z
+branch: feat/multi-sublattice-lips
+
+phase:
+  current: exhaustive_soap_evaluation
+  completed:
+    - resolve_33_cation_space
+    - enumerate_constrained_design_space
+    - map_iter1_to_iter7_experiments
+    - full_space_pca_and_pca_fps
+    - pilot_soap_pool_and_soap_fps
+  next:
+    - implement_resumable_full_space_soap
+    - run_full_space_soap_fps
+    - validate_and_deliver_artifacts
+
+state:
+  parameters:
+    - name: cation_species_count
+      value: 33
+      unit: elements
+      source: "configs/ooh.yaml after incorporating the user's Al, Cr, Ga, In, V, Zn clarification and reconciling the existing list"
+      confidence: high
+    - name: full_design_space_size
+      value: 768935
+      unit: valid compositions
+      source: "Exact enumeration by scripts/analyze_ooh_design_space.py under five distinct cations, 0.05 grid, sum 1.0, and primary-phase constraints"
+      confidence: high
+    - name: experimental_formula_count
+      value: 198
+      unit: formulas
+      source: "../../new_experiment_data/iter1.xlsx through iter7.xlsx; 78 in round 1 and 20 in each later round"
+      confidence: high
+    - name: soap_feature_count
+      value: 2240
+      unit: features
+      source: "DScribe 2.1.2 SOAP with 35 total species, r_cut=5.0 A, n_max=4, l_max=3, sigma=0.5 A, average=inner, compression=mu1nu1"
+      confidence: high
+    - name: candidate_structures_per_formula
+      value: 3
+      unit: deterministic occupations
+      source: "Pilot SOAP analysis design in scripts/analyze_ooh_soap.py"
+      confidence: medium
+
+  experiments:
+    - name: exact_pca_design_space
+      status: completed
+      progress: 1.0
+      results_path: runs/ooh_design_space_analysis
+      next_step: "Retain as final PCA outputs"
+    - name: two_stage_soap_pool
+      status: completed
+      progress: 1.0
+      results_path: runs/ooh_design_space_analysis/soap_metadata.json
+      next_step: "Keep as pilot only; supersede its 20-point ranking with exhaustive SOAP results"
+    - name: exhaustive_soap_full_space
+      status: pending
+      progress: 0.0
+      results_path: runs/ooh_design_space_analysis/soap_full_metadata.json
+      next_step: "Implement disk-backed resumable descriptors, then evaluate all 768935 points"
+
+  decisions:
+    - question: "Can the pilot 20012-point SOAP pool be reported as the whole-space SOAP answer?"
+      decision: "No; run SOAP for every valid design-space point"
+      rationale: "The user explicitly requested the farthest 20 from the overall design space, so pool-exact is not equivalent to full-space exact"
+      alternatives_considered:
+        - "Clearly label and deliver only the two-stage approximation"
+        - "Increase the pilot pool without reaching full coverage"
+      confidence: high
+    - question: "How should full SOAP descriptors fit in memory?"
+      decision: "Use a resumable float32 memory map in /tmp and retain only compact final artifacts"
+      rationale: "768935 x 2240 float32 values require about 6.9 GB, exceeding prudent RAM use but fitting available disk"
+      alternatives_considered:
+        - "Keep all descriptors in RAM"
+        - "Recompute descriptors for each FPS iteration"
+      confidence: high
+
+blockers: []
+
+artifacts:
+  - path: configs/ooh.yaml
+    role: 33-cation design-space configuration
+  - path: scripts/analyze_ooh_design_space.py
+    role: exact enumeration, PCA, coordinate export, and PCA-FPS
+  - path: scripts/analyze_ooh_soap.py
+    role: pilot SOAP analysis and basis for exhaustive mode
+  - path: runs/ooh_design_space_analysis/design_space_pca_coordinates.csv.gz
+    role: PCA coordinates for all 768935 valid compositions
+  - path: runs/ooh_design_space_analysis/experimental_pca_coordinates.csv
+    role: PCA coordinates and constraint audit for all 198 experimental formulas
+  - path: runs/ooh_design_space_analysis/pca_farthest_20.csv
+    role: exact full-space PCA-FPS selections
+
+resume_instructions: |
+  1. Confirm the PCA cache is intact: python -c "import numpy as np; z=np.load('runs/ooh_design_space_analysis/pca_coordinates.npz'); print(z['elem_idx'].shape, z['design_coords'].shape)"
+  2. Add a --full-space path to scripts/analyze_ooh_soap.py using a float32 memmap with a sidecar progress file.
+  3. Keep deterministic three-occupation SOAP generation and the 198 measured formulas as FPS seeds.
+  4. Run the exhaustive job with 8 workers and monitor the progress sidecar.
+  5. Validate 20 unique full-space selections and update the final SOAP plot and metadata.

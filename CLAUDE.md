@@ -1,10 +1,17 @@
 # CLAUDE.md
 
+Current code map: [docs/code_layout.md](docs/code_layout.md). The OOH-specific
+`run_ABCDEOOH_experiment.py` examples below describe the historical pipeline;
+that script was already absent before the September 2026 cleanup. Use
+`scripts/run_experiment.py` or `rl-matdesign` with `--config` for the current
+runner. Shared config/environment factories live in `rl_matdesign.configuration`;
+the experiment driver lives in `rl_matdesign.experiment`.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What This Repo Does
 
-RL-based composition generator for discovering novel oxyhydroxide catalysts (ABCDE-OOH). A 5-step RL environment sequentially picks 5 distinct cations and their fractions (summing to 1.0) from 28 candidate elements. Three algorithms are supported: offline DQN (Q-network trained on Monte Carlo returns), REINFORCE, and A2C.
+RL-based composition generator for discovering novel oxyhydroxide catalysts (ABCDE-OOH). A 5-step RL environment sequentially picks 5 distinct cations and their fractions (summing to 1.0) from 28 candidate elements. Three algorithms are supported: classical online DQN (Q-network trained on one-step TD targets from a replay buffer), REINFORCE, and A2C.
 
 ## Commands
 
@@ -64,56 +71,267 @@ python scripts/run_ABCDEOOH_experiment.py --out runs/a2c --rl-method a2c \
 ```
 Compare `generated.csv` reward distributions across runs.
 
+### Training-reward distribution — `pg_episode` / `dqn_warmup` and `compare_training_rewards.py`
+
+DQN writes one `dqn_train` row per training episode. PG originally wrote only one
+`pg_train` row per *iteration*, holding `mean_return_raw` over the whole batch — so
+a 7,500-episode A2C run produced 300 numbers against DQN's 6,500, and every one of
+them was an average.
+
+That is not just a plotting inconvenience. **The batch mean is precisely the
+statistic A2C optimises**, and on the oxide benchmark it improved monotonically
+(−695 → −435) while the *best* candidate froze ~20% in. Logging only the mean makes
+the failure invisible: you cannot see the tail thin out, and the tail is what
+materials discovery cares about.
+
+**`return` does not mean the same thing in the two loggers.** DQN logs
+`env.path[-1].reward` — the *undiscounted terminal reward*, i.e. the property
+itself. PG logs `returns[0]` — the *discounted* return `G₀ = γ^(n-1) · r_T`. With
+`gamma: 0.9` and `n_components: 5` that is a factor of 0.6561, so a PG log reading
+437 K is really a 666 K composition. Plotting the two columns on one axis makes A2C
+look ~100 K better than it is. Both `pg_train` and `pg_episode` rows therefore also
+carry **`terminal_reward`** (undiscounted, property units) — that is the column to
+compare against DQN's `return`. `compare_training_rewards.py` prefers it and
+un-discounts legacy PG logs via `gamma`/`n_components` from `run_config.json`,
+printing the correction it applied.
+
+`train_pg` therefore also emits one `phase="pg_episode"` row per sampled episode,
+reusing existing column names (`return`, `return_raw`, `repeat_penalty`,
+`visit_count_before`, `terminal_comp_key`) so `RunMetrics.to_csv`'s key-union needs
+no new columns and readers that filter on `phase` are unaffected.
+
+**`warmup_eps` costs completely different amounts in the two methods.** DQN's warmup
+calls `_rollout_random_episode`, which goes through `env.step` → `reward_fn` → the
+predictor: one **real predictor call per warmup episode**. PG's warmup is free —
+`_fit_scaler_from_warmup` (`training.py:846`) temporarily replaces `reward_fn` with a
+no-op, so it pays nothing and produces no rewards to log. Only DQN's warmup belongs
+on the reward axis, and `train_dqn_online` emits it as `phase="dqn_warmup"`
+(`return`, `terminal_reward`, `epsilon: 1.0`, `terminal_comp_key`). Before this,
+1,000 warmup episodes at a 2,500-episode budget meant 40% of the run was invisible.
+
+`compare_training_rewards.py` prepends those rows to `dqn_train` on a **re-indexed
+episode axis** (warmup 1…1000, then training 1001…45000, dotted line at the
+handover), because both phases number their own episodes from 1. `best_reward_so_far`
+was always correct — it comes from `PredictorTimer`, which wraps the predictor before
+warmup, so its cumulative counters already included those calls.
+
+Adding rows at the *front* of the metrics list broke append-mode resume: `to_csv`
+used to seed its column order from `rows[0]`, and a resumed run skips warmup, so it
+would append `dqn_train`-ordered rows under a `dqn_warmup`-ordered header — silent
+misalignment, no error. `to_csv` now reads the existing header when appending
+(`utils/metrics.py`), pinned by `tests/test_training_log_phases.py`.
+
+```bash
+python scripts/baselines/compare_training_rewards.py \
+    --run "DQN(bootstrap):runs/sinter_dqn_eps_7500" \
+    --run "DQN(mc):runs/sinter_mc_eps_7500" \
+    --run "A2C:runs/sinter_a2c_eps_7500" \
+    --out runs/compare/train_rewards \
+    --minimize --y-label "Sintering temperature (K)"
+```
+
+One scatter panel per method (every training episode, with a running-best line),
+plus a shared marginal-distribution panel. `training_reward_summary.csv` adds
+`best_at_budget_frac` — the fraction of the budget at which the best sample was
+first drawn. A small value with a long flat tail after it *is* the freeze
+signature.
+
+**Runs predating this only have batch means.** The script detects which phase is
+present, prefers `pg_episode`, falls back to `pg_train`, and labels each panel with
+what it actually drew. In the mixed case it prints a warning and stamps the figure:
+a mean over B episodes has ~1/√B the spread of raw episodes, so violin widths and
+the ★ are not comparable across granularities — only `best_at_budget_frac` and the
+best-so-far curve are. The `_best_noun` helper is why the A2C panel says "best batch
+mean" rather than "best episode"; conflating those reads as A2C finding a candidate
+100 K better than DQN when it is really a 25-episode average.
+
+The driver (`make_compare_time_figures.py`) emits this figure alongside
+`comparison.png` in the same per-budget output directory.
+
+### Cost accounting — comparing methods on time, not just reward quality
+
+Every run writes `<out>/timing.json` and adds cumulative cost columns to
+`training_log.csv`. Nothing needs to be enabled; the instrumentation is always on.
+
+**How it works.** `run_experiment.py` wraps the predictor in a `PredictorTimer`
+(`src/rl_matdesign/utils/timing.py`) immediately after `build_predictor`, *before*
+`build_env`. Every training reward flows through the `reward_fn` / `mg_reward_fn`
+closures in `build_env`, and the envs only call them at an episode's terminal step
+— so one wrap accounts for every predictor call in every phase, for all three env
+types and all three methods. The proxy delegates unknown attributes to the real
+predictor, so `_cache` checkpointing and `predict_raw` keep working.
+
+`timing.json` holds `phases_s` (`setup` / `warmup` / `train` / `generate`),
+`total_s`, `overhead_s` (= total minus predictor time, i.e. the RL machinery), and
+a `predictor` block with `t_predict_s`, `n_calls`, `n_unique`, `cache_hit_rate`,
+`mean_s_per_unique` and `best_reward`. `n_unique` is counted against the timer's
+own key set, not the predictor's internal cache — the three predictors cache under
+different attribute names (`_cache` vs `_stats_cache`) and `dummy` doesn't cache
+at all.
+
+`training_log.csv` gains `t_wall`, `t_predict_cum`, `n_predict_calls`,
+`n_predict_unique` and `best_reward_so_far` on each `dqn_train` / `pg_train` row.
+`generated.csv` is deliberately unchanged.
+
+**Making the figures** — reads only saved text files, so the expensive runs can
+happen on a GPU box and the plots can be made later on a laptop:
+
+```bash
+python scripts/baselines/compare_timing.py \
+    --run "DQN(bootstrap):runs/ooh_dqn_boot" \
+    --run "DQN(mc):runs/ooh_dqn_mc" \
+    --run "A2C:runs/ooh_a2c" \
+    --out runs/compare/cost --title "OOH: cost to best candidate"
+```
+
+Four panels: best-reward-so-far vs wall-clock, best-reward-so-far vs cumulative
+unique predictor calls, a predictor-vs-overhead wall-clock breakdown, and cost per
+real evaluation with the cache-hit rate overlaid. Each `PATH` is a run directory,
+or a parent holding `seed_*/` dirs (from `run_seeds.py`), in which case curves are
+drawn as a median line with a min–max band. Like `compare_methods.py`, panel order
+follows the `--run` order unless you pass `--sort-by-best`.
+
+**Two things to keep straight when interpreting the result:**
+
+- `--dqn-target-mode mc` is a DQN *ablation*, not a fourth method — same rollout
+  loop, same buffer, same episode count, only the regression target changes. Label
+  the arms `DQN(bootstrap)` / `DQN(mc)` / `A2C`.
+- Configured episode budgets are asymmetric across methods (e.g. `oxides_sinter.yaml`:
+  DQN 1000+50000 episodes vs A2C 500×15 = 7500). That is *why* the comparison is
+  plotted against time and predictor calls rather than episode index — those curves
+  stay comparable no matter how long each arm runs.
+- A run resumed with `--resume-training` restarts its counters with a warm cache,
+  so its hit rate reads artificially high. `compare_timing.py` flags such runs;
+  benchmark without `--resume-training` for clean numbers.
+
 ### DeepMD reward (requires `ase` and `deepmd-kit`)
 ```bash
 python scripts/run_ABCDEOOH_experiment.py --out runs/dp --dp-poscar PATH/TO/POSCAR --dp-model model_1.ckpt.pt --dp-model model_2.ckpt.pt --dp-objective mean_minus_kstd
 ```
+
+### Choosing which adsorbates the OOH predictor builds — `adsorbates`
+
+`predictor: ooh` places adsorbate intermediates on each randomly-doped slab before
+scoring it. The YAML key `adsorbates` selects which ones, in frame order:
+
+```yaml
+predictor: ooh
+adsorbates: [O, OH, OOH]   # default — historical behaviour
+# adsorbates: [O]          # only the frame that is actually read (see below)
+# adsorbates: []           # bare parent slab: no adsorbate atoms at all
+```
+
+**The empty list means the bare parent slab** — one frame per random config instead
+of three, so ~3× fewer DeepMD evaluations and ~3× fewer relaxations under
+`geo_opt: true`. `ads_height` / `ads_dz` are unused in that regime.
+
+Bare is the *empty selection* rather than a member of the list on purpose: every
+frame in one DeepMD batch must have the same atom count (an adsorbate frame has
+`nat_slab + 3` atoms, a bare one `nat_slab`), so the two are mutually exclusive by
+construction and the equal-`natoms` check in `_build_dp_inputs_for_one_doped_slab`
+can never be violated from YAML.
+
+**How `adsorbates` interacts with `output_index`.** All frames go into a single
+`dp.eval` batch, and `pick_scalar` (`utils/dp_eval.py:81-89`) flattens the whole
+batch before indexing. The flattening is frame-major, so with the default list and
+`output_index: 0` **only the O\* frame's value is read** — OH\* and OOH\* are built,
+optionally relaxed, evaluated, and discarded. DeepMD scores frames independently,
+so they do not affect the O\* number. If you are running with the default
+`output_index`, `adsorbates: [O]` is therefore ~3× cheaper for identical rewards.
+
+**Cache invalidation.** `adsorbates` and `output_index` are folded into
+`OOHCatalystPredictor._comp_key`, because both change which structure the cached
+number describes. Changing either means a saved `dp_cache` (carried in the DQN
+`checkpoint.pt`) no longer matches, so a resumed run recomputes once rather than
+returning values for a different structure.
+
+There is no ΔG / Sabatier arithmetic in this repo — no 1.23 V, no ZPE or entropy
+corrections. The DeepProperty head emits the number directly, so changing
+`adsorbates` changes *which structure the model sees*, not a thermodynamic cycle.
+A bare slab may be out of distribution for a head trained on adsorbate-bearing
+slabs; use `--dp-debug-dir` to dump and inspect the exact frames.
 
 ### Evaluate specific formulas with DeepMD (standalone)
 ```bash
 python scripts/evaluate_formulas_dp.py --formula "Ni0.70Fe0.15Ce0.05Er0.05Tm0.05O2H1" --dp-model model.pt --dp-poscar POSCAR
 # Or batch from a file (one formula per line):
 python scripts/evaluate_formulas_dp.py --formulas-file candidates.txt --dp-model model.pt --out-csv results.csv
+# Bare parent slab (flag passed with no names), dumping the structures for inspection:
+python scripts/evaluate_formulas_dp.py --formula "Ni0.70Fe0.15Ce0.05Er0.05Tm0.05O2H1" \
+  --dp-model model.pt --dp-poscar POSCAR --adsorbates --dp-debug-dir /tmp/ooh_bare
 ```
+Omit `--adsorbates` for the default three; pass it bare for the clean slab; pass
+names (`--adsorbates O OH`) for a subset. `--output-index` is also exposed here —
+it previously defaulted to 0 with no way to change it from this script.
 
 ### Summarize a replay buffer
+The DQN replay buffer is persisted inside the periodic `checkpoint.pt` (key `"buffer"`), not as a standalone file. Point the summarizer at the run directory:
 ```bash
-python scripts/summarize_replay_buffer.py <path-to-random_dataset.npz>
+python scripts/summarize_replay_buffer.py --run-dir runs/dqn
+# Recompute predictor mean/std for each unique composition:
+python scripts/summarize_replay_buffer.py --run-dir runs/dqn --recompute
 ```
+It reconstructs episodes (splitting buffer rows on `done=True`), decodes each composition via `species_set` from `run_config.json`, and writes `replay_buffer_summary.csv` (`formula`, `terminal_reward`, `n_buffer_rows`, plus `pred_mean/std` when `--recompute`).
 
 ### Install dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-There is no test suite, linter configuration, or build step.
+Run the regression suite with `python -m pytest`. Build the package with
+`python -m pip wheel --no-deps --no-build-isolation .`. There is no configured linter.
 
 ## Architecture
 
 ### Pipeline flow (all in `scripts/run_ABCDEOOH_experiment.py`)
 
-**DQN path (`--rl-method dqn`, default):**
-1. **Random buffer** — Roll out random episodes in `ABCDEOOHEnv`, compute MC returns as Q targets, save to `random_dataset.npz`
-2. **Q-network training** — `StandardScaler` on state features, then train `QRegressor` (3-layer MLP) with MSE loss
-3. **Iterative buffer** (optional) — Collect more episodes using learned policy (epsilon-greedy or stochastic top-k), append to buffer, retrain
-4. **Candidate generation** — Greedy (or epsilon-greedy) action selection via trained Q-network, deduplicate, optionally filter by primary phase, write `generated.csv`
+**DQN path (`--rl-method dqn`, default), `train_dqn_online`:**
+1. **Warmup** — Roll out `--dqn-warmup-eps` random episodes with real rewards to pre-fill an in-memory FIFO replay buffer (`collections.deque(maxlen=dqn_buffer_size)`) and fit the `StandardScaler` on raw state features. Each env step becomes one transition row: `{s_mat_raw, s_step, a_elem_idx, a_comp_val, reward, s_mat_next_raw, s_step_next, next_allowed_idx, done}` (see `add_episode_to_buffer`).
+2. **Online training** — For `--dqn-num-train-eps` episodes: ε-greedy rollout → new rows, then `--dqn-grad-steps-per-ep` minibatch SGD steps minimizing SmoothL1 on the one-step TD target `r + γ·max_{a'∈next_allowed} Q_target(s',a')`. A target network is hard-copied every `--dqn-target-update-freq` episodes; ε anneals linearly. The buffer is checkpointed to `checkpoint.pt` (key `"buffer"`) for exact-state resume — there is no `random_dataset.npz`.
+3. **Candidate generation** — Boltzmann-sampled (or greedy) action selection via trained Q-network, deduplicate, optionally filter by phase, write `generated.csv`
 
 **PG path (`--rl-method reinforce` or `a2c`):**
 1. **Warmup** — Roll out `--pg-warmup-eps` random episodes to fit `StandardScaler`
 2. **Online training** — Each episode: roll out using `PolicyNet` (softmax sampling), compute MC returns, update actor with REINFORCE gradient; A2C additionally updates `ValueNet` critic to reduce variance
 3. **Candidate generation** — Greedy argmax (default) or stochastic sampling (`--pg-gen-stochastic`) via trained `PolicyNet`
 
+**Advantage standardisation and the entropy floor (PG only).** Advantages are
+standardised across each batch in `train_pg` — unconditionally, no flag. Without
+it the actor term scales with the raw reward (sintering temperatures are 400–700)
+while the entropy bonus is at most `pg_entropy_coef · ln|A| ≈ 0.5`, so the entropy
+term cannot influence the update and the policy collapses to a single composition.
+The observed failure: A2C got *worse* with more episodes (best 632 → 670 → 649 as
+the budget went 2.7k → 7.7k → 45.2k), because mean return kept improving while the
+best candidate froze ~20% in and `unique_comps_seen` stopped growing.
+
+Consequences to keep straight:
+
+- `pg_entropy_coef` and `pg_repeat_penalty_coef` are in **σ of batch return**, not
+  the property's units, as is the `repeat_penalty` log column. `return_shaped`
+  converts the penalty back to the property's units so it stays comparable against
+  `return_raw`. Logs from before this change match neither convention.
+- `pg_entropy_min` (default 0.3) floors **normalised** entropy `H / ln|A|`, not
+  nats, so it ports between the 80-element oxide env and OOH. `entropy_norm` and
+  `entropy_coef_eff` in `training_log.csv` are the diagnostic columns.
+- DQN is unaffected — ε-greedy is exogenous exploration and the replay buffer keeps
+  diverse transitions alive, so it does not have this failure mode.
+- When sweeping budgets, hold `pg_batch_eps` fixed and vary only `pg_num_iters`.
+  Batch size changes gradient noise *and* updates-per-episode, so varying both
+  confounds budget with collapse rate.
+
 ### Output files (under `--out`)
 
 | File | DQN | REINFORCE | A2C | Description |
 |---|---|---|---|---|
-| `random_dataset.npz` | ✓ | — | — | Replay buffer arrays: `s_mat`, `s_step`, `a_elem`, `a_comp`, `y` |
+| `checkpoint.pt` | ✓ | ✓ | ✓ | Periodic mid-run checkpoint. For DQN (`type=="dqn"`) it holds the replay `buffer` (list of transition-row dicts), `qnet_state`, `target_net_state`, `opt_state`, `eps`, `episodes_completed`, `dp_cache`. Enables `--resume-training`. (Replaces the old `random_dataset.npz`.) |
 | `std_scaler.bin` | ✓ | ✓ | ✓ | Serialized `StandardScaler` (joblib) |
 | `qnet.pt` | ✓ | — | — | Q-network state dict (PyTorch) |
 | `policy.pt` | — | ✓ | ✓ | PolicyNet state dict (PyTorch) |
 | `value_net.pt` | — | — | ✓ | ValueNet (critic) state dict (PyTorch) |
 | `generated.csv` | ✓ | ✓ | ✓ | Deduplicated candidates with `formula`, `reward`, `dp_mean/std`, `primary_ok/label` |
 | `run_config.json` | ✓ | ✓ | ✓ | Full `argparse` namespace for reproducibility |
+| `training_log.csv` | ✓ | ✓ | ✓ | Per-episode (`phase="dqn_train"`) / per-iteration (`phase="pg_train"`) metrics, plus the cumulative cost columns below. Every episode that costs a predictor call also gets its own row: `phase="dqn_warmup"` for DQN, `phase="pg_episode"` for PG — see below |
+| `timing.json` | ✓ | ✓ | ✓ | Wall-clock + predictor-call accounting for the run (see "Cost accounting") |
 
 ### Key modules (`src/abcde_ooh/`)
 
@@ -169,7 +387,7 @@ Violations are silent — the agent's value function fragments across orderings,
 
 YAML key: `dqn_augment_permutations: K` (CLI: `--dqn-augment-permutations K`, default `0`).
 
-When set on a DQN run, each completed episode is re-inserted into the replay buffer K additional times under random permutations of the action sequence. The terminal reward is reused (no extra predictor call), and within-episode duplicates are skipped. This gives DQN more `(state, action)` coverage per expensive lab call — useful when the predictor is the bottleneck (DeepMD ensembles, OOH overpotential) or when `cation_set` is large.
+When set on a DQN run, each completed episode is re-inserted into the replay buffer K additional times under random permutations of the action sequence. The terminal reward is reused (no extra predictor call), and within-episode duplicates are skipped. This gives DQN more `(state, action)` coverage per expensive lab call — useful when the predictor is the bottleneck (DeepMD ensembles, OOH overpotential) or when `species_set` is large.
 
 **DQN only.** PG / A2C are on-policy: their gradient direction is tied to the action *actually sampled by the current policy*, so permuting trajectories breaks the policy-gradient theorem. The flag is silently ignored (with a one-line warning) for non-DQN methods.
 

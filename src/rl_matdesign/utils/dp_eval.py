@@ -34,7 +34,7 @@ def load_ase_calculators(
         from deepmd.calculator import DP as DPCalculator
     except ImportError as exc:
         raise ImportError(
-            "DPStructurePredictor requires deepmd-kit (ASE calculator): "
+            "The energy backend requires deepmd-kit (ASE calculator): "
             "`pip install deepmd-kit`."
         ) from exc
     kwargs = {"head": head} if head is not None else {}
@@ -46,18 +46,26 @@ def eval_energy_ase(
     calc_list: List[Any],
     *,
     energy_per_atom: bool = True,
-) -> List[float]:
-    """Evaluate every (structure, calculator) pair → list of scalar energies."""
-    values: List[float] = []
-    for atoms in atoms_list:
-        for calc in calc_list:
+) -> np.ndarray:
+    """Evaluate every (structure, calculator) pair.
+
+    Returns a 2-D array shaped **(n_models, n_structures)** — the repo-wide
+    convention shared with :func:`eval_property_ensemble`, so callers can fold the
+    two axes separately and never have to know which loop ran outermost. Axis 1
+    (structures) is *configurational* spread and gets averaged away; axis 0
+    (models) is *epistemic uncertainty* and is what a ``mean_minus_kstd``
+    objective penalises. See ``structure_score._score``.
+    """
+    out = np.empty((len(calc_list), len(atoms_list)), dtype=float)
+    for j, atoms in enumerate(atoms_list):
+        for i, calc in enumerate(calc_list):
             atoms_copy = atoms.copy()
             atoms_copy.calc = calc
             e = atoms_copy.get_potential_energy()
             if energy_per_atom:
                 e /= len(atoms_copy)
-            values.append(float(e))
-    return values
+            out[i, j] = float(e)
+    return out
 
 
 def pick_scalar(
@@ -94,3 +102,105 @@ def pick_scalar(
     raise ValueError(
         f"Unknown output_aggregator {output_aggregator!r}; expected one of: index, mean, max."
     )
+
+
+def _broadcast_frame_param(fparam: Any, nframes: int) -> np.ndarray:
+    """Broadcast a scalar / length-d vector / (nframes, d) array to (nframes, d)."""
+    arr = np.atleast_1d(np.asarray(fparam, dtype=np.float64))
+    if arr.ndim == 1:
+        return np.tile(arr.reshape(1, -1), (nframes, 1))
+    if arr.ndim == 2:
+        if arr.shape[0] == nframes:
+            return arr
+        if arr.shape[0] == 1:
+            return np.tile(arr, (nframes, 1))
+    raise ValueError(
+        f"fparam must be a scalar, a length-d vector, or an (nframes, d) array; "
+        f"got shape {arr.shape} for nframes={nframes}."
+    )
+
+
+def _broadcast_atomic_param(aparam: Any, nframes: int, natoms: int) -> np.ndarray:
+    """Broadcast atomic params to (nframes, natoms, d)."""
+    arr = np.asarray(aparam, dtype=np.float64)
+    if arr.ndim == 1:                       # per-atom scalar or single d-vector
+        if arr.shape[0] == natoms:
+            arr = arr.reshape(natoms, 1)
+        else:
+            arr = np.tile(arr.reshape(1, -1), (natoms, 1))
+        return np.tile(arr.reshape(1, natoms, -1), (nframes, 1, 1))
+    if arr.ndim == 2 and arr.shape[0] == natoms:
+        return np.tile(arr.reshape(1, natoms, -1), (nframes, 1, 1))
+    if arr.ndim == 3 and arr.shape[:2] == (nframes, natoms):
+        return arr
+    raise ValueError(
+        f"aparam must broadcast to (nframes={nframes}, natoms={natoms}, d); "
+        f"got shape {arr.shape}."
+    )
+
+
+def eval_property_ensemble(
+    structures: List[Any],
+    models: List[Any],
+    elem_to_type: dict,
+    *,
+    output_index: int = 0,
+    output_aggregator: str = "index",
+    fparam: Optional[Any] = None,
+    aparam: Optional[Any] = None,
+) -> np.ndarray:
+    """Evaluate a ``DeepProperty`` ensemble on *structures*.
+
+    Returns a 2-D array shaped **(n_models, n_structures)** — the same convention
+    as :func:`eval_energy_ase` — each entry collapsed from that model's output
+    vector via :func:`pick_scalar`. Used by the ``structure_score`` predictor's
+    ``property`` backend, which averages axis 1 (structures) to define the
+    property and takes mean/std over axis 0 (models) as the uncertainty.
+
+    ``fparam`` / ``aparam`` supply frame / atomic parameters for models trained
+    with them (``numb_fparam > 0`` / ``numb_aparam > 0``). ``fparam`` is broadcast
+    to one row per frame; pass a scalar, a length-``numb_fparam`` vector, or a
+    full ``(nframes, numb_fparam)`` array.
+    """
+    nframes = len(structures)
+    natoms = len(structures[0])
+    coords = np.zeros((nframes, natoms, 3), dtype=np.float64)
+    cells = np.zeros((nframes, 3, 3), dtype=np.float64)
+    atom_types = np.zeros((nframes, natoms), dtype=np.int32)
+    for i, atoms in enumerate(structures):
+        coords[i] = atoms.get_positions()
+        cells[i] = atoms.get_cell().array
+        syms = atoms.get_chemical_symbols()
+        unknown = sorted({s for s in syms if s not in elem_to_type})
+        if unknown:
+            raise RuntimeError(
+                f"Elements {unknown} are not in the DP model type_map "
+                f"({sorted(elem_to_type)}). Check the checkpoint covers every species."
+            )
+        atom_types[i] = np.fromiter(
+            (elem_to_type[s] for s in syms), dtype=np.int32, count=natoms,
+        )
+
+    fparam_arr = _broadcast_frame_param(fparam, nframes) if fparam is not None else None
+    aparam_arr = (
+        _broadcast_atomic_param(aparam, nframes, natoms) if aparam is not None else None
+    )
+
+    eval_kwargs: dict = {"mixed_type": True}
+    if fparam_arr is not None:
+        eval_kwargs["fparam"] = fparam_arr
+    if aparam_arr is not None:
+        eval_kwargs["aparam"] = aparam_arr
+
+    out = np.empty((len(models), nframes), dtype=float)
+    for i, dp in enumerate(models):
+        res = np.asarray(
+            dp.eval(coords=coords, cells=cells, atom_types=atom_types, **eval_kwargs)
+        )
+        if res.ndim == 1:
+            res = res.reshape(1, -1) if nframes == 1 else res.reshape(nframes, -1)
+        for j, frame_vec in enumerate(res):
+            out[i, j] = pick_scalar(
+                frame_vec, output_index=output_index, output_aggregator=output_aggregator
+            )
+    return out

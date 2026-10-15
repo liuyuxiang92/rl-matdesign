@@ -6,7 +6,7 @@ import pytest
 
 def test_builtin_predictor_names_present():
     from rl_matdesign.registry import PREDICTORS
-    expected = {"dp_structure", "hea", "perovskite", "sinter_calcine", "ooh", "dummy"}
+    expected = {"rf_magpie", "ooh", "dummy"}
     assert expected.issubset(set(PREDICTORS))
 
 
@@ -30,7 +30,7 @@ def test_resolve_unknown_predictor_lists_builtins():
         resolve_predictor("definitely_not_a_real_kind", {})
     msg = str(info.value)
     # Helpful error must surface the registered short names.
-    assert "dp_structure" in msg and "ooh" in msg
+    assert "rf_magpie" in msg and "ooh" in msg
 
 
 def test_fqn_dispatch_loads_class(tmp_path, monkeypatch):
@@ -78,3 +78,22 @@ def test_resolve_unknown_constraint_lists_builtins():
     with pytest.raises(ValueError) as info:
         resolve_constraint("not_a_real_constraint", {})
     assert "phase_pattern" in str(info.value)
+
+
+def test_mgtransformer_is_registered_under_a_short_name():
+    # Config authors write `predictor: mgtransformer`, not the full FQN.
+    from rl_matdesign.registry import PREDICTORS
+
+    assert "mgtransformer" in PREDICTORS
+
+
+def test_mgtransformer_resolves_and_reports_the_missing_model_key():
+    # Resolution goes through the registry (not importlib), and the leaf's own
+    # required-key validation is reached.
+    import pytest
+
+    from rl_matdesign.registry import resolve_predictor
+
+    with pytest.raises(ValueError) as info:
+        resolve_predictor("mgtransformer", {"mgt_repo": ".", "mgt_python": "python"})
+    assert "model" in str(info.value)

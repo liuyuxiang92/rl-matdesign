@@ -2,7 +2,10 @@
 
 Config-driven RL runner for materials composition discovery.
 Supports multiple material systems (OOH catalyst, HEA, perovskite, oxides) via YAML configs.
-Three RL algorithms: **DQN** (online, target-network), **REINFORCE**, and **A2C**.
+Three RL algorithms: **DQN** (online, target-network, or MC targets), **REINFORCE**, and **A2C**.
+
+See [code layout and compatibility](docs/code_layout.md) for maintained entry
+points, module responsibilities, and regression checks.
 
 
 ---
@@ -53,14 +56,16 @@ operational flags (seeds, resume, checkpoint). This means:
 
 | Config | Material system | Default method |
 |---|---|---|
-| `configs/ooh.yaml` | 5-cation ABCDEOOH oxyhydroxide (28 cation set) | reinforce |
-| `configs/ooh_dqn.yaml` | Same as `ooh.yaml`, DQN-tuned hyperparameters | dqn |
 | `configs/hea.yaml` | High-entropy alloy formation energy | reinforce |
-| `configs/perovskite.yaml` | Perovskite oxide stability | reinforce |
+| `configs/lips_sse.yaml` | Multi-sublattice LiPS solid electrolyte | Configured in YAML |
 | `configs/oxides_sinter.yaml` | Oxide sintering temperature | reinforce |
 | `configs/oxides_calcine.yaml` | Oxide calcination temperature | reinforce |
-| `configs/ti_alloy.yaml` | 11-element titanium alloy, per-element fraction bounds (Tier-1 example) | a2c |
 | `configs/test_dummy.yaml` | Fast smoke test (no real predictor) | dqn |
+| `configs/test_multigroup_dummy.yaml` | Multi-sublattice smoke test (no real predictor) | CLI selection |
+
+OOH, Ti-alloy, and perovskite scenario YAML files are intentionally local and
+gitignored. Examples below using those paths require your existing local configs
+and model/structure files. They are not included in a fresh checkout.
 
 ---
 
@@ -68,9 +73,9 @@ operational flags (seeds, resume, checkpoint). This means:
 
 ```bash
 python scripts/run_experiment.py \
-    --config configs/ooh.yaml \
-    --method reinforce \
-    --out runs/ooh_reinforce_seed0 \
+    --config configs/test_dummy.yaml \
+    --method a2c \
+    --out runs/smoke_a2c_seed0 \
     --dp-seed 321 --train-seed 123 --gen-seed 213
 ```
 
@@ -108,11 +113,21 @@ Key YAML fields (edit `configs/ooh.yaml`):
 pg_warmup_eps: 1000          # random episodes to fit the StandardScaler
 pg_num_iters: 1000           # outer training iterations
 pg_batch_eps: 21             # episodes per batch; one gradient step per batch
-pg_entropy_coef: 0.15        # entropy bonus weight
-pg_repeat_penalty_coef: 10   # penalises revisiting the same composition
+pg_entropy_coef: 0.15        # entropy bonus weight, in σ of batch return
+pg_entropy_min: 0.3          # floor on normalised entropy H/ln|A|; 0 disables
+pg_repeat_penalty_coef: 10   # penalises revisiting the same composition, in σ
 gen_temperature: 3.0         # Boltzmann T for generation diversity
 num_gen_eps: 2000            # unique compositions to generate
 ```
+
+PG advantages are standardised per batch (no flag), so `pg_entropy_coef` and
+`pg_repeat_penalty_coef` are in standard deviations of batch return rather than in
+the property's own units. `pg_entropy_min` floors the policy's normalised entropy
+so it keeps exploring for the whole budget instead of going deterministic partway
+through — see [`docs/yaml_config_reference.md`](docs/yaml_config_reference.md).
+
+When sweeping budgets, hold `pg_batch_eps` fixed and vary only `pg_num_iters`;
+changing both confounds episode budget with update density.
 
 ---
 
@@ -206,30 +221,35 @@ under built-in short names (Tier 3).
 
 For any system whose reward is "substitute composition onto a base POSCAR,
 evaluate with one or more DeepMD models, aggregate to a scalar", use the
-built-in `predictor: dp_structure`. See `configs/ti_alloy.yaml` for the
-canonical example. A minimal YAML:
+built-in `predictor: structure_score` with `builder: substitute` and one
+`backend: energy` property. See `configs/ti_alloy.yaml` for the canonical
+multi-objective example. A minimal YAML:
 
 ```yaml
 # Environment
-cation_set: [Ti, Al, V, Cr, Fe, Zr, Nb, Mo, Sn, Hf, Ta]
+species_set: [Ti, Al, V, Cr, Fe, Zr, Nb, Mo, Sn, Hf, Ta]
 fraction_set: ["0.00", "0.01", ..., "0.90"]    # whatever step you want
 total_units: 100                                # step = 1/total_units
 n_components: 11
 episode_style: fixed_order_amount               # each step picks an amount;
-                                                # element is cation_set[step]
+                                                # element is species_set[step]
 element_bounds:                                 # per-element [min, max]
   Ti: [0.45, 0.90]
   Al: [0.00, 0.25]
   # ...
 
 # Predictor
-predictor: dp_structure
+predictor: structure_score
+builder: substitute                             # fixed-lattice element swap
 base_poscar: data/ti_alloy/FCC.POSCAR           # placeholder 'X' on sub sites
-dp_models: [models/ti/m1.pt, models/ti/m2.pt]
 site_symbol: X
-output_index: 0                                 # which output of multi-output models
-objective: mean_minus_kstd                      # reward = -mean - k*std
 k: 1.0
+properties:
+  - name: energy
+    backend: energy                             # DP potential energy
+    models: [models/ti/m1.pt, models/ti/m2.pt]
+    direction: min                              # lower energy = better
+    objective: mean_minus_kstd                  # reward = -mean - k*std
 
 # Method + hyperparameters
 method: a2c
@@ -316,9 +336,7 @@ and `ooh_phase` constraint do.
 
 | Name | What it does |
 |---|---|
-| `dp_structure` | Generic DeepMD substitute-and-evaluate; the Tier-1 default |
-| `hea` | DP-ensemble formation energy on FCC/BCC, `site_symbol="X"` |
-| `perovskite` | DP-ensemble formation enthalpy on `LaBO₃`, `site_symbol="Fe"` |
+| `structure_score` | The one structure-based predictor: build (`builder`) -> [relax] -> score N properties (`backend: energy`/`property`) -> combine. `share_structure: false` for independent-structure multi-objective. The Tier-1 default |
 | `sinter_calcine` | RandomForest on Magpie features (no DeepMD) |
 | `ooh` | OOH catalyst overpotential (adsorbate placement + Sabatier formula) |
 | `dummy` | Random-noise predictor for smoke testing |
@@ -340,7 +358,7 @@ and `ooh_phase` constraint do.
 `CompositionEnv` accepts:
 
 - `element_bounds: {El: [min_frac, max_frac]}` — per-element fractional range.
-- `episode_style: fixed_order_amount` — every element in `cation_set` appears
+- `episode_style: fixed_order_amount` — every element in `species_set` appears
   in fixed order; the agent picks the amount per step; the last step's amount
   is forced to satisfy the sum constraint.
 

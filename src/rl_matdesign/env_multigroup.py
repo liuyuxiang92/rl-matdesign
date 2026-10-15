@@ -1,0 +1,455 @@
+"""MultiGroupEnv — a fixed-order sequence of N composition groups.
+
+Generalizes :class:`~rl_matdesign.env.CompositionEnv` from "one composition that
+sums to 1" to "N **sublattice groups**, each summing to 1, filled in a fixed
+order". The single-group case (N=1) reproduces ``CompositionEnv`` exactly, so
+existing scenarios are the degenerate instance of this env.
+
+Why this exists
+---------------
+Multi-sublattice substitutional design (e.g. doped Li6PS6: a P-site group and an
+S-site group) cannot be expressed as one sum-to-1 composition — the agent fills
+several independent sublattices, each of which sums to 1 on its own. Each group
+is a full ``CompositionEnv`` sub-problem (its own ``species_set``,
+``fraction_set``, ``total_units``, ``episode_style``, ``element_bounds`` and
+constraint filter); this env chains them.
+
+Design
+------
+* **Delegation.** One inner ``CompositionEnv`` per group owns that group's
+  feasibility / bounds / episode-style logic. This env drives them in order.
+* **Union alphabet for network I/O.** Actions are exposed to the training code as
+  one-hots over the *union* of all groups' ``species_set`` / ``fraction_set`` so
+  the action dimensions are fixed across groups. ``self.species_set`` /
+  ``self.fraction_set`` are those unions, which is exactly what ``training.py``
+  reads to size the networks and decode ``a_elem_idx`` / ``a_comp_val``. Each
+  step's allowed actions are re-encoded from the active group's alphabet into the
+  union before they leave this env.
+* **State features.** Per-step state = concatenation of every group's partial
+  Magpie features (so the policy sees each sublattice's chemistry).
+* **Cross-group coupling.** When the active group's constraint runs, the
+  already-completed groups' compositions are passed as ``prior_groups`` (e.g. the
+  S-site O range bounded by the P-site metal).
+* **Terminal.** ``terminal_cation_fractions()`` returns the **structured**
+  ``{group_name: {element: fraction}}`` mapping, which is what the predictor
+  receives (``training.py`` passes it straight to ``predictor.predict``).
+"""
+from __future__ import annotations
+
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+from .encoding import decode_one_hot, encode_choice
+from .env import CompositionEnv, EpisodeStep, _step_one_hot
+from .env_integer import IntegerRatioEnv
+from .featurization import featurize_formula
+
+
+def normalize_group_spec(g: Dict[str, Any]) -> Dict[str, Any]:
+    """Expand a composition group's ``fraction_set`` into its canonical explicit-list
+    form and derive ``total_units`` from it.
+
+    ``fraction_set`` accepts two public forms (see
+    :func:`~rl_matdesign.env.expand_fraction_set`):
+
+    * a regular grid ``{min, max, step}``;
+    * an explicit list ``[v1, v2, ...]``.
+
+    ``total_units`` is never read from the config — it is always derived from
+    the (expanded) ``fraction_set`` (see
+    :func:`~rl_matdesign.env.derive_total_units`), so there is exactly one
+    public knob for grid resolution, not two that could silently disagree.
+
+    A mandatory-presence / "host absorbs the rest" requirement is expressed via
+    ``element_bounds`` on the relevant species (e.g. ``{P: [0.92, 0.98]}``), not
+    a dedicated ``host:`` knob — the host is just another entry in
+    ``species_set`` like any other.
+
+    Returns the spec unchanged for ``kind != "composition"`` — ``categorical``
+    and ``integer`` groups have their own, unrelated value-grid conventions
+    (``choices``/``values`` and ``ratio_set`` respectively) and are not touched
+    here.
+    """
+    g = dict(g)
+    g.setdefault("sites", 1)
+    kind = g.get("kind", "composition")
+
+    if kind != "composition":
+        return g
+
+    fraction_set = g.get("fraction_set")
+    if fraction_set is None:
+        raise ValueError(
+            f"group {g.get('name', '?')!r} (kind=composition) needs 'fraction_set' "
+            "— either an explicit list or a {min, max, step} regular grid."
+        )
+    from .env import derive_total_units, expand_fraction_set
+
+    expanded = expand_fraction_set(fraction_set)
+    g["fraction_set"] = expanded
+    g["total_units"] = derive_total_units(expanded)
+    return g
+
+
+class CategoricalGroup:
+    """A pick-from-list group: fixed-order slots, each ``(element, values)``; no sum-to-1.
+
+    Used for sublattices that are discrete choices rather than a composition (e.g. the
+    doped-Li₆PS₆ S-site: an oxygen *form* and a chlorine *count*). The agent picks one
+    value per slot in order. Values are encoded to a numeric **code** for the network's
+    scalar-amount input; the terminal returns the **original** values (so a builder reads
+    the real ``Cl = 1.0`` / ``O = "oxide"`` directly — no selector/cl_map).
+
+    Each slot has a unique **name** (the key the terminal/builder reads) and an
+    underlying **element** (the real chemistry). They default to the same string,
+    so a plain ``{element: O, values: [...]}`` slot is named ``"O"``. Giving two
+    slots the *same* element but *different* names (``{name: O_a, element: O}`` and
+    ``{name: O_b, element: O}``) lets one categorical group carry **per-metal**
+    O-forms without the names colliding in the one-hot alphabet — the builder maps
+    each name back to its element via :attr:`slot_element`.
+
+    Presents the minimal inner-group interface ``MultiGroupEnv`` drives.
+    """
+
+    def __init__(self, choices: Sequence[Dict[str, Any]], *, phase_filter=None) -> None:
+        # (name, element, values) — name is the unique slot id used for encoding
+        # and as the terminal key; element is the real chemistry for the builder.
+        self.slots: List[Tuple[str, str, List[Any]]] = [
+            (str(c.get("name", c["element"])), str(c["element"]), list(c["values"]))
+            for c in choices
+        ]
+        if not self.slots:
+            raise ValueError("categorical group needs a non-empty 'choices' list.")
+        self.species_set: List[str] = [name for name, _el, _v in self.slots]
+        if len(set(self.species_set)) != len(self.species_set):
+            raise ValueError(
+                f"categorical slot names must be unique; got {self.species_set}. "
+                "Give same-element slots distinct 'name' keys (e.g. O_a, O_b)."
+            )
+        self.slot_element: Dict[str, str] = {name: el for name, el, _v in self.slots}
+        self.n_components: int = len(self.slots)
+        self.phase_filter = phase_filter
+        self.constraints_enabled = True  # see IntegerRatioEnv (constrain_training)
+
+        # Per-slot value <-> numeric-code maps; codes go into fraction_set.
+        self._slot_codes: List[List[Tuple[Any, str]]] = []
+        self._code_to_value: List[Dict[str, Any]] = []
+        codes: set[str] = set()
+        for _name, _el, values in self.slots:
+            sc, c2v = [], {}
+            for i, v in enumerate(values):
+                code = self._encode_value(v, i)
+                sc.append((v, code))
+                c2v[code] = v
+                codes.add(code)
+            self._slot_codes.append(sc)
+            self._code_to_value.append(c2v)
+        self.fraction_set: List[str] = sorted(codes, key=float)
+        self.initialize()
+
+    @staticmethod
+    def _encode_value(v: Any, i: int) -> str:
+        try:
+            return f"{float(v):.2f}"          # numeric value -> its own code
+        except (ValueError, TypeError):
+            return f"{float(i):.2f}"           # label -> slot-local index code
+
+    def initialize(self) -> None:
+        self.counter = 0
+        self.state = ""                        # no composition string; featurizer falls back
+        self._picked: Dict[str, Any] = {}
+
+    def allowed_actions(self, *, prior_groups=None):
+        if self.counter >= self.n_components:
+            return []
+        name = self.slots[self.counter][0]
+        actions = [
+            (
+                tuple(encode_choice(name, self.species_set).tolist()),
+                tuple(encode_choice(code, self.fraction_set).tolist()),
+            )
+            for _v, code in self._slot_codes[self.counter]
+        ]
+        if self.phase_filter is not None and self.constraints_enabled:
+            kw = dict(
+                actions=actions, units_map={},
+                steps_left=self.n_components - self.counter - 1,
+                allowed_units=[], possible_sums_by_k=[],
+                species_set=self.species_set, fraction_set=self.fraction_set,
+                # CategoricalGroup encodes the picked *value* in comp_oh's code,
+                # not in the elem one-hot (species_set is just the slot name) —
+                # a filter needs this map to recover the real element/label a
+                # candidate action represents (see SMACTChargeFilter's
+                # categorical-mode branch).
+                code_to_value=self._code_to_value[self.counter],
+            )
+            if prior_groups is not None:
+                kw["prior_groups"] = prior_groups
+            actions = self.phase_filter.filter_actions(**kw)
+        return actions
+
+    def step(self, action) -> None:
+        elem_oh, comp_oh = action
+        name = decode_one_hot(elem_oh, self.species_set)
+        expected = self.slots[self.counter][0]
+        if name != expected:
+            raise ValueError(
+                f"categorical slot {self.counter} expects {expected!r}, got {name!r}."
+            )
+        code = decode_one_hot(comp_oh, self.fraction_set)
+        self._picked[name] = self._code_to_value[self.counter][code]
+        self.counter += 1
+
+    def cation_fractions(self) -> Dict[str, Any]:
+        return dict(self._picked)
+
+    def terminal_comp_key(self) -> tuple:
+        return tuple(sorted((k, str(v)) for k, v in self._picked.items()))
+
+
+class MultiGroupEnv:
+    """Fixed-order sequence of groups (composition: sum-to-1, or categorical: pick-list)."""
+
+    def __init__(
+        self,
+        *,
+        groups: Sequence[Dict[str, Any]],
+        reward_fn: Callable[[Dict[str, Dict[str, float]]], float] | None = None,
+        state_featurizer: Callable[[str], np.ndarray] = featurize_formula,
+    ) -> None:
+        if not groups:
+            raise ValueError("MultiGroupEnv requires a non-empty 'groups' list.")
+
+        self.reward_fn = reward_fn or (lambda _groups: 0.0)
+        self.state_featurizer = state_featurizer
+        self.episode_style = "multi_group"
+        self._constraints_enabled = True
+
+        # Build one inner CompositionEnv per group. Inner reward is a no-op — this
+        # env computes the single terminal reward over all groups.
+        self.group_names: List[str] = []
+        self._sites: List[int] = []
+        self._kinds: List[str] = []
+        self._inners: List[Any] = []
+        for i, g in enumerate(groups):
+            name = str(g.get("name", f"group{i}"))
+            kind = g.get("kind", "composition")
+            self.group_names.append(name)
+            self._sites.append(int(g.get("sites", 1)))
+            self._kinds.append(kind)
+            if kind == "categorical":
+                inner = CategoricalGroup(
+                    g["choices"], phase_filter=g.get("constraint_filter"),
+                )
+            elif kind == "integer":
+                inner = IntegerRatioEnv(
+                    species_set=g["species_set"],
+                    ratio_set=g["ratio_set"],
+                    n_components=int(g.get("n_components", 5)),
+                    state_featurizer=state_featurizer,
+                    phase_filter=g.get("constraint_filter"),
+                )
+            else:
+                inner = CompositionEnv(
+                    species_set=g["species_set"],
+                    fraction_set=g.get("fraction_set") or None,
+                    anion_formula="",  # the predictor/recipe assembles the real structure
+                    n_components=int(g.get("n_components", 5)),
+                    reward_fn=lambda _f: 0.0,
+                    state_featurizer=state_featurizer,
+                    phase_filter=g.get("constraint_filter"),
+                    total_units=int(g.get("total_units", 20)),
+                    element_bounds=g.get("element_bounds"),
+                    episode_style=g.get("episode_style", "element_then_amount"),
+                )
+            self._inners.append(inner)
+
+        # Union alphabets (first-seen order, deduplicated). Exact strings/symbols
+        # are preserved so a union one-hot decodes back to a group-valid token.
+        self.species_set: List[str] = _ordered_union(
+            sym for inner in self._inners for sym in inner.species_set
+        )
+        self.fraction_set: List[str] = _ordered_union(
+            f for inner in self._inners for f in inner.fraction_set
+        )
+
+        # Total episode length across all groups (what training.py reads).
+        self._group_lengths = [inner.n_components for inner in self._inners]
+        self.n_components = int(sum(self._group_lengths))
+        self.max_steps = self.n_components
+
+        self.counter: int = 0
+        self.path: List[EpisodeStep] = []
+        self._gi: int = 0  # active group index
+        self._completed: List[Dict[str, float]] = []  # finished groups' comps
+
+    # ------------------------------------------------------------------
+    # Episode lifecycle
+    # ------------------------------------------------------------------
+
+    @property
+    def constraints_enabled(self) -> bool:
+        return self._constraints_enabled
+
+    @constraints_enabled.setter
+    def constraints_enabled(self, value: bool) -> None:
+        # Propagate to every inner group env so the constrain_training toggle on
+        # the wrapper disables/enables all sub-filters at once.
+        self._constraints_enabled = bool(value)
+        for inner in self._inners:
+            inner.constraints_enabled = bool(value)
+
+    def initialize(self) -> None:
+        for inner in self._inners:
+            inner.initialize()
+        self.counter = 0
+        self.path = []
+        self._gi = 0
+        self._completed = []
+
+    def _active(self) -> CompositionEnv:
+        return self._inners[self._gi]
+
+    def _concat_features(self) -> np.ndarray:
+        """Per-step state = concat of each group's partial-composition features."""
+        return np.concatenate(
+            [np.asarray(self.state_featurizer(inner.state), dtype=float) for inner in self._inners]
+        )
+
+    def current_state_features(self) -> np.ndarray:
+        """Material features of the current state (uniform accessor; see CompositionEnv)."""
+        return self._concat_features()
+
+    def _to_union(
+        self, group_action: Tuple[Tuple[float, ...], Tuple[float, ...]], inner: CompositionEnv
+    ) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
+        """Re-encode a group-alphabet (elem_oh, comp_oh) into the union alphabet."""
+        elem = decode_one_hot(group_action[0], inner.species_set)
+        comp = decode_one_hot(group_action[1], inner.fraction_set)
+        elem_oh = tuple(encode_choice(elem, self.species_set).tolist())
+        comp_oh = tuple(encode_choice(comp, self.fraction_set).tolist())
+        return elem_oh, comp_oh
+
+    def allowed_actions(self) -> List[Tuple[Tuple[float, ...], Tuple[float, ...]]]:
+        """Union-encoded allowed actions for the active group's current step."""
+        if self.counter >= self.n_components:
+            return []
+        inner = self._active()
+        raw = inner.allowed_actions(prior_groups=self._completed)
+        return [self._to_union(a, inner) for a in raw]
+
+    def step(self, action: Tuple[Tuple[float, ...], Tuple[float, ...]]) -> None:
+        if self.counter >= self.n_components:
+            raise RuntimeError("step() called after the episode terminated.")
+
+        inner = self._active()
+        # State features (all groups, BEFORE applying this action) and the
+        # union-encoded allowed actions are captured pre-mutation, mirroring
+        # CompositionEnv.step's ordering.
+        s_material = self._concat_features()
+        current_allowed = self.allowed_actions()
+
+        # Decode the union action and re-encode into the active group's alphabet.
+        elem = decode_one_hot(action[0], self.species_set)
+        comp = decode_one_hot(action[1], self.fraction_set)
+        group_action = (
+            tuple(encode_choice(elem, inner.species_set).tolist()),
+            tuple(encode_choice(comp, inner.fraction_set).tolist()),
+        )
+        inner.step(group_action)
+
+        self.counter += 1
+        s_step = _step_one_hot(self.counter, self.n_components)
+
+        # If the active group just finished, record its composition for
+        # downstream groups' prior_groups, and advance to the next group.
+        if inner.counter >= inner.n_components:
+            self._completed = self._completed + [inner.cation_fractions()]
+            self._gi = min(self._gi + 1, len(self._inners) - 1)
+
+        reward = 0.0
+        if self.counter == self.n_components:
+            reward = float(self.reward_fn(self.terminal_cation_fractions()))
+
+        self.path.append(
+            EpisodeStep(
+                state_material_features=s_material,
+                state_step_onehot=s_step,
+                action_elem_onehot=action[0],
+                action_comp_onehot=action[1],
+                reward=reward,
+                allowed_actions=current_allowed,
+            )
+        )
+
+    def sample_random_action(self) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
+        import random
+
+        actions = self.allowed_actions()
+        if not actions:
+            raise RuntimeError("No valid actions available.")
+        return random.choice(actions)
+
+    # ------------------------------------------------------------------
+    # Terminal accessors (the predictor/dedup interface)
+    # ------------------------------------------------------------------
+
+    def _is_terminal(self) -> bool:
+        return self.counter == self.n_components
+
+    def terminal_cation_fractions(self) -> Dict[str, Dict[str, float]]:
+        """Structured ``{group_name: {element: fraction}}`` for the predictor."""
+        if not self._is_terminal():
+            raise RuntimeError("terminal_cation_fractions called before terminal step")
+        return {
+            name: inner.cation_fractions()
+            for name, inner in zip(self.group_names, self._inners)
+        }
+
+    def terminal_comp_key(self) -> tuple:
+        """Canonical hashable key over all groups for dedup/visit-tracking."""
+        return tuple(
+            (name, inner.terminal_comp_key())
+            for name, inner in zip(self.group_names, self._inners)
+        )
+
+    def assembled_composition(self) -> Dict[str, float]:
+        """Per-formula-unit composition ``{element: count}`` across all groups.
+
+        Each group contributes ``fraction × sites`` per element, so the result is
+        the real chemical composition (counts per formula unit). For a single group
+        with ``sites=1`` this is just the fractions — consistent with a plain
+        ``fraction`` env.
+        """
+        out: Dict[str, float] = {}
+        for inner, sites, kind in zip(self._inners, self._sites, self._kinds):
+            for el, val in inner.cation_fractions().items():
+                if kind == "categorical":
+                    # categorical values are already per-f.u. counts; non-numeric
+                    # labels (e.g. an O "form") are not atoms — the builder resolves them.
+                    if isinstance(val, (int, float)):
+                        out[el] = out.get(el, 0.0) + float(val)
+                else:
+                    out[el] = out.get(el, 0.0) + val * sites
+        return out
+
+    @property
+    def terminal_formula(self) -> str:
+        """Readable assembled chemical formula (per formula unit), for generated.csv."""
+        if not self._is_terminal():
+            return ""
+        items = sorted(
+            ((el, n) for el, n in self.assembled_composition().items() if n > 1e-9),
+            key=lambda t: (-t[1], t[0]),
+        )
+        return "".join(f"{el}{n:.3g}" for el, n in items)
+
+
+def _ordered_union(items) -> List[str]:
+    """Deduplicate while preserving first-seen order."""
+    seen: Dict[str, None] = {}
+    for it in items:
+        if it not in seen:
+            seen[it] = None
+    return list(seen.keys())
