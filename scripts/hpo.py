@@ -13,6 +13,9 @@ Per-trial state lives in an Optuna SQLite study so the driver is crash-safe
 and resumable: relaunch against the same `--out` to continue from where it
 stopped. Stage progression is tracked via a state.json sentinel.
 
+Install rl-matdesign in the active environment before running HPO. Each trial
+invokes the `rl-matdesign` command on PATH with its configuration and seeds.
+
 Usage
 -----
     python scripts/hpo.py \\
@@ -30,12 +33,13 @@ import json
 import logging
 import os
 import queue
+import shlex
 import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# Ensure src/ is on the path (matches scripts/run_experiment.py and run_seeds.py).
+# Load HPO helpers from this checkout; trials use the installed CLI on PATH.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
@@ -234,16 +238,16 @@ def _run_one_seed(
             result.returncode, seed_out, result.stderr_tail[-1500:] or "<empty>",
         )
         raise TrialRunError(
-            f"run_experiment exited with code {result.returncode}; "
+            f"rl-matdesign exited with code {result.returncode}; "
             f"see {seed_out}/stderr.log"
         )
     if not os.path.exists(result.generated_csv):
         log.error(
-            "run_experiment exited 0 but %s is missing; stderr tail:\n%s",
+            "rl-matdesign exited 0 but %s is missing; stderr tail:\n%s",
             result.generated_csv, result.stderr_tail[-1500:] or "<empty>",
         )
         raise RuntimeError(
-            f"run_experiment exited 0 but {result.generated_csv} is missing; "
+            f"rl-matdesign exited 0 but {result.generated_csv} is missing; "
             f"see {seed_out}/stderr.log"
         )
     return top_k_mean_from_csv(result.generated_csv, k=int(_METRIC_K))
@@ -392,12 +396,12 @@ def _write_final_report(
     lines.append(f"Stage-2 mean score: **{winner['mean_score']:.6g}**  (std across "
                  f"{len(winner['seed_scores'])} seeds: {winner['std']:.4g})\n")
     lines.append("Reproduce with:\n")
-    cfg_rel = os.path.relpath(winner["config_path"], _REPO_ROOT)
+    cfg_path = shlex.quote(os.path.abspath(winner["config_path"]))
     lines.append("```bash")
-    lines.append(f"python scripts/run_experiment.py \\")
-    lines.append(f"    --config {cfg_rel} \\")
+    lines.append("rl-matdesign \\")
+    lines.append(f"    --config {cfg_path} \\")
     lines.append(f"    --method {hpo_cfg['method']} \\")
-    lines.append(f"    --out runs/<your_name> \\")
+    lines.append("    --out runs/hpo_winner \\")
     lines.append(f"    --train-seed 0 --dp-seed 10000 --gen-seed 20000")
     lines.append("```\n")
     lines.append("## Stage-2 ranking\n")
@@ -701,7 +705,7 @@ def main() -> None:
             sample_dir = os.path.join(out_root, "stage1", "trial_0000", "seed_0")
             log.error(
                 "all %d stage-1 trials failed. Reproduce one manually to see the error:\n"
-                "    python scripts/run_experiment.py \\\n"
+                "    rl-matdesign \\\n"
                 "        --config %s/stage1/trial_0000/config.yaml \\\n"
                 "        --method %s --out /tmp/repro \\\n"
                 "        --train-seed 0 --dp-seed 10000 --gen-seed 20000\n"

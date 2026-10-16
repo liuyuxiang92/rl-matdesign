@@ -1,22 +1,17 @@
-"""Subprocess runner for one (trial × seed) of `run_experiment.py`.
+"""Subprocess runner for one (trial × seed) of the installed `rl-matdesign` CLI.
 
-Process isolation matters here: DeepMD / TF / matminer globals would accumulate
-across in-process trials and OOM after ~50 runs. Spawning a fresh process per
-seed amortizes import overhead (~10-30 s) over a multi-minute DP-bound run, so
-the cost is <1% of trial wall-clock.
+Each seed runs in a fresh process to isolate model-library state. The CLI is
+resolved through PATH in the caller's environment; no source checkout is needed
+by this runner. Process startup and predictor initialization count toward each
+seed's runtime.
 """
 
 from __future__ import annotations
 
 import os
 import subprocess
-import sys
 from dataclasses import dataclass
 from typing import Optional
-
-
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-_RUN_EXPERIMENT = os.path.join(_REPO_ROOT, "scripts", "run_experiment.py")
 
 
 class TrialRunError(RuntimeError):
@@ -47,7 +42,7 @@ def run_trial_subprocess(
     timeout_s: Optional[int] = None,
     env_extra: Optional[dict] = None,
 ) -> TrialResult:
-    """Spawn `run_experiment.py` once; return the result without raising on nonzero exit.
+    """Spawn `rl-matdesign` once; return the result without raising on nonzero exit.
 
     The caller decides whether to mark the Optuna trial FAIL — that lets the
     driver distinguish "missing generated.csv with exit 0" (bug, raise loudly)
@@ -55,7 +50,7 @@ def run_trial_subprocess(
     """
     os.makedirs(out_dir, exist_ok=True)
     cmd = [
-        sys.executable, _RUN_EXPERIMENT,
+        "rl-matdesign",
         "--config", config_yaml,
         "--method", method,
         "--out", out_dir,
@@ -69,12 +64,17 @@ def run_trial_subprocess(
     try:
         proc = subprocess.run(
             cmd,
-            cwd=_REPO_ROOT,
             env=env,
             capture_output=True,
             text=True,
             timeout=timeout_s,
         )
+    except FileNotFoundError as e:
+        raise TrialRunError(
+            "The rl-matdesign CLI was not found on PATH. Install rl-matdesign "
+            "in the environment used for HPO (python -m pip install -e "
+            "/path/to/rl-matdesign) and activate that environment."
+        ) from e
     except subprocess.TimeoutExpired as e:
         raise TrialRunError(
             f"trial timed out after {timeout_s}s: {' '.join(cmd)}"

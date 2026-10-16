@@ -9,6 +9,7 @@ RL 与 GP 使用同一个 Python 环境。RL 通过现有的 FQN 插件接口导
 在准备运行 RL 的 Python 环境中，安装具有 Python API 的 GP 项目：
 
 ```bash
+python -m pip install -e /path/to/rl-matdesign
 python -m pip install -e /path/to/gp_physchem
 ```
 
@@ -59,15 +60,86 @@ GP 接口启动时重新从结构识别巯基，并校验 `thiol_tokens` 与实�
 在同一 YAML 中保留所需训练和生成预算，然后在 RL 仓库根目录运行：
 
 ```bash
-python scripts/run_experiment.py \
+rl-matdesign \
   --config configs/peptide_gp.yaml \
-  --method a2c --out runs/peptide_gp_a2c \
+  --method dqn --dqn-target-mode mc --out runs/peptide_gp_mc \
   --train-seed 0 --gen-seed 0
 ```
 
-DQN 和 REINFORCE 只需改变 `--method`。GP 的训练表和词典默认来自安装的 GP 包，
+A2C 和 REINFORCE 只需改变 `--method`。GP 的训练表和词典默认来自安装的 GP 包，
 也可在 property 中通过 `train`、`dictionary` 指定原始文件。`new_monomers` 指定动作单体库，
 不会把训练词典中的其他单体加入可选动作。
+
+## MC 与 HPO 起步流程
+
+MC 是 DQN 的回报目标选项，使用 `--method dqn --dqn-target-mode mc`，
+或设置 `method: dqn`、`dqn_target_mode: mc`。本地 `configs/peptide_gp.yaml`
+目前已按用户选择切换到 MC。固定长度的终点奖励任务先用 `dqn_gamma: 1.0`，
+使每个动作的 MC 目标都等于该条完整多肽的终点奖励；`k: 1.0` 仍保持奖励为 mean − std。
+序列排列会改变分子，因此 `dqn_augment_permutations` 必须为 0。
+
+一个 episode 包含一次 N 端选择和 11 次残基选择，共 12 个 transition，
+终点得到一次 GP 分数。`dqn_warmup_eps` 是额外的随机轨迹，不能包含在
+`dqn_num_train_eps` 中重复计数。replay buffer 的容量单位是 transition，
+50,000 行约容纳 4,167 条完整轨迹。
+
+本地还准备了两份 Git 忽略的配置：
+`configs/hpo/peptide_gp_mc_pilot.yaml` 用于计时，
+`configs/hpo/peptide_gp_mc.yaml` 用于两阶段搜索。
+
+HPO 为每个 trial/seed 调用当前环境 PATH 中的 `rl-matdesign` CLI，
+不依赖 `scripts/run_experiment.py` 的源码路径。先激活同时安装 RL、GP 和 Optuna 的环境；
+`rl-matdesign --help` 应能正常运行。先在实际远端机器运行计时配置：
+
+```bash
+python scripts/hpo.py \
+  --hpo-config configs/hpo/peptide_gp_mc_pilot.yaml \
+  --out runs/hpo/peptide_gp_mc_pilot_v1 \
+  --skip-stage2 --no-plots
+```
+
+这只跑一个短 trial：100 个 warmup、300 个训练 episode，最终生成 100 个候选。
+用于确认安装、MC 分支和耗时，不用于选择最佳参数。GP 初始化会在每个 trial/seed
+的进程启动时重复一次；因此不能只用 GP 单次推理速度估算整轮 HPO 时间。
+HPO 默认自动选择 CUDA（可用时）或 CPU；先保持 `n_parallel_trials: 1`。
+
+2026-10-16 已在本地 CPU 验证该短流程：100 warmup + 300 MC 训练 + 100 个
+独特候选，运行器耗时 61.9 秒（初始化 23.3 秒，训练 22.6 秒）；没有启动正式搜索。
+这些时间仅对应本机和该 trial，不能直接当作远端机器或更大 batch/更新次数的耗时。
+证据位于 `runs/hpo/peptide_gp_mc_pilot_local_20261016/validation.json`。
+
+建议的第一轮预算是以下起点，并非已经证明能够收敛的预算：
+
+| 阶段 | 参数组数 | 每组种子数 | 每种子 warmup | 每种子训练 episode | 最终候选数 |
+|---|---:|---:|---:|---:|---:|
+| 初筛 | 20 | 1 | 500 | 2,000 | 200 |
+| 复核 | 前 3 组 | 3 | 1,000 | 8,000 | 200 |
+
+两个阶段合计名义上生成并评分 136,800 条轨迹（含 warmup 和最终生成）；
+缓存命中、重复候选和生成重试会使实际唯一 GP 计算量不同。
+搜索学习率、batch size、每 episode 梯度更新次数、探索衰减时长和生成温度这 5 个参数。
+固定网络大小、gamma、奖励中的 k 及每阶段采样预算；MC 不需要搜索 target-network 更新频率。
+
+```bash
+python scripts/hpo.py \
+  --hpo-config configs/hpo/peptide_gp_mc.yaml \
+  --out runs/hpo/peptide_gp_mc_v1 \
+  --skip-stage2
+```
+
+查看 `stage1_summary.csv` 后，使用相同命令并移除 `--skip-stage2` 开始复核。
+复核会从头训练，最终配置路径在 `final_report.md`。更改预算、搜索空间或原始模型输入时，
+应使用新的输出目录；已经完成的 stage1 会被状态文件跳过，单改 `n_trials` 不会继续搜索。
+
+HPO 当前比较每个 run 的 `generated.csv` 中 reward 最高的 10 个候选的均值。
+要同时核对 `n_generated_used` 为 10、生成数量及去重情况；少于 10 行时指标会退化为
+现有行的均值。该指标衡量最终生成策略，不包含训练过程中发现的所有候选。
+跨 seed 的分数标准差反映训练随机性，与每条候选的 GP `obj_pIC50_std` 是不同量。
+
+复核使用 seed 0、1、2，其中 seed 0 与初筛重合。选定参数后，用新 seed 3、4、5
+检查稳定性，并在相同评价规则下比较 2,000、4,000、8,000 个训练 episode 的收益。
+只有收益仍持续改善时再扩到 16,000；判断时看 top-10 reward、候选多样性和随机采样基线，
+不要只根据训练 loss 决定采样量。
 
 ## 运行时发生什么
 
