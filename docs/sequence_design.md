@@ -196,10 +196,10 @@ A2C critic-schema rejection, joint count feasibility and uncertainty scoring.
 An additional exhaustive audit matched 1,976 prefix masks in 200 small random
 search spaces. These checks establish software behavior, not GP accuracy.
 
-The initial generic implementation was validated before the GP files were
-available. The subsequent real-model adapter and verified catalog contract are
-documented in [gp_physchem integration](gp_physchem_integration.md). Final regression
-checks passed 505 tests across the repository and transport test invocations, with
-11 default skips; 9 of those real-GP checks passed separately with the external
-runtime enabled, leaving only the 2 missing-material-fixture skips. This
-extension covers the RL runner; BO/GA baselines are not adapted to sequence search.
+The current GP path directly imports the installed GP package in the same Python
+process and reads its original monomer CSV. Application-specific chemistry lives
+in that package, as documented in [gp_physchem integration](gp_physchem_integration.md).
+After removing the former process bridge, the full generic suite passed 458 tests
+with 2 missing-material-fixture skips; external GP API checks run separately when
+that package is installed. This extension covers the RL runner; BO/GA baselines
+are not adapted to sequence search.
