@@ -47,6 +47,7 @@ import numpy as np
 import optuna
 import yaml
 
+from rl_matdesign.configuration import resolve_sequence_catalog_paths
 from rl_matdesign.hpo import (
     TrialRunError,
     run_trial_subprocess,
@@ -69,6 +70,11 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 def _load_yaml(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f) or {}
+
+
+def _load_base_config(path: str) -> dict:
+    # Keep flag aliases raw until all overrides and sampled values are merged.
+    return resolve_sequence_catalog_paths(_load_yaml(path), path)
 
 
 def _resolve_base_config(hpo_config_path: str, base_config_ref: str) -> str:
@@ -95,6 +101,10 @@ def _validate_hpo_config(hpo_cfg: dict, hpo_config_path: str) -> dict:
     # Defaults.
     hpo_cfg["base_config"] = _resolve_base_config(hpo_config_path, hpo_cfg["base_config"])
     hpo_cfg.setdefault("fixed_overrides", {})
+    # Overrides are authored in the HPO YAML, independently of the base YAML.
+    hpo_cfg["fixed_overrides"] = resolve_sequence_catalog_paths(
+        hpo_cfg["fixed_overrides"], hpo_config_path,
+    )
     hpo_cfg.setdefault("metric", {"kind": "top_k_mean", "k": 10})
     hpo_cfg.setdefault("optuna", {"seed": 0})
     hpo_cfg.setdefault(
@@ -119,7 +129,7 @@ def _validate_hpo_config(hpo_cfg: dict, hpo_config_path: str) -> dict:
 
     # Validate the search space against base config + fixed overrides so
     # frac_of references resolve cleanly.
-    base_cfg = _load_yaml(hpo_cfg["base_config"])
+    base_cfg = _load_base_config(hpo_cfg["base_config"])
     validate_search_space(
         hpo_cfg["search_space"],
         fixed_overrides=hpo_cfg["fixed_overrides"],
@@ -650,7 +660,8 @@ def main() -> None:
     # Echo to disk for reproducibility.
     shutil.copy(args.hpo_config, os.path.join(out_root, "hpo_config.yaml"))
 
-    base_cfg = _load_yaml(hpo_cfg["base_config"])
+    # Resolve source-relative CSV paths before serializing configs under trial/.
+    base_cfg = _load_base_config(hpo_cfg["base_config"])
 
     n_parallel = int(hpo_cfg["stage1"].get("n_parallel_trials", 1))
     gpu_pool = _build_gpu_pool(n_parallel, args.gpu_ids)

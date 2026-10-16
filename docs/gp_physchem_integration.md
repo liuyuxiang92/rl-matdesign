@@ -57,6 +57,12 @@ GP 接口启动时重新从结构识别巯基，并校验 `thiol_tokens` 与实�
 如果替换单体表后标记改变，应相应调整配置。建议 CSV 使用绝对路径，避免插件路径与
 相对于 YAML 解析的序列 CSV 路径混淆。
 
+序列 `tokens.csv` 的相对路径以定义它的 YAML 所在目录为基准。
+HPO 会在生成 trial 配置前，将 base config 的此路径解析为绝对路径；
+如果通过 HPO 的 `fixed_overrides.groups` 定义序列，该相对路径以 HPO YAML 目录为基准。
+这样两个阶段的 trial 都继续读取原始 CSV。GP 插件的 `new_monomers` 仍建议填写绝对路径，
+通用 HPO 不改写插件自定义字段的路径约定。
+
 在同一 YAML 中保留所需训练和生成预算，然后在 RL 仓库根目录运行：
 
 ```bash

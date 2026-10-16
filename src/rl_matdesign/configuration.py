@@ -1,6 +1,8 @@
 """Shared YAML loading and environment construction for RL and baselines."""
 from __future__ import annotations
 
+from copy import deepcopy
+from pathlib import Path
 import warnings
 
 import yaml
@@ -51,19 +53,33 @@ def _apply_flag_aliases(cfg: dict) -> dict:
     return cfg
 
 
-def load_config(path: str) -> dict:
-    with open(path) as f:
-        cfg = yaml.safe_load(f)
-    # A sequence catalog travels with its YAML; existing material/model path
-    # conventions remain unchanged. Direct build_env callers pass resolved paths.
-    from pathlib import Path
+def resolve_sequence_catalog_paths(cfg: dict, config_path: str) -> dict:
+    """Copy config fields and resolve sequence CSVs relative to their source YAML.
+
+    Call this before relocating a config (for example, into an HPO trial).
+    Existing material/model/plugin path conventions remain unchanged.
+    """
+    cfg = deepcopy(cfg)
+    groups = []
     for group in cfg.get("groups", []):
         tokens = group.get("tokens")
         if group.get("kind") == "sequence" and isinstance(tokens, dict) and tokens.get("csv"):
             catalog = Path(tokens["csv"]).expanduser()
             if not catalog.is_absolute():
-                catalog = Path(path).resolve().parent / catalog
-            tokens["csv"] = str(catalog.resolve())
+                catalog = Path(config_path).resolve().parent / catalog
+            # YAML aliases may share this mapping with unrelated plugin fields.
+            group = {**group, "tokens": {**tokens, "csv": str(catalog.resolve())}}
+        groups.append(group)
+    if "groups" in cfg:
+        cfg["groups"] = groups
+    return cfg
+
+
+def load_config(path: str) -> dict:
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+    # Direct build_env callers pass resolved paths.
+    cfg = resolve_sequence_catalog_paths(cfg, path)
     return _apply_flag_aliases(cfg)
 
 
