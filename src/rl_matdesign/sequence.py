@@ -46,8 +46,10 @@ class SequenceGroup:
 
     ``tokens`` is a non-empty list of replacement/building token names. Without
     ``parent`` and ``num_mutations``, ``length`` consecutive token actions build
-    a sequence. With both fields, each mutation has two decisions: select an
-    untouched position, then select a token different from the parent there.
+    a sequence. With both fields, make one to ``num_mutations`` replacements.
+    Each mutation has two decisions: select an untouched position, then select
+    a token different from the parent there. A stop action can finish a valid
+    sequence between edits; the last permitted replacement finishes automatically.
     Parent tokens can be retained without being available as replacements.
 
     Count constraints select explicit token sets and give inclusive min/max
@@ -82,6 +84,8 @@ class SequenceGroup:
                 json.dumps(["position", i + 1], separators=(",", ":"))
                 for i in range(self.length)
             ] + [json.dumps(["token", token], separators=(",", ":")) for token in self.tokens]
+            self._stop_index = len(self.species_set)
+            self.species_set.append(json.dumps(["stop", None], separators=(",", ":")))
         else:
             self.parent = []
             self.num_mutations = 0
@@ -167,6 +171,7 @@ class SequenceGroup:
 
     def initialize(self) -> None:
         self.counter = 0
+        self._stopped = False
         self.state = ""  # sequence features are supplied by current_state_features
         self._picked: List[str] = list(self.parent)
         self._edited: set[int] = set()
@@ -174,6 +179,10 @@ class SequenceGroup:
         self._used: set[int] = set()
         self._counts = (0,) * len(self._lower)
         self._capacity = self._initial_capacity
+
+    @property
+    def is_done(self) -> bool:
+        return self._stopped or self.counter >= self.n_components
 
     def _advance_counts(self, counts: tuple, group: int) -> tuple:
         return tuple(value + bit for value, bit in zip(counts, self._signatures[group]))
@@ -237,49 +246,49 @@ class SequenceGroup:
         )
 
     def _can_complete_edits(self, fixed: tuple, pending: int) -> bool:
-        """Exactly complete the edit budget without enumerating token products.
+        """Find a legal completion within the budget, with at least one edit.
 
         Enumerate subsets of the remaining positions, then assign constraint
         signatures. For unique-token sequences, an exact matching condition
         handles token identity within each signature (see _assign_edit_groups).
         """
         finalized = dict(fixed)
-        remaining = self.num_mutations - len(finalized)
+        max_remaining = self.num_mutations - len(finalized)
         free = [position for position in range(self.length) if position not in finalized]
-        if remaining < 0 or remaining > len(free) or (pending >= 0 and pending not in free):
+        if max_remaining < 0 or max_remaining > len(free) or (pending >= 0 and pending not in free):
             return False
-        if pending >= 0:
-            if remaining == 0:
-                return False
-            choices = (
-                (pending,) + other
-                for other in combinations([p for p in free if p != pending], remaining - 1)
-            )
-        else:
-            choices = combinations(free, remaining)
-        for changing in choices:
-            changing_set = set(changing)
-            retained = [self.parent[p] for p in free if p not in changing_set]
-            if self.allow_repeats:
-                groups = [self._group_of(token) for token in retained] + list(finalized.values())
-                available = self._group_tokens
+        min_remaining = max(1 - len(finalized), int(pending >= 0))
+        for remaining in range(min_remaining, max_remaining + 1):
+            if pending >= 0:
+                choices = (
+                    (pending,) + other
+                    for other in combinations([p for p in free if p != pending], remaining - 1)
+                )
             else:
-                fixed_tokens = retained + list(finalized.values())
-                if len(set(fixed_tokens)) != len(fixed_tokens):
+                choices = combinations(free, remaining)
+            for changing in choices:
+                changing_set = set(changing)
+                retained = [self.parent[p] for p in free if p not in changing_set]
+                if self.allow_repeats:
+                    groups = [self._group_of(token) for token in retained] + list(finalized.values())
+                    available = self._group_tokens
+                else:
+                    fixed_tokens = retained + list(finalized.values())
+                    if len(set(fixed_tokens)) != len(fixed_tokens):
+                        continue
+                    groups = [self._group_of(token) for token in fixed_tokens]
+                    available = tuple(tokens.difference(fixed_tokens) for tokens in self._group_tokens)
+                counts = tuple(sum(self._signatures[g][i] for g in groups) for i in range(len(self._lower)))
+                if any(n > hi or n + remaining < lo for n, lo, hi in zip(counts, self._lower, self._upper)):
                     continue
-                groups = [self._group_of(token) for token in fixed_tokens]
-                available = tuple(tokens.difference(fixed_tokens) for tokens in self._group_tokens)
-            counts = tuple(sum(self._signatures[g][i] for g in groups) for i in range(len(self._lower)))
-            if any(n > hi or n + remaining < lo for n, lo, hi in zip(counts, self._lower, self._upper)):
-                continue
-            options = [
-                tuple(group for group, tokens in enumerate(available) if tokens - {self.parent[p]})
-                for p in changing
-            ]
-            if any(not groups for groups in options):
-                continue
-            if self._assign_edit_groups(tuple(changing), tuple(options), counts, available):
-                return True
+                options = [
+                    tuple(group for group, tokens in enumerate(available) if tokens - {self.parent[p]})
+                    for p in changing
+                ]
+                if any(not groups for groups in options):
+                    continue
+                if self._assign_edit_groups(tuple(changing), tuple(options), counts, available):
+                    return True
         return False
 
     def _assign_edit_groups(self, positions: tuple, options: tuple, counts: tuple, available: tuple) -> bool:
@@ -324,8 +333,10 @@ class SequenceGroup:
                      () if self.allow_repeats else (-3,) * len(capacities))
 
     def _mutation_action_allowed(self, index: int) -> bool:
-        if self.counter >= self.n_components:
+        if self.is_done:
             return False
+        if index == self._stop_index:
+            return self._can_stop()
         if self._pending_position is None:
             return (
                 index < self.length and index not in self._edited
@@ -337,6 +348,16 @@ class SequenceGroup:
         position = self._pending_position
         return token != self.parent[position] and self._edit_feasible(
             self._fixed_edits(position, token), -1,
+        )
+
+    def _can_stop(self) -> bool:
+        if self._pending_position is not None or not self._edited:
+            return False
+        if not self.allow_repeats and len(set(self._picked)) != self.length:
+            return False
+        return all(
+            lo <= sum(token in members for token in self._picked) <= hi
+            for members, lo, hi in zip(self._constraint_tokens, self._lower, self._upper)
         )
 
     def allowed_actions(self, *, prior_groups=None) -> List[Action]:
@@ -359,7 +380,7 @@ class SequenceGroup:
         return int(np.argmax(values))
 
     def step(self, action: Action) -> None:
-        if self.counter >= self.n_components:
+        if self.is_done:
             raise RuntimeError("Sequence step() called after termination.")
         if not isinstance(action, (tuple, list)) or len(action) != 2:
             raise ValueError("Sequence action must be a pair of one-hot vectors.")
@@ -369,7 +390,9 @@ class SequenceGroup:
         if not allowed(index):
             raise ValueError(f"Action {self.species_set[index]!r} is not allowed at this step.")
         if self.mutation_mode:
-            if self._pending_position is None:
+            if index == self._stop_index:
+                self._stopped = True
+            elif self._pending_position is None:
                 self._pending_position = index
             else:
                 self._picked[self._pending_position] = self.tokens[index - self.length]
@@ -417,6 +440,7 @@ class SequenceGroup:
             schema.update({
                 "parent": list(self.parent),
                 "num_mutations": self.num_mutations,
+                "mutation_count": "up_to",
                 "action_order": ["position", "replacement"],
                 "state_tokens": list(self._state_tokens),
             })

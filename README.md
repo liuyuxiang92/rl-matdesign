@@ -6,8 +6,9 @@ Three RL algorithms: **DQN** (online, target-network, or MC targets), **REINFORC
 
 Ordered token/monomer sequences are also supported through `kind: sequence`,
 with inline candidate names, hard count bounds and categorical processing actions.
-Add `parent` and `num_mutations` to replace exactly n distinct positions of a
-starting sequence; omit both to construct a sequence from scratch. Predictors
+Add `parent` and `num_mutations` to replace between one and n distinct positions
+of a starting sequence; the policy may stop after a valid edit. Omit both to
+construct a sequence from scratch. Predictors
 own the chemistry definitions and may supply domain-specific count constraints.
 See [sequence design and GP adapters](docs/sequence_design.md) for the reusable
 interface and the 11-position synthetic example, and

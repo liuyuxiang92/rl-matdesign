@@ -87,7 +87,7 @@ hard count constraints in addition to any configured bounds. The names passed to
 this optional hook include the replacement choices and any parent-only names.
 The GP adapter can therefore validate all names before training begins.
 
-### Replace exactly n positions of a parent
+### Replace up to n positions of a parent
 
 Add only `parent` and `num_mutations` to a sequence group:
 
@@ -103,8 +103,12 @@ Add only `parent` and `num_mutations` to a sequence group:
 Each episode starts from the same complete parent. Each mutation has two
 decisions: choose an unmodified position, then choose its replacement from
 `tokens`. Replacing a token with itself is excluded and a position can be edited
-only once. The result consequently differs from the parent at exactly
-`num_mutations` positions. Replacement choices are made independently at each
+only once. `num_mutations` is the upper limit: the result differs from the parent
+at between one and `num_mutations` positions. After a completed edit, the policy
+can choose a stop action when the current sequence satisfies all final constraints.
+Reaching the limit finishes automatically. No stop is allowed before the first
+edit or between selecting a position and its replacement.
+Replacement choices are made independently at each
 edit; different sites may receive the same token when `allow_repeats` is true.
 Names present only in the parent can remain in the sequence but are not offered
 as replacements. The predictor must understand those names too.
@@ -112,11 +116,19 @@ as replacements. The predictor must understand those names too.
 Edits are counted by token identity. Use one stable name per building block;
 chemical aliases for the same monomer should not be separate choices.
 
-With n mutations there are 2n sequence decisions, plus any categorical decisions
-such as an N-terminal treatment. Both position and replacement use the existing
-RL policy and exploration settings; replacement is not forced to be uniformly
-random throughout training. Without `parent` and `num_mutations`, the existing
-left-to-right construction behavior is unchanged.
+The maximum is 2n sequence decisions, plus any categorical decisions such as an
+N-terminal treatment. Stopping after k < n edits uses 2k + 1 sequence decisions,
+including the stop action; completing all n edits uses 2n. Network dimensions use
+the maximum horizon, while rewards and returns use the actual episode length.
+Positions, replacements and stopping all use the existing RL policy and exploration
+settings. Counts are not sampled uniformly, and a batch need not contain every
+count from one to n. Some counts may be impossible under the final constraints.
+Without `parent` and `num_mutations`, the existing left-to-right construction
+behavior is unchanged.
+
+This changes the former exact-count semantics. The saved design schema records
+the upper-bound behavior and stop action; old exact-count RL checkpoints cannot
+be reused. Train a new run in a new output directory.
 
 The state contains the complete current sequence, edited positions and the
 pending position between the two decisions. Hard count bounds apply to the

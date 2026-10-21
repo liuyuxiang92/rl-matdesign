@@ -559,7 +559,7 @@ def train_dqn_online(
 
     Phase 1 — Training loop (``dqn_num_train_eps`` episodes):
         Each episode:
-        1. ε-greedy rollout → 5 new buffer rows.
+        1. ε-greedy rollout → one buffer row per actual action.
         2. ``dqn_grad_steps_per_ep`` gradient steps, each sampling ``batch_size``
            rows from the full buffer (SmoothL1 loss on TD targets).
         3. Hard-copy qnet → target_net every ``dqn_target_update_freq`` episodes.
@@ -706,6 +706,8 @@ def train_dqn_online(
         # Collect one episode with epsilon-greedy policy.
         env.initialize()
         for _t in range(env.n_components):
+            if bool(getattr(env, "is_done", False)):
+                break
             _allowed = env.allowed_actions()
             _s_mat_sc = scaler.transform(
                 env.current_state_features().reshape(1, -1))[0]
@@ -880,6 +882,8 @@ def _rollout_random_episode(env: CompositionEnv) -> None:
     """Roll out one episode with uniformly random action selection."""
     env.initialize()
     for _ in range(env.n_components):
+        if bool(getattr(env, "is_done", False)):
+            break
         a = env.sample_random_action()
         env.step(a)
 
@@ -899,6 +903,8 @@ def _rollout_policy_episode(
     """Roll out one episode guided by a Q-network (used during generation)."""
     env.initialize()
     for _ in range(env.n_components):
+        if bool(getattr(env, "is_done", False)):
+            break
         allowed = env.allowed_actions()
         s_mat = scaler.transform(env.current_state_features().reshape(1, -1))[0]
         s_step = np.zeros(env.n_components, dtype=float)
@@ -955,6 +961,8 @@ def _rollout_pg_episode(
     """Roll out one episode with pure softmax sampling (on-policy, no pg_epsilon)."""
     env.initialize()
     for _ in range(env.n_components):
+        if bool(getattr(env, "is_done", False)):
+            break
         allowed = env.allowed_actions()
         s_mat = scaler.transform(env.current_state_features().reshape(1, -1))[0]
         s_step = np.zeros(env.n_components, dtype=float)
@@ -1431,6 +1439,8 @@ def _pg_single_episode_generate(
     """
     env.initialize()
     for _ in range(env.n_components):
+        if bool(getattr(env, "is_done", False)):
+            break
         allowed = env.allowed_actions()
         s_mat = scaler.transform(env.current_state_features().reshape(1, -1))[0]
         s_step = np.zeros(env.n_components, dtype=float)

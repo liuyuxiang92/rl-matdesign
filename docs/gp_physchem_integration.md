@@ -39,7 +39,7 @@ groups:
     length: 11
     tokens: [A, V, F, K, W, HCys, D-HCys]
     parent: [A, HCys, F, K, V, W, W, A, P, R, b-HCys]
-    num_mutations: 2
+    num_mutations: 5
     allow_repeats: true
 
 properties:
@@ -50,10 +50,15 @@ properties:
 k: 1.0
 ```
 
-每个 episode 从同一条母肽开始，执行两次替换。每次先选一个未修改的位置，再从
-`tokens` 中选择一个与原残基不同的名称。两个位置各改一次，最终恰好两个位置与母肽
-不同。两次替换分别选择新残基，可以选不同的，也可以重复选同一种；位置和残基都由
-现有 RL 策略及探索设置决定，不是把同一种残基连续替换两次。
+每个 episode 从同一条母肽开始，执行 1～5 次替换。`num_mutations` 表示上限。
+每次先选一个未修改的位置，再从 `tokens` 中选择一个与原残基不同的名称。
+至少完成一次替换、且当前序列满足最终约束后，RL 可以选择“结束替换”；达到 5 次
+则自动结束。每个位置最多改一次，替换名称可以不同，也可以在不同位置重复。
+位置、替换残基和是否结束都由现有 RL 策略及探索设置决定；不保证 1～5 次等频出现，
+也不保证一批结果包含每一种替换次数。约束不允许的次数不会生成。
+
+旧实现中的 `num_mutations` 表示恰好替换次数。本次增加了结束动作并更新 checkpoint
+语义校验，需要在新输出目录重新训练 RL；GP 模型及其接口无需为这项改动更新。
 
 母肽中不在 `tokens` 内的名称可以保留，但不会成为替换动作。例如这里的 `b-HCys`
 由 GP 内置字典解析，仍能留在母肽中。去掉 `parent` 和 `num_mutations` 两项就恢复
@@ -91,16 +96,19 @@ A2C 和 REINFORCE 只需改变 `--method`。GP 的训练表、词典和新单体
 
 MC 是 DQN 的回报目标选项，使用 `--method dqn --dqn-target-mode mc`，
 或设置 `method: dqn`、`dqn_target_mode: mc`。本地 `configs/peptide_gp.yaml`
-目前已按用户选择切换到 MC。固定长度的终点奖励任务先用 `dqn_gamma: 1.0`，
+目前已按用户选择切换到 MC。终点奖励任务使用 `dqn_gamma: 1.0`，
 使每个动作的 MC 目标都等于该条完整多肽的终点奖励；`k: 1.0` 仍保持奖励为 mean − std。
+这样不会因折扣而额外偏好更早结束的同分候选。
 序列排列会改变分子，因此 `dqn_augment_permutations` 必须为 0。
 
 自由构建模式中，一个 episode 包含一次 N 端选择和 11 次残基选择，共 12 个
-transition。母肽修改模式中，每次替换有“位置、残基”两次决策，因此 n 次替换加
-一次 N 端选择，共 `2n + 1` 个 transition；例如 `num_mutations: 2` 时共 5 步。
+transition。母肽修改模式中，每次替换有“位置、残基”两次决策，上限为 n 时，
+加一次 N 端选择最多 `2n + 1` 个 transition。若在 k < n 次替换后主动结束，
+还包含一次结束动作，总共 `2k + 2` 步；完成 n 次则自动结束，共 `2n + 1` 步。
+例如 `num_mutations: 5` 的 1～5 次替换分别需要 4、6、8、10、11 步。
 两种模式都只在终点得到一次 GP 分数。`dqn_warmup_eps` 是额外的随机轨迹，不能包含在
 `dqn_num_train_eps` 中重复计数。replay buffer 的容量单位是 transition，
-50,000 行在上述两次替换示例中容纳 10,000 条完整轨迹。
+同样的容量能容纳多少轨迹取决于实际替换次数，不能再按固定步数换算。
 
 本地还准备了两份 Git 忽略的配置：
 `configs/hpo/peptide_gp_mc_pilot.yaml` 用于计时，
@@ -165,7 +173,7 @@ HPO 当前比较每个 run 的 `generated.csv` 中 reward 最高的 10 个候选
 1. GP 接口读取原始词典和自己目录中的 `examples/new_monomers.csv`；调用原有化学函数，在内存中计算描述符。
 2. 用原始训练表调用 `train_matrix` 和 `fit_gp`，每个 predictor 实例只拟合一次。
 3. 环境初始化时，GP 的 `sequence_constraints` 根据候选与母肽名称提供巯基数量约束。
-4. RL 选择 N 端，并自由构建序列或对母序列执行 n 次“选位置、选残基”；过程不调用 GP 评分。
+4. RL 选择 N 端，并自由构建序列或对母序列执行 1～n 次“选位置、选残基”；过程不调用 GP 评分。
 5. 完成后，GP 接口从完整序列推导两个巯基位置，调用原始 `validate_candidates → featurise → predict_gp`。
 6. 返回原始预测均值和 GP 不确定性 `std`；RL 计算奖励并写入正常运行结果。
 
@@ -173,9 +181,11 @@ HPO 当前比较每个 run 的 `generated.csv` 中 reward 最高的 10 个候选
 包含 3D 构象计算，因此启动阶段可能需要数分钟；之后的候选预测无需重复初始化。
 GP 接口自身不写文件，正常的 RL 输出（`generated.csv`、模型权重、训练日志等）保持不变。
 
-`sequence_schema.json` 保存本次 RL 使用的母序列及替换次数。GP 输出中的
-`mutation_count_vs_parent` 仍相对于 GP 固定训练母肽；若配置了其他母序列，该诊断值
-不等于 RL 的 `num_mutations`。单体应使用统一名称，避免同一结构的两个别名被计为一次替换。
+`sequence_schema.json` 保存本次 RL 使用的母序列及替换次数上限。实际替换次数是最终
+序列与配置母序列逐位置比较后的差异数。GP 输出中的 `mutation_count_vs_parent`
+仍相对于 GP 固定训练母肽；只有两条母序列相同时，它才等于 RL 实际替换次数。
+`num_mutations` 是上限，不是每条结果的实际次数。单体应使用统一名称，避免同一结构
+的两个别名被计为一次替换。
 
 ## 已确认的模型约定
 

@@ -1,4 +1,4 @@
-"""Parent sequence replacement actions and exact terminal feasibility."""
+"""Parent sequence edits, optional stopping, and exact terminal feasibility."""
 import json
 from itertools import combinations, product
 
@@ -31,6 +31,7 @@ def test_two_decisions_per_edit_and_full_parent_state():
     before = env.current_state_features().copy()
     assert before.shape == (15,)
     assert before.sum() == 3
+    assert not env.is_done
     assert allowed(env) == {("position", 1), ("position", 2), ("position", 3)}
     env.step(action(env, "position", 1))
     assert env.cation_fractions() == ["A", "B", "A"]
@@ -38,13 +39,15 @@ def test_two_decisions_per_edit_and_full_parent_state():
     assert allowed(env) == {("token", "B"), ("token", "C")}
     env.step(action(env, "token", "C"))
     assert env.current_state_features()[-6:].tolist() == [1, 0, 0, 0, 0, 0]
-    assert allowed(env) == {("position", 2), ("position", 3)}
+    assert allowed(env) == {("position", 2), ("position", 3), ("stop", None)}
     edit(env, 2, "A")
     assert env.cation_fractions() == ["C", "A", "A"]
     assert env.terminal_comp_key() == ("C", "A", "A")
     assert env.allowed_actions() == []
+    assert env.is_done
     env.initialize()
     assert env.counter == 0
+    assert not env.is_done
     np.testing.assert_array_equal(env.current_state_features(), before)
     assert env.cation_fractions() == ["A", "B", "A"]
 
@@ -52,7 +55,7 @@ def test_two_decisions_per_edit_and_full_parent_state():
 def test_replacement_is_chosen_independently_and_can_repeat_at_different_sites():
     env = SequenceGroup({"tokens": ["X", "Y"], "parent": ["A", "B", "C"], "num_mutations": 2})
     edit(env, 1, "X")
-    assert allowed(env) == {("position", 2), ("position", 3)}
+    assert allowed(env) == {("position", 2), ("position", 3), ("stop", None)}
     edit(env, 3, "X")
     assert env.cation_fractions() == ["X", "B", "X"]
     env.initialize()
@@ -83,6 +86,11 @@ def test_count_constraint_can_be_temporarily_violated_to_move_membership(first, 
     edit(env, first, replacements[first])
     assert env.cation_fractions().count("C") != 2
     assert ("position", second) in allowed(env)
+    assert ("stop", None) not in allowed(env)
+    with pytest.raises(ValueError, match="not allowed"):
+        env.step(action(env, "stop", None))
+    assert env.counter == 2
+    assert not env.is_done
     edit(env, second, replacements[second])
     assert env.cation_fractions() == ["A", "C", "C"]
 
@@ -101,6 +109,7 @@ def test_parent_only_names_can_be_retained_and_constrained_but_not_inserted():
     assert schema["parent"] == ["legacy", "A", "A"]
     assert schema["length"] == 3
     assert schema["num_mutations"] == 1
+    assert schema["mutation_count"] == "up_to"
     assert schema["action_order"] == ["position", "replacement"]
     schema["parent"].clear()
     assert env.design_schema()["parent"] == ["legacy", "A", "A"]
@@ -110,6 +119,9 @@ def test_unique_final_sequence_can_swap_tokens_through_a_duplicate_intermediate(
     env = SequenceGroup({"tokens": ["A", "B"], "parent": ["A", "B"], "num_mutations": 2, "allow_repeats": False})
     edit(env, 1, "B")
     assert env.cation_fractions() == ["B", "B"]
+    assert ("stop", None) not in allowed(env)
+    with pytest.raises(ValueError, match="not allowed"):
+        env.step(action(env, "stop", None))
     edit(env, 2, "A")
     assert env.cation_fractions() == ["B", "A"]
 
@@ -143,7 +155,7 @@ def test_unique_final_sequence_can_repair_duplicate_parent_but_not_reuse_finaliz
 def test_every_reachable_mask_matches_exhaustive_final_sequence_oracle(parent, tokens, n, constraints, allow_repeats):
     valid = []
     for candidate in product(set(parent) | set(tokens), repeat=len(parent)):
-        if sum(a != b for a, b in zip(parent, candidate)) != n:
+        if not 1 <= sum(a != b for a, b in zip(parent, candidate)) <= n:
             continue
         if any(new != old and new not in tokens for old, new in zip(parent, candidate)):
             continue
@@ -159,7 +171,7 @@ def test_every_reachable_mask_matches_exhaustive_final_sequence_oracle(parent, t
     partials = {()}
     for candidate in valid:
         differences = tuple((i, token) for i, token in enumerate(candidate) if token != parent[i])
-        for size in range(n + 1):
+        for size in range(len(differences) + 1):
             partials.update(combinations(differences, size))
     for fixed in partials:
         env.initialize()
@@ -171,7 +183,19 @@ def test_every_reachable_mask_matches_exhaustive_final_sequence_oracle(parent, t
             ("position", i + 1) for i in range(len(parent)) if i not in edited
             and any(candidate[i] != parent[i] for candidate in completions)
         } if len(fixed) < n else set()
-        assert allowed(env) == expected_positions, (fixed, completions)
+        current = tuple(env.cation_fractions())
+        expected = expected_positions | (
+            {("stop", None)} if fixed and len(fixed) < n and current in valid else set()
+        )
+        assert allowed(env) == expected, (fixed, completions)
+        assert env.is_done == (len(fixed) == n)
+        if ("stop", None) in expected:
+            features = env.current_state_features().copy()
+            env.step(action(env, "stop", None))
+            assert env.is_done
+            assert env.allowed_actions() == []
+            assert tuple(env.cation_fractions()) == current
+            np.testing.assert_array_equal(env.current_state_features(), features)
         for _, position in expected_positions:
             env.initialize()
             for i, token in fixed:
@@ -210,7 +234,6 @@ def test_parent_and_edit_budget_are_required_together(spec):
 
 @pytest.mark.parametrize("spec", [
     {"tokens": ["A"], "parent": ["A"], "num_mutations": 1},
-    {"tokens": ["A", "B"], "parent": ["A", "A"], "num_mutations": 2, "allow_repeats": False},
     {"tokens": ["A", "B"], "parent": ["A", "B"], "num_mutations": 1, "allow_repeats": False},
     {"tokens": ["A", "B"], "parent": ["A", "A"], "num_mutations": 1,
      "count_constraints": [{"tokens": ["A"], "min": 0, "max": 0}]},
@@ -222,13 +245,13 @@ def test_impossible_edit_spaces_fail_at_construction(spec):
 
 def test_phase_noop_edited_position_and_malformed_actions_are_rejected_atomically():
     env = SequenceGroup({"tokens": ["A", "B", "C"], "parent": ["A", "B"], "num_mutations": 2})
-    for bad in [action(env, "token", "C"), ((0.0,) * len(env.species_set), (1.0,)), (1.0, 0.0)]:
+    for bad in [action(env, "token", "C"), action(env, "stop", None), ((0.0,) * len(env.species_set), (1.0,)), (1.0, 0.0)]:
         with pytest.raises(ValueError):
             env.step(bad)
         assert env.counter == 0
         assert env.cation_fractions() == ["A", "B"]
     env.step(action(env, "position", 1))
-    for bad in [action(env, "position", 2), action(env, "token", "A")]:
+    for bad in [action(env, "position", 2), action(env, "token", "A"), action(env, "stop", None)]:
         with pytest.raises(ValueError, match="not allowed"):
             env.step(bad)
         assert env.counter == 1
@@ -242,9 +265,62 @@ def test_phase_noop_edited_position_and_malformed_actions_are_rejected_atomicall
         env.step(action(env, "position", 1))
 
 
-def test_arbitrary_token_names_cannot_collide_with_position_actions():
-    weird = '["position",1]'
+@pytest.mark.parametrize("weird", ['["position",1]', '["stop",null]'])
+def test_arbitrary_token_names_cannot_collide_with_control_actions(weird):
     env = SequenceGroup({"tokens": [weird, "A"], "parent": ["A"], "num_mutations": 1})
-    assert len(set(env.species_set)) == 3
+    assert len(set(env.species_set)) == 4
     edit(env, 1, weird)
     assert env.cation_fractions() == [weird]
+
+
+@pytest.mark.parametrize("edits", range(1, 6))
+def test_upper_bound_five_reaches_every_edit_count_and_resets_after_stop(edits):
+    env = SequenceGroup({"tokens": ["A", "B"], "parent": ["A"] * 5, "num_mutations": 5})
+    initial = env.current_state_features().copy()
+    assert env.n_components == 10
+    assert ("stop", None) not in allowed(env)
+    for position in range(1, edits + 1):
+        edit(env, position, "B")
+    assert env.cation_fractions().count("B") == edits
+    assert env.counter == 2 * edits
+    features = env.current_state_features().copy()
+    if edits < 5:
+        assert not env.is_done
+        env.step(action(env, "stop", None))
+        assert env.counter == 2 * edits + 1
+    assert env.is_done
+    assert env.allowed_actions() == []
+    assert env.terminal_comp_key() == tuple(["B"] * edits + ["A"] * (5 - edits))
+    np.testing.assert_array_equal(env.current_state_features(), features)
+    for bad in [action(env, "stop", None), action(env, "position", 1), action(env, "token", "A")]:
+        with pytest.raises(RuntimeError, match="termination"):
+            env.step(bad)
+    env.initialize()
+    assert env.counter == 0
+    assert not env.is_done
+    assert ("stop", None) not in allowed(env)
+    np.testing.assert_array_equal(env.current_state_features(), initial)
+
+
+def test_exactly_five_impossible_but_one_valid_edit_is_accepted():
+    env = SequenceGroup({"tokens": ["A"], "parent": ["B", "A", "A", "A", "A"], "num_mutations": 5})
+    assert allowed(env) == {("position", 1)}
+    edit(env, 1, "A")
+    assert allowed(env) == {("stop", None)}
+    assert not env.is_done
+    env.step(action(env, "stop", None))
+    assert env.is_done
+    assert env.counter == 3
+    assert env.cation_fractions() == ["A"] * 5
+
+
+def test_duplicate_parent_can_be_repaired_in_less_than_maximum_budget():
+    env = SequenceGroup({
+        "tokens": ["A", "B"], "parent": ["A", "A"], "num_mutations": 2,
+        "allow_repeats": False,
+    })
+    edit(env, 1, "B")
+    assert allowed(env) == {("stop", None)}
+    env.step(action(env, "stop", None))
+    assert env.is_done
+    assert env.cation_fractions() == ["B", "A"]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from collections import deque
 import csv
 import json
 import os
@@ -75,6 +76,123 @@ def test_gp_contract_receives_parent_tokens_and_scores_only_complete_edits():
     assert env.terminal_comp_key() == first_key
 
 
+@pytest.mark.parametrize("sequence_first", [False, True])
+def test_early_stop_scores_once_after_all_groups_and_keeps_actual_steps(sequence_first):
+    cfg = mutation_config()
+    if sequence_first:
+        cfg["groups"].reverse()
+    predictor = PredictorTimer(build_predictor(cfg))
+    env, _, _ = build_env(cfg, predictor)
+    if not sequence_first:
+        env.step(env.allowed_actions()[0])
+    _step(env, _decision(env, "position", 1))
+    _step(env, _decision(env, "token", "D"))
+    assert not env.is_done and predictor.n_calls == 0
+    _step(env, _decision(env, "stop", None))
+    if sequence_first:
+        assert not env.is_done and predictor.n_calls == 0
+        assert env.counter == 3
+        env.step(env.allowed_actions()[0])
+    assert env.is_done and predictor.n_calls == 1
+    assert env.counter == len(env.path) == 4 < env.n_components == 5
+    assert [int(np.argmax(s.state_step_onehot)) for s in env.path] == [0, 1, 2, 3]
+    assert all(len(s.state_step_onehot) == 5 for s in env.path)
+    assert all(step.reward == 0.0 for step in env.path[:-1])
+    assert env.path[-1].reward == pytest.approx(0.75)
+    assert env.terminal_cation_fractions()["peptide"] == ["D", "C", "A", "C", "A"]
+    assert env.allowed_actions() == []
+    with pytest.raises(RuntimeError, match="terminated"):
+        env.step(env.path[-1].action_elem_onehot)
+    env.initialize()
+    assert not env.is_done and env.counter == 0
+
+
+def test_early_stop_mc_returns_and_bootstrap_terminal_target_use_actual_path():
+    from rl_matdesign.training import add_episode_to_buffer, _compute_td_target
+
+    cfg = mutation_config()
+    env, _, _ = build_env(cfg, build_predictor(cfg))
+    env.step(env.allowed_actions()[0])
+    _step(env, _decision(env, "position", 1))
+    _step(env, _decision(env, "token", "D"))
+    _step(env, _decision(env, "stop", None))
+    rows = deque()
+    add_episode_to_buffer(env.path, rows, env.action_features(), env.fraction_set, gamma=0.5)
+    assert len(rows) == 4
+    assert [row["done"] for row in rows] == [False, False, False, True]
+    assert [row["mc_return"] for row in rows] == pytest.approx([0.09375, 0.1875, 0.375, 0.75])
+    assert rows[-1]["next_allowed_idx"] == []
+    # A terminal transition cannot consult a model/scaler, even when its actual
+    # step is earlier than the fixed maximum network step dimension.
+    assert _compute_td_target(rows[-1], None, None, None, None, None, 0.5) == pytest.approx(0.75)
+
+
+def _earliest_stop_choice(env, actions):
+    for kind, value in (("stop", None), ("position", 1), ("token", "D")):
+        wanted = _decision(env, kind, value)
+        for action in actions:
+            if decode_one_hot(action[0], env.species_set) == wanted:
+                return action
+    return actions[0]
+
+
+@pytest.mark.parametrize("rollout", ["random", "q", "pg_train", "pg_generate"])
+def test_each_rollout_honors_early_stop(rollout, monkeypatch):
+    import torch
+    from sklearn.preprocessing import StandardScaler
+    from rl_matdesign import training
+
+    cfg = mutation_config()
+    predictor = PredictorTimer(build_predictor(cfg))
+    env, _, _ = build_env(cfg, predictor)
+    scaler = StandardScaler().fit(env.current_state_features().reshape(1, -1))
+
+    class StopPolicy(torch.nn.Module):
+        def forward(self, state, step, actions, amounts):
+            weights = actions.new_zeros(len(env.species_set))
+            for kind, value, score in (("position", 1, 100), ("token", "D", 100), ("stop", None, 200)):
+                weights[env.species_set.index(_decision(env, kind, value))] = score
+            return actions @ weights
+
+    shared = dict(env=env, scaler=scaler, elem_feats_scaled=env.action_features(),
+                  fraction_set=env.fraction_set, device=torch.device("cpu"))
+    if rollout == "random":
+        monkeypatch.setattr(training.random, "choice", lambda actions: _earliest_stop_choice(env, actions))
+        training._rollout_random_episode(env)
+    elif rollout == "q":
+        training._rollout_policy_episode(**shared, qnet=StopPolicy(), gen_temperature=0.0)
+    elif rollout == "pg_train":
+        training._rollout_pg_episode(**shared, policy=StopPolicy())
+    else:
+        training._pg_single_episode_generate(**shared, policy=StopPolicy(), gen_temperature=0.0)
+    assert env.is_done and env.counter == len(env.path) == 4
+    assert predictor.n_calls == 1
+    assert env.terminal_cation_fractions()["peptide"] == ["D", "C", "A", "C", "A"]
+
+
+@pytest.mark.parametrize("target", ["mc", "bootstrap"])
+def test_dqn_training_updates_on_early_stop_episodes(target, monkeypatch):
+    import torch
+    from rl_matdesign import training
+
+    cfg = mutation_config()
+    predictor = PredictorTimer(build_predictor(cfg))
+    env, _, _ = build_env(cfg, predictor)
+    monkeypatch.setattr(training.random, "choice", lambda actions: _earliest_stop_choice(env, actions))
+    monkeypatch.setattr(training.np.random, "rand", lambda: 0.0)
+    _, _, metrics = training.train_dqn_online(
+        env=env, elem_feats_scaled=env.action_features(), fraction_set=env.fraction_set,
+        device=torch.device("cpu"), hidden_dim=16, n_warmup_eps=1,
+        dqn_num_train_eps=2, batch_size=2, dqn_grad_steps_per_ep=1,
+        dqn_target_mode=target, gamma=1.0,
+    )
+    assert env.is_done and len(env.path) == 4
+    assert predictor.n_calls == 3
+    trained = [row for row in metrics if row["phase"] == "dqn_train"]
+    assert len(trained) == 2
+    assert all(np.isfinite(row["train_loss"]) for row in trained)
+
+
 def test_sequence_constraints_from_all_models_are_preserved_and_detached():
     class Leaf:
         def __init__(self, bound):
@@ -141,6 +259,24 @@ def test_parent_identity_is_part_of_checkpoint_schema(tmp_path):
         )
 
 
+def test_legacy_exact_mutation_checkpoint_is_rejected(tmp_path):
+    cfg = mutation_config()
+    env, _, _ = build_env(cfg, build_predictor(cfg))
+    old = deepcopy(env.design_schema())
+    old["actions"].remove(_decision(env, "stop", None))
+    sequence = old["groups"][1]
+    old_keys = {"name", "kind", "tokens", "length", "allow_repeats", "count_constraints",
+                "parent", "num_mutations", "action_order", "state_tokens"}
+    for key in set(sequence) - old_keys:
+        sequence.pop(key)
+    sequence["action_order"] = ["position", "replacement"]
+    saved = tmp_path / "exact"
+    save_or_check_design_schema(old, str(saved))
+    with pytest.raises(ValueError, match="Sequence design differs"):
+        save_or_check_design_schema(env.design_schema(), str(tmp_path / "new"),
+                                    load_paths=[str(saved / "qnet.pt")])
+
+
 def _cli(config_path, out, method, extra=()):
     executable = Path(sys.executable).parent / "rl-matdesign"
     command = str(executable) if executable.is_file() else shutil.which("rl-matdesign")
@@ -169,7 +305,7 @@ def _assert_generated(out, parent):
         candidate = json.loads(row["candidate_json"])
         seq = candidate["peptide"]
         assert len(seq) == len(parent)
-        assert sum(a != b for a, b in zip(seq, parent)) == 2
+        assert 1 <= sum(a != b for a, b in zip(seq, parent)) <= 2
         assert seq.count("C") == 2
         assert all(a in {"A", "C", "D"} for a, b in zip(seq, parent) if a != b)
         assert np.isfinite([float(row[c]) for c in ("reward", "dp_mean", "obj_activity_std")]).all()

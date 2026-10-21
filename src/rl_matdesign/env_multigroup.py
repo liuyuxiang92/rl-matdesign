@@ -297,7 +297,7 @@ class MultiGroupEnv:
             f for inner in self._inners for f in inner.fraction_set
         )
 
-        # Total episode length across all groups (what training.py reads).
+        # Maximum episode length across all groups (fixed network step dimension).
         self._group_lengths = [inner.n_components for inner in self._inners]
         self.n_components = int(sum(self._group_lengths))
         self.max_steps = self.n_components
@@ -383,14 +383,14 @@ class MultiGroupEnv:
 
     def allowed_actions(self) -> List[Tuple[Tuple[float, ...], Tuple[float, ...]]]:
         """Union-encoded allowed actions for the active group's current step."""
-        if self.counter >= self.n_components:
+        if self.is_done:
             return []
         inner = self._active()
         raw = inner.allowed_actions(prior_groups=self._completed)
         return [self._to_union(a, inner) for a in raw]
 
     def step(self, action: Tuple[Tuple[float, ...], Tuple[float, ...]]) -> None:
-        if self.counter >= self.n_components:
+        if self.is_done:
             raise RuntimeError("step() called after the episode terminated.")
 
         inner = self._active()
@@ -416,12 +416,12 @@ class MultiGroupEnv:
 
         # If the active group just finished, record its composition for
         # downstream groups' prior_groups, and advance to the next group.
-        if inner.counter >= inner.n_components:
+        if getattr(inner, "is_done", inner.counter >= inner.n_components):
             self._completed = self._completed + [inner.cation_fractions()]
             self._gi = min(self._gi + 1, len(self._inners) - 1)
 
         reward = 0.0
-        if self.counter == self.n_components:
+        if self.is_done:
             reward = float(self.reward_fn(self.terminal_cation_fractions()))
 
         self.path.append(
@@ -447,8 +447,12 @@ class MultiGroupEnv:
     # Terminal accessors (the predictor/dedup interface)
     # ------------------------------------------------------------------
 
+    @property
+    def is_done(self) -> bool:
+        return len(self._completed) == len(self._inners)
+
     def _is_terminal(self) -> bool:
-        return self.counter == self.n_components
+        return self.is_done
 
     def terminal_cation_fractions(self) -> Dict[str, Any]:
         """Structured candidate: group mappings or ordered lists of token IDs."""
