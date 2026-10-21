@@ -1,7 +1,8 @@
 # 直接调用 gp_physchem
 
 RL 与 GP 使用同一个 Python 环境。RL 通过现有的 FQN 插件接口导入
-`gp_physchem.api:PeptidePredictor`，直接读取 GP 的原始 `new_monomers.csv`。
+`gp_physchem.api:PeptidePredictor`。RL 使用名称列表定义允许替换的单体，GP 负责把名称
+解析为结构、手性和描述符。新单体的化学定义仍可由 GP 读取 `new_monomers.csv`。
 不需要运行准备命令，也不生成或读取 `catalog.csv`、manifest、GP worker 或描述符缓存文件。
 
 ## 安装与运行
@@ -13,13 +14,15 @@ python -m pip install -e /path/to/rl-matdesign
 python -m pip install -e /path/to/gp_physchem
 ```
 
-该 GP 版本新增了安装配置和 `gp_physchem.api.PeptidePredictor`。旧版仅有脚本的
-GP 目录需要同步这些源码改动后安装；RL 的 Git 仓库不包含外部 GP 项目。
+需要同步本次 GP API 改动，包括可选的 `new_monomers`、已知单体复用和
+`sequence_constraints` 接口。只有旧版 `PeptidePredictor` 还不够：它会把 CSV 名称
+范围当作全部允许输入，并且不会自动提供巯基约束。旧版仅有脚本的 GP 还需要安装配置。
+RL 的 Git 仓库不包含外部 GP 项目，提交或更新 RL 不会自动同步 GP 源码。
 GP 包声明自己的依赖版本，RL 所需的 PyTorch 等依赖也应安装在同一个环境中。
 建议为这套组合单独建立环境，避免改变其他材料模型使用的依赖。
 
 本地配置保存在 `configs/peptide_gp.yaml`，由 `.gitignore` 忽略。
-其中与 GP 有关的配置形状如下，远端使用时替换原始 CSV 的路径：
+其中与 GP 有关的配置形状如下。示例只使用 GP 字典已知名称，因此无需新单体 CSV：
 
 ```yaml
 groups:
@@ -32,35 +35,41 @@ groups:
   - name: peptide
     kind: sequence
     length: 11
-    tokens:
-      csv: &monomers /path/to/gp_physchem/examples/new_monomers.csv
-      id_column: monomer
+    tokens: [A, V, F, K, W, HCys, D-HCys]
+    parent: [A, HCys, F, K, V, W, W, A, P, R, b-HCys]
+    num_mutations: 2
     allow_repeats: true
-    count_constraints:
-      - tokens: &thiols [BB1, BB6, BB55, BB56, BB103, BB137]
-        min: 2
-        max: 2
 
 properties:
   - name: pIC50
     predictor: gp_physchem.api:PeptidePredictor
-    new_monomers: *monomers
-    thiol_tokens: *thiols
     direction: max
     objective: mean_minus_kstd
 k: 1.0
 ```
 
-示例中的 YAML 锚点让 RL 和 GP 使用同一份原始单体表和同一组约束标记。
-这里六个单体来自对当前 138 行原始 CSV 的化学核对，不是通过 ID 名称或 `type2` 猜测。
-GP 接口启动时重新从结构识别巯基，并校验 `thiol_tokens` 与实际结果完全一致；
-如果替换单体表后标记改变，应相应调整配置。建议 CSV 使用绝对路径，避免插件路径与
-相对于 YAML 解析的序列 CSV 路径混淆。
+每个 episode 从同一条母肽开始，执行两次替换。每次先选一个未修改的位置，再从
+`tokens` 中选择一个与原残基不同的名称。两个位置各改一次，最终恰好两个位置与母肽
+不同。两次替换分别选择新残基，可以选不同的，也可以重复选同一种；位置和残基都由
+现有 RL 策略及探索设置决定，不是把同一种残基连续替换两次。
 
-序列 `tokens.csv` 的相对路径以定义它的 YAML 所在目录为基准。
-HPO 会在生成 trial 配置前，将 base config 的此路径解析为绝对路径；
-如果通过 HPO 的 `fixed_overrides.groups` 定义序列，该相对路径以 HPO YAML 目录为基准。
-这样两个阶段的 trial 都继续读取原始 CSV。GP 插件的 `new_monomers` 仍建议填写绝对路径，
+母肽中不在 `tokens` 内的名称可以保留，但不会成为替换动作。例如这里的 `b-HCys`
+由 GP 内置字典解析，仍能留在母肽中。去掉 `parent` 和 `num_mutations` 两项就恢复
+从头选择 11 个残基；其他配置保持同一种写法。
+
+如果候选列表含 `BB103` 等 GP 字典未知名称，在该 property 中增加
+`new_monomers: /absolute/path/to/new_monomers.csv`，并在 `tokens` 中显式列出希望选择
+的名称。GP 读取该文件的 `monomer`、结构 SMILES 和手性等化学定义；文件包含的其他
+单体不会自动加入 RL 动作范围。GP 能识别的全部单体才是可预测范围。与内置名称重复
+的定义必须保持化学身份一致，否则启动时报错，不能覆盖已有训练描述符。
+
+GP 从候选与母肽名称对应的化学结构自动提供“最终恰好两个游离巯基残基”的数量约束，
+无需在 RL 配置里再维护 `thiol_tokens`。不要从 ID 或 `type2` 猜测巯基归属。环境允许
+可被剩余替换修复的中间计数，例如暂时有一个或三个巯基，只有最终合法序列才进入 GP。
+
+旧 `tokens: {csv: ..., id_column: ...}` 和 CSV 列 `where` 约束已经移除。将候选改为
+名称列表，删除重复维护的巯基列表，保留 GP 所需的新单体化学定义文件即可。
+HPO 原样传递名称列表、母肽和替换次数；GP 插件的 `new_monomers` 建议使用绝对路径，
 通用 HPO 不改写插件自定义字段的路径约定。
 
 在同一 YAML 中保留所需训练和生成预算，然后在 RL 仓库根目录运行：
@@ -73,8 +82,8 @@ rl-matdesign \
 ```
 
 A2C 和 REINFORCE 只需改变 `--method`。GP 的训练表和词典默认来自安装的 GP 包，
-也可在 property 中通过 `train`、`dictionary` 指定原始文件。`new_monomers` 指定动作单体库，
-不会把训练词典中的其他单体加入可选动作。
+也可在 property 中通过 `train`、`dictionary` 指定原始文件。`new_monomers` 只扩展
+GP 能理解的化学定义；RL 的动作范围始终由 `tokens` 决定。
 
 ## MC 与 HPO 起步流程
 
@@ -84,10 +93,12 @@ MC 是 DQN 的回报目标选项，使用 `--method dqn --dqn-target-mode mc`，
 使每个动作的 MC 目标都等于该条完整多肽的终点奖励；`k: 1.0` 仍保持奖励为 mean − std。
 序列排列会改变分子，因此 `dqn_augment_permutations` 必须为 0。
 
-一个 episode 包含一次 N 端选择和 11 次残基选择，共 12 个 transition，
-终点得到一次 GP 分数。`dqn_warmup_eps` 是额外的随机轨迹，不能包含在
+自由构建模式中，一个 episode 包含一次 N 端选择和 11 次残基选择，共 12 个
+transition。母肽修改模式中，每次替换有“位置、残基”两次决策，因此 n 次替换加
+一次 N 端选择，共 `2n + 1` 个 transition；例如 `num_mutations: 2` 时共 5 步。
+两种模式都只在终点得到一次 GP 分数。`dqn_warmup_eps` 是额外的随机轨迹，不能包含在
 `dqn_num_train_eps` 中重复计数。replay buffer 的容量单位是 transition，
-50,000 行约容纳 4,167 条完整轨迹。
+50,000 行在上述两次替换示例中容纳 10,000 条完整轨迹。
 
 本地还准备了两份 Git 忽略的配置：
 `configs/hpo/peptide_gp_mc_pilot.yaml` 用于计时，
@@ -109,7 +120,7 @@ python scripts/hpo.py \
 的进程启动时重复一次；因此不能只用 GP 单次推理速度估算整轮 HPO 时间。
 HPO 默认自动选择 CUDA（可用时）或 CPU；先保持 `n_parallel_trials: 1`。
 
-2026-10-16 已在本地 CPU 验证该短流程：100 warmup + 300 MC 训练 + 100 个
+2026-10-16 已在本地 CPU 验证旧自由构建模式的短流程：100 warmup + 300 MC 训练 + 100 个
 独特候选，运行器耗时 61.9 秒（初始化 23.3 秒，训练 22.6 秒）；没有启动正式搜索。
 这些时间仅对应本机和该 trial，不能直接当作远端机器或更大 batch/更新次数的耗时。
 证据位于 `runs/hpo/peptide_gp_mc_pilot_local_20261016/validation.json`。
@@ -149,29 +160,36 @@ HPO 当前比较每个 run 的 `generated.csv` 中 reward 最高的 10 个候选
 
 ## 运行时发生什么
 
-1. GP 接口读取原始词典和新单体 CSV，调用原有化学函数，在内存中计算描述符。
+1. GP 接口读取原始词典，以及配置了才读取的新单体 CSV；调用原有化学函数，在内存中计算描述符。
 2. 用原始训练表调用 `train_matrix` 和 `fit_gp`，每个 predictor 实例只拟合一次。
-3. RL 逐步选择 N 端和 11 个有序单体；通用数量约束保证恰好两个巯基残基。
-4. GP 接口从序列推导两个位置，调用原始 `validate_candidates → featurise → predict_gp`。
-5. 返回原始预测均值和 GP 不确定性 `std`；RL 计算奖励并写入正常运行结果。
+3. 环境初始化时，GP 的 `sequence_constraints` 根据候选与母肽名称提供巯基数量约束。
+4. RL 选择 N 端，并自由构建序列或对母序列执行 n 次“选位置、选残基”；过程不调用 GP 评分。
+5. 完成后，GP 接口从完整序列推导两个巯基位置，调用原始 `validate_candidates → featurise → predict_gp`。
+6. 返回原始预测均值和 GP 不确定性 `std`；RL 计算奖励并写入正常运行结果。
 
 描述符、GP 和 scaler 在本次进程内复用。每次启动新进程都会重新计算描述符，
 包含 3D 构象计算，因此启动阶段可能需要数分钟；之后的候选预测无需重复初始化。
 GP 接口自身不写文件，正常的 RL 输出（`generated.csv`、模型权重、训练日志等）保持不变。
 
+`sequence_schema.json` 保存本次 RL 使用的母序列及替换次数。GP 输出中的
+`mutation_count_vs_parent` 仍相对于 GP 固定训练母肽；若配置了其他母序列，该诊断值
+不等于 RL 的 `num_mutations`。单体应使用统一名称，避免同一结构的两个别名被计为一次替换。
+
 ## 已确认的模型约定
 
 | 项目 | 约定 |
 |---|---|
-| 动作单体库 | 原始 CSV 的 138 个 ID：BB1–BB138 |
+| 动作单体库 | RL `tokens` 中显式列出的名称；母肽中的其他名称只能保留 |
 | 序列 | 11 个有序位置，允许重复 |
 | N 端动作 / C 端 | H 或 Ac / 固定 NH2 |
-| 游离巯基单体 | BB1、BB6、BB55、BB56、BB103、BB137 |
+| 游离巯基单体 | 由 GP 化学定义识别，自动转成 RL 的最终数量约束 |
 | 二硫键 | 恰好两个巯基残基；位置从 1 开始，i < j |
 | 目标 | 原 GP 的伪 pIC50，越大越好 |
 | std | 原 GP 直接返回的预测不确定性 |
 
-例如 BB110 的 `type2` 写着 Cys，但结构为硫醚，不属于游离巯基。
+在原始 138 行 CSV 中，游离巯基名称为 BB1、BB6、BB55、BB56、BB103、BB137。
+更换 CSV、名称或候选子集后应以其实际结构为准。例如原 BB110 的 `type2` 写着 Cys，
+但结构为硫醚，不属于游离巯基。
 原预测器没有最小环大小为 4 的限制；该限制仅属于原项目的候选枚举脚本。
 
 默认奖励为 `mean - k * std`。`objective: mean` 只优化均值，
@@ -198,8 +216,8 @@ GP 接口自身不写文件，正常的 RL 输出（`generated.csv`、模型权�
 
 ## 模型解释边界
 
-此次 GP 源码修改增加可安装 Python API 和包内导入兼容性，保留原核函数、标签、
-特征和预测公式。以下是原模型的现有性质：
+GP API 增加名称解析、可选新单体定义和约束提供接口，保留原核函数、标签、特征
+和预测公式。已知单体使用字典内原描述符，不因重复导入定义而重新覆盖。以下是原模型的现有性质：
 
 - 标签是单点抑制率换算的伪 pIC50，并非实测 IC50。
 - 96 条训练记录只有 2 条 Ac；删失记录的数值标签也参与普通 GP 拟合。

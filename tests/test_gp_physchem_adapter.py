@@ -50,18 +50,26 @@ def mock_gp_inputs(gp_api, monkeypatch, tmp_path):
 
     class Library:
         def __init__(self):
-            self.records = {}
+            self.records = {
+                name: SimpleNamespace(name=name, has_free_thiol=thiol,
+                    smiles_mapped=str(thiol), can_assemble=True, vector=np.zeros(1))
+                for name, thiol in (("A", 0), ("C", 1), ("b-HCys", 1))
+            }
 
         def register_extra_row(self, row):
             calls["descriptor"] += 1
             record = SimpleNamespace(
                 name=row.monomer, has_free_thiol=int(row.has_free_thiol),
-                smiles_mapped=int(row.mapped_thiol), can_assemble=bool(row.can_assemble),
+                smiles_mapped=str(int(row.mapped_thiol)), can_assemble=bool(row.can_assemble),
+                vector=np.zeros(1),
             )
             self.records[record.name] = record
             return record
 
         def get(self, name):
+            if name == "V" and name not in self.records:
+                self.records[name] = SimpleNamespace(name=name, has_free_thiol=0,
+                    smiles_mapped="0", can_assemble=True, vector=np.ones(1))
             return self.records[name]
 
     def load_library(path):
@@ -90,7 +98,7 @@ def mock_gp_inputs(gp_api, monkeypatch, tmp_path):
         return "C", sites
 
     monkeypatch.setattr(gp_api, "load_library", load_library)
-    monkeypatch.setattr(gp_api, "has_map", lambda mapped, atom: mapped == 1)
+    monkeypatch.setattr(gp_api, "has_map", lambda mapped, atom: mapped == "1")
     monkeypatch.setattr(gp_api, "load_training_table", lambda path: gp_api.pd.DataFrame({"pIC50_from_1000nM": [7.0, 8.0]}))
     monkeypatch.setattr(gp_api, "train_matrix", lambda frame, library: (np.zeros((2, 1)), {}, {}, [["BB2"] * 11]))
     monkeypatch.setattr(gp_api, "fit_gp", fit)
@@ -172,7 +180,7 @@ def test_direct_api_fits_once_reuses_in_memory_and_preserves_prediction_metadata
     ({**_candidate(), "peptide": ["BB1"] * 10}, "exactly 11"),
     ({**_candidate(), "peptide": tuple(_candidate()["peptide"])}, "ordered list"),
     ({**_candidate(), "peptide": [1] + ["BB2"] * 9 + ["BB6"]}, "monomer IDs"),
-    ({**_candidate(), "peptide": ["C"] + ["BB2"] * 9 + ["BB6"]}, "outside source catalog"),
+    ({**_candidate(), "peptide": ["BB999"] + ["BB2"] * 9 + ["BB6"]}, "unknown monomer"),
     ({**_candidate(), "peptide": ["BB2"] * 11}, "exactly two"),
     ({**_candidate(), "peptide": ["BB1"] * 3 + ["BB2"] * 8}, "exactly two"),
     ({**_candidate(), "n_terminal": {"treatment": "Boc"}}, "H or Ac"),
@@ -186,6 +194,125 @@ def test_direct_api_rejects_invalid_candidates_before_prediction(mock_gp_inputs,
     assert calls["predict"] == calls["validate"] == 0
     assert predictor.predict(_candidate()) == (7.0, 0.5)
 
+
+
+def test_direct_api_uses_native_dictionary_without_extra_csv(mock_gp_inputs):
+    api, cfg, calls = mock_gp_inputs
+    cfg.pop("new_monomers")
+    predictor = api.PeptidePredictor(cfg)
+    assert predictor.new_monomers is None
+    assert predictor.tokens == predictor.thiol_tokens == []
+    parent = {"peptide": ["C"] + ["A"] * 9 + ["b-HCys"], "n_terminal": {"treatment": "H"}}
+    assert predictor.predict(parent) == (7.0, 0.5)
+    assert calls["descriptor"] == 0
+    assert calls["fit"] == 1
+
+
+def test_direct_api_extra_definitions_are_not_a_candidate_whitelist(mock_gp_inputs):
+    api, cfg, calls = mock_gp_inputs
+    source = Path(cfg["new_monomers"])
+    source.write_text("monomer,has_free_thiol,mapped_thiol,can_assemble\nBB2,0,0,1\n")
+    predictor = api.PeptidePredictor(cfg)
+    assert predictor.tokens == ["BB2"]
+    assert predictor.thiol_tokens == []
+    candidate = {"peptide": ["C", "BB2"] + ["A"] * 8 + ["b-HCys"], "n_terminal": {"treatment": "H"}}
+    assert predictor.predict(candidate) == (7.0, 0.5)
+    assert predictor.sequence_constraints("peptide", ["BB2", "C", "A", "b-HCys"]) == [
+        {"tokens": ["C", "b-HCys"], "min": 2, "max": 2}
+    ]
+
+
+def test_direct_api_constraints_resolve_only_requested_universe(mock_gp_inputs):
+    api, cfg, calls = mock_gp_inputs
+    predictor = api.PeptidePredictor(cfg)
+    assert predictor.sequence_constraints("other", ["unknown"]) == []
+    assert predictor.sequence_constraints("peptide", ["BB2", "C"]) == [
+        {"tokens": ["C"], "min": 2, "max": 2}
+    ]
+    with pytest.raises(ValueError, match="unknown monomer"):
+        predictor.sequence_constraints("peptide", ["C", "undefined"])
+    with pytest.raises(ValueError, match="no free-thiol"):
+        predictor.sequence_constraints("peptide", ["A", "BB2"])
+    with pytest.raises(ValueError, match="duplicate"):
+        predictor.sequence_constraints("peptide", ["C", "C"])
+    assert calls["predict"] == 0
+
+
+def test_direct_api_adds_lazy_builtin_descriptors_without_refitting(mock_gp_inputs):
+    api, cfg, calls = mock_gp_inputs
+    predictor = api.PeptidePredictor(cfg)
+    assert "V" not in predictor.table
+    predictor.sequence_constraints("peptide", ["V", "C"])
+    np.testing.assert_array_equal(predictor.table["V"], np.ones(1))
+    candidate = {"peptide": ["C"] + ["V"] * 9 + ["b-HCys"], "n_terminal": {"treatment": "H"}}
+    assert predictor.predict(candidate) == (7.0, 0.5)
+    assert calls["fit"] == 1
+
+
+@pytest.fixture
+def chemistry_library(gp_api):
+    chemistry = importlib.import_module("gp_physchem.chemistry")
+    return chemistry, chemistry.load_library(gp_api.config.MONOMER_DICTIONARY)
+
+
+@pytest.mark.parametrize("name", ["A", "D-HCys", "HCys", "C", "c", "b-HCys", "p", "Aib"])
+def test_duplicate_known_chemical_definition_reuses_training_descriptors(chemistry_library, monkeypatch, name):
+    chemistry, library = chemistry_library
+    existing = library.get(name)
+    vector = existing.vector.copy()
+    before_computed = list(library.computed_names)
+    def unexpected_recompute(*args, **kwargs):
+        raise AssertionError("known descriptors must be reused")
+    monkeypatch.setattr(chemistry, "descriptors_from_smiles", unexpected_recompute)
+    # Missing chirality uses the existing record, including non-standard D names.
+    row = chemistry.pd.Series({"monomer": name, "smiles_free_aa": existing.smiles_free_aa})
+    assert library.register_extra_row(row) is existing
+    np.testing.assert_array_equal(existing.vector, vector)
+    assert library.computed_names == before_computed
+
+
+@pytest.mark.parametrize("changes", [
+    {"smiles_free_aa": "N[C@H](C)C(=O)O"},  # opposite enantiomer
+    {"chirality": "D"},
+    {"backbone": "beta3"},
+    {"has_free_thiol": 1},
+    {"has_free_thiol": 0.5},
+    {"has_free_thiol": 1.5},
+    {"has_free_thiol": float("inf")},
+    {"smiles_mapped": "[N:1][C@@H](C)[C:2](=O)O"},  # missing leaving map
+    {"smiles_mapped": "[N:1][C@@H](C)[C:2](=[O:4])O"},  # wrong oxygen role
+    {"sidechain": "CC"},
+])
+def test_conflicting_known_definitions_fail_without_mutating_library(chemistry_library, changes):
+    chemistry, library = chemistry_library
+    existing = library.get("A")
+    row = chemistry.pd.Series({"monomer": "A", "smiles_free_aa": existing.smiles_free_aa, **changes})
+    before_records = dict(library.records)
+    before_sidechains = dict(library.extra_sidechains)
+    before_computed = list(library.computed_names)
+    before_vector = existing.vector.copy()
+    with pytest.raises(ValueError):
+        library.register_extra_row(row)
+    assert library.records.keys() == before_records.keys()
+    assert all(library.records[name] is record for name, record in before_records.items())
+    assert library.extra_sidechains == before_sidechains
+    assert library.computed_names == before_computed
+    np.testing.assert_array_equal(existing.vector, before_vector)
+
+
+def test_unused_builtin_name_cannot_be_shadowed_by_conflicting_csv(chemistry_library, monkeypatch):
+    chemistry, library = chemistry_library
+    name = "D-S"
+    library.records.pop(name, None)
+    monkeypatch.setattr(chemistry, "descriptors_from_smiles", lambda smiles: {
+        column: 0.0 for column in chemistry.DESC_COLS
+    })
+    row = chemistry.pd.Series({"monomer": name, "smiles_free_aa": "N[C@@H](C)C(=O)O", "chirality": "L"})
+    before = dict(library.records)
+    with pytest.raises(ValueError, match="conflicts"):
+        library.register_extra_row(row)
+    assert library.records.keys() == before.keys()
+    assert name not in library.computed_names
 
 def _source_snapshot(root):
     # Ignore interpreter bytecode housekeeping; detect model/data artifacts.
@@ -309,6 +436,13 @@ def real_gp_report(tmp_path_factory):
         for seq, cap in ((anchor,"H"), (order_swap,"H"), (bridge_move,"H"), (anchor,"Ac")):
             add(seq, cap)
 
+        # Native parent residues can remain even when absent from replacement CSV.
+        native_parent = ["A", "HCys", "F", "K", "V", "W", "W", "A", "P", "R", "b-HCys"]
+        add(native_parent, "H")
+        add(native_parent, "Ac")
+        assert predictor.sequence_constraints("peptide", ["A", "HCys", "b-HCys"]) == [
+            {"tokens": ["HCys", "b-HCys"], "min": 2, "max": 2}
+        ]
         frame = pd.DataFrame(rows)
         direct_seqs, direct_x, direct_mean, direct_std = direct(frame)
         assert not np.array_equal(direct_x[special_start], direct_x[special_start+1])
@@ -336,7 +470,6 @@ def real_gp_report(tmp_path_factory):
         def payload(seq=None, cap="H", **extra):
             return {"peptide": list(anchor if seq is None else seq), "n_terminal": {"treatment": cap}, **extra}
         invalid = {
-            "dictionary_token_outside_catalog": payload(["A"]+anchor[1:]),
             "unknown_token": payload(["BB999"]+anchor[1:]),
             "length_10": payload(anchor[:-1]),
             "length_12": payload(anchor+["BB96"]),
@@ -383,7 +516,7 @@ def test_real_gp_raw_descriptors_and_original_reference_fixtures(real_gp_report)
 
 def test_real_gp_all_138_candidates_match_direct_original_predictions(real_gp_report):
     assert real_gp_report["covered_tokens"] == 138
-    assert real_gp_report["prediction_count"] == 280
+    assert real_gp_report["prediction_count"] == 282
     assert real_gp_report["mean_max_abs_error"] <= 1e-9
     assert real_gp_report["std_max_abs_error"] <= 1e-9
 
@@ -392,13 +525,13 @@ def test_real_gp_metadata_preserves_caps_order_topology_and_smiles(real_gp_repor
     assert real_gp_report["caps"] == ["Ac", "H"]
     assert real_gp_report["topology_count"] > 2
     assert real_gp_report["order_swap_checked"]
-    assert real_gp_report["smiles_checked"] == 280
+    assert real_gp_report["smiles_checked"] == 282
     assert real_gp_report["metadata_copy_checked"]
 
 
 def test_real_gp_rejects_invalid_actions_and_remains_usable(real_gp_report):
     assert set(real_gp_report["rejections"]) == {
-        "dictionary_token_outside_catalog", "unknown_token", "length_10", "length_12",
+        "unknown_token", "length_10", "length_12",
         "thiols_0", "thiols_1", "thiols_3", "invalid_cap", "extra_group", "extra_terminal_key",
     }
 

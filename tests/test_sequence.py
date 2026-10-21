@@ -96,15 +96,12 @@ def test_impossible_spaces_fail_at_construction(spec):
         SequenceGroup(spec)
 
 
-def test_csv_ids_keep_leading_zeros_and_selectors_use_explicit_annotations(tmp_path):
-    csv_path = tmp_path / "tokens.csv"
-    csv_path.write_text("id,has_free_thiol,smiles\n001,true,S\n002,false,CS\n003,false,C\n")
+def test_explicit_ids_keep_leading_zeros_and_schema_owns_its_lists():
     env = SequenceGroup({
-        "tokens": {"csv": str(csv_path), "id_column": "id"}, "length": 3,
-        "count_constraints": [{"where": {"column": "has_free_thiol", "equals": "true"}, "min": 2, "max": 2}],
+        "tokens": ["001", "002", "003"], "length": 3,
+        "count_constraints": [{"tokens": ["001"], "min": 2, "max": 2}],
     })
     assert env.species_set == ["001", "002", "003"]
-    assert env.token_metadata["002"]["smiles"] == "CS"
     schema = env.design_schema()
     assert schema == {
         "kind": "sequence", "tokens": ["001", "002", "003"],
@@ -112,7 +109,9 @@ def test_csv_ids_keep_leading_zeros_and_selectors_use_explicit_annotations(tmp_p
         "count_constraints": [{"tokens": ["001"], "min": 2, "max": 2}],
     }
     schema["tokens"].reverse()
+    schema["count_constraints"][0]["tokens"].append("003")
     assert env.design_schema()["tokens"] == ["001", "002", "003"]
+    assert env.design_schema()["count_constraints"][0]["tokens"] == ["001"]
     _walk(env, ["002"])
     assert _allowed(env) == {"001"}
     env.step(_action(env, "001"))
@@ -120,19 +119,9 @@ def test_csv_ids_keep_leading_zeros_and_selectors_use_explicit_annotations(tmp_p
     assert env.cation_fractions() == ["002", "001", "001"]
 
 
-@pytest.mark.parametrize("text,match", [
-    ("id,tag\n,yes\n", "missing token ID"),
-    ("id,tag\n001,yes\n001,no\n", "duplicates token ID"),
-    ("wrong,tag\n001,yes\n", "missing ID column"),
-    ("id,id\n001,002\n", "unique, non-empty column"),
-    ("id,tag\n001\n", "wrong number of fields"),
-    ("id,tag\n", "no catalog entries"),
-])
-def test_csv_rejects_missing_duplicate_and_malformed_entries(tmp_path, text, match):
-    path = tmp_path / "tokens.csv"
-    path.write_text(text)
-    with pytest.raises(ValueError, match=match):
-        SequenceGroup({"tokens": {"csv": str(path), "id_column": "id"}, "length": 2})
+def test_legacy_csv_configuration_reports_migration_without_opening_a_file():
+    with pytest.raises(ValueError, match="CSV sequence tokens are no longer supported.*explicit list"):
+        SequenceGroup({"tokens": {"csv": "missing.csv", "id_column": "id"}, "length": 2})
 
 
 @pytest.mark.parametrize("action", [
@@ -163,9 +152,12 @@ def test_strict_action_validation_is_atomic(action):
     ({"length": 2.5}, "integer"),
     ({"allow_repeats": "false"}, "boolean"),
     ({"tokens": ["A", "A"]}, "duplicate"),
+    ({"tokens": []}, "non-empty list"),
+    ({"tokens": [1, "A"]}, "string IDs"),
+    ({"tokens": ("A", "B")}, "non-empty list"),
     ({"count_constraints": [{"tokens": ["Z"], "min": 1}]}, "unknown tokens"),
     ({"count_constraints": [{"tokens": ["A"], "min": 2, "max": 1}]}, "Count bounds"),
-    ({"count_constraints": [{"where": {"column": "tag", "equals": "true"}, "min": 1}]}, "require a CSV"),
+    ({"count_constraints": [{"where": {"column": "tag", "equals": "true"}, "min": 1}]}, "no longer supported"),
 ])
 def test_invalid_configuration_fails_explicitly(extra, match):
     with pytest.raises(ValueError, match=match):

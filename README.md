@@ -5,7 +5,10 @@ Supports multiple material systems (OOH catalyst, HEA, perovskite, oxides) via Y
 Three RL algorithms: **DQN** (online, target-network, or MC targets), **REINFORCE**, and **A2C**.
 
 Ordered token/monomer sequences are also supported through `kind: sequence`,
-with repeatable choices, hard count bounds and categorical processing actions.
+with inline candidate names, hard count bounds and categorical processing actions.
+Add `parent` and `num_mutations` to replace exactly n distinct positions of a
+starting sequence; omit both to construct a sequence from scratch. Predictors
+own the chemistry definitions and may supply domain-specific count constraints.
 See [sequence design and GP adapters](docs/sequence_design.md) for the reusable
 interface and the 11-position synthetic example, and
 [gp_physchem integration](docs/gp_physchem_integration.md) for the real peptide GP setup.

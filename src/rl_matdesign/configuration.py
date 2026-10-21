@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from pathlib import Path
 import warnings
 
 import yaml
@@ -53,33 +52,9 @@ def _apply_flag_aliases(cfg: dict) -> dict:
     return cfg
 
 
-def resolve_sequence_catalog_paths(cfg: dict, config_path: str) -> dict:
-    """Copy config fields and resolve sequence CSVs relative to their source YAML.
-
-    Call this before relocating a config (for example, into an HPO trial).
-    Existing material/model/plugin path conventions remain unchanged.
-    """
-    cfg = deepcopy(cfg)
-    groups = []
-    for group in cfg.get("groups", []):
-        tokens = group.get("tokens")
-        if group.get("kind") == "sequence" and isinstance(tokens, dict) and tokens.get("csv"):
-            catalog = Path(tokens["csv"]).expanduser()
-            if not catalog.is_absolute():
-                catalog = Path(config_path).resolve().parent / catalog
-            # YAML aliases may share this mapping with unrelated plugin fields.
-            group = {**group, "tokens": {**tokens, "csv": str(catalog.resolve())}}
-        groups.append(group)
-    if "groups" in cfg:
-        cfg["groups"] = groups
-    return cfg
-
-
 def load_config(path: str) -> dict:
     with open(path) as f:
         cfg = yaml.safe_load(f)
-    # Direct build_env callers pass resolved paths.
-    cfg = resolve_sequence_catalog_paths(cfg, path)
     return _apply_flag_aliases(cfg)
 
 
@@ -227,6 +202,29 @@ def build_env(cfg: dict, predictor):
         built_groups = []
         for g in groups:
             gspec = normalize_group_spec(g)
+            if gspec.get("kind") == "sequence":
+                # Domain adapters may resolve identities and provide intrinsic
+                # count bounds. Include retained parent tokens without adding
+                # them to the replacement action list.
+                from .sequence import _token_list
+
+                tokens = _token_list(gspec.get("tokens"), label="sequence tokens")
+                parent = (_token_list(gspec["parent"], label="sequence parent", unique=False)
+                          if "parent" in gspec else [])
+                universe = list(dict.fromkeys(tokens + parent))
+                hook = getattr(predictor, "sequence_constraints", None)
+                if callable(hook):
+                    inferred = hook(gspec.get("name", ""), universe)
+                    if not isinstance(inferred, list) or any(not isinstance(b, dict) for b in inferred):
+                        raise ValueError("sequence_constraints must return a list of count-constraint mappings")
+                    configured = gspec.get("count_constraints", [])
+                    if not isinstance(configured, list):
+                        raise ValueError("count_constraints must be a list")
+                    bounds = deepcopy(configured)
+                    for bound in inferred:
+                        if bound not in bounds:
+                            bounds.append(deepcopy(bound))
+                    gspec["count_constraints"] = bounds
             gspec["constraint_filter"] = build_constraint_filter(gspec, env=None)
             built_groups.append(gspec)
         env = MultiGroupEnv(groups=built_groups, reward_fn=mg_reward_fn)

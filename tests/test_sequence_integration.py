@@ -164,13 +164,10 @@ def test_checkpoint_rejects_reordered_vocabulary_with_identical_dimensions(tmp_p
     assert not (rejected_dir / "sequence_schema.json").exists()
 
 
-def test_relative_token_catalog_is_resolved_from_config_directory(tmp_path, monkeypatch):
+def test_inline_tokens_work_independently_of_config_directory(tmp_path, monkeypatch):
     config_dir = tmp_path / "scenario"
     config_dir.mkdir()
-    catalog = config_dir / "monomers.csv"
-    catalog.write_text("id,category\nA,other\nC,counted\nD,other\n", encoding="utf-8")
     cfg = sequence_config()
-    cfg["groups"][1]["tokens"] = {"csv": "monomers.csv", "id_column": "id"}
     config_path = config_dir / "design.yaml"
     config_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
     unrelated_dir = tmp_path / "working_directory"
@@ -178,7 +175,7 @@ def test_relative_token_catalog_is_resolved_from_config_directory(tmp_path, monk
     monkeypatch.chdir(unrelated_dir)
 
     loaded = load_config(str(config_path))
-    assert Path(loaded["groups"][1]["tokens"]["csv"]) == catalog.resolve()
+    assert loaded["groups"][1]["tokens"] == ["A", "C", "D"]
     env, _, _ = build_env(loaded, _RecordingPredictor())
     sequence = ["C", "C"] + ["A"] * 9
     assert _candidate(env, sequence)["peptide"] == sequence

@@ -60,3 +60,40 @@ def write_sequence_config(path: Path) -> Path:
     """Write the fixture in a test's temporary directory for the CLI runner."""
     path.write_text(yaml.safe_dump(sequence_config()), encoding="utf-8")
     return path
+
+
+class CountedSequencePredictor:
+    """Synthetic domain adapter: C is a counted token, with no chemistry claim."""
+
+    def __init__(self, cfg=None, seed=None):
+        self.calls = 0
+
+    def sequence_constraints(self, group_name, tokens):
+        if group_name != "peptide":
+            return []
+        if set(tokens) - {"A", "C", "D", "P"}:
+            raise ValueError("Unknown fixture token")
+        return [{"tokens": ["C"], "min": 2, "max": 2}]
+
+    def predict(self, candidate):
+        sequence = candidate["peptide"]
+        assert len(sequence) == 5 and sequence.count("C") == 2
+        self.calls += 1
+        return float(sum(i + 1 for i, token in enumerate(sequence) if token == "D")), 0.25
+
+
+def mutation_config() -> dict:
+    cfg = sequence_config()
+    cfg["groups"][1] = {
+        "name": "peptide", "kind": "sequence", "tokens": ["A", "C", "D"],
+        "parent": ["P", "C", "A", "C", "A"], "num_mutations": 2,
+    }
+    cfg.pop("predictor")
+    cfg["properties"] = [{
+        "name": "activity", "predictor": "tests.sequence_fixture:CountedSequencePredictor",
+        "direction": "max", "objective": "mean_minus_kstd",
+    }]
+    cfg["dqn_target_mode"] = "mc"
+    cfg["dqn_gamma"] = 1.0
+    cfg["dqn_augment_permutations"] = 0
+    return cfg

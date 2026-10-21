@@ -437,6 +437,26 @@ class StructureScorePredictor:
         """Return ``{name: (mean, std)}`` per objective, for CSV logging."""
         return dict(self._raw_stats(candidate))
 
+    def sequence_constraints(self, group_name: str, tokens: List[str]) -> list[dict]:
+        """Collect optional domain-owned count bounds before constructing an env.
+
+        Leaves resolve token identities; the generic environment only enforces
+        the resulting name sets. All objective/model requirements apply jointly.
+        """
+        constraints = []
+        for prop in self.properties:
+            for leaf in prop.get("instance") or []:
+                hook = getattr(leaf, "sequence_constraints", None)
+                if not callable(hook):
+                    continue
+                bounds = hook(group_name, list(tokens))
+                if not isinstance(bounds, list) or any(not isinstance(b, dict) for b in bounds):
+                    raise ValueError("sequence_constraints must return a list of count-constraint mappings")
+                for bound in bounds:
+                    if bound not in constraints:
+                        constraints.append(deepcopy(bound))
+        return constraints
+
     def candidate_metadata(self, candidate: Any) -> dict:
         """Return diagnostics captured with the cached prediction.
 
