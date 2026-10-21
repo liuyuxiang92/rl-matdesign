@@ -2,7 +2,8 @@
 
 RL 与 GP 使用同一个 Python 环境。RL 通过现有的 FQN 插件接口导入
 `gp_physchem.api:PeptidePredictor`。RL 使用名称列表定义允许替换的单体，GP 负责把名称
-解析为结构、手性和描述符。新单体的化学定义仍可由 GP 读取 `new_monomers.csv`。
+解析为结构、手性和描述符。GP 默认读取自己目录中的 `examples/new_monomers.csv`，
+RL 无需填写该文件的路径。
 不需要运行准备命令，也不生成或读取 `catalog.csv`、manifest、GP worker 或描述符缓存文件。
 
 ## 安装与运行
@@ -14,7 +15,7 @@ python -m pip install -e /path/to/rl-matdesign
 python -m pip install -e /path/to/gp_physchem
 ```
 
-需要同步本次 GP API 改动，包括可选的 `new_monomers`、已知单体复用和
+需要同步本次 GP API 改动，包括包内新单体 CSV 的默认加载、已知单体复用和
 `sequence_constraints` 接口。只有旧版 `PeptidePredictor` 还不够：它会把 CSV 名称
 范围当作全部允许输入，并且不会自动提供巯基约束。旧版仅有脚本的 GP 还需要安装配置。
 RL 的 Git 仓库不包含外部 GP 项目，提交或更新 RL 不会自动同步 GP 源码。
@@ -22,7 +23,8 @@ GP 包声明自己的依赖版本，RL 所需的 PyTorch 等依赖也应安装�
 建议为这套组合单独建立环境，避免改变其他材料模型使用的依赖。
 
 本地配置保存在 `configs/peptide_gp.yaml`，由 `.gitignore` 忽略。
-其中与 GP 有关的配置形状如下。示例只使用 GP 字典已知名称，因此无需新单体 CSV：
+其中与 GP 有关的配置形状如下。单体选择只需填写候选名称、母序列和替换次数，
+化学定义文件由 GP 自行定位：
 
 ```yaml
 groups:
@@ -57,9 +59,9 @@ k: 1.0
 由 GP 内置字典解析，仍能留在母肽中。去掉 `parent` 和 `num_mutations` 两项就恢复
 从头选择 11 个残基；其他配置保持同一种写法。
 
-如果候选列表含 `BB103` 等 GP 字典未知名称，在该 property 中增加
-`new_monomers: /absolute/path/to/new_monomers.csv`，并在 `tokens` 中显式列出希望选择
-的名称。GP 读取该文件的 `monomer`、结构 SMILES 和手性等化学定义；文件包含的其他
+如果候选列表含 `BB103` 等新单体，只需在 `tokens` 中显式列出希望选择的名称，
+并确保 GP 自己的 `examples/new_monomers.csv` 中已有对应定义。GP 读取该文件的
+`monomer`、结构 SMILES 和手性等化学定义；文件包含的其他
 单体不会自动加入 RL 动作范围。GP 能识别的全部单体才是可预测范围。与内置名称重复
 的定义必须保持化学身份一致，否则启动时报错，不能覆盖已有训练描述符。
 
@@ -69,8 +71,8 @@ GP 从候选与母肽名称对应的化学结构自动提供“最终恰好两�
 
 旧 `tokens: {csv: ..., id_column: ...}` 和 CSV 列 `where` 约束已经移除。将候选改为
 名称列表，删除重复维护的巯基列表，保留 GP 所需的新单体化学定义文件即可。
-HPO 原样传递名称列表、母肽和替换次数；GP 插件的 `new_monomers` 建议使用绝对路径，
-通用 HPO 不改写插件自定义字段的路径约定。
+HPO 原样传递名称列表、母肽和替换次数。GP 按自身安装位置定位 CSV，
+不依赖启动目录或 trial 目录；RL 配置不需要 `new_monomers` 字段。
 
 在同一 YAML 中保留所需训练和生成预算，然后在 RL 仓库根目录运行：
 
@@ -81,9 +83,9 @@ rl-matdesign \
   --train-seed 0 --gen-seed 0
 ```
 
-A2C 和 REINFORCE 只需改变 `--method`。GP 的训练表和词典默认来自安装的 GP 包，
-也可在 property 中通过 `train`、`dictionary` 指定原始文件。`new_monomers` 只扩展
-GP 能理解的化学定义；RL 的动作范围始终由 `tokens` 决定。
+A2C 和 REINFORCE 只需改变 `--method`。GP 的训练表、词典和新单体 CSV 默认都来自
+安装的 GP 包。CSV 扩展 GP 能理解的化学定义；RL 的动作范围始终由 `tokens` 决定。
+直接调用 GP API 的其他应用仍可显式覆盖输入文件，但这套 RL 配置无需设置这些路径。
 
 ## MC 与 HPO 起步流程
 
@@ -160,7 +162,7 @@ HPO 当前比较每个 run 的 `generated.csv` 中 reward 最高的 10 个候选
 
 ## 运行时发生什么
 
-1. GP 接口读取原始词典，以及配置了才读取的新单体 CSV；调用原有化学函数，在内存中计算描述符。
+1. GP 接口读取原始词典和自己目录中的 `examples/new_monomers.csv`；调用原有化学函数，在内存中计算描述符。
 2. 用原始训练表调用 `train_matrix` 和 `fit_gp`，每个 predictor 实例只拟合一次。
 3. 环境初始化时，GP 的 `sequence_constraints` 根据候选与母肽名称提供巯基数量约束。
 4. RL 选择 N 端，并自由构建序列或对母序列执行 n 次“选位置、选残基”；过程不调用 GP 评分。

@@ -10,6 +10,7 @@ import importlib
 import json
 import os
 from pathlib import Path
+import runpy
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -33,6 +34,16 @@ def test_direct_api_does_not_import_unrelated_top_level_modules(gp_api, monkeypa
     imported = importlib.import_module("gp_physchem.api")
     assert callable(imported.PeptidePredictor)
     assert all(sys.modules[name] is sentinel for name, sentinel in unrelated.items())
+
+
+def test_bundled_catalog_default_is_relative_to_gp_package(gp_api, monkeypatch, tmp_path):
+    monkeypatch.delenv("GP_PHYSCHEM_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)
+    values = runpy.run_path(gp_api.config.__file__)
+    package_root = Path(gp_api.config.__file__).resolve().parent
+    assert values["EXAMPLES"] == package_root / "examples"
+    assert values["NEW_MONOMERS"] == values["EXAMPLES"] / "new_monomers.csv"
+    assert values["NEW_MONOMERS"].is_absolute()
 
 
 @pytest.fixture
@@ -106,6 +117,7 @@ def mock_gp_inputs(gp_api, monkeypatch, tmp_path):
     monkeypatch.setattr(gp_api, "featurise", lambda seqs, columns, table, ring, nres, acetyl: np.asarray(acetyl).reshape(-1, 1))
     monkeypatch.setattr(gp_api, "predict_gp", predict)
     monkeypatch.setattr(gp_api, "build_peptide", build)
+    monkeypatch.setattr(gp_api.config, "NEW_MONOMERS", source)
     cfg = {"new_monomers": str(source), "dictionary": str(dictionary), "train": str(train)}
     return gp_api, cfg, calls
 
@@ -196,9 +208,53 @@ def test_direct_api_rejects_invalid_candidates_before_prediction(mock_gp_inputs,
 
 
 
-def test_direct_api_uses_native_dictionary_without_extra_csv(mock_gp_inputs):
+def test_direct_api_loads_gp_default_catalog_from_any_working_directory(mock_gp_inputs, monkeypatch, tmp_path):
+    api, cfg, calls = mock_gp_inputs
+    source = Path(cfg.pop("new_monomers"))
+    workdir = tmp_path / "rl_working_directory"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    predictor = api.PeptidePredictor(cfg)
+    assert predictor.new_monomers == source
+    assert predictor.tokens == ["BB1", "BB2", "BB3", "BB6"]
+    assert predictor.sequence_constraints("peptide", predictor.tokens) == [
+        {"tokens": ["BB1", "BB6"], "min": 2, "max": 2}
+    ]
+    assert predictor.predict(_candidate()) == (7.0, 0.5)
+    assert calls["descriptor"] == 4
+    assert calls["fit"] == 1
+    assert list(workdir.iterdir()) == []
+
+
+def test_direct_api_missing_default_catalog_fails_before_fitting(mock_gp_inputs, monkeypatch, tmp_path):
     api, cfg, calls = mock_gp_inputs
     cfg.pop("new_monomers")
+    monkeypatch.setattr(api.config, "NEW_MONOMERS", tmp_path / "missing_new_monomers.csv")
+    with pytest.raises(FileNotFoundError, match="missing_new_monomers.csv"):
+        api.PeptidePredictor(cfg)
+    assert calls["library"] == calls["descriptor"] == calls["fit"] == 0
+
+
+@pytest.mark.parametrize("missing_default", [False, True])
+def test_direct_api_explicit_catalog_overrides_gp_default(mock_gp_inputs, monkeypatch, tmp_path, missing_default):
+    api, cfg, calls = mock_gp_inputs
+    if missing_default:
+        monkeypatch.setattr(api.config, "NEW_MONOMERS", tmp_path / "missing_default.csv")
+    override = tmp_path / "custom_monomers.csv"
+    override.write_text("monomer,has_free_thiol,mapped_thiol,can_assemble\nBB8,0,0,1\n")
+    predictor = api.PeptidePredictor({**cfg, "new_monomers": str(override)})
+    assert predictor.new_monomers == override
+    assert predictor.tokens == ["BB8"]
+    candidate = {"peptide": ["C"] + ["BB8"] * 9 + ["b-HCys"], "n_terminal": {"treatment": "H"}}
+    assert predictor.predict(candidate) == (7.0, 0.5)
+    with pytest.raises(ValueError, match="unknown monomer"):
+        predictor.sequence_constraints("peptide", ["BB2", "C"])
+    assert calls["descriptor"] == calls["fit"] == 1
+
+
+def test_direct_api_uses_native_dictionary_when_extra_catalog_explicitly_disabled(mock_gp_inputs):
+    api, cfg, calls = mock_gp_inputs
+    cfg["new_monomers"] = None
     predictor = api.PeptidePredictor(cfg)
     assert predictor.new_monomers is None
     assert predictor.tokens == predictor.thiol_tokens == []
@@ -346,6 +402,7 @@ def real_gp_report(tmp_path_factory):
     with pytest.MonkeyPatch.context() as patch:
         patch.chdir(workdir)
         patch.setattr(sys, "dont_write_bytecode", True)
+        patch.setattr(api.config, "NEW_MONOMERS", root / "examples/new_monomers.csv")
         original = load_library(root / "data/monomer_dictionary.csv", root / "examples/new_monomers.csv")
         raw = pd.read_csv(root / "examples/new_monomers.csv", encoding="utf-8-sig")
         tokens = raw.monomer.tolist()
@@ -357,7 +414,6 @@ def real_gp_report(tmp_path_factory):
         model, scaler = fit_gp(matrix, train.pIC50_from_1000nM.to_numpy(float))
 
         predictor = api.PeptidePredictor({
-            "new_monomers": str(root / "examples/new_monomers.csv"),
             "dictionary": str(root / "data/monomer_dictionary.csv"),
             "train": str(root / "data/long_table.csv"),
         })

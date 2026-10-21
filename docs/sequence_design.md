@@ -131,9 +131,10 @@ than the order of edits.
 
 `tokens: {csv: ..., id_column: ...}` and CSV-column `where` constraints are no
 longer accepted. Replace the former with `tokens: [name1, name2, ...]`, and use
-explicit count sets or a predictor-supplied constraint hook. A chemistry file
-such as GP's `new_monomers` can still be configured inside that predictor; it is
-not an RL candidate-list input and HPO does not rewrite its path.
+explicit count sets or a predictor-supplied constraint hook. GP owns and loads
+its existing `examples/new_monomers.csv` relative to its package directory;
+the RL configuration needs no chemistry-file path. RL and HPO use the inline
+names to define the replacement choices.
 
 ## GP-side adapter contract
 
@@ -251,9 +252,9 @@ An additional exhaustive audit matched 1,976 prefix masks in 200 small random
 search spaces. These checks establish software behavior, not GP accuracy.
 
 The current GP path directly imports the installed GP package in the same Python
-process. Its optional monomer CSV provides chemistry definitions; RL receives
-the chosen names directly in YAML. Application-specific chemistry lives
-in that package, as documented in [gp_physchem integration](gp_physchem_integration.md).
+process. Its package-owned monomer CSV is loaded by default and provides chemistry
+definitions; RL receives the chosen names directly in YAML. Application-specific
+chemistry lives in that package, as documented in [gp_physchem integration](gp_physchem_integration.md).
 After removing the former process bridge, the full generic suite passed 458 tests
 with 2 missing-material-fixture skips; external GP API checks run separately when
 that package is installed. This extension covers the RL runner; BO/GA baselines
