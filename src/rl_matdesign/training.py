@@ -333,6 +333,8 @@ def _augment_episode_in_buffer(
     """
     global _AUG_WARNED_NO_ALTS, _AUG_WARNED_FIXED_ORDER
 
+    if K > 0 and getattr(env, "has_fields", False):
+        raise ValueError("Named fields use a fixed filling order; set dqn_augment_permutations=0")
     if K > 0 and getattr(env, "order_sensitive", False):
         raise ValueError("Permutation augmentation cannot reuse rewards for ordered sequences; set dqn_augment_permutations=0")
 
@@ -585,6 +587,8 @@ def train_dqn_online(
     """
     from .model import QRegressor
 
+    if augment_permutations > 0 and getattr(env, "has_fields", False):
+        raise ValueError("Named fields use a fixed filling order; set dqn_augment_permutations=0")
     if augment_permutations > 0 and getattr(env, "order_sensitive", False):
         raise ValueError("Permutation augmentation cannot reuse rewards for ordered sequences; set dqn_augment_permutations=0")
 
@@ -1680,7 +1684,7 @@ def generate_candidates(
                 "reward": reward,
                 "dp_mean": raw_mean,
             }
-            if getattr(env, "has_sequences", False):
+            if getattr(env, "has_explicit_features", False):
                 import json
 
                 row["candidate_json"] = json.dumps(comp, ensure_ascii=False, sort_keys=True)

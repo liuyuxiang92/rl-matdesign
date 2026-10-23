@@ -36,6 +36,8 @@ Design
 """
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
+from numbers import Real
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -44,6 +46,59 @@ from .encoding import decode_one_hot, encode_choice
 from .env import CompositionEnv, EpisodeStep, _step_one_hot
 from .env_integer import IntegerRatioEnv
 from .featurization import featurize_formula
+
+
+def _field_values(spec: Any) -> List[Any]:
+    """Expand a named field's discrete values without rounding its identities."""
+    if isinstance(spec, dict):
+        if set(spec) != {"min", "max", "step"}:
+            raise ValueError("field values grid requires exactly min, max and step")
+        try:
+            lo, hi, step = (Decimal(str(spec[key])) for key in ("min", "max", "step"))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("field values grid must contain finite numbers") from exc
+        if not all(value.is_finite() for value in (lo, hi, step)):
+            raise ValueError("field values grid must contain finite numbers")
+        if step <= 0 or hi < lo:
+            raise ValueError("field values grid needs step > 0 and max >= min")
+        intervals = (hi - lo) / step
+        if intervals != intervals.to_integral_value():
+            raise ValueError("field values grid max must lie exactly on the min/step grid")
+        exact = [lo + index * step for index in range(int(intervals) + 1)]
+        # Preserve integer grids as integers and fractional grids as numbers.
+        integer_grid = all(value == value.to_integral_value() for value in (lo, hi, step))
+        values = [int(value) if integer_grid else float(value) for value in exact]
+    elif isinstance(spec, (list, tuple)):
+        values = list(spec)
+    else:
+        raise ValueError("field values must be a non-empty list or {min, max, step} grid")
+    if not values:
+        raise ValueError("field values must be non-empty")
+    for value in values:
+        if not isinstance(value, (str, bool, Real)):
+            raise ValueError("field values must be scalar strings, booleans or finite numbers")
+        if isinstance(value, Real) and not np.isfinite(value):
+            raise ValueError("field values must be finite")
+    keys = [(type(value).__name__, value) for value in values]
+    if len(set(keys)) != len(keys):
+        raise ValueError("field values must be unique, including their scalar types")
+    return values
+
+
+def _field_codes(values: List[Any]) -> List[str]:
+    """Finite, unique scalar action codes in [0, 1]; retain physical distances."""
+    if len(values) == 1:
+        return ["0.0"]
+    if all(isinstance(value, Real) and not isinstance(value, bool) for value in values):
+        exact = [Decimal(str(value)) for value in values]
+        lo, hi = min(exact), max(exact)
+        if hi > lo:
+            codes = [repr(float((value - lo) / (hi - lo))) for value in exact]
+            if len(set(codes)) == len(codes):
+                return codes
+    # Labels (and typed alternatives such as 1 versus 1.0) have no physical
+    # distance. Their declared indices remain distinguishable scalar actions.
+    return [repr(index / (len(values) - 1)) for index in range(len(values))]
 
 
 def normalize_group_spec(g: Dict[str, Any]) -> Dict[str, Any]:
@@ -109,6 +164,13 @@ class CategoricalGroup:
     O-forms without the names colliding in the one-hot alphabet — the builder maps
     each name back to its element via :attr:`slot_element`.
 
+    A ``{name: temperature, values: [...]}`` slot without ``element`` is a
+    generic experimental field. Its values may also be a ``{min, max, step}``
+    grid. Its original typed values reach the predictor, while action codes
+    use the physical range for numbers or declared indices for labels, both
+    normalized to [0, 1]. Filling order is computational; the final mapping
+    carries no sequence-position semantics.
+
     Presents the minimal inner-group interface ``MultiGroupEnv`` drives.
     """
 
@@ -116,10 +178,17 @@ class CategoricalGroup:
                  index_codes: bool = False) -> None:
         # (name, element, values) — name is the unique slot id used for encoding
         # and as the terminal key; element is the real chemistry for the builder.
-        self.slots: List[Tuple[str, str, List[Any]]] = [
-            (str(c.get("name", c["element"])), str(c["element"]), list(c["values"]))
-            for c in choices
-        ]
+        self.slots: List[Tuple[str, str, List[Any]]] = []
+        self.field_slots: List[bool] = []
+        for choice in choices:
+            is_field = "element" not in choice
+            name = choice.get("name", choice.get("element"))
+            if name is None or not str(name):
+                raise ValueError("categorical choices require a non-empty name or element")
+            values = _field_values(choice["values"]) if is_field else list(choice["values"])
+            self.slots.append((str(name), str(choice.get("element", name)), values))
+            self.field_slots.append(is_field)
+        self.has_fields = any(self.field_slots)
         if not self.slots:
             raise ValueError("categorical group needs a non-empty 'choices' list.")
         self.species_set: List[str] = [name for name, _el, _v in self.slots]
@@ -137,12 +206,14 @@ class CategoricalGroup:
         self._slot_codes: List[List[Tuple[Any, str]]] = []
         self._code_to_value: List[Dict[str, Any]] = []
         codes: set[str] = set()
-        for _name, _el, values in self.slots:
+        for (_name, _el, values), is_field in zip(self.slots, self.field_slots):
             if index_codes and (not values or len({(type(v).__name__, str(v)) for v in values}) != len(values)):
                 raise ValueError("categorical choices must have non-empty, unique values")
             sc, c2v = [], {}
+            field_codes = _field_codes(values) if is_field else None
             for i, v in enumerate(values):
-                code = f"{float(i):.2f}" if index_codes else self._encode_value(v, i)
+                code = (field_codes[i] if field_codes is not None else
+                        f"{float(i):.2f}" if index_codes else self._encode_value(v, i))
                 sc.append((v, code))
                 c2v[code] = v
                 codes.add(code)
@@ -238,6 +309,12 @@ class MultiGroupEnv:
         self.episode_style = "multi_group"
         self._constraints_enabled = True
         self.has_sequences = any(g.get("kind") == "sequence" for g in groups)
+        self.has_fields = any(
+            g.get("kind") == "categorical" and
+            any("element" not in choice for choice in g.get("choices", []))
+            for g in groups
+        )
+        self.has_explicit_features = self.has_sequences or self.has_fields
         self.order_sensitive = self.has_sequences
 
         # Build one inner CompositionEnv per group. Inner reward is a no-op — this
@@ -338,18 +415,18 @@ class MultiGroupEnv:
         """Per-step state = concat of each group's partial-composition features."""
         return np.concatenate(
             [inner.current_state_features()
-             if self.has_sequences and kind in ("sequence", "categorical")
+             if self.has_explicit_features and kind in ("sequence", "categorical")
              else np.asarray(self.state_featurizer(inner.state), dtype=float)
              for kind, inner in zip(self._kinds, self._inners)]
         )
 
     def action_features(self) -> np.ndarray | None:
-        """Explicit token identity features for domains with ordered sequences.
+        """Explicit token/field identity features for nonchemical domains.
 
         Returning None retains the existing elemental feature path for materials.
         Tokens are identifiers, so parsing them as chemical formulas is invalid.
         """
-        return np.eye(len(self.species_set), dtype=float) if self.has_sequences else None
+        return np.eye(len(self.species_set), dtype=float) if self.has_explicit_features else None
 
     def design_schema(self) -> dict:
         """Persist feature/decision semantics so checkpoint reuse cannot reorder IDs."""
@@ -360,12 +437,17 @@ class MultiGroupEnv:
                 spec.update(inner.design_schema())
             elif kind == "categorical":
                 spec["slots"] = inner.slots
+                if self.has_fields:
+                    spec["field_slots"] = inner.field_slots
             else:
                 spec.update(species=inner.species_set, fractions=inner.fraction_set,
                             length=inner.n_components)
             groups.append(spec)
-        return {"version": 1, "groups": groups, "actions": self.species_set,
-                "amount_codes": self.fraction_set}
+        schema = {"version": 1, "groups": groups, "actions": self.species_set,
+                  "amount_codes": self.fraction_set}
+        if self.has_fields:
+            schema["field_encoding"] = "physical_range_or_typed_index_v1"
+        return schema
 
     def current_state_features(self) -> np.ndarray:
         """Material features of the current state (uniform accessor; see CompositionEnv)."""
@@ -399,8 +481,8 @@ class MultiGroupEnv:
         # CompositionEnv.step's ordering.
         s_material = self._concat_features()
         current_allowed = self.allowed_actions()
-        if self.has_sequences and action not in current_allowed:
-            raise ValueError("Action is not allowed in the current sequence design state")
+        if self.has_explicit_features and action not in current_allowed:
+            raise ValueError("Action is not allowed in the current sequence/field design state")
 
         # Decode the union action and re-encode into the active group's alphabet.
         elem = decode_one_hot(action[0], self.species_set)
@@ -458,14 +540,19 @@ class MultiGroupEnv:
         """Structured candidate: group mappings or ordered lists of token IDs."""
         if not self._is_terminal():
             raise RuntimeError("terminal_cation_fractions called before terminal step")
-        return {
+        candidate = {
             name: inner.cation_fractions()
             for name, inner in zip(self.group_names, self._inners)
         }
+        if self.has_fields:
+            from .utils.composition import FieldCandidate
+
+            return FieldCandidate(candidate)
+        return candidate
 
     def terminal_comp_key(self) -> tuple:
         """Canonical hashable key over all groups for dedup/visit-tracking."""
-        if self.has_sequences:
+        if self.has_explicit_features:
             from .utils.composition import composition_key
 
             return composition_key(self.terminal_cation_fractions())
@@ -482,8 +569,8 @@ class MultiGroupEnv:
         with ``sites=1`` this is just the fractions — consistent with a plain
         ``fraction`` env.
         """
-        if self.has_sequences:
-            raise TypeError("Sequence tokens are not an elemental composition")
+        if self.has_explicit_features:
+            raise TypeError("Sequence tokens and named fields are not an elemental composition")
         out: Dict[str, float] = {}
         for inner, sites, kind in zip(self._inners, self._sites, self._kinds):
             for el, val in inner.cation_fractions().items():
@@ -501,7 +588,7 @@ class MultiGroupEnv:
         """Readable assembled chemical formula (per formula unit), for generated.csv."""
         if not self._is_terminal():
             return ""
-        if self.has_sequences:
+        if self.has_explicit_features:
             import json
 
             return json.dumps(self.terminal_cation_fractions(), ensure_ascii=False,

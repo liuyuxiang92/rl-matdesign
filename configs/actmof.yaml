@@ -1,0 +1,59 @@
+# Encoded conditions from ActMOF, NOT physical units.
+# Prepare scores: python scripts/prepare_actmof_lookup.py --download --out data/actmof
+# Run using scripts/run_experiment.py; output is the usual generated.csv.
+groups:
+  - name: conditions
+    kind: categorical
+    choices:
+      - name: metal_amount
+        values: {min: 5, max: 75, step: 1}
+      - name: modulator
+        values: {min: 5, max: 15, step: 1}
+      - name: add_solvent
+        values: {min: 0, max: 30, step: 1}
+      - name: reaction_time
+        values: {min: 1, max: 12, step: 1}
+      - name: reaction_temperature
+        values: {min: 10, max: 30, step: 1}
+
+properties:
+  - name: q
+    predictor: rl_matdesign.predictors.lookup:LookupPredictor
+    model: data/actmof/lookup.npz
+    direction: max
+    objective: mean
+    # Numerical conditioning only: generated.csv retains raw q in obj_q_mean.
+    scale: 100000
+
+method: dqn
+dqn_target_mode: mc
+dqn_warmup_eps: 3
+dqn_num_train_eps: 117
+dqn_hidden_dim: 128
+dqn_buffer_size: 10000
+dqn_batch_size: 32
+dqn_grad_steps_per_ep: 5
+dqn_target_update_freq: 12
+dqn_eps_anneal_eps: 117
+dqn_eps_min: 0.05
+dqn_lr: 0.001
+dqn_loss: smoothl1
+dqn_gamma: 1.0
+dqn_augment_permutations: 0
+
+pg_warmup_eps: 3
+pg_num_iters: 39
+pg_batch_eps: 3
+pg_lr_actor: 0.001
+pg_lr_critic: 0.001
+pg_entropy_coef: 0.01
+pg_entropy_min: 0.3
+gamma: 1.0
+
+# Generation is a separate stage, as for materials and peptide design.
+# These 200 requested candidates are additional to training; this config is
+# a normal RL example, not the paper's 120-query comparison protocol.
+num_gen_eps: 200
+exploration_gen_eps: 0
+gen_temperature: 0.3
+gen_epsilon: 0.05

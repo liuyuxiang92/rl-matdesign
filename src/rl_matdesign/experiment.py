@@ -213,7 +213,7 @@ def main() -> None:
                 elem_feats_scaled.shape[1] == 0 or not np.isfinite(elem_feats_scaled).all()):
             raise ValueError("Environment action_features must be a finite matrix with one row per action token")
 
-    if getattr(env, "has_sequences", False):
+    if getattr(env, "has_explicit_features", False):
         from .utils.design_schema import save_or_check_design_schema
 
         load_paths = []
@@ -543,7 +543,7 @@ def main() -> None:
                 if value_net is not None:
                     if not os.path.exists(vnet_path):
                         raise SystemExit(f"--resume-training (a2c) requires {vnet_path} (use --load-value-net to override)")
-                    if getattr(env, "has_sequences", False):
+                    if getattr(env, "has_explicit_features", False):
                         save_or_check_design_schema(env.design_schema(), args.out, load_paths=[vnet_path])
                     value_net.load_state_dict(torch.load(vnet_path, map_location=device))
                     print(f"[INFO] Loaded value_net from {vnet_path}", flush=True)

@@ -5,6 +5,14 @@ from numbers import Integral, Real
 from typing import Any
 
 
+class FieldCandidate(dict):
+    """Named-field mapping whose scalar types and exact values are identities.
+
+    It retains the normal dict/JSON interface while allowing shared caches to
+    distinguish field tokens without changing legacy composition cache keys.
+    """
+
+
 def _contains_sequence(candidate: Any) -> bool:
     if isinstance(candidate, (list, tuple)):
         return True
@@ -13,16 +21,20 @@ def _contains_sequence(candidate: Any) -> bool:
     return False
 
 
-def _ordered_candidate_key(candidate: Any) -> Any:
+def _ordered_candidate_key(candidate: Any, *, sort_mappings: bool = False) -> Any:
     """Freeze a structured candidate without conflating identifiers and numbers."""
     if isinstance(candidate, dict):
-        return ("mapping", frozenset(
-            (_ordered_candidate_key(key), _ordered_candidate_key(value))
+        pairs = (
+            (_ordered_candidate_key(key, sort_mappings=sort_mappings),
+             _ordered_candidate_key(value, sort_mappings=sort_mappings))
             for key, value in candidate.items()
-        ))
+        )
+        # Plain tuples are also supported by torch's restricted checkpoint
+        # loader; keep historical sequence frozensets for cache compatibility.
+        return ("mapping", tuple(sorted(pairs, key=repr)) if sort_mappings else frozenset(pairs))
     if isinstance(candidate, (list, tuple)):
         return ("list" if isinstance(candidate, list) else "tuple",
-                tuple(_ordered_candidate_key(value) for value in candidate))
+                tuple(_ordered_candidate_key(value, sort_mappings=sort_mappings) for value in candidate))
     if candidate is None:
         return ("none",)
     if isinstance(candidate, str):
@@ -48,7 +60,11 @@ def composition_key(candidate: Any, *, decimals: int | None = None) -> Any:
     explicit marker separates them from legacy composition keys. Mappings
     without sequences keep their historical numeric coercion and rounding,
     preserving existing composition caches and checkpoint compatibility.
+    ``FieldCandidate`` explicitly opts named fields into exact typed identities
+    without adding a marker to the predictor's visible mapping or its JSON.
     """
+    if isinstance(candidate, FieldCandidate):
+        return ("field_candidate", _ordered_candidate_key(candidate, sort_mappings=True))
     if _contains_sequence(candidate):
         return ("ordered_candidate", _ordered_candidate_key(candidate))
     if isinstance(candidate, dict):

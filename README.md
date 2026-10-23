@@ -17,6 +17,10 @@ interface and the 11-position synthetic example, and
 See [code layout and compatibility](docs/code_layout.md) for maintained entry
 points, module responsibilities, and regression checks.
 
+Named experimental fields reuse `kind: categorical` and the same training and
+`generated.csv` workflow. See [field design and external scores](docs/field_design.md)
+for configuration, predictor integration, and the ActMOF score-table example.
+
 
 ---
 

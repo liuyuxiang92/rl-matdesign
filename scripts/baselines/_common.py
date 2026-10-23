@@ -115,7 +115,7 @@ def decode_choices(env, choices: List[int]) -> Optional[Dict[str, object]]:
         return None
     return {
         "formula": env.terminal_formula,
-        "comp": dict(env.terminal_cation_fractions()),
+        "comp": env.terminal_cation_fractions(),
         "key": env.terminal_comp_key(),
     }
 
@@ -141,7 +141,7 @@ def random_choices(env, rng: random.Random) -> Tuple[List[int], Dict[str, object
         env.step(allowed[idx])
     return choices, {
         "formula": env.terminal_formula,
-        "comp": dict(env.terminal_cation_fractions()),
+        "comp": env.terminal_cation_fractions(),
         "key": env.terminal_comp_key(),
     }
 

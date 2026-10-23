@@ -1,4 +1,4 @@
-"""Guard checkpoint reuse when ordered token/action semantics change."""
+"""Guard checkpoint reuse when token, field or action semantics change."""
 from __future__ import annotations
 
 import json
@@ -12,20 +12,25 @@ def save_or_check_design_schema(schema: dict, output_dir: str, *, load_paths=())
     Keep sequence_schema.json beside exported weights and scalers when moving them.
     """
     expected = json.loads(json.dumps(schema, ensure_ascii=False))
+    # Keep the established sequence manifest and its diagnostics unchanged.
+    # Named fields are a new domain, with a general design manifest.
+    named_fields = "field_encoding" in schema
+    manifest_name = "design_schema.json" if named_fields else "sequence_schema.json"
+    domain = "Field" if named_fields else "Sequence"
     # Python considers True == 1 == 1.0; categorical token codes must not.
     def signature(value):
         return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False)
 
     expected_signature = signature(expected)
     for parent in {Path(path).resolve().parent for path in load_paths}:
-        manifest = parent / "sequence_schema.json"
+        manifest = parent / manifest_name
         if not manifest.is_file():
-            raise ValueError(f"Sequence checkpoint requires {manifest}; token semantics cannot be verified")
+            raise ValueError(f"{domain} checkpoint requires {manifest}; token semantics cannot be verified")
         with manifest.open(encoding="utf-8") as stream:
             actual = json.load(stream)
         if signature(actual) != expected_signature:
-            raise ValueError(f"Sequence design differs from {manifest}; retrain after changing tokens, order, choices or constraints")
-    destination = Path(output_dir) / "sequence_schema.json"
+            raise ValueError(f"{domain} design differs from {manifest}; retrain after changing tokens, order, choices or constraints")
+    destination = Path(output_dir) / manifest_name
     # A new training attempt can fail before replacing weights. Never relabel
     # old artifacts with a new vocabulary merely because a run was started.
     artifacts = ("qnet.pt", "policy.pt", "value_net.pt", "checkpoint.pt", "std_scaler.bin")
@@ -35,7 +40,7 @@ def save_or_check_design_schema(schema: dict, output_dir: str, *, load_paths=())
         with destination.open(encoding="utf-8") as stream:
             previous = json.load(stream)
         if signature(previous) != expected_signature:
-            raise ValueError(f"Sequence design differs from existing artifacts in {output_dir}; use a new output directory")
+            raise ValueError(f"{domain} design differs from existing artifacts in {output_dir}; use a new output directory")
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(expected, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
