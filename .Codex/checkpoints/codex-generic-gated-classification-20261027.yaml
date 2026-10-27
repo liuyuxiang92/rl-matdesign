@@ -1,0 +1,62 @@
+checkpoint_version: 3.0.0
+created_at: '2026-10-27T09:56:55.806499+00:00'
+branch: codex/generic-gated-classification
+base_main: 354b09796923c2f97c73a6be8c65052652fc1a51
+phase:
+  current: implementation_complete
+  completed:
+  - api_inspection
+  - implementation
+  - unit_and_integration_tests
+  - real_checkpoint_smoke
+  - independent_review
+  - reflection
+  next: []
+state:
+  worktree: /Users/liuyuxiang/.codex/worktrees/generic-gated-classification/rl-matdesign
+  commit_status: local implementation commit including this checkpoint; no merge or
+    push
+  decisions:
+  - decision: Generic weighted_sum and gated only; direct predict_proba; explicit
+      classification index.
+    rationale: User approved main-based implementation with no product, no delta normalization,
+      no Pareto training or RL-side softmax.
+  experiments:
+  - name: full_regression_suite
+    status: completed
+    result: 465 passed, 4 optional-fixture skips; one pre-existing deprecation warning
+    command: PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 /opt/anaconda3/bin/python
+      -m pytest -p no:cacheprovider
+  - name: subsequently_added_gated_rl_flows
+    status: completed
+    result: '3 passed: DQN, REINFORCE, A2C; CSV values checked against formula'
+    command: PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 /opt/anaconda3/bin/python
+      -m pytest -p no:cacheprovider tests/test_reward_integration.py -k reaches
+  - name: real_classification_checkpoint
+    status: completed
+    result:
+      pure_probabilities:
+      - 0.02469815484489379
+      - 0.013018774286060353
+      mean: 0.018858464565477073
+      ensemble_std: 0.0
+      gated_reward: -10.781141535434523
+    scope: Two synthetic cubic SrTiO3 API inputs; actual supplied checkpoint and latest
+      source. No real material optimization or prediction-accuracy validation.
+blockers: []
+artifacts:
+- path: README.md
+  role: delta and classification gated configuration example
+- path: docs/yaml_config_reference.md
+  role: complete configuration semantics
+- path: src/rl_matdesign/rewards.py
+  role: generic combiner
+- path: tests/test_reward_integration.py
+  role: cross-path and RL end-to-end coverage
+resume_instructions: Work only in this isolated worktree. Inspect git status and diff;
+  main and the original codex/peptide-gp-integration checkout were not modified. Implementation
+  is complete in a local feature commit. Merge/push only if subsequently requested.
+  Production classification needs the user-provided updated DeepMD runtime; current
+  global deepmd3 installation alone lacks classification support. Read docs for class
+  index semantics and choose scientific thresholds/failure baseline for the actual
+  delta scale.

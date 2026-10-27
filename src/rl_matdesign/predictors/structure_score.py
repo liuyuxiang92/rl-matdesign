@@ -3,17 +3,17 @@
 One predictor per objective, folded into a single reward:
 
     for each property:
-      predictor: dp_energy | dp_property      -> build (+ optional relax) a
+      predictor: dp_energy | dp_property | dp_classification -> build (+ optional relax) a
                                                  structure, score with DeepMD
       predictor: rf_magpie | <fqn> | ...      -> score the composition directly
-    reward = Σ weight·objective_from_mean_std(direction·mean, std, obj) / scale
+    reward.type: weighted_sum (default) or gated, using weighted-sum scores
 
 Single vs multi-objective is **auto-detected** from the list length — one entry
-is the single-objective case, the same fold with one term. There is no separate
-mode and no ``backend``/``mode`` key.
+is the single-objective case, the same fold with one term. The optional
+``reward.type`` selects how those properties are combined.
 
-Structure objectives (``dp_energy``/``dp_property``) build a cell; the
-``share_structure`` boolean controls reuse:
+Structure objectives (``dp_energy``/``dp_property``/``dp_classification``) build
+cells; the ``share_structure`` boolean controls reuse:
 
 * ``share_structure: true`` (default) — build **one** structure with the
   top-level builder, relax it **once**, score every structure objective on that
@@ -55,7 +55,7 @@ then averages the structures axis and takes mean/std across models, so a single
 :func:`_fold_models_structures`.
 
 Consumer contract (``training.py``): exposes ``predict`` (reward, std),
-``predict_raw`` (Σ weight·direction·mean/scale, for the ``dp_mean`` CSV column),
+``predict_raw`` (same reward rule without std penalties, for ``dp_mean``),
 and ``per_objective_stats`` ({name: (mean, std)} for per-objective CSV columns).
 
 Config keys
@@ -75,8 +75,10 @@ Config keys
                       substituted into each property's fparam ``null`` slot and
                       reported as a ``<name>`` stat (→ ``obj_<name>_mean`` CSV
                       column). Structures are built+relaxed once and reused.
+    reward:           optional combination rule: weighted_sum (default) or gated.
+                      See rl_matdesign.rewards.RewardCombiner.
     properties:       non-empty list; each entry:
-        name, predictor (dp_energy|dp_property|rf_magpie|<fqn>), direction
+        name, predictor (dp_energy|dp_property|dp_classification|rf_magpie|<fqn>), direction
         (max|min, REQUIRED), weight, scale, objective. Structure predictors also
         take models (or legacy dp_models), head, output_index, output_aggregator,
         energy_per_atom, fparam, aparam; a ``null`` in ``fparam`` marks the slot
@@ -167,7 +169,7 @@ class StructureScorePredictor:
         if not raw_props:
             raise ValueError(
                 "reward needs a non-empty 'properties' list. Each entry is one "
-                "objective: {name, predictor: dp_energy|dp_property|rf_magpie|<fqn>, "
+                "objective: {name, predictor: dp_energy|dp_property|dp_classification|rf_magpie|<fqn>, "
                 "direction: max|min, ...}."
             )
 
@@ -176,7 +178,7 @@ class StructureScorePredictor:
 
         self.properties: List[Dict[str, Any]] = []
         # Per-property structure builder (share_structure: false), keyed by name;
-        # only structure predictors (dp_energy/dp_property) get one.
+        # only structure predictors get one.
         self._builders: Dict[str, Any] = {}
         seen: set[str] = set()
         for i, p in enumerate(raw_props):
@@ -192,10 +194,10 @@ class StructureScorePredictor:
             if not predictor_name:
                 raise ValueError(
                     f"properties[{i}] ({name!r}) needs a 'predictor' — one of "
-                    "'dp_energy', 'dp_property', a registry leaf (e.g. 'rf_magpie', "
+                    "'dp_energy', 'dp_property', 'dp_classification', a registry leaf (e.g. 'rf_magpie', "
                     "'ooh'), or an FQN 'pkg.mod:Class'."
                 )
-            is_dp_backend = predictor_name in ("dp_energy", "dp_property")
+            is_dp_backend = predictor_name in ("dp_energy", "dp_property", "dp_classification")
 
             # direction is REQUIRED — the sign (lower vs higher is better) must be
             # explicit, never implied.
@@ -286,7 +288,29 @@ class StructureScorePredictor:
                         f"properties[{i}] ({name!r}) with predictor={predictor_name!r} "
                         "needs 'models' (list of DeepMD checkpoint paths)."
                     )
-                backend = "energy" if predictor_name == "dp_energy" else "property"
+                backend = predictor_name.removeprefix("dp_")
+                if backend == "classification":
+                    if not isinstance(models, (list, tuple)):
+                        raise ValueError(f"properties[{i}].models must be a list of paths.")
+                    aggregator = p.get("output_aggregator", "index")
+                    if aggregator not in ("index", "mean", "max"):
+                        raise ValueError(f"properties[{i}].output_aggregator must be index, mean, or max.")
+                    index = p.get("output_index")
+                    if aggregator == "index" and (
+                        isinstance(index, bool) or not isinstance(index, int) or index < 0
+                    ):
+                        raise ValueError(
+                            f"properties[{i}] dp_classification needs an explicit non-negative "
+                            "integer output_index matching the model's class order."
+                        )
+                    if transform != "none":
+                        raise ValueError("dp_classification probabilities require transform: none.")
+                    if p.get("head") is not None and not isinstance(p["head"], str):
+                        raise ValueError("dp_classification head must be a branch name string.")
+                    if "output_kind" in p:
+                        raise ValueError(
+                            "dp_classification always calls predict_proba(); remove output_kind."
+                        )
                 instance = None
                 is_structure = True
             else:
@@ -358,6 +382,12 @@ class StructureScorePredictor:
                     str(sub_cfg.get("builder", top_builder)), sub_cfg, seed=child_seed
                 )
 
+        from ..rewards import RewardCombiner
+
+        self._reward_combiner = RewardCombiner(
+            cfg.get("reward"), {p["name"]: p["weight"] for p in self.properties}
+        )
+
         # Any structure predictor present? Only then do we need a builder / base
         # POSCAR — a pure composition-predictor config (e.g. rf_magpie) builds
         # nothing.
@@ -390,17 +420,25 @@ class StructureScorePredictor:
     # PropertyPredictor protocol
     # ------------------------------------------------------------------
 
-    def _combine(self, stats: Dict[str, Tuple[float, float]]) -> float:
-        """Weighted/signed/scaled fold of per-property stats into one reward.
+    def _reward_details(
+        self, stats: Dict[str, Tuple[float, float]], *, raw: bool = False,
+    ) -> Dict[str, Any]:
+        """Use one reward rule for training, generation, sweeps and diagnostics."""
+        means = {p["name"]: stats[p["name"]][0] for p in self.properties}
+        values = {
+            p["name"]: self._property_value(
+                p, stats[p["name"]][0], 0.0 if raw else stats[p["name"]][1]
+            ) / p["scale"]
+            for p in self.properties
+        }
+        return self._reward_combiner.evaluate(means, values)
 
-        Shared by ``predict`` and the sweep argmax so both rank temperatures by
-        the identical objective.
-        """
-        reward = 0.0
-        for prop in self.properties:
-            m, s = stats[prop["name"]]
-            reward += prop["weight"] * self._property_value(prop, m, s) / prop["scale"]
-        return float(reward)
+    def _combine(self, stats: Dict[str, Tuple[float, float]]) -> float:
+        return self._reward_details(stats)["reward"]
+
+    def reward_details(self, candidate: Any) -> Dict[str, Any]:
+        """Return objective and gate diagnostics using the cached property stats."""
+        return self._reward_details(self._raw_stats(candidate))
 
     def _property_value(self, prop: Dict[str, Any], mean: float, std: float) -> float:
         """Signed 'higher is better' value for ONE objective, before weight/scale.
@@ -428,7 +466,7 @@ class StructureScorePredictor:
         return reward, float(np.mean(stds)) if stds else 0.0
 
     def predict_raw(self, candidate: Any) -> Tuple[float, float]:
-        """Combined value from raw means (no std penalty) — for the dp_mean column."""
+        """Same reward rule with std set to zero — for the dp_mean column."""
         return float(self.raw_combine(self._raw_stats(candidate))), 0.0
 
     def per_objective_stats(self, candidate: Any) -> Dict[str, Tuple[float, float]]:
@@ -497,23 +535,22 @@ class StructureScorePredictor:
                     )
                     for p in self.properties
                 }
-            rows.append({"value": v, "stats": stats, "reward": self._combine(stats)})
+            details = self._reward_details(stats)
+            rows.append({
+                "value": v, "stats": stats, "reward": details["reward"],
+                "reward_details": details,
+            })
         best = max(rows, key=lambda r: r["reward"])
         return {"rows": rows, "best": best, "structures": prop_structures}
 
     def raw_combine(self, stats: Dict[str, Tuple[float, float]]) -> float:
-        """Σ weight·direction·mean/scale (no std penalty) — the dp_mean fold.
+        """Apply the configured reward rule without std penalties.
 
-        Mirrors :meth:`predict_raw` but operates on already-computed stats, so a
-        caller holding a ``score_breakdown`` result need not re-score.
+        For the default weighted sum this preserves the historical dp_mean.
+        For gated rewards it uses the same gates and failure branch; individual
+        physical means remain available through per_objective_stats.
         """
-        raw = 0.0
-        for prop in self.properties:
-            m, _s = stats[prop["name"]]
-            # std = 0 collapses every objective to the plain value, so for a
-            # max/min property this is exactly `direction * mean` as before.
-            raw += prop["weight"] * self._property_value(prop, m, 0.0) / prop["scale"]
-        return float(raw)
+        return self._reward_details(stats, raw=True)["reward"]
 
     # ------------------------------------------------------------------
     # Internal
@@ -522,7 +559,7 @@ class StructureScorePredictor:
     def _materialize_structures(self, candidate: Any) -> Dict[str, Any]:
         """Resolve the per-property scoring input once, independent of any sweep.
 
-        For a **structure** objective (dp_energy/dp_property) the input is a list
+        For a **structure** objective (including dp_classification) the input is a list
         of built (and optionally relaxed) cells — shared across objectives when
         ``share_structure``, else built per objective. For a **composition**
         objective (rf_magpie / FQN leaf) the input is just the candidate
@@ -623,9 +660,13 @@ class StructureScorePredictor:
                 energy_per_atom=prop["energy_per_atom"],
             )
         else:
-            from ..utils.dp_eval import eval_property_ensemble
+            from ..utils.dp_eval import eval_classification_ensemble, eval_property_ensemble
             models, elem_to_type = self._get_prop_models(prop)
-            values = eval_property_ensemble(
+            evaluate = (
+                eval_classification_ensemble if prop["backend"] == "classification"
+                else eval_property_ensemble
+            )
+            values = evaluate(
                 structures, models, elem_to_type,
                 output_index=prop["output_index"],
                 output_aggregator=prop["output_aggregator"],
@@ -699,12 +740,26 @@ class StructureScorePredictor:
     def _get_prop_models(self, prop: Dict[str, Any]) -> Tuple[List[Any], Dict[str, int]]:
         name = prop["name"]
         if name not in self._prop_cache:
-            from deepmd.pt.infer.deep_eval import DeepProperty
+            if prop["backend"] == "classification":
+                from deepmd.infer import DeepEval
+                factory = DeepEval
+            else:
+                from deepmd.pt.infer.deep_eval import DeepProperty
+                factory = DeepProperty
             models = [
-                DeepProperty(model_file=p, auto_batch_size=False, head=prop["head"])
+                factory(model_file=p, auto_batch_size=False, head=prop["head"])
                 for p in prop["models"]
             ]
-            type_map = models[0].get_type_map()
+            if prop["backend"] == "classification" and any(
+                not callable(getattr(model, "predict_proba", None)) for model in models
+            ):
+                raise ValueError(
+                    "dp_classification requires a classification head and a DeepMD version "
+                    "providing predict_proba()."
+                )
+            type_map = list(models[0].get_type_map())
+            if any(list(model.get_type_map()) != type_map for model in models[1:]):
+                raise ValueError(f"Property {name!r}: ensemble models must share the same type_map.")
             self._prop_cache[name] = (models, {el: i for i, el in enumerate(type_map)})
         return self._prop_cache[name]
 

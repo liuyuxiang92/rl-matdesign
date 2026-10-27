@@ -1508,8 +1508,9 @@ def generate_candidates(
     Raw predictor values are fetched via ``predictor.predict_raw()`` when
     available (OOHCatalystPredictor exposes this), falling back to
     ``predictor.predict()`` otherwise.  This ensures ``dp_mean`` stores the
-    raw property value (e.g. overpotential in mV for OOH), not a transformed
-    reward scalar.
+    raw property value for a single predictor (e.g. overpotential in mV for
+    OOH). The multi-property engine instead records its configured combination
+    without std penalties; obj_<name>_mean columns retain physical values.
     """
     if policy is None and qnet is None:
         raise ValueError("Provide either policy (PG) or qnet (DQN).")
@@ -1671,6 +1672,17 @@ def generate_candidates(
             else:
                 row["dp_std"] = std
                 row["dp_mean_minus_std"] = raw_mean - k * std
+            details_fn = getattr(predictor, "reward_details", None)
+            if callable(details_fn):
+                details = details_fn(comp)
+                if details["type"] == "gated":
+                    row["reward_objective"] = float(details["objective"])
+                    row["gate_passed"] = bool(details["gate_passed"])
+                    for gate in details["gates"]:
+                        prefix = f"gate_{gate['name']}"
+                        row[f"{prefix}_value"] = float(gate["score"])
+                        row[f"{prefix}_passed"] = bool(gate["passed"])
+                        row[f"{prefix}_violation"] = float(gate["violation"])
             if use_check_phase:
                 phase_ok, phase_label = predictor.check_phase(comp)
                 row["primary_ok"] = bool(phase_ok)

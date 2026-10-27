@@ -1,0 +1,19 @@
+- id: pitfall-dp-output-001
+  date: '2026-10-27'
+  expires: '2027-01-27'
+  title: Unpack DeepProperty tuple before iterating frames
+  wrong: 'Converting DeepProperty.eval() directly to np.asarray adds an outer tuple
+    axis: (nframes,K) becomes (1,nframes,K).'
+  right: Unwrap the documented tuple first, retain legacy ndarray support, and validate
+    the number of returned frames in utils/dp_eval.py. Classification should call
+    DeepMD predict_proba() directly and validate its (nframes,K) probability matrix.
+  impact: Only one frame was iterated and remaining entries of the preallocated ensemble
+    array could remain uninitialized. Multi-configuration regression rewards could
+    be incorrect.
+  files:
+  - src/rl_matdesign/utils/dp_eval.py
+  - tests/test_dp_eval.py
+  tags:
+  - deepmd
+  - inference-contract
+  - batching
