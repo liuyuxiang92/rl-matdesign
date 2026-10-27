@@ -75,7 +75,7 @@ def _make_dummy(cfg: dict, **_):
 
 
 # Leaf predictors usable as a flat `predictor:` or as a `properties[].predictor:`
-# inside the reward engine. `dp_energy`/`dp_property` are NOT here — they are
+# inside the reward engine. `dp_energy`/`dp_property`/`dp_classification` are NOT here — they are
 # structure-scoring branches handled internally by the engine (they need its
 # build/relax machinery), not standalone composition leaves.
 def _make_mgtransformer(cfg: dict, *, seed: Optional[int] = None, **_):
@@ -357,6 +357,8 @@ def build_reward(cfg: dict, *, seed: Optional[int] = None):
     props = cfg.get("properties")
     if isinstance(props, list) and props:
         return _make_structure_score(cfg, seed=seed)
+    if "reward" in cfg:
+        raise ValueError("A 'reward' combination rule requires a non-empty 'properties' list.")
     kind = cfg.get("predictor")
     if not kind:
         raise ValueError(

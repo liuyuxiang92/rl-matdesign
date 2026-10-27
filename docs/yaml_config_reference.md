@@ -12,9 +12,10 @@ colorlinks: true
 # Overview
 
 A run is configured by one YAML file plus a few CLI flags. The three pluggable
-layers are chosen by **`env_type`** (the search space), **`predictor`** (the
-reward), and **`constraint_filter`** (action masking); each then reads its own
-keys. The RL and generation knobs are shared across scenarios.
+layers configure the search space, property prediction, and action masking.
+A non-empty **`properties`** list selects the reward engine; each entry names
+its **`predictor`**. A flat top-level `predictor` is also supported for a single
+standalone predictor. The RL and generation knobs are shared across scenarios.
 
 - The YAML is the base; a few CLI flags override matching keys.
 - **Seeds are CLI-only**: `--dp-seed` (predictor RNG), `--train-seed` (training;
@@ -119,34 +120,44 @@ list. The dopant fraction must remain strictly below 25%.
 
 \newpage
 
-# 4. Predictors (`predictor:`)
+# 4. Property prediction and reward
+
+A non-empty `properties:` list selects the reward engine automatically, for
+one or many properties. Set `properties[].predictor` to one of the following:
 
 | Value | What it does |
 |---|---|
-| `dummy` | Random reward (default; no models — smoke tests) |
-| `structure_score` | **The one structure-based predictor** — build -> [relax] -> score N properties -> combine (see below) |
+| `dp_energy` | DeepMD potential energy on built structures |
+| `dp_property` | DeepMD regression head on built structures |
+| `dp_classification` | DeepMD class probabilities on built structures |
+| `rf_magpie` | RandomForest prediction from composition; `model` selects the checkpoint |
 | `ooh` | OOH overpotential (adsorbate slabs) |
-| `sinter_calcine` | RandomForest sintering/calcine temperature |
+| `mgtransformer` | External MGTransformer predictor |
+| `dummy` | Random score for smoke tests |
 | `"pkg.mod:Class"` | Your own predictor (FQN) |
 
-## `structure_score` keys
+The three `dp_*` entries are structure-scoring branches of the reward engine,
+not standalone top-level predictors. Registry leaves and FQNs can also be used
+as a flat top-level `predictor`. `predictor: structure_score` remains an engine
+alias but is unnecessary with a non-empty `properties` list.
 
-One predictor steered by dials. The pipeline is
-`builder.build -> [relax once, optional] -> score each property -> combine`.
-It replaces the former `dp_structure` / `dp_property` / `composite` /
-`structure_pipeline` (and the `hea` / `perovskite` aliases): each is now just a
-particular setting of the dials below.
+## Reward engine keys
+
+The pipeline is `build -> [relax, optional] -> score properties -> combine`.
+Composition-only properties do not require a structure or a builder. The
+combiner supports any property names, independent of the material system.
 
 | Key | What it does | Default |
 |---|---|---|
 | `builder` | Builder name/FQN (`substitute` = fixed-lattice element swap; `sse` = doped supercell; or `pkg.mod:Class`) | `substitute` |
-| `share_structure` | `true` = build+relax **one** cell, score all properties on it; `false` = each property builds its **own** | `true` |
+| `share_structure` | `true` = build+relax shared structures, score all structure properties on them; `false` = each property builds its own | `true` |
 | `n_random_configs` | Random placements per candidate | `1` |
 | `geo_opt` | Relaxation stage (see below); omit / `enabled: false` to skip | optional |
-| `properties` | Non-empty list of objective specs (see below) | required |
-| `k` | Uncertainty coefficient | `1.0` |
+| `properties` | Non-empty list of property specs (see below) | required |
+| `reward` | Combination rule: `type: weighted_sum` or `type: gated` | weighted sum |
+| `k` | Uncertainty coefficient for property objectives | `1.0` |
 | `sweep` | Optional `{name, values}` — optimize a shared operating condition (e.g. temperature) per composition (see below) | optional |
-| `base_poscar` / `site_symbol` | Builder knobs (for `substitute`); inherited by per-objective builders when `share_structure: false` | — |
+| `base_poscar` / `site_symbol` | Builder knobs (for `substitute`); inherited by per-property builders when `share_structure: false` | — |
 
 `geo_opt:` sub-keys — `model` (default `models/DPA-3.1-3M.pt`), `head` (user-defined),
 `fmax` (`0.001`), `steps` (`1000`), `relax_cell` (`true`), `enabled` (`true`).
@@ -156,19 +167,20 @@ particular setting of the dials below.
 | Key | What it does | Default |
 |---|---|---|
 | `name` | Unique label (CSV column prefix) | `prop{i}` |
-| `backend` | `energy` (DP potential energy via ASE) or `property` (DP `DeepProperty` head) | `property` |
-| `models` (or legacy `dp_models`) | Ensemble checkpoint list | required |
-| `head` | DP head (energy: calculator head; property: `DeepProperty` head) | none |
-| `direction` | `max` / `min` / `target` (energy: use `min` for "lower is better") | **required** |
+| `predictor` | `dp_energy`, `dp_property`, `dp_classification`, a registry leaf, or an FQN | **required** |
+| `models` (or legacy `dp_models`) | DeepMD ensemble checkpoint list; registry leaves use their own keys such as `model` | required for `dp_*` |
+| `head` | DeepMD branch name; explicitly select the classification head in multi-head checkpoints | none |
+| `direction` | `max` / `min` / `target` (`dp_energy`: use `min` for "lower is better") | **required** |
 | `target_value` | Value to hit, in the property's real units. Required with `direction: target`. **Not** the leaf's `model:`/checkpoint key. | — |
 | `target_tolerance` | Deadband half-width; inside it the term is at its maximum (0) and stops competing with other objectives | `0.0` |
 | `weight` / `scale` | Combine weight / unit scale | `1.0` / `1.0` |
 | `objective` | `mean_minus_kstd` / `mean` / `mean_plus_kstd` | `mean_minus_kstd` |
-| `energy_per_atom` *(energy backend)* | Normalize by atom count | `true` |
-| `output_index` / `output_aggregator` *(property backend)* | Which vector component / collapse mode | `0` / `index` (`index`/`mean`/`max`) |
-| `fparam` / `aparam` *(property backend)* | Frame / atomic parameters for heads trained with them. A `null` in `fparam` marks the slot filled by the `sweep` value (requires a top-level `sweep`) | none |
+| `energy_per_atom` *(`dp_energy`)* | Normalize by atom count | `true` |
+| `output_index` / `output_aggregator` *(`dp_property`, `dp_classification`)* | Select a vector component, or collapse output channels using `mean` / `max` | aggregator `index`; index `0` for regression, **explicit index required for classification in `index` mode** |
+| `transform` | `none`, or `exp` for regression heads predicting log-values; classification uses `none` | `none` |
+| `fparam` / `aparam` *(`dp_property`, `dp_classification`)* | Frame / atomic parameters for heads trained with them. A `null` in `fparam` marks the slot filled by the `sweep` value (requires a top-level `sweep`) | none |
 
-Reward = `sum weight * value(prop) / scale`, where `value` is
+The default weighted-sum reward is `sum weight * value(prop) / scale`, where `value` is
 
 - `max`/`min`: `objective_from_mean_std(direction*mean, std, objective, k)`
 - `target`:    `objective_from_mean_std(-e, std, objective, k)` with
@@ -191,7 +203,132 @@ Two axes, folded separately and deliberately not pooled:
 So `mean` is the mean of the per-model averages and `std` is the spread **across models**.
 A single model therefore gives `std == 0` exactly, whatever `n_random_configs` is, and
 `mean_minus_kstd` is then identical to `mean` — no flag needed.
-over the properties (identical formula in both `share_structure` regimes).
+The same fold is used in both `share_structure` regimes.
+
+### `dp_classification`: class probabilities
+
+Use a classification-enabled DeepMD installation that exposes
+`DeepClassification.predict_proba`. The engine loads each checkpoint using the
+public `DeepEval(..., head=...)` factory and calls `predict_proba()` directly.
+DeepMD returns a probability array of shape `(n_frames, num_classes)`.
+The engine does not parse `dp test` output, consume logits, or implement softmax.
+There is no `output_kind` setting.
+
+```yaml
+properties:
+  - name: pure_probability
+    predictor: dp_classification
+    models: [models/synthesizability.pt]
+    head: synthesizability
+    output_aggregator: index
+    output_index: 2                  # trained order: impure, nearly pure, pure
+    direction: max
+    objective: mean
+```
+
+For a binary model whose training labels are `[impure, pure]`, set
+`output_index: 1`. The engine checks the index against the model's number of
+classes; the user must supply its meaning from the training labels. Class
+count alone cannot identify which class means "pure". For ensembles, all
+checkpoints must use the same class order and meaning.
+
+`output_aggregator` acts on the class channels **within one frame**:
+`index` selects the requested class; `max` selects the most confident class
+regardless of its identity; `mean` averages the classes and is always `1/K`
+for `K` classes, so it is unsuitable as a synthesizability score. It does not
+control averaging across configurations.
+
+For class `k`, the composition score is the mean of `p[j,k]` across the
+`n_random_configs` structures. Multiple checkpoints then follow the model
+mean/std fold above. A single checkpoint gives `std = 0`, even when its
+configuration probabilities differ. `1 - p_pure` means predicted probability
+of a different class; it is not the model-ensemble standard deviation. The
+probabilities themselves do not provide an independent uncertainty estimate.
+
+### `reward`: weighted sum or gated
+
+Omitting `reward` or writing `reward: {type: weighted_sum}` preserves the
+existing combination and property weights. No automatic normalization is
+introduced: use the default `scale: 1.0` to keep delta in its original units.
+
+For a piecewise reward, choose `type: gated`. Every gate must pass before the
+objective is used. Gate scores and the objective can each combine multiple
+properties. For example, append this block to a configuration with properties
+named `delta`, `conductivity`, `pure_probability`, and `stability`:
+
+```yaml
+reward:
+  type: gated
+  gates:
+    - name: synthesis
+      score:
+        type: weighted_sum
+        terms: {pure_probability: 1.0}
+      min: 0.8
+      penalty_weight: 1.0
+    - name: combined_requirement
+      score:
+        type: weighted_sum
+        terms: {stability: 0.7, pure_probability: 0.3}
+      min: 0.5
+      max: 1.0
+      penalty_weight: 2.0
+  objective:
+    type: weighted_sum
+    terms: {delta: 1.0, conductivity: 0.2}
+  failure:
+    reward: -10.0
+```
+
+The names and numeric thresholds above are illustrative; choose coefficients
+and thresholds for your properties' units and meaning. No environment,
+builder, predictor, or property name is hard-coded in the combination rule.
+
+| Setting | Meaning |
+|---|---|
+| `reward.type` | `weighted_sum` (default) or `gated` |
+| `reward.objective` | Optional `{type: weighted_sum, terms: {property_name: coefficient}}`; omitted means all properties with their configured `weight` |
+| `reward.gates` | Non-empty list for `gated`; all gates must pass |
+| `gates[].name` | Unique label used in diagnostics |
+| `gates[].score` | `{type: weighted_sum, terms: {property_name: coefficient}}` |
+| `gates[].min` / `max` | At least one bound required; both ends are inclusive |
+| `gates[].penalty_weight` | Nonnegative coefficient multiplying this gate's violation; default `1.0` |
+| `reward.failure.reward` | Required for `gated`; base reward for any failing candidate, chosen for the objective's range |
+
+Gate scores use **raw property means**: property `direction`, `objective`,
+`weight`, and `scale` are not applied. Thus a gate on `pure_probability` compares
+the actual averaged probability to its threshold. Its score is
+`g = sum(coefficient * property_mean)` and its violation is
+`max(min - g, 0) + max(g - max, 0)`, omitting a term when that bound is absent.
+This also permits multi-property requirements without assigning their signs
+implicitly.
+
+The optimization objective uses the same direction, target, uncertainty, and
+optional scale handling as the legacy weighted sum. Explicit `terms`
+coefficients **replace** each selected property's `weight`; they do not
+multiply it again. Only properties named in `terms` contribute. An omitted
+objective uses all property weights, so specify an objective explicitly when
+some properties should only serve as requirements. An explicit objective is
+also available with `type: weighted_sum`.
+
+If every gate passes, reward equals the objective. Otherwise it equals
+`failure.reward - sum(penalty_weight * violation)` over all gates. With only a
+pure-probability gate at `0.8` and base `-10`, a candidate at `0.7` gets `-10.1`.
+Penalties use the gate score's raw units. They do not rescale delta or the
+objective. A fixed failure base guarantees that every passing candidate ranks
+higher only when it is below a known lower bound of the feasible objective.
+Choose it for the actual objective range; no such guarantee follows for an
+objective with an unknown or unbounded lower range.
+
+The same reward is used for training, generation, and operating-condition
+sweeps. The predictor's `reward_details` exposes objective and gate diagnostics.
+Generated candidate CSVs include `reward_objective`, `gate_passed`, and
+`gate_<name>_value`, `gate_<name>_passed`, `gate_<name>_violation`; per-property
+`obj_<name>_mean/std` retain their original meaning. `dp_mean` applies the same
+reward rule with objective standard deviations set to zero, including the
+same gates and failure branch; it is not an individual property's mean.
+Changing the reward does not rewrite saved replay-buffer targets. Start a new run or recompute those targets
+before training with the new definition.
 
 ### `sweep:` — per-composition operating-condition optimization
 
@@ -208,12 +345,12 @@ sweep:
   values: [460, 470, 480, 490]
 properties:
   - name: conductivity
-    backend: property
+    predictor: dp_property
     fparam: [3.9568e-05, null, 6]      # null = the swept temperature slot
     direction: max
     ...
   - name: stability
-    backend: property
+    predictor: dp_property
     fparam: [3.9568e-05, null, 6, 4]
     direction: max
     ...
@@ -221,17 +358,17 @@ properties:
 
 The chosen value is logged per candidate as `obj_<name>_mean` (e.g.
 `obj_temperature_mean`) in `generated.csv`. A property with no `null` in its
-`fparam` (or an `energy` backend) is condition-independent — scored once and
+`fparam` (or a `dp_energy` predictor) is condition-independent — scored once and
 contributing equally at every sweep value.
 
-**Migration cheatsheet** (old -> `structure_score`):
+**Migration cheatsheet** (old -> `properties` entries):
 
 | Old predictor | Now |
 |---|---|
-| `dp_structure` | `builder: substitute`, one property `backend: energy`, `direction: min` |
-| `dp_property` | `builder: substitute`, one property `backend: property` |
+| `dp_structure` | `builder: substitute`, one property `predictor: dp_energy`, `direction: min` |
+| `dp_property` | `builder: substitute`, one property `predictor: dp_property` |
 | `hea` / `perovskite` | as `dp_structure`, with `site_symbol: X` / `Fe` |
-| `structure_pipeline` | `share_structure: true` (default), N `backend: property` objectives |
+| `structure_pipeline` | `share_structure: true` (default), N `predictor: dp_property` properties |
 | `composite` | `share_structure: false`, the `objectives:` list becomes `properties:` |
 
 ## `ooh` keys
@@ -256,9 +393,10 @@ frame. Changing `adsorbates` or `output_index` invalidates a saved `dp_cache`
 (they are folded into the cache key), so a resumed run pays a one-time recompute
 instead of returning values that describe a different structure.
 
-## `sinter_calcine` keys
+## `rf_magpie` keys
 
-`rf_model` (joblib path), `mode` (`sinter` / `calcine`).
+`model` is the joblib checkpoint path. Use separate named properties for
+sintering and calcination, as in `configs/oxides_sinter_calcine.yaml`.
 
 \newpage
 

@@ -2615,3 +2615,15 @@ update defect_site.py's docstring, then write the new test file.
 - Removed one OOH presence toggle, three derived environment-type fields and twelve derived composition-grid unit fields. Updated two HPO base-config references for the copied directory layout and two obsolete CLI seed examples. Scientific settings/budgets otherwise match parsed sources.
 - All23 runtime configs completed a constant-reward episode; all6 HPO configs passed base-reference/search-space validation. All original configs and historical analysis definitions retain their hashes. Persisted a complete29-config ignored snapshot in the original checkout's `runs/cleanup_integration_configs_20261015/` so private files do not depend on the temporary worktree surviving.
 - Reflect: applied existing cleanup-scope decision; historical analysis semantics stay separate. No new parameter, core-code change, real-model run, main merge or push. Private configuration persistence is recorded explicitly because Git branches carry only tracked files. Evidence: `docs/validation/config_cleanup_20261015.{md,json}`.
+
+### 2026-10-27 — Generic gated rewards and DeepMD classification
+<!-- concepts: reward-composition, deepmd-inference, uncertainty-aggregation -->
+- Implemented in an isolated worktree from main 354b0979 on codex/generic-gated-classification; original dirty experiment checkout was preserved. Saved as a local feature commit; no merge or push.
+- Default weighted sum is retained; gated supports multi-property raw-mean gates and a separately weighted objective. No product, forced delta normalization or Pareto training. Direct DeepMD predict_proba supports binary and multiclass models with explicit class selection and configuration-then-model averaging.
+- Fixed shared DeepProperty tuple unpacking; inspection found all main raw property eval calls use this helper. Training, generation, cached diagnostics and operating-condition sweeps use the same reward rule.
+- Validation: full suite 465 passed / 4 optional-fixture skips; three subsequently added gated DQN/REINFORCE/A2C subprocess tests passed (468 tested passes total). Real supplied three-class checkpoint passed the new loader/evaluation/fold path on two synthetic SrTiO3 cells, using latest user source plus the installed native library in a process-local import bridge. This validates API behavior, not synthesizability accuracy. No environment installation was performed.
+- Reflect: persisted the DP tuple pitfall and generic reward/classification decision. Class probabilities and ensemble std remain distinct; failure baselines must be chosen against the actual feasible objective range.
+
+### EARS — Commit Digest (2026-10-27 17:58)
+<!-- concepts: worktree-isolation, reward-composition, deepmd-inference -->
+- The EARS notification named an unrelated generated-CSV-columns commit in the original checkout. That work is outside this task; no findings about it are inferred or recorded here. This worktree's task is generic gated rewards and direct DeepMD classification, with design and validation captured above. Keep the checkpoint and inference-contract fix with this isolated main-based implementation.

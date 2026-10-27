@@ -220,10 +220,12 @@ under built-in short names (Tier 3).
 ### Tier 1 — pure YAML
 
 For any system whose reward is "substitute composition onto a base POSCAR,
-evaluate with one or more DeepMD models, aggregate to a scalar", use the
-built-in `predictor: structure_score` with `builder: substitute` and one
-`backend: energy` property. See `configs/ti_alloy.yaml` for the canonical
-multi-objective example. A minimal YAML:
+evaluate with one or more DeepMD models, aggregate to a scalar", use
+a `properties:` list with `builder: substitute` and a property whose
+`predictor` is `dp_energy`, `dp_property`, or `dp_classification`. The list
+automatically selects the reward engine. Composition-only predictors can use
+the same engine without a builder; see `configs/oxides_sinter_calcine.yaml` for
+a multi-objective example. A minimal YAML:
 
 ```yaml
 # Environment
@@ -239,14 +241,13 @@ element_bounds:                                 # per-element [min, max]
   # ...
 
 # Predictor
-predictor: structure_score
 builder: substitute                             # fixed-lattice element swap
 base_poscar: data/ti_alloy/FCC.POSCAR           # placeholder 'X' on sub sites
 site_symbol: X
 k: 1.0
 properties:
   - name: energy
-    backend: energy                             # DP potential energy
+    predictor: dp_energy                        # DP potential energy
     models: [models/ti/m1.pt, models/ti/m2.pt]
     direction: min                              # lower energy = better
     objective: mean_minus_kstd                  # reward = -mean - k*std
@@ -266,6 +267,72 @@ python scripts/run_experiment.py \
 ```
 
 **Zero Python required.**
+
+### Combining properties and synthesizability
+
+The default reward remains the weighted sum of the configured properties.
+Set top-level `reward.type: gated` to optimize an objective only after all
+requirements pass. Both the objective and each gate can be weighted sums of
+any named properties, including composition-only predictors; this is shared
+across material systems.
+
+This fragment assumes that the environment and structure builder have already
+been configured, and that you supply the two model files:
+
+```yaml
+n_random_configs: 10
+properties:
+  - name: delta
+    predictor: dp_property
+    models: [models/delta.pt]
+    output_index: 0
+    direction: max
+    objective: mean
+    scale: 1.0                       # delta stays in its original units
+  - name: pure_probability
+    predictor: dp_classification
+    models: [models/synthesizability.pt]
+    head: synthesizability
+    output_index: 2                  # [impure, nearly pure, pure]
+    direction: max
+    objective: mean
+
+reward:
+  type: gated
+  gates:
+    - name: synthesis
+      score:
+        type: weighted_sum
+        terms: {pure_probability: 1.0}
+      min: 0.8
+      penalty_weight: 1.0
+  objective:
+    type: weighted_sum
+    terms: {delta: 1.0}
+  failure:
+    reward: -10.0
+```
+
+For a binary model trained with labels `[impure, pure]`, change `output_index`
+to `1`; class meanings must match the model's training labels. The classifier
+uses DeepMD's Python `predict_proba()` directly, requiring a classification-enabled
+DeepMD installation. No `dp test` output or probability conversion in
+rl-matdesign is needed. The selected probability is averaged across the
+`n_random_configs` structures. With several model files, the engine then
+computes mean and standard deviation across those model averages; one file
+gives `std = 0`. This standard deviation is not `1 - p`.
+
+Here a mean pure probability of at least `0.8` gives reward `delta`; otherwise,
+reward is `-10 - (0.8 - pure_probability)`. The failure value is configurable.
+To guarantee that every passing candidate outranks every failing candidate,
+choose it below the lowest possible feasible objective; a fixed value cannot
+guarantee this when the objective has no known lower bound.
+
+Omit `reward` or use `reward: {type: weighted_sum}` to keep the existing weighted
+sum. No automatic property normalization is added. Start a new run or recompute
+saved rewards after changing the reward definition; old replay-buffer targets
+still encode the old reward. See the [YAML reference](docs/yaml_config_reference.md#reward-weighted-sum-or-gated)
+for multiple gates, multi-property gate scores, and diagnostics.
 
 ### Tier 2 — YAML + ~30-line custom predictor
 
@@ -332,12 +399,14 @@ and `ooh_phase` constraint do.
 
 ### Plug-in surface reference
 
-**Built-in predictor short names** — use in YAML as `predictor: <name>`:
+**Built-in predictor short names** — use as `properties[].predictor`;
+registry leaves also support a flat `predictor: <name>`:
 
 | Name | What it does |
 |---|---|
-| `structure_score` | The one structure-based predictor: build (`builder`) -> [relax] -> score N properties (`backend: energy`/`property`) -> combine. `share_structure: false` for independent-structure multi-objective. The Tier-1 default |
-| `sinter_calcine` | RandomForest on Magpie features (no DeepMD) |
+| `structure_score` | Reward engine selected automatically by a non-empty `properties:` list; optional shared build/relax, then weighted-sum or gated reward |
+| `dp_energy` / `dp_property` / `dp_classification` | DeepMD energy, regression, or class probabilities; use within `properties[].predictor` |
+| `rf_magpie` | RandomForest on Magpie features (no DeepMD); select the target with `model` |
 | `ooh` | OOH catalyst overpotential (adsorbate placement + Sabatier formula) |
 | `dummy` | Random-noise predictor for smoke testing |
 

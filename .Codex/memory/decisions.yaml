@@ -9,3 +9,29 @@
   trade_off: "The legacy sampler and standalone phase checker still differ in presence semantics. Historical analysis results and the original feature checkout retain their original code/data; they do not authorize reintroducing the toggle into the cleanup branch. Old main YAML still requires groups-schema migration before merge compatibility can be claimed."
   files: [src/abcde_ooh/constraints/phase_sampler.py, src/abcde_ooh/constraints/primary_phase.py, src/rl_matdesign/registry.py, docs/validation/ooh_phase_revert_20261015.md]
   tags: [cleanup-scope, constraint-design, compatibility]
+- id: decision-reward-001
+  date: '2026-10-27'
+  expires: '2027-04-27'
+  title: Separate raw feasibility scores from adjusted reward objectives
+  choice: reward.type defaults to weighted_sum; gated compares weighted raw property
+    means against inclusive bounds and applies the adjusted weighted objective only
+    when every gate passes. Explicit objective terms replace property weights. Classification
+    selects an explicit model class index and averages probabilities across configurations
+    before ensemble mean/std.
+  alternatives_considered:
+  - Product rewards, automatic delta normalization and Pareto-driven training were
+    excluded by the user.
+  - Computing softmax or parsing dp test output in rl-matdesign was rejected in favor
+    of the DeepMD predict_proba API.
+  trade_off: A failure baseline gives strict feasible dominance only below a known
+    lower bound of the feasible objective. Classification requires a compatible DeepMD
+    runtime and correct training class order. One checkpoint has zero ensemble std;
+    1-p is not this uncertainty.
+  files:
+  - src/rl_matdesign/rewards.py
+  - src/rl_matdesign/predictors/structure_score.py
+  - docs/yaml_config_reference.md
+  tags:
+  - reward-design
+  - classification
+  - configurational-averaging
