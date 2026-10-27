@@ -54,7 +54,7 @@ from rl_matdesign.training import (
     train_dqn_online,
     train_pg,
 )
-from rl_matdesign.utils.metrics import RunMetrics
+from rl_matdesign.utils.metrics import RunMetrics, validate_generated_columns
 from rl_matdesign.utils.seeding import set_global_seed
 from rl_matdesign.utils.timing import PhaseTimer, PredictorTimer
 
@@ -146,6 +146,7 @@ def main() -> None:
         raise SystemExit("--only-generate and --resume-training are mutually exclusive.")
 
     cfg = load_config(args.config)
+    generated_columns = validate_generated_columns(cfg.get("generated_columns"))
 
     method = args.method or cfg.get("method", "a2c")
     train_seed = args.train_seed if args.train_seed is not None else args.dp_seed
@@ -644,18 +645,7 @@ def main() -> None:
     metrics.to_csv(_log_path, mode=_log_mode)
     print(f"[INFO] Training log {'appended to' if _log_mode == 'a' else 'written to'} {_log_path}", flush=True)
 
-    gen_rows_only = sorted(
-        [r for r in metrics.rows if r.get("phase") == "generate"],
-        key=lambda r: float(r["reward"]),
-        reverse=True,
-    )
-    if gen_rows_only:
-        import csv
-        fieldnames = [k for k in gen_rows_only[0].keys() if k != "phase"]
-        with open(os.path.join(args.out, "generated.csv"), "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(gen_rows_only)
+    metrics.to_generated_csv(os.path.join(args.out, "generated.csv"), generated_columns)
 
     top10     = metrics.top_k("dp_mean", k=10, phase="generate")
     diversity = metrics.diversity(phase="generate")

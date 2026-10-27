@@ -238,7 +238,7 @@ orders and N-terminal treatments have distinct deduplication and cache keys.
 `dqn_augment_permutations` must be zero: reordering a sequence changes the
 candidate and cannot reuse its reward.
 
-For sequence runs, `generated.csv` includes `candidate_json`, containing the
+By default, sequence runs' `generated.csv` includes `candidate_json`, containing the
 complete ordered sequence and categorical groups. The legacy `formula` column
 contains a readable JSON candidate label, not a molecular formula.
 With the property name above, `obj_gp_property_mean` and `obj_gp_property_std`
@@ -246,6 +246,15 @@ contain the raw GP statistics; `reward` contains the optimization score.
 Legacy `dp_mean` is the engine's signed/weighted mean aggregate and must not be
 mistaken for the raw GP target. The adapter can derive the exact two positions
 again from the saved sequence and verified catalog.
+
+An optional `generated_columns` mapping selects and renames columns only when
+writing `generated.csv`: keys are output names, values are recorded field names,
+and mapping order is CSV order. Preserve `formula: formula` and `reward: reward`
+for candidate identity and scoring; missing source fields raise an error rather
+than silently writing blanks. Complete records remain in `training_log.csv`.
+The peptide configuration uses this to export six columns with raw `pIC50` and
+`pIC50_uncertainty`; see [the GP output example](gp_physchem_integration.md#输出).
+This setting leaves model inputs, checkpoints, training and summary metrics unchanged.
 
 `sequence_schema.json` is saved alongside weights and the scaler. Keep it when
 moving checkpoints: generate-only/resume validates the vocabulary order,

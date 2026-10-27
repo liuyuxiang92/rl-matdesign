@@ -161,7 +161,7 @@ python scripts/hpo.py \
 HPO 当前比较每个 run 的 `generated.csv` 中 reward 最高的 10 个候选的均值。
 要同时核对 `n_generated_used` 为 10、生成数量及去重情况；少于 10 行时指标会退化为
 现有行的均值。该指标衡量最终生成策略，不包含训练过程中发现的所有候选。
-跨 seed 的分数标准差反映训练随机性，与每条候选的 GP `obj_pIC50_std` 是不同量。
+跨 seed 的分数标准差反映训练随机性，与每条候选的 GP `pIC50_uncertainty` 是不同量。
 
 复核使用 seed 0、1、2，其中 seed 0 与初筛重合。选定参数后，用新 seed 3、4、5
 检查稳定性，并在相同评价规则下比较 2,000、4,000、8,000 个训练 episode 的收益。
@@ -209,22 +209,36 @@ GP 接口自身不写文件，正常的 RL 输出（`generated.csv`、模型权�
 
 ## 输出
 
+多肽配置的 `generated.csv` 仅输出以下六列，按 `reward` 从高到低排列：
+
 | generated.csv 字段 | 含义 |
 |---|---|
-| `candidate_json` | 完整有序序列和 N 端动作 |
-| `obj_pIC50_mean`, `obj_pIC50_std` | 原 GP 均值、不确定性 |
+| `formula` | 包含完整有序序列和 N 端处理的 JSON 标签 |
 | `reward` | 配置的优化奖励 |
+| `pIC50` | 原 GP 预测均值 |
+| `pIC50_uncertainty` | 原 GP 返回的标准差 |
 | `meta_monomers` | 原 GP 的单体串，以竖线分隔 |
-| `meta_n_term`, `meta_c_term` | 端基处理 |
-| `meta_disulfide_pos_i`, `meta_disulfide_pos_j` | 传入 GP 的两个位置 |
 | `meta_smiles` | 原化学代码组装的完整分子 |
-| `meta_nearest_training_distance_scaled` | 到训练集的标准化特征距离 |
-| `meta_unseen_position_monomer` | 未见过的位置与单体名称组合 |
-| `metadata_json` | 完整诊断信息 |
 
-`meta_pred_pIC50` 和 `meta_posterior_sd` 保留 GP 的原始字段名，与 `obj_pIC50_*` 对应。
-`dp_mean` 是已有奖励引擎的聚合字段；本单目标配置中等于原始均值。
-多目标情况下，metadata 按 property 名和模型索引嵌套，避免同名字段覆盖。
+本地私有 YAML 已包含下面的通用导出映射。远端 YAML 不随 Git 推送，需要同步这一段：
+
+```yaml
+generated_columns:
+  formula: formula
+  reward: reward
+  pIC50: obj_pIC50_mean
+  pIC50_uncertainty: obj_pIC50_std
+  meta_monomers: meta_monomers
+  meta_smiles: meta_smiles
+```
+
+映射只控制 `generated.csv` 的列选择、顺序和名称；不改变训练、GP、奖励或去重逻辑。
+`pIC50` 的 I 是大写字母 I；不确定性取原始标准差，不是方差或奖励罚项。
+完整的 `candidate_json`、`metadata_json`、`obj_pIC50_mean/std`、二硫键位置和
+其他诊断字段仍保存在 `training_log.csv` 的 `phase=generate` 行。
+HPO 继续读取 `reward`，不受列精简影响。依赖旧 `obj_*` 列名的其他分析程序应使用
+完整日志中的生成记录。未设置 `generated_columns` 的其他体系保持原有导出格式。
+本次导出设置不影响 checkpoint 兼容性，也不需要更新 GP 或重新训练 RL。
 
 ## 模型解释边界
 
