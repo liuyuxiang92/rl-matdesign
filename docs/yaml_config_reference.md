@@ -153,6 +153,7 @@ combiner supports any property names, independent of the material system.
 | `share_structure` | `true` = build+relax shared structures, score all structure properties on them; `false` = each property builds its own | `true` |
 | `n_random_configs` | Random placements per candidate | `1` |
 | `geo_opt` | Relaxation stage (see below); omit / `enabled: false` to skip | optional |
+| `structure_parallel` | Persistent GPU workers for independent configurations; see below | omitted: serial execution |
 | `properties` | Non-empty list of property specs (see below) | required |
 | `reward` | Combination rule: `type: weighted_sum` or `type: gated` | weighted sum |
 | `k` | Uncertainty coefficient for property objectives | `1.0` |
@@ -204,6 +205,140 @@ So `mean` is the mean of the per-model averages and `std` is the spread **across
 A single model therefore gives `std == 0` exactly, whatever `n_random_configs` is, and
 `mean_minus_kstd` is then identical to `mean` — no flag needed.
 The same fold is used in both `share_structure` regimes.
+
+### `structure_parallel`: per-configuration GPU workers
+
+This optional block applies to the structure-scoring reward engine. It detects
+available GPUs and distributes one candidate's configurations over persistent
+subprocesses, each pinned to one GPU. It can measure whether one or two workers
+per GPU improves throughput. Each task calls the configured builder with
+`n_configs=1` and a task-local RNG, then applies top-level `geo_opt` if enabled.
+For a builder that already runs
+MD and optimization, such as `clc_workflow.rl_builder:MDAveragedOptBuilder`, both
+stages run on the same worker; set `geo_opt: null` to avoid another relaxation.
+The external builder itself needs no parallel implementation.
+
+```yaml
+share_structure: true
+n_random_configs: 5
+structure_parallel:
+  devices: auto
+  workers_per_device: auto
+  reserve_devices: []
+  threads_per_worker: 1
+  timeout_s: 7200
+  startup_timeout_s: 300
+  min_successful_configs: 5
+  min_speedup: 1.15
+```
+
+| Key | What it does | Default |
+|---|---|---|
+| `devices` | `auto` detects GPUs in the inherited allocation; alternatively, a non-empty list of distinct nonnegative visible GPU indices | `auto` |
+| `workers_per_device` | `auto` measures one vs two workers per GPU when useful; `1` or `2` fixes the count and skips calibration | `auto` |
+| `reserve_devices` | Visible GPU indices to leave out of worker allocation; requires `devices: auto`; `[0]` reserves GPU 0 for the parent | `[]` |
+| `threads_per_worker` | CPU numerical-library threads per worker; positive integer | `1` |
+| `timeout_s` | Maximum elapsed seconds for one configuration task, including build and optional relaxation | `3600` |
+| `startup_timeout_s` | Maximum seconds allowed for worker initialization | `300` |
+| `min_successful_configs` | Minimum completed configurations required to score this candidate; integer from 1 through `n_random_configs` | `1` |
+| `min_speedup` | Required throughput ratio for auto mode to retain two workers instead of one; finite and at least 1 | `1.15` |
+
+Concurrency is capped at the smaller of `n_random_configs` and the sum of the
+selected worker counts across GPUs. Extra configurations wait for a free worker;
+each worker runs only one task at a time. Four GPUs with two workers each can run
+eight configurations concurrently only if at least eight configurations are
+requested. Models cached by a builder or its optimizer remain loaded in that
+worker across candidates. Extra slots used only for calibration are closed if
+the requested ensemble does not need them. Results
+are collected in configuration-index order, then scored in the parent process.
+Property inference, reward combination, and RL updates are not distributed by
+this option. A gated reward still evaluates after structure preparation and
+property prediction; it does not avoid the MD cost of a failing candidate.
+
+**Automatic concurrency selection.** With `workers_per_device: auto`, calibration
+is needed only when `n_random_configs` exceeds the number of selected GPUs. For
+example, five configurations on five GPUs use one worker per GPU without testing
+two. Otherwise, the first candidate is used for the following calibration on each
+tested GPU, using the same candidate and configuration seed:
+
+1. Warm up the primary worker with one complete build/MD/optimization task.
+2. Time a second complete task on that worker alone (`t_single`).
+3. Start and warm up a second worker with the same task.
+4. Time both workers running the task concurrently (`t_pair`, the longer completion time).
+
+This costs **up to five additional full configuration executions per tested GPU**. The
+calibration structures are excluded from the reward and do not count as additional
+RL episodes, but their wall time is part of the run. The throughput ratio is
+`2 * t_single / t_pair`; retain two workers only if it is at least `min_speedup`.
+Reported task errors in the second-worker trial, including out-of-memory errors,
+select one worker. A failure in the one-worker baseline fails the current candidate;
+worker crashes and timeouts follow the pool-abort behavior described below.
+The log reports `concurrency`, `reason`, `t_single`, `t_pair`, and `speedup` for each
+GPU. `ParallelStructureBuilder.autotune_report` exposes the selected `counts` and
+per-GPU `measurements` after calibration. This is an empirical choice for the first
+candidate, not a guarantee that the same count is optimal for every later
+composition. There is no automatic recalibration after a successful calibration.
+Explicit `workers_per_device: 1` or `2` skips these trial executions.
+
+**GPU allocation.** Indices are relative to the parent process's inherited
+`CUDA_VISIBLE_DEVICES`, including allocations expressed as GPU UUIDs. If that
+variable is `2,4,7`, index `1` means the allocation's second GPU, physical card 4.
+Without that variable, indices select the CUDA device ordinals directly. A worker
+exposes only its selected GPU, so its DeepMD and LAMMPS processes use local GPU 0.
+Keep LAMMPS configured for one GPU per process (for example `-k on g 1`). Overrides
+of `CUDA_VISIBLE_DEVICES`, `LOCAL_RANK`, and `DEVICE` in `md.env` are rejected so
+they cannot bypass worker assignment.
+
+By default `devices: auto` includes all visible GPUs, including GPU 0 normally
+used by the parent. The parent DeepMD device is controlled by the DeepMD
+environment; the experiment's `--device` controls RL. To give the worker pool the
+available GPUs without sharing with parent models, launch with `DEVICE=cpu` and
+`--device cpu`; workers still explicitly use CUDA. This trades GPU space for slower
+CPU property inference. Alternatively, use `devices: auto` with
+`reserve_devices: [0]` to leave GPU 0 for the parent, or supply a manual device list
+such as `[1, 2, 3]`. At least one worker GPU must remain. The parent preloads its
+persistent DeepMD energy, regression, and classification models before the first
+parallel build, so calibration includes their resident memory. Later external GPU
+load or additional per-property worker pools can still change available memory
+and throughput. Start one experiment process, without `torchrun`.
+The subprocess implementation targets POSIX systems; actual CUDA
+execution requires a compatible Linux GPU environment and the installed builder,
+DeepMD backend, and LAMMPS binary to support that environment.
+
+**Failures and timeouts.** Ordinary task exceptions are logged. The predictor
+scores the successful configurations if their count reaches
+`min_successful_configs`; otherwise the candidate evaluation raises an error.
+Workers propagate optimizer execution exceptions, including CUDA OOM, even when
+an external builder calls the shared `relax_structure` helper internally. This
+prevents failed optimizations from appearing as fast calibration successes.
+Reaching the optimization step limit without convergence retains the existing
+warning behavior; it is distinct from an execution exception.
+The default of 1 permits a mean over fewer than the requested configurations;
+set it to `n_random_configs` when every candidate must use the full sample count.
+A worker crash or timeout aborts the current candidate and discards the worker
+pool; the next prediction creates a new pool. The experiment's existing handling
+of failed candidate evaluations still applies. Choose the timeout to allow a
+complete MD-plus-optimization task, including first-use model initialization.
+The CLI closes worker process groups on normal exit, exceptions, Ctrl+C, and
+SIGTERM termination. SIGKILL cannot run Python cleanup and provides no such
+guarantee.
+
+**Builder contract and reproducibility.** The builder must return exactly one
+ASE `Atoms` object in a sequence when called with `n_configs=1`; builders that
+return multiple templates from that call are unsupported and raise an error.
+Task seeds are assigned before scheduling, so builders that honor the supplied
+RNG receive the same configuration seeds regardless of completion order or worker
+count. They are not the same samples as the legacy serial path for an identical
+predictor seed, and CUDA computations may still have numerical nondeterminism.
+For the MD builder, configured `md_debug_dir` output is separated by run and worker
+to prevent filename collisions.
+
+With `share_structure: false`, each structure property inherits the top-level
+`structure_parallel` block and may override it. Properties are still evaluated
+one after another, with configurations parallel within each property. Independent
+pools can retain separate model copies on the same GPUs; prefer
+`share_structure: true` when properties can use the same structures.
+Omit `structure_parallel` entirely to preserve the existing serial behavior.
 
 ### `dp_classification`: class probabilities
 

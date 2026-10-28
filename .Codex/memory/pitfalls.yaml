@@ -17,3 +17,25 @@
   - deepmd
   - inference-contract
   - batching
+- id: pitfall-gpu-workers-001
+  date: '2026-10-28'
+  expires: '2027-01-28'
+  title: Treat swallowed optimizer failures as failures when measuring GPU concurrency
+  wrong: relax_structure catches optimizer exceptions and returns a partial cell;
+    a CUDA OOM can therefore appear as a fast successful calibration trial.
+  right: GPU workers wrap the entire builder and optional optimization in strict_relaxation_errors(),
+    including external builders using the shared helper. Propagate execution exceptions;
+    keep step-limit nonconvergence separate. Detach calculators before IPC and kill
+    complete process groups on timeout or CLI termination.
+  impact: False throughput gains could select excessive concurrency and score unoptimized
+    structures; Python-only cleanup could leave LAMMPS children on GPUs.
+  files:
+  - src/rl_matdesign/utils/structure.py
+  - src/rl_matdesign/utils/structure_worker.py
+  - src/rl_matdesign/utils/parallel_structures.py
+  - tests/test_relaxation_errors.py
+  - tests/test_parallel_structures.py
+  tags:
+  - gpu-processes
+  - error-propagation
+  - calibration

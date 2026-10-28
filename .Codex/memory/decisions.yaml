@@ -35,3 +35,30 @@
   - reward-design
   - classification
   - configurational-averaging
+- id: decision-gpu-workers-001
+  date: '2026-10-28'
+  expires: '2027-04-28'
+  title: Generic configuration workers with measured one-or-two GPU concurrency
+  choice: Keep RL episodes and property aggregation serial; wrap arbitrary single-configuration
+    builders in persistent subprocesses whose CUDA environment is set before imports.
+    Discover only visible GPUs; optionally reserve logical indices. Auto-calibrate
+    one versus two workers per GPU on identical candidate/seed when configurations
+    outnumber GPUs; require 15 percent measured throughput improvement.
+  alternatives_considered:
+  - Threads or fork after CUDA initialization risk shared device state; fresh subprocesses
+    isolate models and external MD children.
+  - Guessing concurrency from VRAM alone cannot establish throughput; full-physics
+    calibration uses up to five extra tasks per tested GPU.
+  trade_off: Calibration uses the first candidate and does not guarantee optimal concurrency
+    for every later composition. It adds real MD/optimization cost but contributes
+    no reward samples. Preload parent DP models before calibration; retire calibration-only
+    idle slots. No actual CUDA/MD benchmark was available locally.
+  files:
+  - src/rl_matdesign/utils/parallel_structures.py
+  - src/rl_matdesign/utils/structure_autotune.py
+  - src/rl_matdesign/predictors/structure_score.py
+  - docs/yaml_config_reference.md
+  tags:
+  - parallel-configurations
+  - gpu-scheduling
+  - generic-builders

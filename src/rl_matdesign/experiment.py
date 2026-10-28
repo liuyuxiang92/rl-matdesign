@@ -21,8 +21,11 @@ import copy
 import json
 import os
 import random
+import signal
+import threading
 import time
 import warnings
+from contextlib import ExitStack
 
 # Required for torch.use_deterministic_algorithms(True) with CUDA >= 10.2.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -138,6 +141,33 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # Predictor-owned processes must be reaped on exceptions and Ctrl+C as well
+    # as normal completion, including errors raised while constructing the env.
+    with ExitStack() as resources:
+        # Scheduler/kill SIGTERM does not ordinarily unwind Python finally blocks.
+        # Preserve an embedding application's custom handler, but make the CLI's
+        # default termination release worker process groups before it exits.
+        if (threading.current_thread() is threading.main_thread()
+                and signal.getsignal(signal.SIGTERM) == signal.SIG_DFL):
+            resources.callback(signal.signal, signal.SIGTERM, signal.SIG_DFL)
+            signal.signal(signal.SIGTERM, _terminate_experiment)
+        _run_experiment(resources)
+
+
+def _terminate_experiment(signum, _frame) -> None:
+    raise SystemExit(128 + signum)
+
+
+def _close_predictor(predictor) -> None:
+    close = getattr(predictor, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception as exc:
+            print(f"[WARN] predictor.close() failed: {type(exc).__name__}: {exc}")
+
+
+def _run_experiment(resources: ExitStack) -> None:
     t_start = time.perf_counter()
     phases = PhaseTimer()
     args = parse_args()
@@ -179,6 +209,7 @@ def main() -> None:
         # every phase. The proxy delegates unknown attributes to the real
         # predictor, so `_cache` checkpointing and `predict_raw` still work.
         predictor = PredictorTimer(build_predictor(cfg, seed=args.dp_seed), t0=t_start)
+        resources.callback(_close_predictor, predictor)
 
         # Build the env + reward_fn + constraint filter (shared with baselines).
         env, env_type, flat_cfg = build_env(cfg, predictor)
@@ -679,18 +710,6 @@ def main() -> None:
           f"hit_rate={_pred['cache_hit_rate']:.3f}) | "
           f"overhead={timing['overhead_s']:.1f}s")
     print(f"[INFO] Results saved to {args.out}")
-
-    # Release any external resources the reward's leaves hold — e.g. one
-    # MGTransformer serve.py subprocess per property, which would otherwise linger
-    # until the GC runs the leaf's __del__. Best-effort and always last, so it can
-    # never cost us an already-written result.
-    _close = getattr(predictor, "close", None)
-    if callable(_close):
-        try:
-            _close()
-        except Exception as exc:  # noqa: BLE001 - teardown must not fail a finished run
-            print(f"[WARN] predictor.close() failed: {type(exc).__name__}: {exc}")
-
 
 if __name__ == "__main__":
     main()
