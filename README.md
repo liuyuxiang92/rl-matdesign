@@ -334,6 +334,75 @@ saved rewards after changing the reward definition; old replay-buffer targets
 still encode the old reward. See the [YAML reference](docs/yaml_config_reference.md#reward-weighted-sum-or-gated)
 for multiple gates, multi-property gate scores, and diagnostics.
 
+### Parallel structure preparation on multiple GPUs
+
+Add `structure_parallel` to a `properties:` configuration to prepare a candidate's
+configurations concurrently. The engine detects available GPUs and can measure
+whether one or two workers per GPU gives better throughput. Each persistent worker
+builds one configuration and completes its relaxation before returning it. An external
+builder that performs MD followed by optimization, such as
+`clc_workflow.rl_builder:MDAveragedOptBuilder`, runs that entire sequence in the
+worker; keep `geo_opt: null` when the builder already optimizes the structure.
+For other builders, optional top-level `geo_opt` also runs in the worker.
+
+```yaml
+share_structure: true
+n_random_configs: 5
+structure_parallel:
+  devices: auto                 # detect GPUs in the inherited allocation
+  workers_per_device: auto      # measure one vs two workers when useful
+  threads_per_worker: 1
+  timeout_s: 7200                # maximum seconds for one configuration
+  startup_timeout_s: 300
+  min_successful_configs: 5      # require all five; default is 1
+  min_speedup: 1.15              # retain two workers only for >=15% throughput gain
+```
+
+With five configurations and at least five selected GPUs, one worker on each of
+five GPUs is sufficient, so no one-vs-two calibration runs. With fewer GPUs,
+automatic calibration compares full build/MD/optimization throughput after
+warming up the workers. It costs **up to five extra configuration executions per
+tested GPU** on first use; those structures do not enter the reward. Reported
+two-worker task errors, including out-of-memory errors, fall back to one worker.
+The log reports timings and each
+choice. To skip calibration, set `workers_per_device: 1` or explicitly choose `2`.
+At most `n_random_configs` tasks run concurrently; for example, four GPUs can
+run eight configurations together only when two workers per GPU are selected
+and at least eight configurations are requested.
+
+By default `auto` includes GPU 0, which the parent also uses for prediction and
+RL. To give workers the available GPUs without that contention, run the parent
+on CPU:
+
+```bash
+DEVICE=cpu python scripts/run_experiment.py \
+    --config configs/your_system.yaml --out runs/multigpu --device cpu
+```
+
+Workers explicitly select CUDA, independently of the parent's `DEVICE=cpu`.
+CPU property prediction may cost more time, so measure it before choosing this
+allocation. Alternatively, add `reserve_devices: [0]` to the block to leave visible
+GPU 0 for the parent and automatically use the remaining GPUs. Parent DeepMD
+scoring models are loaded before calibration, so their persistent memory is
+included in the measurement. The first-candidate timing remains a heuristic:
+different compositions, external GPU load, or additional property-specific worker
+pools can change the best worker count. There is no automatic recalibration.
+
+Manual `devices: [1, 2]` is also supported. Indices are relative to the inherited
+`CUDA_VISIBLE_DEVICES`: with `CUDA_VISIBLE_DEVICES=2,4,7`, this selects physical GPUs
+4 and 7. Each worker sees its assigned GPU as local device 0. Keep LAMMPS's
+single-GPU arguments, such as `-k on g 1`; do not override `CUDA_VISIBLE_DEVICES`,
+`LOCAL_RANK`, or `DEVICE` through `md.env`. Start one experiment process; this
+feature does not need `torchrun` or distributed RL training.
+
+Property scoring and reward calculation wait for the completed structures and
+keep their existing averaging rules. `share_structure: true` lets all structure
+properties reuse the same prepared configurations. Omitting `structure_parallel`
+preserves serial execution. GPU execution requires the appropriate CUDA-enabled
+DeepMD/LAMMPS installation; speedup depends on MD/optimization cost, CPU resources,
+and the work that remains serial. See the [YAML reference](docs/yaml_config_reference.md#structure_parallel-per-configuration-gpu-workers)
+for failure handling, supported builders, and reproducibility.
+
 ### Tier 2 — YAML + ~30-line custom predictor
 
 For novel reward physics (custom property, bespoke aggregation, model from a

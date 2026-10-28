@@ -22,8 +22,10 @@ Two layers live here:
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
 
 import numpy as np
 # Module-level (not lazy like the ASE imports elsewhere in this file): scipy is
@@ -32,6 +34,29 @@ import numpy as np
 # exercise the QhullError failure path -- a function-local `from scipy.spatial
 # import ...` would not create a patchable module attribute.
 from scipy.spatial import QhullError, Voronoi, cKDTree
+
+
+_STRICT_RELAXATION_ERRORS: ContextVar[bool] = ContextVar(
+    "rl_matdesign_strict_relaxation_errors", default=False
+)
+
+
+@contextmanager
+def strict_relaxation_errors() -> Iterator[None]:
+    """Propagate optimizer exceptions for all relaxation calls in this context.
+
+    GPU workers use this around the whole builder call, including external
+    builders that import :func:`relax_structure`. Otherwise an optimization OOM
+    could return a partial structure and look like a fast, successful timing
+    trial. Calls outside this context retain their existing error handling.
+    Reaching the optimizer's step limit without convergence is still a warning.
+    Nested contexts and exceptions restore the caller's previous setting.
+    """
+    token = _STRICT_RELAXATION_ERRORS.set(True)
+    try:
+        yield
+    finally:
+        _STRICT_RELAXATION_ERRORS.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -680,7 +705,9 @@ def relax_structure(
                 f"relax_structure: did NOT converge to fmax={fmax} within {steps} "
                 f"steps (reached fmax={final_fmax:.4f})."
             )
-    except Exception as exc:  # noqa: BLE001 - relaxation failures shouldn't crash the run
+    except Exception as exc:  # noqa: BLE001 - legacy callers accept partial results
+        if _STRICT_RELAXATION_ERRORS.get():
+            raise
         print(f"relax_structure: optimization raised and did not complete: {exc}")
 
     if keep_indices is None:

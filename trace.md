@@ -2627,3 +2627,16 @@ update defect_site.py's docstring, then write the new test file.
 ### EARS — Commit Digest (2026-10-27 17:58)
 <!-- concepts: worktree-isolation, reward-composition, deepmd-inference -->
 - The EARS notification named an unrelated generated-CSV-columns commit in the original checkout. That work is outside this task; no findings about it are inferred or recorded here. This worktree's task is generic gated rewards and direct DeepMD classification, with design and validation captured above. Keep the checkpoint and inference-contract fix with this isolated main-based implementation.
+
+### 2026-10-28 — Automatic multi-GPU configuration execution
+<!-- concepts: gpu-scheduling, error-propagation, reproducible-ensembles -->
+- Continued from main-based gated/classification commit 04c3da7d in isolated branch codex/multi-gpu-structures; original dirty checkout and external clc_workflow source were preserved.
+- Added generic persistent subprocess workers for full builder MD/opt plus optional top-level relaxation. Each worker binds one GPU before imports, retains its optimizer, returns calculator-free structures, and consumes seeds assigned by configuration index.
+- User requested automatic GPU detection and per-GPU concurrency. Auto mode respects CUDA_VISIBLE_DEVICES, optionally reserves devices, and measures one vs two workers on the same candidate/seed. The initial probe costs up to five extra full executions per tested GPU and is excluded from reward; 15 percent throughput gain is required to retain two workers. Parent DP models preload before calibration; unused probe workers are retired.
+- Review found optimizer exceptions could be swallowed as apparent fast successes. Added worker-scoped strict error propagation while preserving legacy serial behavior and existing nonconvergence warnings. CLI cleanup now handles setup exceptions, Ctrl+C and SIGTERM; timeout cleanup includes LAMMPS descendants.
+- Validation: full suite 584 passed, 4 optional-fixture skips, one pre-existing SMACT warning. Three subsequently added regressions passed (587 tested passes total): external-builder optimization OOM, serial behavior, and unused calibration-slot retirement. Tests use real subprocesses and ASE with simulated CUDA/models, including 4 GPUs x 2 workers, calibration exclusion/RNG, genuine SIGTERM cleanup and unchanged gated aggregation. No real CUDA/MD speedup claim.
+- Generated an ignored private multigpu YAML beside the user's previous gated YAML; parsed MD, opt, scientific, model and RL settings remain unchanged. Reflect recorded one pitfall and one decision; no configured auto-memory project directory exists on this host.
+
+### EARS — Commit Digest (2026-10-28 16:51)
+<!-- concepts: worktree-isolation, gpu-scheduling, calibration-validation -->
+- The hook reported a generated-CSV-columns commit from the original experiment checkout, not this branch's multi-GPU changes. No conclusions about that unrelated work are inferred. The current branch's implementation and validation are recorded above; preserve original checkout edits and keep this feature's commit isolated.

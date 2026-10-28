@@ -1,0 +1,64 @@
+checkpoint_version: 3.0.0
+created_at: '2026-10-28T08:49:40.119855+00:00'
+branch: codex/multi-gpu-structures
+base_commit: 04c3da7df21b84215fb79cbe1243bec2b9cda6f8
+phase:
+  current: implementation_validated
+  completed:
+  - generic_worker_pool
+  - automatic_gpu_discovery
+  - measured_concurrency_selection
+  - independent_review
+  - regression_validation
+  - reflection
+  next:
+  - benchmark_on_user_gpu_host
+state:
+  worktree: /private/tmp/rl-matdesign-multigpu-20261028
+  parameters:
+  - name: min_speedup
+    value: 1.15
+    source: 'Implementation heuristic: retain dual workers only for at least 15 percent
+      measured throughput gain; not a measured universal optimum.'
+  - name: automatic_max_workers_per_gpu
+    value: 2
+    source: 'User request: automatically determine whether one GPU can efficiently
+      run two configurations.'
+  experiments:
+  - name: full_regression
+    status: completed
+    result: 584 passed, 4 missing optional-fixture skips, one existing warning; 185.16s
+    command: PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 /opt/anaconda3/bin/python
+      -m pytest -p no:cacheprovider
+  - name: subsequent_regressions
+    status: completed
+    result: 3 additional cases passed for strict optimization errors, serial behavior
+      and idle calibration-slot cleanup.
+  - name: real_gpu_throughput
+    status: not_run
+    reason: Local host has no CUDA GPU/LAMMPS production environment; process scheduling
+      was tested with simulated CUDA and real subprocesses.
+  decisions:
+  - decision: Leave external clc_workflow unchanged; generic wrapper executes its
+      complete builder on assigned GPUs.
+    rationale: Maintain material-system independence and reuse established MD/averaging
+      implementation.
+  - decision: Calibration extra structures never affect reward or RL sample count.
+    rationale: Avoid changing the scientific ensemble or training budget semantics.
+blockers: []
+artifacts:
+- path: src/rl_matdesign/utils/parallel_structures.py
+  role: GPU allocation and process pool
+- path: src/rl_matdesign/utils/structure_autotune.py
+  role: measured per-GPU one-vs-two selection
+- path: docs/yaml_config_reference.md
+  role: configuration and calibration-cost documentation
+- path: /Users/liuyuxiang/Dropbox/Macbook_air/aisi/shanghai/reinforcement_learning/rl-matdesign/runs/config_templates/perovskite_gated_binary_multigpu.yaml
+  role: ignored private user scenario with automatic GPU settings
+resume_instructions: 'Inspect git status and log in this worktree and remote branch
+  codex/multi-gpu-structures for delivery state; do not alter original dirty experiment
+  checkout. For GPU deployment use the private YAML, replace the binary checkpoint
+  placeholder, keep the single-GPU LAMMPS flags, and launch one experiment process.
+  Auto calibration adds up to five extra full MD/opt tasks per GPU when n_configs
+  exceeds GPU count; disable it with workers_per_device: 1. Actual GPU throughput
+  still requires the production host. No main merge is implied.'

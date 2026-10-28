@@ -65,6 +65,8 @@ Config keys
                       is present.
     share_structure:  bool, default ``true`` (see above).
     n_random_configs: random realizations per candidate (default 1).
+    structure_parallel: optional GPU worker settings; configurations build/relax
+                      in independent processes, then use the same scoring fold.
     geo_opt:          optional ``{model, head, fmax, steps, relax_cell, enabled}``;
                       omit / ``enabled: false`` to score the unrelaxed structure.
     k:                uncertainty coefficient for the objective folding.
@@ -108,7 +110,7 @@ _TRANSFORMS = ("none", "exp")
 # when the objective entry doesn't set them. Mirrors the old composite behavior.
 _SHARED_BUILDER_KEYS = (
     "builder", "base_poscar", "poscar", "poscar_template", "site_symbol",
-    "n_random_configs",
+    "n_random_configs", "structure_parallel",
 )
 
 
@@ -146,6 +148,16 @@ class StructureScorePredictor:
         go = cfg.get("geo_opt") or {}
         self.geo_opt: Dict[str, Any] = dict(go)
         self.geo_opt_enabled: bool = bool(go) and bool(go.get("enabled", True))
+
+        def make_builder(kind, builder_cfg, *, seed):
+            if builder_cfg.get("structure_parallel") is not None:
+                from ..utils.parallel_structures import ParallelStructureBuilder
+                # Geometry optimization remains a top-level shared setting, as
+                # in the serial path; run it on the same GPU as the builder.
+                return ParallelStructureBuilder(
+                    kind, {**builder_cfg, "geo_opt": self.geo_opt}, seed=seed
+                )
+            return resolve_builder(kind, builder_cfg, seed=seed)
 
         # Optional inner optimization over a shared operating condition (e.g.
         # temperature). For each candidate we score every property at each sweep
@@ -378,7 +390,7 @@ class StructureScorePredictor:
                 # builder knobs, let the entry override. Decorrelate the RNG.
                 sub_cfg = {**shared_builder_cfg, **p}
                 child_seed = None if seed is None else int(seed) + i
-                self._builders[name] = resolve_builder(
+                self._builders[name] = make_builder(
                     str(sub_cfg.get("builder", top_builder)), sub_cfg, seed=child_seed
                 )
 
@@ -396,7 +408,7 @@ class StructureScorePredictor:
         # Shared builder (share_structure: true) — build once, score all structure
         # objectives on it. Skipped entirely when no structure objective exists.
         self._shared_builder = (
-            resolve_builder(top_builder, cfg, seed=seed)
+            make_builder(top_builder, cfg, seed=seed)
             if (self.share_structure and self._has_structure) else None
         )
 
@@ -404,6 +416,7 @@ class StructureScorePredictor:
         self._calc_cache: Dict[str, Any] = {}     # name -> ase calculators (energy backend)
         self._prop_cache: Dict[str, Tuple[List[Any], Dict[str, int]]] = {}  # name -> property models
         self._geo_calc: Optional[Any] = None
+        self._parallel_models_ready = False
         # Persistent per-composition stats cache (LRU). Keyed by the canonical
         # candidate key, it makes each unique composition build+relax+score
         # exactly ONCE for the predictor's lifetime — so training repeats and
@@ -493,6 +506,13 @@ class StructureScorePredictor:
                         fn()
                     except Exception:  # noqa: BLE001 - teardown is best-effort
                         pass
+        for builder in [self._shared_builder, *self._builders.values()]:
+            fn = getattr(builder, "close", None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:  # noqa: BLE001 - close every pool even if one fails
+                    pass
 
     def composition_formula(self, candidate: Any) -> Optional[str]:
         """Full composition label of the built structure, if the builder exposes it.
@@ -501,7 +521,7 @@ class StructureScorePredictor:
         ``composition_formula``. Builders that don't implement it (most) return
         ``None``, so callers fall back to the env's ``terminal_formula``.
         """
-        builder = self._shared_builder or (self._builders[0] if self._builders else None)
+        builder = self._shared_builder or next(iter(self._builders.values()), None)
         fn = getattr(builder, "composition_formula", None)
         return fn(candidate) if callable(fn) else None
 
@@ -568,12 +588,25 @@ class StructureScorePredictor:
         """
         prop_inputs: Dict[str, Any] = {}
         structure_props = [p for p in self.properties if p["backend"] != "composition"]
+        if not self._parallel_models_ready and any(
+            getattr(builder, "parallel_execution", False)
+            for builder in [self._shared_builder, *self._builders.values()]
+        ):
+            # Calibration must see the parent's persistent scoring-model memory.
+            # Otherwise two MD workers may fit initially and OOM on the next
+            # candidate after the property models have been loaded on GPU 0.
+            for prop in structure_props:
+                if prop["backend"] == "energy":
+                    self._get_calculators(prop)
+                elif prop["backend"] in ("property", "classification"):
+                    self._get_prop_models(prop)
+            self._parallel_models_ready = True
         if structure_props:
             if self.share_structure:
                 structures = self._shared_builder.build(
                     candidate, n_configs=self.n_random_configs, rng=self._rng
                 )
-                if self.geo_opt_enabled:
+                if self.geo_opt_enabled and not getattr(self._shared_builder, "handles_geo_opt", False):
                     structures = [self._relax(s) for s in structures]
                 for prop in structure_props:
                     prop_inputs[prop["name"]] = structures
@@ -583,7 +616,7 @@ class StructureScorePredictor:
                     structures = builder.build(
                         candidate, n_configs=prop["n_random_configs"], rng=self._rng
                     )
-                    if self.geo_opt_enabled:
+                    if self.geo_opt_enabled and not getattr(builder, "handles_geo_opt", False):
                         structures = [self._relax(s) for s in structures]
                     prop_inputs[prop["name"]] = structures
         # Composition objectives: scored directly on the candidate composition.
