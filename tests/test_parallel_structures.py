@@ -227,6 +227,41 @@ def _initializations(root):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
+def test_full_defect_formula_survives_external_wrapper_and_worker_ipc(pool_factory, tmp_path):
+    """Match the MD plugin's forwarding contract without running any physics."""
+    from tests.test_defect_site_formula import _candidate, _parse, _template
+    from rl_matdesign.utils.parallel_structures import ParallelStructureBuilder
+
+    # pool_factory installs the child-only CUDA shim and module search path.
+    module = tmp_path / "fake_modules" / "formula_forwarding_builder.py"
+    module.write_text('''
+from rl_matdesign.predictors.builders.defect_site import DefectSiteBuilder
+
+class Builder:
+    def __init__(self, cfg, *, seed=None):
+        self._inner = DefectSiteBuilder(cfg, seed=seed)
+
+    def build(self, *args, **kwargs):
+        raise AssertionError("formula reporting must never run MD or optimization")
+
+    def composition_formula(self, candidate):
+        return self._inner.composition_formula(candidate)
+''')
+    pool = ParallelStructureBuilder("formula_forwarding_builder:Builder", {
+        "base_poscar": _template(tmp_path),
+        "structure_parallel": {"devices": [0], "workers_per_device": 1,
+                               "startup_timeout_s": 15, "timeout_s": 15},
+    })
+    try:
+        formula = pool.composition_formula(_candidate(
+            {"Sr": .5, "Ba": .5}, {"Fe": .75, "Co": .25}))
+        assert _parse(formula) == {"Sr": .5, "Ba": .5, "Fe": .75, "Co": .25, "O": 3}
+        pids = [worker.process.pid for worker in pool._workers.values()]
+    finally:
+        pool.close()
+    _wait_stopped(pids)
+
+
 def _process_running(pid):
     try:
         os.kill(pid, 0)

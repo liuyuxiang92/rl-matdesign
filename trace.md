@@ -2670,3 +2670,14 @@ update defect_site.py's docstring, then write the new test file.
 ### EARS — Commit Digest (2026-10-30 10:06)
 <!-- concepts: episode-budgeting, checkpoint-compatibility, worktree-isolation -->
 - The hook again reported the original checkout's unrelated generated-CSV-columns commit. This isolated branch implements configurable duplicate training budgets, with the user's explicit decision to retain duplicate learning, complete seen-key checkpoint state, and 674 passing regression tests. No conclusions about the unrelated commit are inferred; the design and recovery requirements are captured above and in .Codex/memory/.
+
+### 2026-10-30 — Complete perovskite formulas in generated.csv
+<!-- concepts: composition-reporting, sublattice-defects, formula-validation -->
+- User reported incomplete perovskite formulas. DefectSiteBuilder formatted only resolved dopants, omitting surviving hosts and untouched template atoms. Formula reporting now applies the construction operations to the template elemental counts and normalizes all species by the original A-site count. Oxygen comes from the template; vacancies/interstitials change elemental coefficients, and 1/32 fractions retain precision.
+- Existing predictor, external MD-wrapper and worker forwarding use the corrected hook without additional construction, MD or optimization. The optional generation charge filter also sees the complete formula. Other builder formula hooks were inspected and already retain template species; no changes were needed there.
+- Validation: 21 new tests passed, including actual structure-count comparisons, mixed anions, unequal A/B counts, defects, CSV generation with shared/separate structures and charge filtering, and a real subprocess forwarding test. The related builder, structure-score, charge, parallel and interstitial regression selection passed with two optional perovskite.vasp fixture skips. No physical GPU/MD run was necessary for this formula-reporting change.
+- Independent review found no issue. Reflect recorded the dopant-count versus complete-composition pitfall. Work remains isolated on codex/training-duplicate-budget after 08145da1; the original dirty checkout is untouched. New output uses the full formula; existing CSV files are not rewritten.
+
+### EARS — Commit Digest (2026-10-30 11:06)
+<!-- concepts: composition-reporting, sublattice-defects, worktree-isolation -->
+- The hook named the original checkout's unrelated generated-CSV-columns work. This worktree's change instead corrects DefectSiteBuilder's full elemental formula, validated against built atom counts and both serial and parallel output paths. The original A-site normalization preserves vacancy and spectator ratios without an extra physical calculation. The implementation, tests and reflection are recorded above; no conclusions about the unrelated hook diff are inferred.

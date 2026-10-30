@@ -605,6 +605,21 @@ A builder turns the agent's pick (a flat `{element: fraction}` or a structured
 | `sse` | Doped-supercell recipe (P->metal, S->O/Cl/Br, charge-neutral Li vacancies). Keys below. |
 | `"pkg.mod:Class"` | Your own builder (FQN) with `build(candidate, *, n_configs, rng)`. |
 
+For `defect_site`, the `formula` column in `generated.csv` contains the full
+elemental composition, including the surviving host atoms and untouched template
+elements such as oxygen. Counts are normalized by the **original number of
+A-site atoms** in `base_poscar`. A template with equal A/B counts and three O per
+A gives, for example, `Sr0.5Ba0.5Fe0.75Co0.25O3`; an A-site vacancy can give
+`Sr0.875FeO3`, and an interstitial can give `Sr1.125FeO3`. Oxygen stoichiometry is
+read from the template, not fixed to three. The label follows the actual integer
+substitutions and defect clamping, preserves fractions such as `0.03125`, and
+combines an element present on multiple sublattices. External MD wrappers that
+delegate `composition_formula()` to this builder, including
+`clc_workflow.rl_builder:MDAveragedOptBuilder`, receive the same complete formula
+in serial and parallel execution, without an additional MD or optimization run.
+When the optional generation charge-neutrality filter is enabled, it also checks
+this complete formula rather than a dopant-only label.
+
 ## `sse` builder keys
 
 | Key | What it does | Default |

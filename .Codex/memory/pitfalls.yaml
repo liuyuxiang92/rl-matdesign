@@ -82,3 +82,24 @@
   - checkpoints
   - preprocessing
   - input-artifact-preservation
+- id: pitfall-defect-formula-001
+  date: '2026-10-30'
+  expires: '2027-01-30'
+  title: Dopant operation counts are not a complete chemical formula
+  wrong: Formatting only the resolved A/B dopant counts omits residual hosts and
+    untouched template elements; three significant digits also truncate 1/32 fractions.
+  right: Apply the same resolved integer substitution, removal and insertion counts
+    to the template elemental counts. Normalize all species by the original A-site
+    count, combine shared elements, and preserve fractional precision. Compare the
+    formula with actual built atom counts, including defects and unequal site pools.
+  impact: generated.csv omitted Sr, Fe and oxygen and used vacancy/interstitial
+    annotations instead of chemical formulas. The optional generation charge filter
+    consumes the same formula hook, so this is also a downstream validation contract.
+  files:
+  - src/rl_matdesign/predictors/builders/defect_site.py
+  - tests/test_defect_site_formula.py
+  - tests/test_parallel_structures.py
+  tags:
+  - composition-reporting
+  - sublattice-defects
+  - formula-validation

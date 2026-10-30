@@ -82,6 +82,7 @@ Config keys
 """
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -120,24 +121,10 @@ class DefectSiteBuilder:
         rng: Optional[np.random.Generator] = None,
     ) -> List["ase.Atoms"]:
         from ...utils.structure import SublatticeOp, build_substituted_structure
-        from ase.io import read as ase_read
-
         if rng is None:
             rng = np.random.default_rng(self._seed)
 
-        template = ase_read(self.base_poscar)
-        symbols = template.get_chemical_symbols()
-        n_a = sum(1 for s in symbols if s == self.a_site_symbol)
-        n_b = sum(1 for s in symbols if s == self.b_site_symbol)
-        if n_a == 0:
-            raise ValueError(
-                f"No sites with symbol {self.a_site_symbol!r} found in {self.base_poscar}."
-            )
-        if n_b == 0:
-            raise ValueError(
-                f"No sites with symbol {self.b_site_symbol!r} found in {self.base_poscar}."
-            )
-
+        template, n_a, n_b = self._read_template()
         a_counts, b_counts, a_remove, insert_spec = self._resolve_ops(candidate, n_a, n_b)
 
         ops = [
@@ -153,43 +140,53 @@ class DefectSiteBuilder:
         return build_substituted_structure(template, ops, n_configs=n_configs, rng=rng)
 
     def composition_formula(self, candidate: Dict[str, Dict[str, Any]]) -> str:
-        """Display-only label reflecting what was ACTUALLY built, not the raw
-        candidate picks -- routes through the same ``_resolve_ops`` decoding
-        ``build()`` uses (host excluded from dopant counts, vacancy/interstitial
-        folded in), so the label can never drift from the real structure. With
-        the old ``independent``-kind dopant group, two picks landing on the same
-        element could sum past 1.0 (e.g. Ca=0.65625 + Ca=0.65625 = 1.3125) --
-        physically impossible as a site fraction, silently clamped by
-        `_resolve_ops` -- so the raw candidate value could print e.g. "Ca1.31"
-        while the structure that was actually built, MD'd and scored was
-        fully-substituted (Ca1.00), a real bug this repo hit in practice. The
-        current ``composition``-kind dopant group makes that overshoot
-        structurally impossible (one sum-to-1 pick), but this still routes
-        through ``_resolve_ops`` rather than the raw candidate for the same
-        reason: the displayed label must reflect what was built, not what was
-        requested.
+        """Full elemental formula, normalized by the original A-site count.
+
+        Apply the same integer counts and defect clamping as ``build`` to the
+        template composition, including residual hosts and untouched atoms.
+        A/B/O therefore retain their actual ratios; oxygen is never assumed to
+        be three. Vacancies reduce the affected element and interstitials add
+        it, rather than emitting nonchemical ``_vac``/``_int`` labels.
+
+        Normalization uses the template before defects, so an A-site vacancy
+        leaves, for example, ``Sr0.875FeO3``. No structure generation, RNG draw,
+        MD or optimization is needed. Elements occupying multiple sublattices
+        are combined in this elemental formula.
         """
+        template, n_a, n_b = self._read_template()
+        a_counts, b_counts, a_remove, insert_spec = self._resolve_ops(candidate, n_a, n_b)
+        counts = Counter(template.get_chemical_symbols())
+        counts[self.a_site_symbol] -= sum(a_counts.values()) + a_remove
+        counts[self.b_site_symbol] -= sum(b_counts.values())
+        counts.update(a_counts)
+        counts.update(b_counts)
+        counts.update(insert_spec)
+
+        # Keep A-site species, then B-site species, then the remaining template
+        # elements in a stable readable order. Shared elements appear once.
+        order = dict.fromkeys([
+            self.a_site_symbol, *sorted(a_counts), *sorted(insert_spec),
+            self.b_site_symbol, *sorted(b_counts), *sorted(counts),
+        ])
+        return "".join(
+            el + ("" if counts[el] == n_a else f"{counts[el] / n_a:.12f}".rstrip("0").rstrip("."))
+            for el in order if counts[el] > 0
+        )
+
+    # ------------------------------------------------------------------
+
+    def _read_template(self) -> tuple:
+        """Read and validate the same sublattices for construction and labels."""
         from ase.io import read as ase_read
 
         template = ase_read(self.base_poscar)
-        symbols = template.get_chemical_symbols()
-        n_a = sum(1 for s in symbols if s == self.a_site_symbol)
-        n_b = sum(1 for s in symbols if s == self.b_site_symbol)
-        a_counts, b_counts, a_remove, insert_spec = self._resolve_ops(candidate, n_a, n_b)
-        defect_species, _defect_amount = self._decode_defect(candidate)
-
-        parts = []
-        for el, c in sorted(a_counts.items()):
-            parts.append(f"{el}{c / n_a:.3g}")
-        for el, c in sorted(b_counts.items()):
-            parts.append(f"{el}{c / n_b:.3g}")
-        if a_remove:
-            parts.append(f"{defect_species}_vac{a_remove / n_a:.3g}")
-        for el, c in insert_spec.items():
-            parts.append(f"{el}_int{c / n_a:.3g}")
-        return "".join(parts)
-
-    # ------------------------------------------------------------------
+        counts = Counter(template.get_chemical_symbols())
+        for symbol in (self.a_site_symbol, self.b_site_symbol):
+            if counts[symbol] == 0:
+                raise ValueError(
+                    f"No sites with symbol {symbol!r} found in {self.base_poscar}."
+                )
+        return template, counts[self.a_site_symbol], counts[self.b_site_symbol]
 
     def _resolve_ops(
         self, candidate: Dict[str, Dict[str, Any]], n_a: int, n_b: int,
