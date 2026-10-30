@@ -172,6 +172,44 @@ dqn_batch_size: 256
 
 Override the loss function from the CLI: `--dqn-loss smoothl1` (default) or `--dqn-loss mse`.
 
+### Counting repeated candidates in the training budget
+
+By default every completed training episode consumes one budget slot. To count
+only candidates that have not been evaluated earlier in training, add these
+top-level YAML fields:
+
+```yaml
+train_count_duplicates: false       # default: true
+train_max_duplicate_attempts: 1000   # maximum consecutive completed duplicates
+```
+
+Repeated episodes still enter the DQN replay buffer and receive normal training
+updates; REINFORCE/A2C also keep them in their training batches. Only the budget
+counter changes. This works for every material system and both DQN target modes
+(`mc` and `bootstrap`). Candidate identity uses the environment's final
+composition key: action order does not matter, while sublattice assignments and
+categorical choices remain distinct.
+
+For DQN, `dqn_warmup_eps: 400` plus `dqn_num_train_eps: 1600` now requests 400
+distinct warmup candidates followed by 1,600 **additional** distinct candidates.
+The seen-candidate set is shared across both phases. Epsilon annealing, target
+network updates, and checkpoint frequency still follow actual sampled online
+episodes. For PG, the unique target is `pg_num_iters * pg_batch_eps`; duplicate
+episodes can require additional batches and updates. Batches contain at most
+`pg_batch_eps` sampled episodes, with a shorter final batch when the target is
+reached. PG's scaler-only warmup does not enter the seen-candidate set.
+
+Use `--no-train-count-duplicates` or `--train-count-duplicates` to override the
+YAML, and `--train-max-duplicate-attempts N` to override the duplicate limit. A new
+candidate resets the consecutive-duplicate counter. If the limit is reached,
+training stops with an error instead of sampling indefinitely in an exhausted
+search space. The limit applies only when duplicates do not consume budget.
+
+The per-episode rows in `training_log.csv` report `budget_counted`,
+`training_attempts`, `training_budget_used`, `training_unique_candidates`, and
+`training_duplicate_episodes`. DQN totals include warmup. With duplicate counting
+disabled, `episode` tracks actual samples and can exceed the configured budget.
+
 ---
 
 ## Checkpointing and resume
@@ -206,6 +244,15 @@ python scripts/run_experiment.py \
 
 Use `--load-policy`, `--load-qnet`, `--load-scaler`, `--load-value-net` to load
 model files from a non-default path.
+
+New checkpoints preserve the training budget counters and seen-candidate set.
+Keep `train_count_duplicates` unchanged when resuming a checkpoint that has
+already collected episodes. Older checkpoints and weights-only resumes lack the
+history required for unique-candidate accounting: resume them with the default
+`train_count_duplicates: true`, or start a new run to use `false`.
+When resuming an older checkpoint, `training_budget_history_complete: false`
+marks budget diagnostics that cover only the resumed portion. Appending to an
+older CSV preserves its header, so new budget columns appear only in new logs.
 
 ---
 

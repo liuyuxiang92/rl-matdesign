@@ -39,3 +39,46 @@
   - gpu-processes
   - error-propagation
   - calibration
+- id: pitfall-deepmd-runtime-001
+  date: '2026-10-29'
+  expires: '2027-01-29'
+  title: Verify the imported DeepMD model factory before expensive classification runs
+  wrong: Updating rl-matdesign or copying a new DeepMD source tree while the CLI interpreter
+    still imports an older DeepMD package leaves DPA4 classification unsupported.
+  right: Inspect deepmd.__file__ and deepmd.pt.model.model.__file__ using the same Python
+    interpreter as rl-matdesign. The supplied DeepMD commit c856a77bfddce66afd0956c24487999a5c69c7cd
+    adds classification to get_sezm_model and provides DeepClassification.predict_proba.
+    Verify the selected checkpoint and head load before launching MD-backed RL. A version
+    string alone may not distinguish custom source revisions.
+  impact: The old factory raises 'DPA4/SeZM model supports `dpa4_ener`, `sezm_ener`, or `property`
+    fitting, but got `classification`.' Candidate retries cannot fix this environment error;
+    failed attempts consume wall time while the successful-episode counter remains zero.
+  files:
+  - src/rl_matdesign/predictors/structure_score.py
+  - src/rl_matdesign/configuration.py
+  - src/rl_matdesign/training.py
+  tags:
+  - deepmd
+  - runtime-compatibility
+  - model-preflight
+- id: pitfall-checkpoint-prerequisites-001
+  date: '2026-10-30'
+  expires: '2027-01-30'
+  title: Persist preprocessing before publishing intermediate training checkpoints
+  wrong: DQN saved std_scaler.bin only after successful training, while intermediate
+    checkpoints could already exist. A duplicate-budget guard or other training error
+    could therefore leave a checkpoint that the runner could not resume.
+  right: When checkpointing is enabled, persist the fitted scaler immediately after
+    warmup to the output directory. Never use an explicit --load-scaler input path
+    as the save destination. Preserve the budget history together with model and
+    optimizer states, and verify actual CLI recovery after an interrupted run.
+  impact: An otherwise usable intermediate model checkpoint could fail the runner's
+    scaler prerequisite check; careless early persistence could overwrite a user input.
+  files:
+  - src/rl_matdesign/training.py
+  - src/rl_matdesign/experiment.py
+  - tests/test_duplicate_budget_cli.py
+  tags:
+  - checkpoints
+  - preprocessing
+  - input-artifact-preservation

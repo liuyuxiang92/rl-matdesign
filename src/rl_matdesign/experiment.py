@@ -60,6 +60,7 @@ from rl_matdesign.training import (
 from rl_matdesign.utils.metrics import RunMetrics
 from rl_matdesign.utils.seeding import set_global_seed
 from rl_matdesign.utils.timing import PhaseTimer, PredictorTimer
+from rl_matdesign.utils.training_budget import TrainingBudget
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +126,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-gen-attempts", type=int, default=None,
                    dest="max_gen_attempts",
                    help="Max generation attempts before stopping. Default: 10 × num_gen_eps.")
+    p.add_argument("--train-count-duplicates", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="Count repeated terminal candidates toward training budgets (default true). "
+                        "--no-train-count-duplicates counts new candidates only; repeats still train.")
+    p.add_argument("--train-max-duplicate-attempts", type=int, default=None,
+                   help="Stop after this many consecutive duplicate training episodes in "
+                        "unique-budget mode (default 1000). Overrides YAML.")
     p.add_argument("--constrain-training", dest="constrain_training",
                    action="store_true", default=None,
                    help="Apply in-episode constraint filters during training "
@@ -176,6 +184,17 @@ def _run_experiment(resources: ExitStack) -> None:
         raise SystemExit("--only-generate and --resume-training are mutually exclusive.")
 
     cfg = load_config(args.config)
+    train_count_duplicates = (
+        args.train_count_duplicates if args.train_count_duplicates is not None
+        else cfg.get("train_count_duplicates", True)
+    )
+    train_max_duplicate_attempts = (
+        args.train_max_duplicate_attempts if args.train_max_duplicate_attempts is not None
+        else cfg.get("train_max_duplicate_attempts", 1000)
+    )
+    # Validate before constructing models or running expensive structure builders.
+    TrainingBudget(count_duplicates=train_count_duplicates,
+                   max_duplicate_attempts=train_max_duplicate_attempts)
 
     method = args.method or cfg.get("method", "a2c")
     train_seed = args.train_seed if args.train_seed is not None else args.dp_seed
@@ -193,6 +212,8 @@ def _run_experiment(resources: ExitStack) -> None:
         **cfg,
         "config_file": args.config, "method": method,
         "dp_seed": args.dp_seed, "train_seed": train_seed, "gen_seed": gen_seed,
+        "train_count_duplicates": train_count_duplicates,
+        "train_max_duplicate_attempts": train_max_duplicate_attempts,
     }
     with open(os.path.join(args.out, "run_config.json"), "w") as f:
         json.dump(run_config, f, indent=2)
@@ -391,10 +412,19 @@ def _run_experiment(resources: ExitStack) -> None:
                     "buffer": buffer,
                     "start_ep": start_ep,
                     "eps": eps_val,
+                    "training_episodes_completed": (
+                        _mid.get("training_episodes_completed", start_ep) if _mid else start_ep
+                    ),
+                    "training_budget_state": _mid.get("training_budget_state") if _mid else None,
+                    "training_budget_history_complete": (
+                        _mid.get("training_budget_history_complete", "training_budget_state" in _mid)
+                        if _mid else False
+                    ),
                 }
 
             # Thread the predictor cache into checkpoint_cfg so periodic saves include it.
             if checkpoint_cfg is not None:
+                checkpoint_cfg["scaler_path"] = os.path.join(args.out, "std_scaler.bin")
                 _pcache = getattr(predictor, "_cache", None)
                 if _pcache is not None:
                     checkpoint_cfg["dp_cache"] = _pcache
@@ -427,6 +457,8 @@ def _run_experiment(resources: ExitStack) -> None:
                     resume_state=resume_state,
                     augment_permutations=_aug_K,
                     timer=predictor,
+                    train_count_duplicates=train_count_duplicates,
+                    train_max_duplicate_attempts=train_max_duplicate_attempts,
                     # --- BEGIN mc-target experiment (removable) ---
                     dqn_target_mode=(
                         args.dqn_target_mode
@@ -566,6 +598,13 @@ def _run_experiment(resources: ExitStack) -> None:
                 "opt_critic_state": _mid_ckpt.get("opt_critic_state") if _mid_ckpt else None,
                 "visit_counts": _mid_ckpt.get("visit_counts") if _mid_ckpt else None,
                 "entropy_coef_eff": _mid_ckpt.get("entropy_coef_eff") if _mid_ckpt else None,
+                "training_budget_state": _mid_ckpt.get("training_budget_state") if _mid_ckpt else None,
+                "training_budget_history_complete": (
+                    _mid_ckpt.get("training_budget_history_complete", "training_budget_state" in _mid_ckpt)
+                    if _mid_ckpt else False
+                ),
+                "start_iteration": _mid_ckpt.get("iteration", 0) if _mid_ckpt else 0,
+                "is_resume": True,
             }
 
         else:
@@ -608,6 +647,8 @@ def _run_experiment(resources: ExitStack) -> None:
                     pg_repeat_penalty_shape=pg_repeat_penalty_shape,
                     checkpoint_cfg=checkpoint_cfg,
                     timer=predictor,
+                    train_count_duplicates=train_count_duplicates,
+                    train_max_duplicate_attempts=train_max_duplicate_attempts,
                 )
             for r in train_rows:
                 metrics.log(**r)

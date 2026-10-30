@@ -2640,3 +2640,33 @@ update defect_site.py's docstring, then write the new test file.
 ### EARS — Commit Digest (2026-10-28 16:51)
 <!-- concepts: worktree-isolation, gpu-scheduling, calibration-validation -->
 - The hook reported a generated-CSV-columns commit from the original experiment checkout, not this branch's multi-GPU changes. No conclusions about that unrelated work are inferred. The current branch's implementation and validation are recorded above; preserve original checkout edits and keep this feature's commit isolated.
+
+### 2026-10-29 — Diagnose DPA4 classification runtime mismatch
+<!-- concepts: runtime-compatibility, deepmd-inference, evaluation-budget -->
+- User's new runtime failure rejects fitting `classification`. The exact error exists in the parent of supplied DeepMD commit c856a77bfddce66afd0956c24487999a5c69c7cd; that commit explicitly adds DPA4 classification factory dispatch and the public predict_proba API. The installed/imported runtime therefore lacks that support or resolves to a stale copy. No access to the failing container was available to verify its import path or install a correction.
+- Failure is during classification model construction, before probability evaluation. Updating rl-matdesign alone, changing the class index, or relabeling the fitting as property does not supply the missing runtime support. Python package imports and the separately built LAMMPS/Kokkos binary require separate verification; the prior V100 Kokkos initialization error is a different failure.
+- Confirmed MC episode budgets count successful duplicate rollouts, with per-candidate predictor caching avoiding repeated MD in the same process. CandidateEvaluationFailed retries do not advance the episode count, explaining 0/400 despite elapsed time in this error. No training or inference logic changed; one runtime compatibility pitfall recorded through reflect.
+
+### EARS — Session Start (2026-10-30 09:50)
+<!-- concepts: episode-budgeting, composition-deduplication, checkpoint-compatibility -->
+- Task: Add a configurable choice of whether duplicate training episodes count toward the training budget, preserving the current default.
+- Why: Distinguish sampled episode count from exploration of new material compositions while retaining generic multi-system training support and bounded retry behavior.
+- Work continues in the isolated multi-GPU feature worktree; the hook named the original dirty checkout, whose unrelated changes are preserved.
+
+### EARS — Session End (2026-10-30 10:03; early hook)
+<!-- concepts: episode-budgeting, checkpoint-compatibility, branch-integration -->
+- Accomplished so far: implemented optional unique-candidate training budgets with duplicate learning preserved, resume state, guard checkpoints, documentation and targeted tests. Reflect recorded the decision and preprocessing-checkpoint pitfall in .Codex/memory/.
+- Next: finish the full regression run and inspect fetched origin/main before committing/pushing. The remote parallel branch no longer exists and main advanced to 86d5fd90, so publication must use the current main baseline.
+- Open issues: this hook fired during a read-only branch-ancestry check; the session has not finished, and full-suite results and final branch integration remain pending.
+
+### 2026-10-30 — Optional unique-candidate training budgets
+<!-- concepts: episode-budgeting, composition-deduplication, checkpoint-compatibility -->
+- User explicitly chose to retain duplicate episodes for learning while optionally excluding them from budget. Added train_count_duplicates (default true) and train_max_duplicate_attempts (default 1000), with CLI overrides, strict early validation and effective run-config values.
+- Shared canonical-key bookkeeping applies to all environments, DQN mc/bootstrap, REINFORCE and A2C. DQN warmup and online training share seen keys; PG scaler warmup is excluded. Actual sampled episodes continue to drive gradient updates and DQN schedules. PG keeps sampled batch sizes and can run extra updates, stopping exactly at its unique target with a partial final batch.
+- Checkpoints retain seen keys, counting mode and independent counters; legacy unique-mode resume is rejected rather than inferring history from incomplete caches or replay. Added diagnostic columns and an incomplete-history marker. Duplicate guards train collected samples first, then stop with a checkpoint when configured. Saved the DQN scaler before intermediate checkpoints and preserved explicit input scaler files. CSV append now honors the existing header instead of leaking new columns past it.
+- Independent review found and corrected the input-scaler save destination. Validation: full suite 674 passed, 4 missing optional-fixture skips and one existing SMACT deprecation warning in 162.18s. This includes 87 new tests across budget bookkeeping, controlled real-optimizer DQN/PG runs, and 14 CLI cases. The strengthened guard/resume test separately verified the explicit input scaler remains untouched.
+- Fetched remote main 86d5fd90 (merge of the earlier feature branches); its tree exactly matches the previous 104d39a9 baseline. Continued on new branch codex/training-duplicate-budget based on that current main. Original dirty checkout was not changed. Reflect recorded one budget decision and one checkpoint-prerequisite pitfall; checkpoint prepared for handoff.
+
+### EARS — Commit Digest (2026-10-30 10:06)
+<!-- concepts: episode-budgeting, checkpoint-compatibility, worktree-isolation -->
+- The hook again reported the original checkout's unrelated generated-CSV-columns commit. This isolated branch implements configurable duplicate training budgets, with the user's explicit decision to retain duplicate learning, complete seen-key checkpoint state, and 674 passing regression tests. No conclusions about the unrelated commit are inferred; the design and recovery requirements are captured above and in .Codex/memory/.
