@@ -180,3 +180,4 @@ def test_append_keeps_columns_absent_from_the_header_out_of_the_rows(tmp_path):
         assert reader.fieldnames == ["phase", "x"]
         rows = list(reader)
     assert [(r["phase"], r["x"]) for r in rows] == [("a", "1"), ("b", "2")]
+    assert all(None not in row for row in rows), "new columns must not leak past the existing CSV header"

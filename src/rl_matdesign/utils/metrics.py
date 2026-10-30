@@ -56,10 +56,11 @@ class RunMetrics:
         if not write_header:
             with open(path, newline="") as f:
                 fieldnames = next(csv.reader(f), []) or []
-        for row in self.rows:
-            for k in row:
-                if k not in fieldnames:
-                    fieldnames.append(k)
+        if write_header:
+            for row in self.rows:
+                for k in row:
+                    if k not in fieldnames:
+                        fieldnames.append(k)
 
         with open(path, mode, newline="") as f:
             # restval: a row missing a column writes blank instead of raising.

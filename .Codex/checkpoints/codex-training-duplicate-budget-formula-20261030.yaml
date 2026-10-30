@@ -1,0 +1,30 @@
+checkpoint_version: '3.0.0'
+created_at: '2026-10-30'
+branch: codex/training-duplicate-budget
+base_commit: 08145da1c15c0018ecf2f64a23b8f530be274bf8
+phase:
+  current: implementation_validated
+  completed: [full_elemental_formula, documentation, regression_tests, independent_review, reflection]
+  next: [commit_and_push]
+state:
+  worktree: /private/tmp/rl-matdesign-multigpu-20261028
+  decisions:
+  - decision: Derive the full elemental formula from the template and the same resolved operations as construction.
+    rationale: Dopant counts omit residual hosts and spectators; defects and integer rounding must match the scored structure.
+  - decision: Normalize every species by the original A-site count and keep decimal precision.
+    rationale: Preserve actual elemental ratios, including A vacancies, unequal A/B counts and template oxygen content.
+  experiments:
+  - name: new_formula_regressions
+    status: completed
+    result: 21 new tests passed, including actual atom counts, CSV and charge-filter forwarding, and worker IPC.
+  - name: related_regression_selection
+    status: completed
+    result: Builder, structure-score, charge, parallel and interstitial tests passed; two optional perovskite.vasp fixture skips.
+blockers: []
+resume_instructions: |
+  Inspect git status and git log in the isolated worktree before publication; this
+  checkpoint was written before commit. Keep the original dirty checkout unchanged.
+  The budget feature at 08145da1 was already pushed to this branch. This follow-up
+  fixes DefectSiteBuilder.composition_formula, inherited by external MD wrappers.
+  No new YAML parameter, extra MD calculation, or automatic rewrite of old CSVs.
+  Commit and push to the existing branch; do not infer a main merge from publication.

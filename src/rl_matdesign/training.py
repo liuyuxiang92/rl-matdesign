@@ -39,6 +39,7 @@ from tqdm import tqdm
 
 from .env import CompositionEnv
 from .predictors.base import PropertyPredictor
+from .utils.training_budget import TrainingBudget
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +548,8 @@ def train_dqn_online(
     augment_permutations: int = 0,
     timer: Optional[object] = None,
     dqn_target_mode: str = "bootstrap",
+    train_count_duplicates: bool = True,
+    train_max_duplicate_attempts: int = 1000,
 ) -> Tuple[torch.nn.Module, StandardScaler, List[dict]]:
     """Classical online DQN with FIFO replay buffer and TD targets.
 
@@ -579,8 +582,37 @@ def train_dqn_online(
         every per-episode row also carries cumulative wall-clock and
         predictor-call counters, which is what makes a best-reward-vs-time curve
         plottable after the run.
+
+    ``train_count_duplicates=False`` counts new terminal candidate keys only,
+    sharing a seen set across the rewarded warmup and online training phases.
+    Repeated trajectories still enter replay and trigger the normal gradient
+    steps. Epsilon, target-copy and checkpoint schedules follow actual sampled
+    online episodes. The duplicate guard bounds consecutive repeats; the
+    budget state and actual episode counter are stored separately on resume.
     """
     from .model import QRegressor
+
+    budget_state = resume_state.get("training_budget_state") if resume_state else None
+    if resume_state is not None and budget_state is None and not train_count_duplicates:
+        raise ValueError(
+            "Cannot resume with train_count_duplicates=false: checkpoint has no "
+            "training_budget_state containing previously seen candidates. Start a new run "
+            "or resume with train_count_duplicates=true."
+        )
+    budget = TrainingBudget(
+        count_duplicates=train_count_duplicates,
+        max_duplicate_attempts=train_max_duplicate_attempts,
+        state=budget_state,
+    )
+    budget_history_complete = bool(
+        resume_state.get("training_budget_history_complete", budget_state is not None)
+    ) if resume_state is not None else True
+    if resume_state is not None and budget_state is None:
+        print("[WARN] Legacy checkpoint has no training budget history: new diagnostic "
+              "counters start at this resume; the existing episode schedule is preserved.", flush=True)
+    if not train_count_duplicates:
+        print("[INFO] Training budget counts new candidates across DQN warmup and training; "
+              "duplicate episodes still enter replay and receive gradient updates.", flush=True)
 
     # --- BEGIN mc-target experiment (removable) ---
     if dqn_target_mode == "mc":
@@ -611,6 +643,7 @@ def train_dqn_online(
         optimizer  = resume_state["optimizer"]
         buffer     = resume_state["buffer"]
         start_ep   = int(resume_state.get("start_ep", 0))
+        train_attempts = int(resume_state.get("training_episodes_completed", start_ep))
         eps        = float(resume_state.get(
             "eps", max(dqn_eps_min, 1.0 - start_ep / dqn_eps_anneal_eps),
         ))
@@ -632,16 +665,25 @@ def train_dqn_online(
         else:
             print(f"[INFO] DQN warmup: {n_warmup_eps} random episodes with real rewards...")
         pbar = tqdm(total=n_warmup_eps, desc="DQN warmup")
-        for _w in range(n_warmup_eps):
+        warmup_counted = 0
+        warmup_attempts = 0
+        while warmup_counted < n_warmup_eps:
+            budget.check_can_sample()
             _rollout_with_retry(lambda: _rollout_random_episode(env))
+            counted = budget.record(env.terminal_comp_key())
+            warmup_counted += int(counted)
+            warmup_attempts += 1
             if env.path:
                 warmup_rows.append({
                     "phase": "dqn_warmup",
-                    "episode": _w + 1,
+                    "episode": warmup_attempts,
                     "return": float(env.path[-1].reward),
                     "terminal_reward": float(env.path[-1].reward),
                     "epsilon": 1.0,          # warmup is uniformly random by definition
                     "terminal_comp_key": str(env.terminal_comp_key()),
+                    "budget_counted": counted,
+                    "training_budget_history_complete": budget_history_complete,
+                    **budget.snapshot(),
                 })
             if augment_permutations > 0:
                 _augment_episode_in_buffer(
@@ -650,7 +692,7 @@ def train_dqn_online(
                 )
             else:
                 add_episode_to_buffer(env.path, buffer, elem_feats_scaled, fraction_set, gamma=gamma)
-            pbar.update(1)
+            pbar.update(int(counted))
         pbar.close()
         # Unlike PG warmup (which neutralises reward_fn), DQN warmup pays a real
         # predictor call per episode. The mark makes that cost visible.
@@ -659,6 +701,11 @@ def train_dqn_online(
 
         s_mat_all = np.asarray([r["s_mat_raw"] for r in buffer], dtype=float)
         scaler = StandardScaler().fit(s_mat_all)
+        if checkpoint_cfg and checkpoint_cfg.get("scaler_path"):
+            # Mid-training checkpoints must be usable even if training later stops
+            # at the duplicate guard, before the runner's final artifact save.
+            import joblib
+            joblib.dump(scaler, checkpoint_cfg["scaler_path"])
         state_dim = int(s_mat_all.shape[1])
         elem_dim  = int(elem_feats_scaled.shape[1])
         step_dim  = env.n_components
@@ -673,6 +720,7 @@ def train_dqn_online(
         optimizer = torch.optim.Adam(qnet.parameters(), lr=lr)
         loss_fn = _make_loss_fn(loss_name)
         start_ep = 0
+        train_attempts = 0
         eps = 1.0
 
     ckpt_path: Optional[str] = None
@@ -694,7 +742,7 @@ def train_dqn_online(
         )
         return qnet, scaler, metrics
 
-    pbar = tqdm(range(start_ep, dqn_num_train_eps), desc="DQN train")
+    pbar = tqdm(total=dqn_num_train_eps, initial=start_ep, desc="DQN train")
 
     def _rollout_eps_greedy_episode() -> None:
         # Collect one episode with epsilon-greedy policy.
@@ -717,9 +765,14 @@ def train_dqn_online(
                 )
             env.step(_a)
 
-    for ep in pbar:
+    completed = start_ep
+    while completed < dqn_num_train_eps:
+        budget.check_can_sample()
         qnet.eval()
         _rollout_with_retry(_rollout_eps_greedy_episode)
+        counted = budget.record(env.terminal_comp_key())
+        completed += int(counted)
+        train_attempts += 1
 
         episode_reward = float(env.path[-1].reward)
         if augment_permutations > 0:
@@ -745,17 +798,21 @@ def train_dqn_online(
             mean_loss = float(np.mean(losses))
 
         # 3. Hard target-net copy.
-        if (ep + 1) % dqn_target_update_freq == 0:
+        if train_attempts % dqn_target_update_freq == 0:
             target_net.load_state_dict(qnet.state_dict())
             target_net.eval()
 
         # 4. Linear epsilon anneal.
-        eps = max(dqn_eps_min, 1.0 - ep / dqn_eps_anneal_eps)
+        eps = max(dqn_eps_min, 1.0 - (train_attempts - 1) / dqn_eps_anneal_eps)
 
         _row = {
             "phase": "dqn_train",
-            "iteration": ep + 1,
-            "episode": ep + 1,
+            "iteration": train_attempts,
+            "episode": train_attempts,
+            "budget_counted": counted,
+            "training_budget_history_complete": budget_history_complete,
+            "terminal_comp_key": str(env.terminal_comp_key()),
+            **budget.snapshot(),
             "return": episode_reward,
             # Identical to `return` for DQN (it already logs the undiscounted
             # terminal reward), but present so every phase carries the column that
@@ -769,6 +826,7 @@ def train_dqn_online(
         if timer is not None:
             _row.update(timer.snapshot())
         metrics.append(_row)
+        pbar.update(int(counted))
         pbar.set_postfix(
             eps=f"{eps:.3f}",
             loss=f"{mean_loss:.4f}" if not math.isnan(mean_loss) else "warmup",
@@ -776,11 +834,18 @@ def train_dqn_online(
         )
 
         # 5. Periodic checkpoint.
-        if ckpt_freq > 0 and ckpt_path and (ep + 1) % ckpt_freq == 0:
-            _numbered = ckpt_path.replace(".pt", f"-ep{ep + 1}.pt")
+        budget_stop = not train_count_duplicates and (
+            completed >= dqn_num_train_eps
+            or budget.consecutive_duplicates >= train_max_duplicate_attempts
+        )
+        if ckpt_path and ckpt_freq > 0 and (train_attempts % ckpt_freq == 0 or budget_stop):
+            _numbered = ckpt_path.replace(".pt", f"-ep{train_attempts}.pt")
             _save_checkpoint(ckpt_path, {
                 "type": "dqn",
-                "episodes_completed": ep + 1,
+                "episodes_completed": completed,
+                "training_episodes_completed": train_attempts,
+                "training_budget_state": budget.state_dict(),
+                "training_budget_history_complete": budget_history_complete,
                 "qnet_state": qnet.state_dict(),
                 "target_net_state": target_net.state_dict(),
                 "opt_state": optimizer.state_dict(),
@@ -789,7 +854,8 @@ def train_dqn_online(
                 "eps": eps,
                 "dp_cache": dict(dp_cache_ref) if dp_cache_ref is not None else {},
             }, numbered_path=_numbered)
-            tqdm.write(f"[INFO] DQN checkpoint saved at episode {ep + 1} → {_numbered}")
+            tqdm.write(f"[INFO] DQN checkpoint saved at episode {train_attempts} "
+                       f"(budget {completed}/{dqn_num_train_eps}) → {_numbered}")
 
     pbar.close()
     return qnet, scaler, metrics
@@ -1117,6 +1183,8 @@ def train_pg(
     pg_repeat_penalty_coef: float = 0.0,
     pg_repeat_penalty_shape: str = "log",
     max_train_attempts: Optional[int] = None,
+    train_count_duplicates: bool = True,
+    train_max_duplicate_attempts: int = 1000,
     checkpoint_cfg: Optional[dict] = None,
     timer: Optional[object] = None,
 ) -> List[dict]:
@@ -1127,6 +1195,14 @@ def train_pg(
             collect batch_eps episodes under current policy
             standardise advantages across the batch
             one optimizer step over the entire batch
+
+    With ``train_count_duplicates=False``, the budget is instead
+    ``num_iters * batch_eps`` new terminal compositions. Duplicate episodes
+    still participate in the same learning batches and repeat penalties, so
+    the run can perform more updates than ``num_iters``. The final batch may
+    contain fewer than ``batch_eps`` trajectories. A resumed invocation requests
+    this many *additional* budgeted episodes while retaining all previously seen
+    compositions; PG's scaler-only warmup does not enter the seen set.
 
     Scale invariance
     ----------------
@@ -1150,6 +1226,35 @@ def train_pg(
        ``return_raw``. Logs written before this change are not comparable to
        either.
     """
+    budget_state = checkpoint_cfg.get("training_budget_state") if checkpoint_cfg else None
+    resuming = bool(checkpoint_cfg and (
+        checkpoint_cfg.get("is_resume")
+        or checkpoint_cfg.get("start_episode", 0)
+        or checkpoint_cfg.get("opt_actor_state") is not None
+    ))
+    if not train_count_duplicates and resuming and budget_state is None:
+        raise ValueError(
+            "Cannot resume with train_count_duplicates=false: this checkpoint "
+            "has no training_budget_state and the previously seen compositions "
+            "cannot be recovered reliably. Start a new run or retain "
+            "train_count_duplicates=true."
+        )
+    budget = TrainingBudget(
+        count_duplicates=train_count_duplicates,
+        max_duplicate_attempts=train_max_duplicate_attempts,
+        state=budget_state,
+    )
+    budget_start = budget.counted
+    budget_target = budget_start + max(0, int(num_iters)) * int(batch_eps)
+    if int(batch_eps) < 1:
+        raise ValueError("batch_eps must be a positive integer")
+    budget_history_complete = bool(checkpoint_cfg.get(
+        "training_budget_history_complete", budget_state is not None,
+    )) if resuming else True
+    if resuming and budget_state is None:
+        print("[WARN] Legacy checkpoint has no training budget history: new diagnostic "
+              "counters start at this resume; the existing episode schedule is preserved.", flush=True)
+
     policy.train()
     opt_actor = torch.optim.Adam(policy.parameters(), lr=lr_actor)
     if value_net is not None:
@@ -1182,16 +1287,42 @@ def train_pg(
     metrics: List[dict] = []
     accepted = int(checkpoint_cfg.get("start_episode", 0)) if checkpoint_cfg else 0
     attempted = 0
-    update_idx = 0
+    start_iteration = int(checkpoint_cfg.get("start_iteration", 0)) if checkpoint_cfg else 0
+    update_idx = start_iteration
+    iteration_in_run = 0
 
-    total_updates = max(1, int(num_iters))
+    total_updates = max(0, int(num_iters))
+    budget_label = "episodes" if train_count_duplicates else "new compositions"
     print(
-        f"[INFO] PG: {num_iters} iters × "
-        f"{batch_eps} eps/update = {total_updates} updates, {total_updates * batch_eps} total episodes."
+        f"[INFO] PG: budget={total_updates * batch_eps} {budget_label}, "
+        f"up to {batch_eps} sampled episodes/update; "
+        f"train_count_duplicates={train_count_duplicates}."
     )
 
-    outer_pbar = tqdm(range(int(num_iters)), desc=f"{rl_method.upper()} iters")
-    for it in outer_pbar:
+    outer_pbar = tqdm(
+        total=total_updates if train_count_duplicates else budget_target - budget_start,
+        desc=f"{rl_method.upper()} " + ("iters" if train_count_duplicates else "new compositions"),
+    )
+    while (iteration_in_run < total_updates if train_count_duplicates
+           else budget.counted < budget_target):
+        # The previous batch has already learned from its duplicate episodes.
+        # Only now may the duplicate guard stop the next batch.
+        try:
+            budget.check_can_sample()
+        except RuntimeError:
+            outer_pbar.close()
+            raise
+        if max_train_attempts is not None and attempted >= max_train_attempts:
+            if not train_count_duplicates:
+                outer_pbar.close()
+                raise RuntimeError(
+                    f"PG max_train_attempts={max_train_attempts} reached with "
+                    f"only {budget.counted - budget_start}/{budget_target - budget_start} "
+                    "new compositions; the training budget is incomplete."
+                )
+            break
+        it = start_iteration + iteration_in_run
+        iteration_in_run += 1
         batch_paths: List[list] = []
         batch_returns: List[List[float]] = []
         batch_terminal_keys: List[tuple] = []
@@ -1204,9 +1335,14 @@ def train_pg(
 
         collected = 0
         while collected < int(batch_eps):
-            attempted += 1
-            if max_train_attempts is not None and attempted > max_train_attempts:
+            if not train_count_duplicates and (
+                budget.counted >= budget_target
+                or budget.consecutive_duplicates >= train_max_duplicate_attempts
+            ):
                 break
+            if max_train_attempts is not None and attempted >= max_train_attempts:
+                break
+            attempted += 1
             _rollout_with_retry(lambda: _rollout_pg_episode(
                 env=env, policy=policy, scaler=scaler,
                 elem_feats_scaled=elem_feats_scaled, fraction_set=fraction_set,
@@ -1224,6 +1360,9 @@ def train_pg(
             returns.reverse()
 
             terminal_key = env.terminal_comp_key()
+            budget_counted = budget.record(terminal_key)
+            if not train_count_duplicates and budget_counted:
+                outer_pbar.update(1)
             n_visits_before = visit_counts[terminal_key]
             if pg_repeat_penalty_coef > 0.0:
                 if pg_repeat_penalty_shape == "log":
@@ -1262,8 +1401,13 @@ def train_pg(
                 "repeat_penalty": repeat_penalty,
                 "visit_count_before": n_visits_before,
                 "terminal_comp_key": str(terminal_key),
+                "budget_counted": budget_counted,
+                **budget.snapshot(),
+                "training_budget_history_complete": budget_history_complete,
             })
 
+        if train_count_duplicates:
+            outer_pbar.update(1)
         if not batch_paths:
             continue
 
@@ -1350,6 +1494,7 @@ def train_pg(
             "update": update_idx,
             "episode": accepted,
             "batch_eps": int(batch_eps),
+            "batch_eps_actual": len(batch_paths),
             "return": mean_return_raw,
             "return_raw": mean_return_raw,
             "return_shaped": mean_return_shaped,
@@ -1368,6 +1513,8 @@ def train_pg(
             "adv_mean_raw": adv_mean,
             "adv_std_raw": adv_std,
             "critic_loss": critic_loss_val,
+            **budget.snapshot(),
+            "training_budget_history_complete": budget_history_complete,
         }
         if timer is not None:
             _row.update(timer.snapshot())
@@ -1381,7 +1528,15 @@ def train_pg(
             upd=update_idx,
         )
 
-        if ckpt_freq > 0 and ckpt_path and (it + 1) % ckpt_freq == 0:
+        stopping_incomplete = not train_count_duplicates and budget.counted < budget_target and (
+            budget.consecutive_duplicates >= train_max_duplicate_attempts
+            or (max_train_attempts is not None and attempted >= max_train_attempts)
+        )
+        budget_finished = not train_count_duplicates and budget.counted >= budget_target
+        if ckpt_path and (
+            (ckpt_freq > 0 and (it + 1) % ckpt_freq == 0)
+            or stopping_incomplete or budget_finished
+        ):
             _numbered = ckpt_path.replace(".pt", f"-iter{it + 1}.pt")
             _save_checkpoint(ckpt_path, {
                 "type": "pg",
@@ -1394,11 +1549,19 @@ def train_pg(
                 "opt_critic_state": opt_critic.state_dict() if opt_critic is not None else None,
                 "visit_counts": dict(visit_counts),
                 "entropy_coef_eff": coef_eff,
+                "training_budget_state": budget.state_dict(),
+                **budget.snapshot(),
+                "training_budget_history_complete": budget_history_complete,
             }, numbered_path=_numbered)
             tqdm.write(f"[INFO] PG checkpoint saved at iter {it + 1} → {_numbered}")
 
     outer_pbar.close()
-    print(f"[INFO] PG training: {update_idx} updates over {accepted} episodes, {attempted} attempts.")
+    print(
+        f"[INFO] PG training: {update_idx - start_iteration} updates over "
+        f"{attempted} sampled episodes this invocation; "
+        f"budget used {budget.counted - budget_start}/{budget_target - budget_start} "
+        f"{budget_label} ({accepted} cumulative episodes)."
+    )
     return metrics
 
 

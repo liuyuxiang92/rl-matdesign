@@ -1,0 +1,49 @@
+checkpoint_version: '3.0.0'
+created_at: '2026-10-30T10:07:00+08:00'
+branch: codex/training-duplicate-budget
+base_commit: 86d5fd90f7ce768f377721a73073cc95c42749d4
+phase:
+  current: implementation_validated
+  completed: [budget_bookkeeping, dqn_mc_and_bootstrap, policy_gradient, resume_support,
+    documentation, independent_review, full_regression, reflection]
+  next: [commit_and_push]
+state:
+  worktree: /private/tmp/rl-matdesign-multigpu-20261028
+  parameters:
+  - name: train_count_duplicates
+    value: true
+    source: Backward-compatible default; user explicitly requested false to retain duplicate learning without counting duplicates toward budget.
+  - name: train_max_duplicate_attempts
+    value: 1000
+    source: Implementation default for bounded consecutive duplicate episodes in unique-budget mode; configurable, not a measured optimum.
+  experiments:
+  - name: full_regression
+    status: completed
+    result: 674 passed, 4 missing optional-fixture skips, one existing SMACT warning; 162.18 seconds.
+    command: PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 /opt/anaconda3/bin/python -m pytest -p no:cacheprovider
+  - name: guard_resume_input_scaler
+    status: completed
+    result: CLI guard writes usable checkpoint and output scaler before normal checkpoint cadence; increasing cap resumes with seen keys intact; explicit input scaler unchanged.
+  decisions:
+  - decision: Retain repeated episodes in replay and policy-gradient batches; count only new environment terminal keys when configured false.
+    rationale: User explicitly selected keeping duplicates for learning while changing only budget accounting.
+  - decision: DQN shares rewarded warmup and online seen keys; PG scaler warmup is excluded.
+    rationale: Count genuinely new evaluated candidates and avoid treating feature-scaling samples as evaluations.
+  - decision: Save full seen history and reject mode changes on nonempty resumed state; legacy resumes may retain default mode with explicitly incomplete diagnostics.
+    rationale: FIFO replay and prediction caches cannot reconstruct complete history or the original meaning of consumed budget.
+blockers: []
+artifacts:
+- path: /private/tmp/rl-matdesign-multigpu-20261028/src/rl_matdesign/utils/training_budget.py
+  role: Shared bookkeeping and checkpoint validation.
+- path: /private/tmp/rl-matdesign-multigpu-20261028/src/rl_matdesign/training.py
+  role: DQN and PG training integration.
+- path: /private/tmp/rl-matdesign-multigpu-20261028/docs/yaml_config_reference.md
+  role: Public configuration and resume semantics.
+resume_instructions: |
+  Check git status and git log in the isolated worktree above. This branch starts at
+  origin/main 86d5fd90; the previous parallel branch was merged and deleted remotely.
+  Keep the original checkout's unrelated changes untouched. Full CPU regression is
+  complete. Use train_count_duplicates: false to enable unique counting, retaining
+  duplicate learning. Enable --save-checkpoint-freq for recoverable intermediate
+  checkpoints. Do not enable unique mode on old checkpoints without seen history.
+  Confirm commit/push state before publication; do not infer it from this pre-commit file.

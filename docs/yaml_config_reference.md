@@ -25,6 +25,8 @@ standalone predictor. The RL and generation knobs are shared across scenarios.
 **CLI flags:** `--config` (required), `--out` (required), `--method`,
 `--dp-seed`, `--train-seed`, `--gen-seed`, `--device` (`cpu`/`cuda`),
 `--dqn-loss`, `--dqn-augment-permutations`, `--save-checkpoint-freq`,
+`--train-count-duplicates` / `--no-train-count-duplicates`,
+`--train-max-duplicate-attempts`,
 `--resume-training`, `--only-generate`, `--skip-generation`, `--max-gen-attempts`,
 `--load-qnet` / `--load-policy` / `--load-value-net` / `--load-scaler`.
 
@@ -603,6 +605,21 @@ A builder turns the agent's pick (a flat `{element: fraction}` or a structured
 | `sse` | Doped-supercell recipe (P->metal, S->O/Cl/Br, charge-neutral Li vacancies). Keys below. |
 | `"pkg.mod:Class"` | Your own builder (FQN) with `build(candidate, *, n_configs, rng)`. |
 
+For `defect_site`, the `formula` column in `generated.csv` contains the full
+elemental composition, including the surviving host atoms and untouched template
+elements such as oxygen. Counts are normalized by the **original number of
+A-site atoms** in `base_poscar`. A template with equal A/B counts and three O per
+A gives, for example, `Sr0.5Ba0.5Fe0.75Co0.25O3`; an A-site vacancy can give
+`Sr0.875FeO3`, and an interstitial can give `Sr1.125FeO3`. Oxygen stoichiometry is
+read from the template, not fixed to three. The label follows the actual integer
+substitutions and defect clamping, preserves fractions such as `0.03125`, and
+combines an element present on multiple sublattices. External MD wrappers that
+delegate `composition_formula()` to this builder, including
+`clc_workflow.rl_builder:MDAveragedOptBuilder`, receive the same complete formula
+in serial and parallel execution, without an additional MD or optimization run.
+When the optional generation charge-neutrality filter is enabled, it also checks
+this complete formula rather than a dopant-only label.
+
 ## `sse` builder keys
 
 | Key | What it does | Default |
@@ -625,6 +642,75 @@ charge-neutral Li vacancy are derived. (No `cl_map` / `o_off`.)
 | Key | What it does | Choices / default |
 |---|---|---|
 | `method` | Algorithm (CLI `--method` overrides) | `a2c` (default), `reinforce`, `dqn` |
+
+## Training budget and duplicate episodes (all methods)
+
+| Key | What it does | Choices / default |
+|---|---|---|
+| `train_count_duplicates` | Whether a completed episode revisiting a seen final candidate consumes budget | YAML boolean; `true` |
+| `train_max_duplicate_attempts` | Stop with an error after this many consecutive completed duplicate episodes when `train_count_duplicates: false` | Positive integer; `1000` |
+
+These keys are top-level and apply to all environments and material systems.
+`--train-count-duplicates` / `--no-train-count-duplicates` override the YAML
+boolean; `--train-max-duplicate-attempts N` overrides the limit. Use an unquoted
+YAML `true` or `false`; strings such as `"false"` are rejected.
+
+With the default `true`, training budgets retain their existing meaning: one
+completed episode consumes one slot, including repeated candidates. With
+`false`, only the first successfully completed episode for a final candidate key
+consumes a slot. Duplicate episodes still train normally: DQN stores their
+transitions in replay, and REINFORCE/A2C include them in gradient batches. Failed
+candidate evaluations continue to use the separate evaluation-retry mechanism
+and do not consume budget.
+
+Identity comes from `env.terminal_comp_key()`, independently of the predictor
+cache. Different action orders leading to the same final candidate are
+duplicates. Multi-group keys preserve group assignments, integer ratios, and
+categorical values, so these distinctions are not lost by flattening a formula.
+The configurations sampled to evaluate one candidate are not separate episodes.
+
+With `train_count_duplicates: false`, the phase budgets mean:
+
+- **DQN (`mc` and `bootstrap`):** `dqn_warmup_eps` counts distinct warmup
+  candidates; `dqn_num_train_eps` counts additional distinct online candidates.
+  One seen-candidate set spans both phases, so warmup candidates cannot consume
+  the online budget again. For example, `400 + 1600` requests 2,000 distinct
+  evaluated candidates. Epsilon annealing, target-network updates, and periodic
+  checkpoints follow actual sampled online episodes, including duplicates.
+- **REINFORCE/A2C:** the unique target is `pg_num_iters * pg_batch_eps`.
+  Each update uses up to `pg_batch_eps` sampled episodes, including duplicates;
+  additional batches are collected until the target is reached. The final batch
+  may be shorter to stop at the exact target. The scaler-only `pg_warmup_eps`
+  phase does not populate the seen-candidate set.
+
+When unique accounting is enabled, a new candidate resets the consecutive
+duplicate counter. Reaching `train_max_duplicate_attempts` stops training with
+an error, which bounds stalls when exploration collapses or the candidate space
+is exhausted. A larger unique budget can therefore require more gradient steps
+and wall time than an equally sized episode budget.
+
+Per-episode `training_log.csv` columns distinguish these quantities:
+
+| Column | Meaning |
+|---|---|
+| `budget_counted` | Whether this completed episode consumed a slot |
+| `training_attempts` | Cumulative successfully completed episodes, including duplicates |
+| `training_budget_used` | Cumulative slots consumed under the selected mode |
+| `training_unique_candidates` | Cumulative distinct final candidate keys |
+| `training_duplicate_episodes` | Cumulative completed episodes that revisited a key |
+| `training_budget_history_complete` | Whether the counters and seen keys cover the entire training history |
+
+DQN cumulative columns include warmup, while its `episode` column is the actual
+attempt number within the current phase. PG episode counts exclude scaler-only
+warmup. New checkpoints preserve counters, candidate keys, and accounting mode.
+Changing `train_count_duplicates` while resuming a nonempty checkpoint is
+rejected. Legacy checkpoints and weights-only resumes without candidate history
+can use `true`; `false` requires a new run.
+
+For a legacy resume, `training_budget_history_complete: false` indicates that
+budget diagnostics start from the resumed portion. Appending to an existing CSV
+preserves its header; logs created before these fields were added will therefore
+not gain the new columns on resume.
 
 ## Policy gradient (`a2c` / `reinforce`)
 

@@ -62,3 +62,28 @@
   - parallel-configurations
   - gpu-scheduling
   - generic-builders
+- id: decision-budget-001
+  date: '2026-10-30'
+  expires: '2027-04-30'
+  title: Separate unique-candidate budget from sampled training episodes
+  choice: train_count_duplicates defaults to true. When false, count canonical environment
+    terminal keys once while retaining duplicate replay rows and learning updates. Share
+    DQN seen keys across rewarded warmup and online training; PG scaler warmup is excluded.
+    Keep DQN schedules and PG batch sizes tied to actual sampled episodes, with bounded
+    consecutive duplicates and checkpointed seen keys plus separate counters.
+  alternatives_considered:
+  - Discard duplicate trajectories; user explicitly selected keeping them for training.
+  - Infer history from the predictor cache or FIFO replay; neither guarantees complete
+    candidate history, so legacy checkpoints cannot enable unique counting.
+  trade_off: A fixed unique-candidate budget can take more samples, updates and wall time.
+    Candidate-space exhaustion or a collapsed policy stops at the duplicate guard.
+    Resume retains the saved counting mode; legacy default-mode diagnostics describe
+    the resumed segment and are marked incomplete.
+  files:
+  - src/rl_matdesign/training.py
+  - src/rl_matdesign/utils/training_budget.py
+  - src/rl_matdesign/experiment.py
+  tags:
+  - episode-budgeting
+  - composition-deduplication
+  - checkpoint-compatibility
