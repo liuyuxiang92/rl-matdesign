@@ -1,0 +1,53 @@
+checkpoint_version: '3.0.0'
+created_at: '2026-11-03'
+branch: codex/cross-formula-parallel
+base_commit: f37bb7bf6c1f0ead43e79dbc3bf600bd09c4ed51
+phase:
+  current: implementation_validated
+  completed: [fixed_worker_allocation, default_formula_batching, failure_filtering, documentation, full_regression, independent_review, reflection]
+  next: [commit_and_push]
+state:
+  worktree: /private/tmp/rl-matdesign-cross-formula-20261103
+  parameters:
+  - name: GPU structure concurrency
+    value: 1
+    source: Explicit user request to remove per-GPU concurrency optimization.
+  - name: candidate_batch_size default
+    value: auto
+    source: User requested automatic cross-formula scheduling with minimal configuration.
+  - name: usable configurations required
+    value: 1
+    source: User requested scoring any survivors and skipping only formulas with none.
+  decisions:
+  - decision: Remove autotuning and default to ceil(selected GPUs / n_configs) formulas per wave.
+    rationale: One task per GPU and no extra timing work; structure_parallel mapping needs no scheduling parameters.
+  - decision: Reject optimizer nonconvergence within strict scoring contexts, including serial structure scoring.
+    rationale: Warning-only behavior let unconverged cells corrupt delta and classification averages; full ASE convergence includes cell stress.
+  - decision: Preserve original serial builder batch calls and isolate top-level relaxation per configuration.
+    rationale: Retain multi-template counts; external CLC builder already isolates MD and shared-helper errors internally.
+  experiments:
+  - name: full_regression
+    status: completed
+    result: 746 passed, 4 skipped, one existing SMACT warning in 219.95 seconds.
+    command: PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 /opt/anaconda3/bin/python -m pytest -p no:cacheprovider -o addopts='' -q
+  - name: worker_and_filtering_tests
+    status: completed
+    result: Real subprocess8GPU/2formula/4config barrier, free-GPU queue refill, no same-GPU overlap, partial/all failure and serial/batch survivor averaging verified.
+  - name: hardware_benchmark
+    status: not_run
+    result: GPU devices and DeepMD physics simulated in tests; no real hardware speed claim.
+  private_configs:
+  - /Users/liuyuxiang/Dropbox/Macbook_air/aisi/shanghai/reinforcement_learning/rl-matdesign/runs/config_templates/perovskite_gated_binary_cross_formula.yaml
+  - /Users/liuyuxiang/Dropbox/Macbook_air/aisi/shanghai/reinforcement_learning/rl-matdesign/runs/config_templates/perovskite_gated_binary_multigpu.yaml
+blockers: []
+resume_instructions: |
+  Inspect git status and log in the isolated worktree before publishing; checkpoint
+  was written before commit. Commit and push to origin/codex/cross-formula-parallel,
+  then verify remote SHA. Do not merge main or alter unrelated original checkout work.
+  Supersedes earlier opt-in and automatic1-vs2 concurrency behavior. Minimal YAML is
+  structure_parallel: {}; private YAMLs retain only their prior timeout_s: 7200.
+  Scientific settings including n_random_configs: 5 remain unchanged in those files.
+  Failed/unconverged configs are not replaced; remaining configs alone enter means.
+  All-failed formulas skip training budget; the11-consecutive-failure guard remains.
+  DQN policy/epsilon is frozen within a collection wave; explicit candidate_batch_size1
+  restores scalar collection. Third-party private optimizers must report convergence.

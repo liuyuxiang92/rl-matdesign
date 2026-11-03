@@ -81,6 +81,22 @@ class Builder:
         return "H2"
 
     def build(self, candidate, *, n_configs=1, rng=None):
+        if not self.cfg.get("test_track_execution"):
+            return self._build(candidate, n_configs=n_configs, rng=rng)
+        lock = self.root / ("busy-" + self.device)
+        lock.touch(exist_ok=False)  # A second task on this GPU must fail the test.
+        def record(event):
+            with (self.root / "execution_events.jsonl").open("a") as out:
+                out.write(json.dumps({"event": event, "device": self.device,
+                                      "pid": os.getpid(), "candidate_id": candidate.get("id")}) + "\\n")
+        record("start")
+        try:
+            return self._build(candidate, n_configs=n_configs, rng=rng)
+        finally:
+            record("end")
+            lock.unlink()
+
+    def _build(self, candidate, *, n_configs=1, rng=None):
         assert n_configs == 1, "one MD+optimization task per dispatched configuration"
         self.calls += 1
         with (self.root / "build_calls.jsonl").open("a") as out:
@@ -102,15 +118,14 @@ class Builder:
             raise RuntimeError("simulated MD failure on GPU " + self.device)
         if mode == "empty":
             return []
-        if mode == "pair_fail":
-            marker = self.root / ("active-" + self.device + "-" + str(os.getpid()))
-            marker.touch()
-            try:
-                time.sleep(.15)
-                if len(list(self.root.glob("active-" + self.device + "-*"))) > 1:
-                    raise RuntimeError("simulated GPU OOM during concurrent pair")
-            finally:
-                marker.unlink()
+        if candidate.get("release"):
+            (self.root / candidate["release"]).touch()
+        if candidate.get("wait_for") and self.device == candidate.get("wait_for_device"):
+            deadline = time.monotonic() + 8
+            while not (self.root / candidate["wait_for"]).exists():
+                if time.monotonic() > deadline:
+                    raise RuntimeError("free GPU did not receive the next queued configuration")
+                time.sleep(.01)
         if mode == "hang":
             child_script = (
                 "import os, sys, time\\n"
@@ -325,26 +340,6 @@ def test_workers_reuse_builder_across_candidates_and_close_cleanly(pool_factory)
     _wait_stopped(pids)
 
 
-@pytest.mark.parametrize("device_count", [2, 4])
-def test_two_workers_per_device_fills_slots_without_calibration(
-    pool_factory, monkeypatch, device_count,
-):
-    physical = ["3", "7", "9", "11"][:device_count]
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ",".join(physical))
-    pool, root = pool_factory(parallel_extra={
-        "devices": list(range(device_count)), "workers_per_device": 2,
-    })
-    atoms = pool.build({"mode": "barrier"}, n_configs=2 * device_count)
-    pids_by_device = {}
-    for cell in atoms:
-        pids_by_device.setdefault(cell.info["device"], set()).add(cell.info["pid"])
-    assert {device: len(pids) for device, pids in pids_by_device.items()} == {
-        device: 2 for device in physical
-    }
-    calls = [json.loads(line) for line in (root / "build_calls.jsonl").read_text().splitlines()]
-    assert len(calls) == 2 * device_count
-
-
 def test_auto_discovers_visible_devices_and_reserves_logical_gpu(pool_factory):
     pool, _ = pool_factory(parallel_extra={"devices": "auto", "reserve_devices": [0]})
     atoms = pool.build({}, n_configs=2)
@@ -358,12 +353,37 @@ def test_auto_uses_visible_allocation_when_no_devices_reserved(pool_factory):
     assert {cell.info["device"] for cell in atoms} == {"3", "7"}
 
 
-def test_auto_skips_calibration_when_one_job_per_gpu_is_enough(pool_factory):
-    pool, root = pool_factory(parallel_extra={"workers_per_device": "auto"})
-    atoms = pool.build({}, n_configs=2)
-    assert len(atoms) == 2
-    assert pool.autotune_report is None
-    assert len((root / "build_calls.jsonl").read_text().splitlines()) == 2
+def test_default_is_one_worker_per_gpu(pool_factory):
+    pool, root = pool_factory(cfg_extra={"structure_parallel": {"devices": [0, 1]}})
+    atoms = pool.build({}, n_configs=5)
+    assert len(atoms) == 5
+    assert len(_initializations(root)) == 2
+    assert len((root / "build_calls.jsonl").read_text().splitlines()) == 5
+
+
+@pytest.mark.parametrize("n_configs", [1, 2, 5])
+def test_legacy_auto_warns_and_runs_only_requested_tasks(pool_factory, n_configs):
+    with pytest.warns(DeprecationWarning, match="workers_per_device"):
+        pool, root = pool_factory(parallel_extra={"workers_per_device": "auto"})
+    atoms = pool.build({}, n_configs=n_configs)
+    assert len(atoms) == n_configs
+    assert len(_initializations(root)) == min(2, n_configs)
+    assert len((root / "build_calls.jsonl").read_text().splitlines()) == n_configs
+    assert len({(cell.info["device"], cell.info["pid"]) for cell in atoms}) == min(2, n_configs)
+
+
+@pytest.mark.parametrize("value", [2, 3, 0, -1, True, False, 1.0, "1", None, [], {}])
+def test_multiple_workers_or_invalid_worker_count_rejected(pool_factory, value):
+    with pytest.raises(ValueError, match="workers_per_device"):
+        pool_factory(parallel_extra={"workers_per_device": value})
+
+
+def test_obsolete_min_speedup_warns_and_does_not_add_probe_runs(pool_factory):
+    with pytest.warns(DeprecationWarning, match="min_speedup"):
+        pool, root = pool_factory(parallel_extra={"min_speedup": 1.15})
+    assert len(pool.build({}, n_configs=5)) == 5
+    assert len(_initializations(root)) == 2
+    assert len((root / "build_calls.jsonl").read_text().splitlines()) == 5
 
 
 @pytest.mark.parametrize("reserve", [[0, 1], [2], [0, 0], [-1]])
@@ -377,49 +397,6 @@ def test_manual_devices_cannot_also_request_auto_reservation(pool_factory):
     with pytest.raises(ValueError):
         pool, _ = pool_factory(parallel_extra={"reserve_devices": [0]})
         pool.build({}, n_configs=1)
-
-
-def test_auto_calibrates_actual_work_once_and_excludes_probe_results(pool_factory):
-    auto, root = pool_factory(
-        cfg_extra={"test_delays": {"3": .15}},
-        parallel_extra={"devices": [0], "workers_per_device": "auto", "min_speedup": 1.15},
-    )
-    serial, _ = pool_factory(parallel_extra={"devices": [0], "workers_per_device": 1})
-    first = auto.build({}, n_configs=5, rng=np.random.default_rng(191))
-    reference = serial.build({}, n_configs=5, rng=np.random.default_rng(191))
-    assert [cell.info["draw"] for cell in first] == [cell.info["draw"] for cell in reference]
-    assert len({cell.info["pid"] for cell in first}) == 2
-    assert len((root / "build_calls.jsonl").read_text().splitlines()) == 10
-    second = auto.build({}, n_configs=5)
-    assert len(second) == 5
-    assert len((root / "build_calls.jsonl").read_text().splitlines()) == 15
-
-
-def test_auto_pair_failure_falls_back_to_one_worker(pool_factory):
-    pool, root = pool_factory(parallel_extra={"devices": [0], "workers_per_device": "auto"})
-    atoms = pool.build({"mode": "pair_fail"}, n_configs=5)
-    assert len(atoms) == 5
-    assert len({cell.info["pid"] for cell in atoms}) == 1
-    initializations = _initializations(root)
-    assert len(initializations) == 2
-    retired_pids = {row["pid"] for row in initializations} - {atoms[0].info["pid"]}
-    _wait_stopped(retired_pids)
-
-
-def test_auto_retires_calibrated_slot_not_needed_by_current_candidate(pool_factory):
-    pool, root = pool_factory(
-        cfg_extra={"test_delays": {"3": .15, "7": .15}},
-        parallel_extra={"workers_per_device": "auto"},
-    )
-    atoms = pool.build({}, n_configs=3)
-    assert len(atoms) == 3
-    assert pool.autotune_report["counts"] == [2, 2]
-    production_pids = {cell.info["pid"] for cell in atoms}
-    assert len(production_pids) == 3
-    initial_pids = {record["pid"] for record in _initializations(root)}
-    assert len(initial_pids) == 4
-    _wait_stopped(initial_pids - production_pids)
-    assert all(_process_running(pid) for pid in production_pids)
 
 
 def test_internal_plugin_optimization_error_is_not_silently_scored(pool_factory):
@@ -494,10 +471,12 @@ def test_no_successful_configuration_raises(pool_factory, mode):
         pool.build({"mode": mode}, n_configs=2)
 
 
-def test_minimum_successful_configurations_is_enforced(pool_factory):
-    pool, _ = pool_factory(parallel_extra={"min_successful_configs": 2})
-    with pytest.raises(RuntimeError):
-        pool.build({"mode": "one_fail"}, n_configs=2)
+def test_legacy_success_minimum_warns_and_partial_success_remains_usable(pool_factory):
+    with pytest.warns(DeprecationWarning, match="min_successful_configs"):
+        pool, _ = pool_factory(parallel_extra={"min_successful_configs": 2})
+    atoms = pool.build({"mode": "one_fail"}, n_configs=2)
+    assert len(atoms) == 1
+    assert atoms[0].info["device"] == "7"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="worker process-group cleanup is POSIX")
@@ -552,10 +531,11 @@ def test_empty_or_duplicate_gpu_allocation_rejected(pool_factory, monkeypatch, v
         pool_factory()
 
 
-def test_minimum_cannot_exceed_requested_configurations(pool_factory):
-    pool, _ = pool_factory(parallel_extra={"min_successful_configs": 2})
-    with pytest.raises(ValueError):
-        pool.build({}, n_configs=1)
+def test_legacy_success_minimum_does_not_require_extra_configurations(pool_factory):
+    with pytest.warns(DeprecationWarning, match="min_successful_configs"):
+        pool, root = pool_factory(parallel_extra={"min_successful_configs": 5})
+    assert len(pool.build({}, n_configs=1)) == 1
+    assert len((root / "build_calls.jsonl").read_text().splitlines()) == 1
 
 
 @pytest.mark.parametrize("setting,value", [

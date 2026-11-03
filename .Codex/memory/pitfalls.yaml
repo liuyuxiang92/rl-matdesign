@@ -18,27 +18,37 @@
   - inference-contract
   - batching
 - id: pitfall-gpu-workers-001
-  date: '2026-10-28'
-  expires: '2027-01-28'
-  title: Treat swallowed optimizer failures as failures when measuring GPU concurrency
+  date: '2026-11-03'
+  expires: '2027-02-03'
+  title: Reject failed and unconverged configurations before property averaging
   wrong: relax_structure catches optimizer exceptions and returns a partial cell;
-    a CUDA OOM can therefore appear as a fast successful calibration trial.
-  right: GPU workers wrap the entire builder and optional optimization in strict_relaxation_errors(),
-    including external builders using the shared helper. Propagate execution exceptions;
-    keep step-limit nonconvergence separate. Detach calculators before IPC and kill
+    a CUDA OOM can therefore appear as a successful structure. Optimizer.run(False)
+    previously only warned, allowing unconverged structures into the average.
+  right: Both GPU workers and serial structure scoring wrap builders and optional
+    optimization in strict_relaxation_errors(), including external builders using
+    the shared helper. Propagate execution errors and reject nonconvergence using
+    the optimizer's full result (including cell stress), not just atomic forces.
+    Inspect cached quantities for non-finite values without another DP evaluation.
+    Filter per-config failures and average any survivors; reject the formula only
+    when none survive. External serial builders must isolate their own per-config
+    failures. Direct helper callers outside the context retain legacy handling.
+    Detach calculators before IPC and kill
     complete process groups on timeout or CLI termination.
-  impact: False throughput gains could select excessive concurrency and score unoptimized
-    structures; Python-only cleanup could leave LAMMPS children on GPUs.
+  impact: Unusable structures would corrupt delta and classification averages;
+    Python-only cleanup could leave LAMMPS children on GPUs.
   files:
   - src/rl_matdesign/utils/structure.py
   - src/rl_matdesign/utils/structure_worker.py
   - src/rl_matdesign/utils/parallel_structures.py
+  - src/rl_matdesign/predictors/structure_score.py
   - tests/test_relaxation_errors.py
   - tests/test_parallel_structures.py
+  - tests/test_config_failure_filtering.py
+  - tests/test_parallel_nonconvergence.py
   tags:
   - gpu-processes
   - error-propagation
-  - calibration
+  - convergence-validation
 - id: pitfall-deepmd-runtime-001
   date: '2026-10-29'
   expires: '2027-01-29'

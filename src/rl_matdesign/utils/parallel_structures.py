@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+import warnings
 from multiprocessing import Pipe
 from multiprocessing.connection import wait
 from pathlib import Path
@@ -25,10 +26,6 @@ import numpy as np
 
 if TYPE_CHECKING:
     from ase import Atoms
-
-
-class _CalibrationCandidateFailure(RuntimeError):
-    """A normal candidate error in a calibration baseline, not lost workers."""
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -172,11 +169,11 @@ class _Worker:
 
 
 class ParallelStructureBuilder:
-    """Run independent configurations on detected GPUs with optional calibration.
+    """Run independent configurations with one structure worker per GPU.
 
     A plugin must honor the supplied RNG and return one ASE Atoms for n_configs=1.
-    RL episode order stays serial. Calibration repeats full-physics tasks once;
-    these are excluded from the returned ensemble and from RL sample counts.
+    Configurations from multiple formulas share the same queue. Each GPU starts
+    the next queued configuration when its current build and optimization finish.
     """
 
     parallel_execution = True
@@ -196,18 +193,37 @@ class ParallelStructureBuilder:
         self.threads = _positive_int(options.get("threads_per_worker", 1), "threads_per_worker")
         self.timeout = _positive_seconds(options.get("timeout_s", 3600), "timeout_s")
         self.startup_timeout = _positive_seconds(options.get("startup_timeout_s", 300), "startup_timeout_s")
-        self.min_successful = _positive_int(options.get("min_successful_configs", 1), "min_successful_configs")
-        self.candidate_batch_size = options.get("candidate_batch_size", 1)
+        min_successful = _positive_int(options.get("min_successful_configs", 1), "min_successful_configs")
+        if min_successful > 1:
+            warnings.warn(
+                "structure_parallel.min_successful_configs is deprecated and values "
+                "above 1 are ignored; every nonempty successful ensemble is accepted",
+                DeprecationWarning, stacklevel=2,
+            )
+        self.min_successful = 1
+        self.candidate_batch_size = options.get("candidate_batch_size", "auto")
         if self.candidate_batch_size != "auto":
             self.candidate_batch_size = _positive_int(self.candidate_batch_size, "candidate_batch_size")
         self.devices = _device_tokens(options.get("devices", "auto"), options.get("reserve_devices", []), self.startup_timeout)
-        self.workers_per_device = options.get("workers_per_device", "auto")
-        if (self.workers_per_device != "auto" and
-                (type(self.workers_per_device) is not int or self.workers_per_device not in (1, 2))):
-            raise ValueError("structure_parallel.workers_per_device must be auto, 1 or 2")
-        self.min_speedup = _positive_seconds(options.get("min_speedup", 1.15), "min_speedup")
-        if self.min_speedup < 1:
-            raise ValueError("structure_parallel.min_speedup must be at least 1")
+        workers_per_device = options.get("workers_per_device", 1)
+        if workers_per_device == "auto":
+            warnings.warn(
+                "structure_parallel.workers_per_device: auto is deprecated and now "
+                "uses one worker per GPU; remove this option or set it to 1",
+                DeprecationWarning, stacklevel=2,
+            )
+        elif type(workers_per_device) is not int or workers_per_device != 1:
+            raise ValueError(
+                "structure_parallel.workers_per_device must be 1; each GPU runs "
+                "one structure at a time"
+            )
+        self.workers_per_device = 1
+        if "min_speedup" in options:
+            warnings.warn(
+                "structure_parallel.min_speedup is deprecated and ignored; "
+                "GPU concurrency is fixed at one worker per GPU",
+                DeprecationWarning, stacklevel=2,
+            )
         overrides = ((cfg.get("md") or {}).get("env") or {})
         reserved = {"CUDA_VISIBLE_DEVICES", "LOCAL_RANK", "DEVICE"}.intersection(overrides)
         if reserved:
@@ -224,10 +240,6 @@ class ParallelStructureBuilder:
         self._closed = False
         self._registered = False
         self._run_id = uuid.uuid4().hex[:12]
-        count = 1 if self.workers_per_device == "auto" else self.workers_per_device
-        self._counts = [count] * len(self.devices)
-        self._tuned = False
-        self.autotune_report: dict | None = None
         go = cfg.get("geo_opt") or {}
         self.handles_geo_opt = bool(go) and bool(go.get("enabled", True))
 
@@ -268,7 +280,7 @@ class ParallelStructureBuilder:
                   *, label: str) -> list[dict]:
         """Queue (candidate index, config index, seed) jobs across shared workers.
 
-        Replies retain job order. Calibration supplies exactly one job per target.
+        Replies retain job order, independently of worker completion order.
         """
         self._ensure_targets(targets)
         replies: dict[int, dict] = {}
@@ -323,79 +335,15 @@ class ParallelStructureBuilder:
         if worker is not None:
             worker.close()
 
-    def _calibrate(self, candidate: Any, seed: int, *,
-                   tolerate_candidate_failure: bool = False) -> None:
-        from .structure_autotune import autotune_concurrency
-
-        print(
-            "[structure_parallel] calibrating 1 vs 2 jobs per GPU using the same "
-            "candidate/seed. Up to 5 EXTRA full build/opt tasks per GPU; "
-            "calibration structures are excluded from reward.", flush=True,
-        )
-
-        phase = 0
-
-        def run_batch(probes):
-            nonlocal phase
-            phase += 1
-            targets = [(job["device"], job["slot"]) for job in probes]
-            jobs = [(0, index, job["seed"]) for index, job in enumerate(probes)]
-            replies = self._run_jobs([candidate], jobs, targets, label="calibration")
-            # Distinguish worker-reported baseline failures from infrastructure
-            # exceptions raised by _run_jobs; only the former may fall back.
-            if phase <= 2:
-                failure = next((reply for reply in replies if not reply.get("ok")), None)
-                if failure is not None:
-                    raise _CalibrationCandidateFailure(
-                        f"Autotune baseline failed: {failure.get('error', 'unknown worker error')}"
-                    )
-            return replies
-
-        try:
-            report = autotune_concurrency(
-                len(self.devices), run_batch, self._retire, seed=seed, min_speedup=self.min_speedup,
-            )
-        except _CalibrationCandidateFailure as exc:
-            if not tolerate_candidate_failure:
-                self._stop_workers()
-                raise
-            self._counts = [1] * len(self.devices)
-            for device, slot in list(self._workers):
-                if slot:
-                    self._retire(device, slot)
-            print(
-                "[structure_parallel] first candidate failed calibration; using "
-                "one slot per GPU for this batch and retrying calibration on a "
-                f"later batch. {exc}", flush=True,
-            )
-            return
-        except BaseException:
-            self._stop_workers()
-            raise
-        self.autotune_report = report
-        self._counts = report["counts"]
-        self._tuned = True
-        for token, measurement in zip(self.devices, report["measurements"]):
-            print(f"[structure_parallel] GPU {token}: {measurement}", flush=True)
-
     def _validate_n_configs(self, n_configs: int) -> int:
-        n_configs = _positive_int(n_configs, "n_configs")
-        if self.min_successful > n_configs:
-            raise ValueError("structure_parallel.min_successful_configs exceeds n_configs")
-        return n_configs
+        return _positive_int(n_configs, "n_configs")
 
     def recommended_candidate_batch_size(self, n_configs: int) -> int:
-        """Recommend enough formulas to fill worker slots, without starting workers.
-
-        Before automatic calibration, allow two potential slots per GPU so the
-        first multi-formula batch can measure and use the available concurrency.
-        """
+        """Recommend enough formulas to fill the GPUs, without starting workers."""
         n_configs = self._validate_n_configs(n_configs)
         if self.candidate_batch_size != "auto":
             return self.candidate_batch_size
-        slots = (2 * len(self.devices)
-                 if self.workers_per_device == "auto" and not self._tuned
-                 else sum(self._counts))
+        slots = len(self.devices)
         return max(1, (slots + n_configs - 1) // n_configs)
 
     def build(self, candidate: Any, *, n_configs: int = 1,
@@ -409,9 +357,10 @@ class ParallelStructureBuilder:
                    rng: np.random.Generator | None = None) -> list[list[Atoms] | Exception]:
         """Build formulas together, returning ordered ensembles or per-formula errors.
 
-        Ordinary worker-reported errors only reduce that formula's ensemble;
+        Any nonempty successful ensemble is returned. Ordinary worker-reported
+        errors only reduce that formula's ensemble;
         timeout, crash, and startup failures stop the pool and propagate. Seeds
-        are assigned in candidate/config order before any dispatch or probes.
+        are assigned in candidate/config order before any dispatch.
         """
         n_configs = self._validate_n_configs(n_configs)
         candidates = list(candidates)
@@ -420,19 +369,13 @@ class ParallelStructureBuilder:
         rng = self._rng if rng is None else rng
         total_configs = len(candidates) * n_configs
         seeds = [int(s) for s in rng.integers(0, 2**32, size=total_configs, dtype=np.uint64)]
-        if (self.workers_per_device == "auto" and not self._tuned
-                and total_configs > len(self.devices)):
-            self._calibrate(candidates[0], seeds[0], tolerate_candidate_failure=len(candidates) > 1)
-        # Fill distinct GPUs first, then second slots; don't initialize idle slots.
-        targets = [(d, slot) for slot in range(max(self._counts))
-                   for d, count in enumerate(self._counts) if slot < count][:total_configs]
-        # Calibration explores both slots on every GPU. Do not leave unused
-        # optimizer models resident when the actual ensemble needs fewer slots.
+        targets = [(device, 0) for device in range(min(len(self.devices), total_configs))]
+        # Do not leave optimizer models resident on GPUs unused by this batch.
         for device, slot in set(self._workers) - set(targets):
             self._retire(device, slot)
         print(f"[structure_parallel] scheduling {len(candidates)} candidates x "
               f"{n_configs} configurations on "
-              f"{len(targets)} slots across {len({d for d, _ in targets})} GPUs", flush=True)
+              f"{len(targets)} GPUs (one structure per GPU)", flush=True)
         started = time.monotonic()
         jobs = [(index // n_configs, index % n_configs, seed)
                 for index, seed in enumerate(seeds)]
@@ -443,12 +386,12 @@ class ParallelStructureBuilder:
             atoms = [reply["atoms"] for reply in candidate_replies if reply.get("ok")]
             print(f"[structure_parallel] candidate {index + 1}/{len(candidates)}: "
                   f"{len(atoms)}/{n_configs} configurations succeeded", flush=True)
-            if len(atoms) < self.min_successful:
+            if not atoms:
                 failure = next((r.get("error") for r in candidate_replies if not r.get("ok")), "no structures")
                 results.append(RuntimeError(
                     f"Only {len(atoms)}/{n_configs} configurations succeeded for "
                     f"candidate {index + 1}/{len(candidates)}; "
-                    f"min_successful_configs={self.min_successful}. First failure: {failure}"
+                    f"at least one successful configuration is required. First failure: {failure}"
                 ))
             else:
                 results.append(atoms)
