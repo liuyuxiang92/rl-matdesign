@@ -36,27 +36,28 @@
   - classification
   - configurational-averaging
 - id: decision-gpu-workers-001
-  date: '2026-10-28'
-  expires: '2027-04-28'
-  title: Generic configuration workers with measured one-or-two GPU concurrency
+  date: '2026-11-03'
+  expires: '2027-05-03'
+  title: One persistent structure worker per GPU with automatic formula batches
   choice: Keep RL sampling and property aggregation serial; wrap arbitrary single-configuration
     builders in persistent subprocesses whose CUDA environment is set before imports.
-    Discover only visible GPUs; optionally reserve logical indices. Auto-calibrate
-    one versus two workers per GPU on identical candidate/seed when queued configurations
-    outnumber GPUs; require 15 percent measured throughput improvement. Optional
-    cross-formula evaluation waves were added on 2026-11-03 (see decision-formula-batches-001).
+    Discover only visible GPUs; optionally reserve logical indices. User explicitly
+    removed concurrency tuning on 2026-11-03. Run exactly one task per GPU and
+    default to cross-formula waves (see decision-formula-batches-001). A minimal
+    structure_parallel mapping enables automatic allocation without extra parameters.
   alternatives_considered:
   - Threads or fork after CUDA initialization risk shared device state; fresh subprocesses
     isolate models and external MD children.
-  - Guessing concurrency from VRAM alone cannot establish throughput; full-physics
-    calibration uses up to five extra tasks per tested GPU.
-  trade_off: Calibration uses the first candidate and does not guarantee optimal concurrency
-    for every later composition. It adds real MD/optimization cost but contributes
-    no reward samples. Preload parent DP models before calibration; retire calibration-only
-    idle slots. No actual CUDA/MD benchmark was available locally.
+  - Prior one-versus-two calibration required up to five extra full MD/optimization
+    runs per GPU; user preferred predictable allocation and fewer parameters.
+  trade_off: One task per GPU can underutilize a small workload but avoids same-card
+    structure contention and all calibration cost. Parent property models can still
+    occupy GPU memory; preload them before worker allocation. Any usable configuration
+    suffices, with no configurable success threshold. Legacy auto maps to one and
+    old thresholds above one are ignored with deprecation warnings. No actual
+    CUDA/MD benchmark was available locally.
   files:
   - src/rl_matdesign/utils/parallel_structures.py
-  - src/rl_matdesign/utils/structure_autotune.py
   - src/rl_matdesign/predictors/structure_score.py
   - docs/yaml_config_reference.md
   tags:
@@ -91,22 +92,24 @@
 - id: decision-formula-batches-001
   date: '2026-11-03'
   expires: '2027-05-03'
-  title: Opt-in bounded formula batches share one configuration worker queue
-  choice: structure_parallel.candidate_batch_size defaults to 1 and accepts auto or
+  title: Bounded formula batches share one configuration worker queue by default
+  choice: structure_parallel.candidate_batch_size defaults to auto and accepts auto or
     a positive integer. Capture terminal reward inputs while sampling sequentially,
     evaluate uncached unique candidates through one worker pool, then consume trajectory
     snapshots in sampling order. Keep duplicate learning and independent per-formula
     reward/failure aggregation; retain property inference in the parent process.
+    Explicit batch size 1 preserves single-formula collection. User requested this
+    automatic default on 2026-11-03 to avoid extra configuration parameters.
   alternatives_considered:
   - Concurrent threads mutating one environment or predictor would race policy state,
     caches, RNG and CUDA model access.
   - Requiring a fixed number of successful configs conflates candidate acceptance with
-    hardware scheduling; preserve min_successful_configs default 1.
+    hardware scheduling; accept any nonempty usable ensemble without a threshold.
   trade_off: DQN samples a wave with frozen policy and epsilon before sequential updates,
-    so opt-in batching changes sampling trajectories. PG waves stay inside one existing
+    so batching changes sampling trajectories. PG waves stay inside one existing
     on-policy batch. Conservative budget, duplicate, failure and checkpoint caps can
     reduce utilization, but prevent overrun or unconsumed results at checkpoint saves.
-    Auto sizing adapts after one-versus-two-worker calibration; cached formulas may leave
+    Auto sizing is ceil(selected GPU count / configs per formula); cached formulas may leave
     some slots idle. No real GPU speedup measurement was available.
   files:
   - src/rl_matdesign/utils/episode_batch.py

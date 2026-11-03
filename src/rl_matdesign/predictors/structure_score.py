@@ -675,26 +675,49 @@ class StructureScorePredictor:
         self._preload_parallel_models()
         if structure_props:
             if self.share_structure:
-                structures = self._shared_builder.build(
-                    candidate, n_configs=self.n_random_configs, rng=self._rng
+                structures = self._build_structures(
+                    self._shared_builder, candidate, self.n_random_configs
                 )
-                if self.geo_opt_enabled and not getattr(self._shared_builder, "handles_geo_opt", False):
-                    structures = [self._relax(s) for s in structures]
                 for prop in structure_props:
                     prop_inputs[prop["name"]] = structures
             else:
                 for prop in structure_props:
                     builder = self._builders[prop["name"]]
-                    structures = builder.build(
-                        candidate, n_configs=prop["n_random_configs"], rng=self._rng
+                    structures = self._build_structures(
+                        builder, candidate, prop["n_random_configs"]
                     )
-                    if self.geo_opt_enabled and not getattr(builder, "handles_geo_opt", False):
-                        structures = [self._relax(s) for s in structures]
                     prop_inputs[prop["name"]] = structures
         for prop in self.properties:
             if prop["backend"] == "composition":
                 prop_inputs[prop["name"]] = candidate
         return prop_inputs
+
+    def _build_structures(self, builder: Any, candidate: Any, n_configs: int) -> List[Any]:
+        from ..utils.structure import strict_relaxation_errors
+
+        # External MD builders can catch these errors per configuration and
+        # return their surviving ensemble, just as the GPU workers do.
+        with strict_relaxation_errors():
+            structures = builder.build(candidate, n_configs=n_configs, rng=self._rng)
+        return self._usable_structures(builder, structures)
+
+    def _usable_structures(self, builder: Any, structures: Any) -> List[Any]:
+        from ..utils.structure import strict_relaxation_errors
+
+        structures = list(structures)
+        if self.geo_opt_enabled and not getattr(builder, "handles_geo_opt", False):
+            successful = []
+            for index, atoms in enumerate(structures):
+                try:
+                    with strict_relaxation_errors():
+                        successful.append(self._relax(atoms))
+                except Exception as exc:
+                    print(f"[structure_score] config {index + 1}/{len(structures)} "
+                          f"relaxation failed, skipping: {type(exc).__name__}: {exc}")
+            structures = successful
+        if not structures:
+            raise ValueError("No usable configurations remain for candidate")
+        return structures
 
     def _preload_parallel_models(self) -> None:
         structure_props = [p for p in self.properties if p["backend"] != "composition"]
@@ -702,8 +725,8 @@ class StructureScorePredictor:
             getattr(builder, "parallel_execution", False)
             for builder in [self._shared_builder, *self._builders.values()]
         ):
-            # Calibration must see the parent's persistent scoring-model memory.
-            # Otherwise two MD workers may fit initially and OOM on the next
+            # Load persistent parent models before allocating worker model memory.
+            # Otherwise MD workers may fit initially and OOM on the next
             # candidate after the property models have been loaded on GPU 0.
             for prop in structure_props:
                 if prop["backend"] == "energy":
@@ -728,24 +751,26 @@ class StructureScorePredictor:
                 break
             build_many = getattr(builder, "build_many", None)
             if callable(build_many):
-                built = build_many([candidates[i] for i in active], n_configs=n_configs, rng=self._rng)
+                from ..utils.structure import strict_relaxation_errors
+
+                with strict_relaxation_errors():
+                    built = build_many([candidates[i] for i in active], n_configs=n_configs, rng=self._rng)
                 if len(built) != len(active):
                     raise ValueError("build_many must return one result per candidate")
             else:
                 built = []
                 for i in active:
                     try:
-                        built.append(builder.build(candidates[i], n_configs=n_configs, rng=self._rng))
+                        built.append(self._build_structures(builder, candidates[i], n_configs))
                     except Exception as exc:
                         built.append(exc)
             for i, structures in zip(active, built):
                 try:
                     if isinstance(structures, Exception):
                         raise structures
-                    if not structures:
-                        raise ValueError("Builder returned no structures for candidate")
-                    if self.geo_opt_enabled and not getattr(builder, "handles_geo_opt", False):
-                        structures = [self._relax(s) for s in structures]
+                    # The scalar fallback already handled top-level relaxation.
+                    if callable(build_many):
+                        structures = self._usable_structures(builder, structures)
                     for prop in props:
                         inputs[i][prop["name"]] = structures
                 except Exception as exc:

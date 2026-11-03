@@ -41,15 +41,19 @@ _STRICT_RELAXATION_ERRORS: ContextVar[bool] = ContextVar(
 )
 
 
+class RelaxationNotConverged(RuntimeError):
+    """The optimizer stopped before satisfying its convergence criterion."""
+
+
 @contextmanager
 def strict_relaxation_errors() -> Iterator[None]:
-    """Propagate optimizer exceptions for all relaxation calls in this context.
+    """Reject failed or unconverged relaxation calls in this context.
 
     GPU workers use this around the whole builder call, including external
-    builders that import :func:`relax_structure`. Otherwise an optimization OOM
-    could return a partial structure and look like a fast, successful timing
-    trial. Calls outside this context retain their existing error handling.
-    Reaching the optimizer's step limit without convergence is still a warning.
+    builders that import :func:`relax_structure`. A failed optimization, a step
+    limit without convergence, or a non-finite final result must not become an
+    input to property scoring. Calls outside this context retain their existing
+    warning/partial-structure behavior.
     Nested contexts and exceptions restore the caller's previous setting.
     """
     token = _STRICT_RELAXATION_ERRORS.set(True)
@@ -669,6 +673,12 @@ def relax_structure(
     mask_indices:
         Optional site indices to *exclude* from optimization (e.g. OOH adsorbate
         placeholders); their positions are restored unchanged in the result.
+
+    Inside :func:`strict_relaxation_errors`, exceptions propagate, a false
+    optimizer convergence result raises :class:`RelaxationNotConverged`, and
+    non-finite geometry or cached calculator results raise ``RuntimeError``.
+    The optimizer's convergence result includes cell stress when relaxing the
+    cell; an atomic-force-only check cannot replace it.
     """
     from ase.optimize import LBFGS
 
@@ -694,17 +704,37 @@ def relax_structure(
     target = UnitCellFilter(work, scalar_pressure=0.0) if relax_cell else work
     opt = LBFGS(target)
     try:
-        # LBFGS.run() returns a bool (converged or not) -- running out of `steps`
-        # without reaching fmax is NOT an exception, so the except branch alone
-        # was silently swallowing that case (the caller got an unconverged
-        # structure back with no signal at all that it hadn't converged).
+        # The optimizer includes the cell-filter degrees of freedom in this
+        # result. Checking only work.get_forces() could accept an unconverged
+        # cell despite converged atomic positions.
         converged = bool(opt.run(fmax=fmax, steps=steps))
+        if _STRICT_RELAXATION_ERRORS.get():
+            for name, value in (
+                ("positions", work.get_positions()),
+                ("cell", work.get_cell()),
+            ):
+                if not np.isfinite(value).all():
+                    raise RuntimeError(
+                        f"relax_structure: optimizer produced non-finite {name}"
+                    )
+            # ASE's optimizer has already evaluated these quantities. Inspect
+            # its calculator cache rather than causing another expensive DP
+            # evaluation merely to validate the final result.
+            results = getattr(work.calc, "results", {})
+            for name in ("energy", "free_energy", "forces", "stress"):
+                value = results.get(name)
+                if value is not None and not np.isfinite(value).all():
+                    raise RuntimeError(
+                        f"relax_structure: optimizer produced non-finite {name}"
+                    )
         if not converged:
-            final_fmax = float((work.get_forces() ** 2).sum(axis=1).max() ** 0.5)
-            print(
+            message = (
                 f"relax_structure: did NOT converge to fmax={fmax} within {steps} "
-                f"steps (reached fmax={final_fmax:.4f})."
+                "steps" + (" (including cell stress)." if relax_cell else ".")
             )
+            if _STRICT_RELAXATION_ERRORS.get():
+                raise RelaxationNotConverged(message)
+            print(message)
     except Exception as exc:  # noqa: BLE001 - legacy callers accept partial results
         if _STRICT_RELAXATION_ERRORS.get():
             raise

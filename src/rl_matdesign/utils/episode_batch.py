@@ -122,7 +122,7 @@ class EpisodeBatchEvaluator:
             raise ValueError("evaluation wave has no remaining budget")
         while True:
             if not self.pending:
-                # Auto-tuning can shrink the pool after the preceding wave.
+                # A predictor can change its recommendation between waves.
                 # Never change collection behavior while prefetched paths remain.
                 self._refresh_size()
                 if self.size == 1 and self.failures == 0:

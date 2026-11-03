@@ -34,9 +34,7 @@ class Builder(Base):
         "builder": "composition_batch_builder:Builder", "test_root": str(root),
         "n_random_configs": 2, "predict_cache_size": 1,
         "structure_parallel": {
-            "devices": [0, 1, 2, 3], "workers_per_device": 1,
-            "candidate_batch_size": "auto", "timeout_s": 20,
-            "startup_timeout_s": 20, "min_successful_configs": 1,
+            "devices": "auto", "timeout_s": 20, "startup_timeout_s": 20,
         },
         "properties": [
             {"name": "delta", "predictor": "dp_property", "models": ["unused"],

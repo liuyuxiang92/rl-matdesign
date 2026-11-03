@@ -208,81 +208,61 @@ A single model therefore gives `std == 0` exactly, whatever `n_random_configs` i
 `mean_minus_kstd` is then identical to `mean` — no flag needed.
 The same fold is used in both `share_structure` regimes.
 
-### `structure_parallel`: GPU workers and optional formula batches
+### `structure_parallel`: GPU workers and automatic formula batches
 
 This optional block applies to the structure-scoring reward engine. It detects
 available GPUs and distributes configurations over persistent subprocesses,
-each pinned to one GPU. By default it evaluates one candidate at a time;
-`candidate_batch_size` can opt into evaluating several formulas together so
-small configuration ensembles can use more GPUs. It can measure whether one or
-two workers per GPU improves throughput. Each task calls the configured builder with
+each pinned to one GPU. It automatically evaluates several formulas together
+when one formula has fewer configurations than the selected GPU count.
+Each GPU runs exactly one structure task at a time, without concurrency
+calibration or extra probe runs. Each task calls the configured builder with
 `n_configs=1` and a task-local RNG, then applies top-level `geo_opt` if enabled.
-For a builder that already runs
-MD and optimization, such as `clc_workflow.rl_builder:MDAveragedOptBuilder`, both
+For a builder that already runs MD and optimization, such as
+`clc_workflow.rl_builder:MDAveragedOptBuilder`, both
 stages run on the same worker; set `geo_opt: null` to avoid another relaxation.
 The external builder itself needs no parallel implementation.
 
 ```yaml
 share_structure: true
-n_random_configs: 5
-structure_parallel:
-  devices: auto
-  workers_per_device: auto
-  candidate_batch_size: 1  # opt in with auto or a larger positive integer
-  reserve_devices: []
-  threads_per_worker: 1
-  timeout_s: 7200
-  startup_timeout_s: 300
-  min_successful_configs: 1
-  min_speedup: 1.15
+n_random_configs: 4
+structure_parallel: {}  # automatic GPUs and formula batches; one task per GPU
 ```
+
+No scheduling or success-threshold parameters are required. The following
+optional overrides are for device allocation, time limits and reproducing an
+older single-formula sampling schedule.
 
 | Key | What it does | Default |
 |---|---|---|
 | `devices` | `auto` detects GPUs in the inherited allocation; alternatively, a non-empty list of distinct nonnegative visible GPU indices | `auto` |
-| `workers_per_device` | `auto` measures one vs two workers per GPU when useful; `1` or `2` fixes the count and skips calibration | `auto` |
-| `candidate_batch_size` | Maximum formulas collected for one reward-evaluation wave: positive integer, or `auto` to fill available worker slots using each formula's configuration count | `1` |
+| `candidate_batch_size` | Maximum formulas collected for one reward-evaluation wave: positive integer, or `auto` to fill available GPUs using each formula's configuration count; `1` restores single-formula collection | `auto` |
 | `reserve_devices` | Visible GPU indices to leave out of worker allocation; requires `devices: auto`; `[0]` reserves GPU 0 for the parent | `[]` |
 | `threads_per_worker` | CPU numerical-library threads per worker; positive integer | `1` |
 | `timeout_s` | Maximum elapsed seconds for one configuration task, including build and optional relaxation | `3600` |
 | `startup_timeout_s` | Maximum seconds allowed for worker initialization | `300` |
-| `min_successful_configs` | Minimum completed configurations required to score this candidate; integer from 1 through `n_random_configs` | `1` |
-| `min_speedup` | Required throughput ratio for auto mode to retain two workers instead of one; finite and at least 1 | `1.15` |
 
 Concurrency is capped at the smaller of the wave's total configuration count
-and the sum of the selected worker counts across GPUs. Extra configurations wait
-for a free worker; each worker runs only one task at a time. For example,
-`n_random_configs: 2` with `candidate_batch_size: 2` supplies four configuration
-tasks, enough to use four GPUs with one worker each. With two workers per GPU,
-four formulas supply eight tasks and can use all eight slots. Increasing formula
+and the selected GPU count. Extra configurations wait for a free worker; a worker
+immediately takes the next queued configuration when its current task finishes.
+For example, `n_random_configs: 4` with `candidate_batch_size: 2` supplies eight
+configuration tasks from two formulas, enough to use eight GPUs. Increasing formula
 concurrency does not increase `n_random_configs` for any formula.
 Models cached by a builder or its optimizer remain loaded in that worker across
-candidates. Extra slots used only for calibration are closed if the wave does
-not need them. Results are collected in candidate/configuration order, then
+candidates. Results are collected in candidate/configuration order, then
 scored in the parent process.
 Property inference, reward combination, and RL updates are not distributed by
 this option. A gated reward still evaluates after structure preparation and
 property prediction; it does not avoid the MD cost of a failing candidate.
 
-**Opting into formula batches.** Set `candidate_batch_size: auto` to collect
-enough formulas to fill the worker slots (slot count divided by configurations
-per formula, rounded up). Before automatic worker calibration, the estimate allows
-up to two slots per GPU; after calibration, subsequent waves use the measured
-worker counts. A positive integer fixes the maximum formulas per wave. With the
-default `1`, having spare GPUs alone does not enable cross-formula batching.
-For example:
+**Automatic formula batches.** The default `candidate_batch_size: auto` collects
+enough formulas to fill the GPUs (selected GPU count divided by configurations
+per formula, rounded up). An explicit positive integer fixes the maximum formulas
+per wave; `1` disables cross-formula batching.
 
-```yaml
-n_random_configs: 2
-structure_parallel:
-  devices: auto
-  workers_per_device: auto
-  candidate_batch_size: auto
-  min_successful_configs: 1
-```
-
-On four GPUs this can collect up to four formulas initially, and then use two
-or four per wave if calibration retains one or two slots on every GPU.
+On eight GPUs this collects two formulas per wave, with four configurations each.
+On six GPUs it also collects two formulas: six tasks start immediately, and the
+remaining two start as workers become free. It does not wait for an entire formula
+to finish before dispatching another queued task.
 Cache hits and duplicate formulas in a wave reuse predictions instead of
 submitting additional structure tasks. Consequently, a wave containing cached
 formulas may leave some slots idle. With `share_structure: true`, all structure
@@ -296,41 +276,22 @@ evaluation, and generation use these waves. PG waves stay within the existing
 that batch. DQN holds the policy and epsilon fixed while collecting each wave,
 then processes successful episodes and their updates in order. This changes
 the DQN sampling schedule when the size exceeds `1`; identical seeds need not
-produce the same training trajectory as single-formula execution. The default
-preserves the existing episode-by-episode schedule. Waves are shortened at
-remaining episode-budget, duplicate-attempt, evaluation-failure, and checkpoint
+produce the same training trajectory as single-formula execution. Set
+`candidate_batch_size: 1` when the original episode-by-episode schedule is needed.
+Waves are shortened at remaining episode-budget, duplicate-attempt,
+evaluation-failure, and checkpoint
 boundaries. A failed formula does not consume training budget or discard its
-successful neighbors. `min_successful_configs` remains an independent
-per-formula acceptance threshold, with default `1`.
+successful neighbors. Every formula with at least one usable configuration is
+scored; a formula with no usable configurations is skipped.
 
-**Automatic concurrency selection.** With `workers_per_device: auto`, calibration
-is needed only when the wave's total configuration count exceeds the number of
-selected GPUs. With the default formula batch size of `1`, five configurations
-on five GPUs use one worker per GPU without testing two. When calibration is
-needed, the first candidate is used for the following calibration on each tested
-GPU, using the same candidate and configuration seed:
-
-1. Warm up the primary worker with one complete build/MD/optimization task.
-2. Time a second complete task on that worker alone (`t_single`).
-3. Start and warm up a second worker with the same task.
-4. Time both workers running the task concurrently (`t_pair`, the longer completion time).
-
-This costs **up to five additional full configuration executions per tested GPU**. The
-calibration structures are excluded from the reward and do not count as additional
-RL episodes, but their wall time is part of the run. The throughput ratio is
-`2 * t_single / t_pair`; retain two workers only if it is at least `min_speedup`.
-Reported task errors in the second-worker trial, including out-of-memory errors,
-select one worker. A failure reported by the one-worker baseline fails a
-single-candidate call. In a multi-formula wave, it instead falls back to one
-worker per GPU for that wave, evaluates formulas independently, and retries
-calibration on a later wave. Worker crashes and timeouts follow the pool-abort
-behavior described below.
-The log reports `concurrency`, `reason`, `t_single`, `t_pair`, and `speedup` for each
-GPU. `ParallelStructureBuilder.autotune_report` exposes the selected `counts` and
-per-GPU `measurements` after calibration. This is an empirical choice for the first
-candidate, not a guarantee that the same count is optimal for every later
-composition. There is no automatic recalibration after a successful calibration.
-Explicit `workers_per_device: 1` or `2` skips these trial executions.
+**Migrating older configurations.** Remove `workers_per_device`, `min_speedup`
+and `min_successful_configs`. For compatibility, the old `workers_per_device: auto`
+means one worker per GPU, `min_speedup` is ignored, and a legacy success threshold
+above one is ignored; these emit deprecation warnings. `workers_per_device: 1`
+is also accepted, while `2` is rejected.
+There are no additional calibration structures or timing trials. GPU discovery
+and automatic formula-batch sizing remain available through `devices: auto` and
+`candidate_batch_size: auto`.
 
 **GPU allocation.** Indices are relative to the parent process's inherited
 `CUDA_VISIBLE_DEVICES`, including allocations expressed as GPU UUIDs. If that
@@ -350,23 +311,26 @@ CPU property inference. Alternatively, use `devices: auto` with
 `reserve_devices: [0]` to leave GPU 0 for the parent, or supply a manual device list
 such as `[1, 2, 3]`. At least one worker GPU must remain. The parent preloads its
 persistent DeepMD energy, regression, and classification models before the first
-parallel build, so calibration includes their resident memory. Later external GPU
-load or additional per-property worker pools can still change available memory
+parallel build. Their resident memory, external GPU load, or additional
+per-property worker pools can still affect available memory
 and throughput. Start one experiment process, without `torchrun`.
 The subprocess implementation targets POSIX systems; actual CUDA
 execution requires a compatible Linux GPU environment and the installed builder,
 DeepMD backend, and LAMMPS binary to support that environment.
 
-**Failures and timeouts.** Ordinary task exceptions are logged. The predictor
-scores the successful configurations if their count reaches
-`min_successful_configs`; otherwise the candidate evaluation raises an error.
+**Failures and timeouts.** MD errors, optimizer errors and optimization that
+reaches its step limit without convergence are logged and the affected
+configuration is skipped. The predictor averages the remaining configurations;
+if none remain, that formula is skipped without consuming training budget.
 Workers propagate optimizer execution exceptions, including CUDA OOM, even when
 an external builder calls the shared `relax_structure` helper internally. This
-prevents failed optimizations from appearing as fast calibration successes.
-Reaching the optimization step limit without convergence retains the existing
-warning behavior; it is distinct from an execution exception.
-The default of 1 permits a mean over fewer than the requested configurations;
-set it to `n_random_configs` when every candidate must use the full sample count.
+prevents failed optimizations from being included in a successful ensemble.
+The same strict relaxation checks apply to serial structure scoring. External
+builders using their own optimizer must report failure/nonconvergence themselves;
+in serial batch builds they must catch errors per configuration and return only
+usable structures. No replacement configurations are generated for failed ones.
+The existing consecutive-candidate-failure guard still stops training after 11
+consecutive failed formulas, avoiding an endless run with no scores.
 A worker crash or timeout aborts the current wave and discards the worker
 pool; the next prediction creates a new pool. The experiment's existing handling
 of failed candidate evaluations still applies. Choose the timeout to allow a
