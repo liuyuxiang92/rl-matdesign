@@ -85,7 +85,8 @@ class Builder:
         self.calls += 1
         with (self.root / "build_calls.jsonl").open("a") as out:
             out.write(json.dumps({"pid": os.getpid(), "device": self.device,
-                                  "call": self.calls}) + "\\n")
+                                  "call": self.calls,
+                                  "candidate_id": candidate.get("id")}) + "\\n")
         (self.root / ("started-" + str(os.getpid()))).touch()
         mode = candidate.get("mode", self.cfg.get("test_mode", "normal"))
         if mode == "crash":
@@ -93,7 +94,7 @@ class Builder:
         if mode == "barrier":
             # Serial execution cannot pass this rendezvous, regardless of speed.
             deadline = time.monotonic() + 8
-            while len(list(self.root.glob("started-*"))) < 2:
+            while len(list(self.root.glob("started-*"))) < candidate.get("barrier_count", 2):
                 if time.monotonic() > deadline:
                     raise RuntimeError("second worker never reached the barrier")
                 time.sleep(.01)
@@ -141,6 +142,7 @@ class Builder:
                 "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"]
         atoms.info.update(
             pid=os.getpid(), device=self.device, call=self.calls, draw=value,
+            candidate_id=candidate.get("id"),
             env={key: os.environ.get(key) for key in keys},
             import_env={key: torch.IMPORT_ENV.get(key) for key in keys},
             torch_threads=torch.THREADS,

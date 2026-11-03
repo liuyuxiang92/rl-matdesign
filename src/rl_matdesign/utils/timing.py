@@ -25,6 +25,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from .composition import composition_key
+from .episode_batch import supports_partial_batch_prediction
 
 
 def candidate_key(candidate: Any) -> tuple:
@@ -103,15 +104,42 @@ class PredictorTimer:
         self._record(candidate, out[0], dt)
         return out
 
-    def batch_predict(self, candidates: List[Any]) -> List[Tuple[float, float]]:
+    def batch_predict(
+        self, candidates: List[Any], *, return_exceptions: bool = False,
+    ) -> List[Any]:
+        candidates = list(candidates)
+        if not candidates:
+            return []
         t = time.perf_counter()
-        out = self._inner.batch_predict(candidates)
+        if return_exceptions:
+            batch = getattr(self._inner, "batch_predict", None)
+            if supports_partial_batch_prediction(self._inner):
+                try:
+                    out = batch(candidates, return_exceptions=True)
+                except Exception as exc:
+                    out = [exc] * len(candidates)
+            else:
+                out = []
+                for candidate in candidates:
+                    try:
+                        out.append(self._inner.predict(candidate))
+                    except Exception as exc:
+                        out.append(exc)
+        else:
+            out = self._inner.batch_predict(candidates)
         dt = time.perf_counter() - t
+        if len(out) != len(candidates):
+            raise ValueError("batch_predict must return one result per candidate")
         # Attribute the batch cost evenly; the per-call figure stays honest and
         # the total is exact, which is what the comparison needs.
         share = dt / max(1, len(candidates))
         for cand, res in zip(candidates, out):
-            self._record(cand, res[0], share)
+            if isinstance(res, Exception):
+                # Failed work costs wall time, but it is not a successful reward
+                # observation and must not advance unique/call counters.
+                self.t_predict_s += share
+            else:
+                self._record(cand, res[0], share)
         return out
 
     def __getattr__(self, name: str) -> Any:

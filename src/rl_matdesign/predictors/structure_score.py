@@ -136,6 +136,8 @@ def _fold_models_structures(arr: "np.ndarray") -> Tuple[float, float]:
 
 
 class StructureScorePredictor:
+    supports_partial_batch = True
+
     def __init__(self, cfg: Dict[str, Any], *, seed: Optional[int] = None) -> None:
         from ..registry import resolve_builder
 
@@ -423,11 +425,14 @@ class StructureScorePredictor:
         # duplicate generation rollouts of the same composition are free (the
         # single biggest saving when geo_opt is expensive). `predict_cache_size`
         # caps entries (<=0 = unbounded); each entry is a few floats, so a large
-        # cap is cheap. Set to 0/1 to effectively disable.
+        # cap is cheap. A cap of 1 retains only the most recent cache entry.
         from collections import OrderedDict
 
         self._stats_cache: "OrderedDict[tuple, Dict[str, Tuple[float, float]]]" = OrderedDict()
         self._stats_cache_size: int = int(cfg.get("predict_cache_size", 200000))
+        # Retain the most recent evaluation wave until consumers have logged its
+        # raw/property statistics, even when the persistent LRU is smaller.
+        self._batch_stats: Dict[tuple, Dict[str, Tuple[float, float]]] = {}
 
     # ------------------------------------------------------------------
     # PropertyPredictor protocol
@@ -486,8 +491,87 @@ class StructureScorePredictor:
         """Return ``{name: (mean, std)}`` per objective, for CSV logging."""
         return dict(self._raw_stats(candidate))
 
-    def batch_predict(self, candidates: List[Any]) -> List[Tuple[float, float]]:
-        return [self.predict(c) for c in candidates]
+    def evaluation_batch_size(self) -> int:
+        """Suggested number of episodes to collect before a GPU evaluation wave."""
+        if self.share_structure:
+            builders = [(self._shared_builder, self.n_random_configs)]
+        else:
+            builders = [(self._builders[p["name"]], p["n_random_configs"])
+                        for p in self.properties if p["name"] in self._builders]
+        sizes = [1]
+        for builder, n_configs in builders:
+            recommend = getattr(builder, "recommended_candidate_batch_size", None)
+            if callable(recommend):
+                sizes.append(recommend(n_configs))
+        return max(sizes)
+
+    def batch_predict(
+        self, candidates: List[Any], *, return_exceptions: bool = False,
+    ) -> List[Any]:
+        """Build unique uncached candidates together; score them in input order.
+
+        GPU workers only handle construction/relaxation. Property inference and
+        cache mutation remain in the parent process. A failed candidate can be
+        returned as an exception without discarding other candidates' results.
+        """
+        candidates = list(candidates)
+        if not candidates:
+            return []
+        # Preserve recent diagnostics while checking for hits in this new wave.
+        previous_batch = self._batch_stats
+        self._batch_stats = {}
+        results: Dict[tuple, Any] = {}
+        pending: Dict[tuple, Any] = {}
+        keys: List[Any] = []
+        for candidate in candidates:
+            try:
+                key = self._key(candidate)
+            except Exception as exc:
+                keys.append(exc)
+                continue
+            keys.append(key)
+            try:
+                if key in results or key in pending:
+                    continue
+                stats = self._stats_cache.get(key, previous_batch.get(key))
+                if stats is None:
+                    pending[key] = candidate
+                else:
+                    results[key] = self._prediction_from_stats(stats)
+                    self._batch_stats[key] = stats
+                    if key in self._stats_cache:
+                        self._stats_cache.move_to_end(key)
+            except Exception as exc:
+                results[key] = exc
+
+        if pending:
+            try:
+                inputs = self._materialize_structures_many(list(pending.values()))
+            except Exception as exc:
+                # A pool crash/timeout closes that pool. Nothing from an
+                # incomplete wave is misreported as a successful evaluation.
+                inputs = [exc] * len(pending)
+            for (key, _candidate), prop_inputs in zip(pending.items(), inputs):
+                try:
+                    if isinstance(prop_inputs, Exception):
+                        raise prop_inputs
+                    stats = self._stats_from_inputs(prop_inputs)
+                    results[key] = self._prediction_from_stats(stats)
+                    self._cache_stats(key, stats)
+                    self._batch_stats[key] = stats
+                except Exception as exc:
+                    results[key] = exc
+        out = [key if isinstance(key, Exception) else results[key] for key in keys]
+        if not return_exceptions:
+            for result in out:
+                if isinstance(result, Exception):
+                    raise result
+        return out
+
+    def _prediction_from_stats(self, stats: Dict[str, Tuple[float, float]]) -> Tuple[float, float]:
+        reward = self._combine(stats)
+        stds = [stats[p["name"]][1] for p in self.properties]
+        return reward, float(np.mean(stds)) if stds else 0.0
 
     def close(self) -> None:
         """Release leaf resources — safe to call more than once.
@@ -588,19 +672,7 @@ class StructureScorePredictor:
         """
         prop_inputs: Dict[str, Any] = {}
         structure_props = [p for p in self.properties if p["backend"] != "composition"]
-        if not self._parallel_models_ready and any(
-            getattr(builder, "parallel_execution", False)
-            for builder in [self._shared_builder, *self._builders.values()]
-        ):
-            # Calibration must see the parent's persistent scoring-model memory.
-            # Otherwise two MD workers may fit initially and OOM on the next
-            # candidate after the property models have been loaded on GPU 0.
-            for prop in structure_props:
-                if prop["backend"] == "energy":
-                    self._get_calculators(prop)
-                elif prop["backend"] in ("property", "classification"):
-                    self._get_prop_models(prop)
-            self._parallel_models_ready = True
+        self._preload_parallel_models()
         if structure_props:
             if self.share_structure:
                 structures = self._shared_builder.build(
@@ -619,11 +691,66 @@ class StructureScorePredictor:
                     if self.geo_opt_enabled and not getattr(builder, "handles_geo_opt", False):
                         structures = [self._relax(s) for s in structures]
                     prop_inputs[prop["name"]] = structures
-        # Composition objectives: scored directly on the candidate composition.
         for prop in self.properties:
             if prop["backend"] == "composition":
                 prop_inputs[prop["name"]] = candidate
         return prop_inputs
+
+    def _preload_parallel_models(self) -> None:
+        structure_props = [p for p in self.properties if p["backend"] != "composition"]
+        if not self._parallel_models_ready and any(
+            getattr(builder, "parallel_execution", False)
+            for builder in [self._shared_builder, *self._builders.values()]
+        ):
+            # Calibration must see the parent's persistent scoring-model memory.
+            # Otherwise two MD workers may fit initially and OOM on the next
+            # candidate after the property models have been loaded on GPU 0.
+            for prop in structure_props:
+                if prop["backend"] == "energy":
+                    self._get_calculators(prop)
+                elif prop["backend"] in ("property", "classification"):
+                    self._get_prop_models(prop)
+            self._parallel_models_ready = True
+
+    def _materialize_structures_many(self, candidates: List[Any]) -> List[Any]:
+        self._preload_parallel_models()
+        inputs: List[Any] = [
+            {p["name"]: candidate for p in self.properties if p["backend"] == "composition"}
+            for candidate in candidates
+        ]
+        structure_props = [p for p in self.properties if p["backend"] != "composition"]
+        groups = ([(self._shared_builder, self.n_random_configs, structure_props)]
+                  if self.share_structure and structure_props else
+                  [(self._builders[p["name"]], p["n_random_configs"], [p]) for p in structure_props])
+        for builder, n_configs, props in groups:
+            active = [i for i, entry in enumerate(inputs) if not isinstance(entry, Exception)]
+            if not active:
+                break
+            build_many = getattr(builder, "build_many", None)
+            if callable(build_many):
+                built = build_many([candidates[i] for i in active], n_configs=n_configs, rng=self._rng)
+                if len(built) != len(active):
+                    raise ValueError("build_many must return one result per candidate")
+            else:
+                built = []
+                for i in active:
+                    try:
+                        built.append(builder.build(candidates[i], n_configs=n_configs, rng=self._rng))
+                    except Exception as exc:
+                        built.append(exc)
+            for i, structures in zip(active, built):
+                try:
+                    if isinstance(structures, Exception):
+                        raise structures
+                    if not structures:
+                        raise ValueError("Builder returned no structures for candidate")
+                    if self.geo_opt_enabled and not getattr(builder, "handles_geo_opt", False):
+                        structures = [self._relax(s) for s in structures]
+                    for prop in props:
+                        inputs[i][prop["name"]] = structures
+                except Exception as exc:
+                    inputs[i] = exc
+        return inputs
 
     def _raw_stats(self, candidate: Any) -> Dict[str, Tuple[float, float]]:
         key = self._key(candidate)
@@ -631,11 +758,17 @@ class StructureScorePredictor:
         if cached is not None:
             self._stats_cache.move_to_end(key)   # LRU: mark most-recently used
             return cached
+        if key in self._batch_stats:
+            return self._batch_stats[key]
 
         # 1. Materialize structures once (build + optional relax) — independent
         #    of any sweep value.
         prop_structures = self._materialize_structures(candidate)
+        stats = self._stats_from_inputs(prop_structures)
+        self._cache_stats(key, stats)
+        return stats
 
+    def _stats_from_inputs(self, prop_structures: Dict[str, Any]) -> Dict[str, Tuple[float, float]]:
         # 2. Score. No sweep: score each property once. Sweep: try each value,
         #    keep the single (shared) value maximizing the combined reward — the
         #    expensive build+relax above is reused across all sweep values.
@@ -661,15 +794,14 @@ class StructureScorePredictor:
             stats = dict(best_stats)  # type: ignore[arg-type]
             stats[self.sweep["name"]] = (float(best_value), 0.0)
 
-        # Persistent LRU cache: each unique composition is built+relaxed+scored
-        # exactly once for the predictor's lifetime; all later occurrences (across
-        # training episodes / duplicate generation rollouts) are hits.
+        return stats
+
+    def _cache_stats(self, key: tuple, stats: Dict[str, Tuple[float, float]]) -> None:
         self._stats_cache[key] = stats
         cap = self._stats_cache_size
         if cap and cap > 0:
             while len(self._stats_cache) > cap:
                 self._stats_cache.popitem(last=False)   # evict least-recently used
-        return stats
 
     @staticmethod
     def _fparam_at(prop: Dict[str, Any], value: float) -> Any:

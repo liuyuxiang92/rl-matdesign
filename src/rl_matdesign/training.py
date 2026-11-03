@@ -40,6 +40,9 @@ from tqdm import tqdm
 from .env import CompositionEnv
 from .predictors.base import PropertyPredictor
 from .utils.training_budget import TrainingBudget
+from .utils.episode_batch import (
+    CandidateEvaluationFailed, EpisodeBatchEvaluator, training_wave_limit,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -50,11 +53,6 @@ from .utils.training_budget import TrainingBudget
 # with a fresh candidate instead of either crashing the run or burning a
 # real episode-budget slot on a candidate that was never actually scored.
 # ---------------------------------------------------------------------------
-
-class CandidateEvaluationFailed(Exception):
-    """A well-formed candidate's predictor/builder call failed; retry, don't
-    count it against the episode budget."""
-
 
 # How many consecutive candidates may fail evaluation before a rollout call
 # site gives up and lets the failure surface as a hard error. A handful of
@@ -589,6 +587,11 @@ def train_dqn_online(
     steps. Epsilon, target-copy and checkpoint schedules follow actual sampled
     online episodes. The duplicate guard bounds consecutive repeats; the
     budget state and actual episode counter are stored separately on resume.
+
+    Opt-in cross-candidate evaluation collects a wave under the current Q-network
+    and epsilon, then preserves one replay insertion and gradient group per
+    successful episode. This delays behavior-policy refresh relative to scalar
+    online DQN; ``epsilon_used`` records the collection wave's exploration rate.
     """
     from .model import QRegressor
 
@@ -631,6 +634,8 @@ def train_dqn_online(
             )
     # --- END mc-target experiment ---
 
+    evaluator = EpisodeBatchEvaluator(env, max_retries=_MAX_CANDIDATE_RETRIES)
+
     # Warmup pays one real predictor call per episode (see below), so those
     # episodes are part of the training cost and belong in the log. Collected
     # here because `metrics` isn't built until after the warmup branch.
@@ -669,29 +674,33 @@ def train_dqn_online(
         warmup_attempts = 0
         while warmup_counted < n_warmup_eps:
             budget.check_can_sample()
-            _rollout_with_retry(lambda: _rollout_random_episode(env))
-            counted = budget.record(env.terminal_comp_key())
+            episode = evaluator.next(
+                lambda: _rollout_random_episode(env),
+                limit=training_wave_limit(budget, n_warmup_eps - warmup_counted),
+                retry_scalar=_rollout_with_retry,
+            )
+            counted = budget.record(episode.terminal_key)
             warmup_counted += int(counted)
             warmup_attempts += 1
-            if env.path:
+            if episode.path:
                 warmup_rows.append({
                     "phase": "dqn_warmup",
                     "episode": warmup_attempts,
-                    "return": float(env.path[-1].reward),
-                    "terminal_reward": float(env.path[-1].reward),
+                    "return": float(episode.path[-1].reward),
+                    "terminal_reward": float(episode.path[-1].reward),
                     "epsilon": 1.0,          # warmup is uniformly random by definition
-                    "terminal_comp_key": str(env.terminal_comp_key()),
+                    "terminal_comp_key": str(episode.terminal_key),
                     "budget_counted": counted,
                     "training_budget_history_complete": budget_history_complete,
                     **budget.snapshot(),
                 })
             if augment_permutations > 0:
                 _augment_episode_in_buffer(
-                    env, env.path, buffer, elem_feats_scaled, fraction_set,
+                    env, episode.path, buffer, elem_feats_scaled, fraction_set,
                     K=augment_permutations,
                 )
             else:
-                add_episode_to_buffer(env.path, buffer, elem_feats_scaled, fraction_set, gamma=gamma)
+                add_episode_to_buffer(episode.path, buffer, elem_feats_scaled, fraction_set, gamma=gamma)
             pbar.update(int(counted))
         pbar.close()
         # Unlike PG warmup (which neutralises reward_fn), DQN warmup pays a real
@@ -769,19 +778,28 @@ def train_dqn_online(
     while completed < dqn_num_train_eps:
         budget.check_can_sample()
         qnet.eval()
-        _rollout_with_retry(_rollout_eps_greedy_episode)
-        counted = budget.record(env.terminal_comp_key())
+        episode = evaluator.next(
+            _rollout_eps_greedy_episode,
+            limit=training_wave_limit(
+                budget, dqn_num_train_eps - completed,
+                checkpoint_freq=ckpt_freq if ckpt_path else 0,
+                completed_attempts=train_attempts,
+            ),
+            retry_scalar=_rollout_with_retry,
+            metadata={"epsilon_used": eps},
+        )
+        counted = budget.record(episode.terminal_key)
         completed += int(counted)
         train_attempts += 1
 
-        episode_reward = float(env.path[-1].reward)
+        episode_reward = float(episode.path[-1].reward)
         if augment_permutations > 0:
             _augment_episode_in_buffer(
-                env, env.path, buffer, elem_feats_scaled, fraction_set,
+                env, episode.path, buffer, elem_feats_scaled, fraction_set,
                 K=augment_permutations,
             )
         else:
-            add_episode_to_buffer(env.path, buffer, elem_feats_scaled, fraction_set, gamma=gamma)
+            add_episode_to_buffer(episode.path, buffer, elem_feats_scaled, fraction_set, gamma=gamma)
 
         # 2. Gradient steps.
         mean_loss = float("nan")
@@ -811,7 +829,7 @@ def train_dqn_online(
             "episode": train_attempts,
             "budget_counted": counted,
             "training_budget_history_complete": budget_history_complete,
-            "terminal_comp_key": str(env.terminal_comp_key()),
+            "terminal_comp_key": str(episode.terminal_key),
             **budget.snapshot(),
             "return": episode_reward,
             # Identical to `return` for DQN (it already logs the undiscounted
@@ -821,6 +839,7 @@ def train_dqn_online(
             "train_loss": mean_loss,
             "mse_loss": mean_loss,
             "epsilon": eps,
+            "epsilon_used": episode.metadata["epsilon_used"],
             "buffer_rows": len(buffer),
         }
         if timer is not None:
@@ -1255,6 +1274,7 @@ def train_pg(
         print("[WARN] Legacy checkpoint has no training budget history: new diagnostic "
               "counters start at this resume; the existing episode schedule is preserved.", flush=True)
 
+    evaluator = EpisodeBatchEvaluator(env, max_retries=_MAX_CANDIDATE_RETRIES)
     policy.train()
     opt_actor = torch.optim.Adam(policy.parameters(), lr=lr_actor)
     if value_net is not None:
@@ -1342,13 +1362,22 @@ def train_pg(
                 break
             if max_train_attempts is not None and attempted >= max_train_attempts:
                 break
+            wave_limit = training_wave_limit(
+                budget, min(int(batch_eps) - collected, budget_target - budget.counted),
+                attempts_remaining=(max_train_attempts - attempted
+                                    if max_train_attempts is not None else None),
+            )
             attempted += 1
-            _rollout_with_retry(lambda: _rollout_pg_episode(
-                env=env, policy=policy, scaler=scaler,
-                elem_feats_scaled=elem_feats_scaled, fraction_set=fraction_set,
-                device=device,
-            ))
-            path = env.path
+            episode = evaluator.next(
+                lambda: _rollout_pg_episode(
+                    env=env, policy=policy, scaler=scaler,
+                    elem_feats_scaled=elem_feats_scaled, fraction_set=fraction_set,
+                    device=device,
+                ),
+                limit=wave_limit,
+                retry_scalar=_rollout_with_retry,
+            )
+            path = episode.path
             if not path:
                 continue
 
@@ -1359,7 +1388,7 @@ def train_pg(
                 returns.append(G)
             returns.reverse()
 
-            terminal_key = env.terminal_comp_key()
+            terminal_key = episode.terminal_key
             budget_counted = budget.record(terminal_key)
             if not train_count_duplicates and budget_counted:
                 outer_pbar.update(1)
@@ -1684,6 +1713,24 @@ def generate_candidates(
     else:
         qnet.eval()
 
+    evaluator = EpisodeBatchEvaluator(env, max_retries=_MAX_CANDIDATE_RETRIES)
+
+    def rollout_generation():
+        if use_pg:
+            _pg_single_episode_generate(
+                env=env, policy=policy, scaler=scaler,
+                elem_feats_scaled=elem_feats_scaled, fraction_set=fraction_set,
+                device=device, gen_epsilon=gen_epsilon,
+                gen_top_frac=gen_top_frac, gen_temperature=gen_temperature,
+            )
+        else:
+            _rollout_policy_episode(
+                env=env, qnet=qnet, scaler=scaler, device=device,
+                elem_feats_scaled=elem_feats_scaled, fraction_set=fraction_set,
+                gen_epsilon=gen_epsilon, gen_top_frac=gen_top_frac,
+                gen_temperature=gen_temperature,
+            )
+
     use_predict_raw = hasattr(predictor, "predict_raw")
     use_check_phase = hasattr(predictor, "check_phase")
     use_per_obj_stats = hasattr(predictor, "per_objective_stats")
@@ -1713,23 +1760,10 @@ def generate_candidates(
             attempted += 1
 
             try:
-                if use_pg:
-                    _pg_single_episode_generate(
-                        env=env, policy=policy, scaler=scaler,
-                        elem_feats_scaled=elem_feats_scaled, fraction_set=fraction_set,
-                        device=device,
-                        gen_epsilon=gen_epsilon,
-                        gen_top_frac=gen_top_frac,
-                        gen_temperature=gen_temperature,
-                    )
-                else:
-                    _rollout_policy_episode(
-                        env=env, qnet=qnet, scaler=scaler, device=device,
-                        elem_feats_scaled=elem_feats_scaled, fraction_set=fraction_set,
-                        gen_epsilon=gen_epsilon,
-                        gen_top_frac=gen_top_frac,
-                        gen_temperature=gen_temperature,
-                    )
+                episode = evaluator.next(
+                    rollout_generation,
+                    limit=min(n_target - accepted, max_att - attempted + 1),
+                )
             except CandidateEvaluationFailed as exc:
                 # Unlike training, generation already has a generous, separate
                 # attempts budget (max_att) distinct from `n_target` -- treat
@@ -1740,8 +1774,8 @@ def generate_candidates(
                       f"skipping: {exc}")
                 continue
 
-            comp     = env.terminal_cation_fractions()
-            comp_key = env.terminal_comp_key()
+            comp     = episode.composition
+            comp_key = episode.terminal_key
 
             if comp_key in seen_comp_keys:
                 dup_rejected += 1
@@ -1761,7 +1795,7 @@ def generate_candidates(
                 # Prefer the builder's full composition label (host/derived
                 # anions the env never sees); fall back to the env pick-only
                 # formula. Same resolution as the accepted-row path below.
-                _formula = env.terminal_formula
+                _formula = episode.formula
                 _cf = getattr(predictor, "composition_formula", None)
                 if callable(_cf):
                     try:
@@ -1780,7 +1814,7 @@ def generate_candidates(
                     continue
 
             # Reward from the episode (env.reward_fn already called in env.step).
-            reward = float(env.path[-1].reward) if env.path else 0.0
+            reward = float(episode.path[-1].reward) if episode.path else 0.0
 
             # Raw predictor values for CSV columns. OOHCatalystPredictor caches
             # internally so this is usually a cache hit when env.reward_fn
@@ -1809,7 +1843,7 @@ def generate_candidates(
             # Prefer the builder's full composition label (includes host/derived
             # elements the env never sees — e.g. SSE's surviving S, derived Br,
             # charge-balanced Li); fall back to the env's pick-only formula.
-            formula = env.terminal_formula
+            formula = episode.formula
             comp_formula = getattr(predictor, "composition_formula", None)
             if callable(comp_formula):
                 try:

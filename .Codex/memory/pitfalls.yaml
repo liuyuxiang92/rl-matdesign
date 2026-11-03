@@ -103,3 +103,25 @@
   - composition-reporting
   - sublattice-defects
   - formula-validation
+- id: pitfall-batch-proxy-001
+  date: '2026-11-03'
+  expires: '2027-02-03'
+  title: Transparent predictor wrappers must forward optional batch capabilities
+  wrong: The reward adapter recognized return_exceptions by signature, while the
+    timing wrapper required a separate supports_partial_batch marker. A valid plugin
+    batched directly but silently evaluated serially when wrapped by the runner.
+  right: Share capability detection between the adapter and timer. Test a plugin with
+    the explicit partial-batch signature and no marker, preserving output order and
+    candidate-local failures. Account failed batch work in elapsed time without
+    counting it as a successful reward observation.
+  impact: Generic plugins could lose cross-formula concurrency only in real runs,
+    despite passing direct predictor tests.
+  files:
+  - src/rl_matdesign/utils/episode_batch.py
+  - src/rl_matdesign/utils/timing.py
+  - src/rl_matdesign/configuration.py
+  - tests/test_cross_formula_predictor.py
+  tags:
+  - wrapper-contracts
+  - batched-rewards
+  - performance-accounting

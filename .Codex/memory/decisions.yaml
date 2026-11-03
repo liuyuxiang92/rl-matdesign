@@ -39,11 +39,12 @@
   date: '2026-10-28'
   expires: '2027-04-28'
   title: Generic configuration workers with measured one-or-two GPU concurrency
-  choice: Keep RL episodes and property aggregation serial; wrap arbitrary single-configuration
+  choice: Keep RL sampling and property aggregation serial; wrap arbitrary single-configuration
     builders in persistent subprocesses whose CUDA environment is set before imports.
     Discover only visible GPUs; optionally reserve logical indices. Auto-calibrate
-    one versus two workers per GPU on identical candidate/seed when configurations
-    outnumber GPUs; require 15 percent measured throughput improvement.
+    one versus two workers per GPU on identical candidate/seed when queued configurations
+    outnumber GPUs; require 15 percent measured throughput improvement. Optional
+    cross-formula evaluation waves were added on 2026-11-03 (see decision-formula-batches-001).
   alternatives_considered:
   - Threads or fork after CUDA initialization risk shared device state; fresh subprocesses
     isolate models and external MD children.
@@ -87,3 +88,32 @@
   - episode-budgeting
   - composition-deduplication
   - checkpoint-compatibility
+- id: decision-formula-batches-001
+  date: '2026-11-03'
+  expires: '2027-05-03'
+  title: Opt-in bounded formula batches share one configuration worker queue
+  choice: structure_parallel.candidate_batch_size defaults to 1 and accepts auto or
+    a positive integer. Capture terminal reward inputs while sampling sequentially,
+    evaluate uncached unique candidates through one worker pool, then consume trajectory
+    snapshots in sampling order. Keep duplicate learning and independent per-formula
+    reward/failure aggregation; retain property inference in the parent process.
+  alternatives_considered:
+  - Concurrent threads mutating one environment or predictor would race policy state,
+    caches, RNG and CUDA model access.
+  - Requiring a fixed number of successful configs conflates candidate acceptance with
+    hardware scheduling; preserve min_successful_configs default 1.
+  trade_off: DQN samples a wave with frozen policy and epsilon before sequential updates,
+    so opt-in batching changes sampling trajectories. PG waves stay inside one existing
+    on-policy batch. Conservative budget, duplicate, failure and checkpoint caps can
+    reduce utilization, but prevent overrun or unconsumed results at checkpoint saves.
+    Auto sizing adapts after one-versus-two-worker calibration; cached formulas may leave
+    some slots idle. No real GPU speedup measurement was available.
+  files:
+  - src/rl_matdesign/utils/episode_batch.py
+  - src/rl_matdesign/utils/parallel_structures.py
+  - src/rl_matdesign/predictors/structure_score.py
+  - src/rl_matdesign/training.py
+  tags:
+  - gpu-scheduling
+  - batched-rewards
+  - episode-budgeting
