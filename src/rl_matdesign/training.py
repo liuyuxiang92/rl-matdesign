@@ -29,6 +29,7 @@ import collections
 import copy
 import math
 import random
+import time
 from collections import Counter
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -63,6 +64,29 @@ from .utils.episode_batch import (
 # amount of retrying will fix — better to fail loudly than spend the rest of
 # the training budget on candidates that never get scored.
 _MAX_CANDIDATE_RETRIES = 10
+
+
+def _sync_training_device(device) -> None:
+    """Measure completed CUDA updates, not only asynchronous launch time."""
+    if torch.device(device).type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _episode_timing_row(episode, update_s: float = 0.0) -> dict:
+    timing = dict(episode.timing)
+    timing.update({
+        "formula": episode.formula,
+        "status": "ok",
+        "rl_update_s": update_s,
+        "episode_wall_share_s": timing.get("episode_wall_share_s", 0.0) + update_s,
+    })
+    return timing
+
+
+def _record_episode_timing(timer, row) -> None:
+    record = getattr(timer, "record_episode", None)
+    if callable(record):
+        record(row)
 
 
 def _rollout_with_retry(rollout_fn: Callable[[], None]) -> None:
@@ -634,7 +658,7 @@ def train_dqn_online(
             )
     # --- END mc-target experiment ---
 
-    evaluator = EpisodeBatchEvaluator(env, max_retries=_MAX_CANDIDATE_RETRIES)
+    evaluator = EpisodeBatchEvaluator(env, max_retries=_MAX_CANDIDATE_RETRIES, timer=timer)
 
     # Warmup pays one real predictor call per episode (see below), so those
     # episodes are part of the training cost and belong in the log. Collected
@@ -678,6 +702,7 @@ def train_dqn_online(
                 lambda: _rollout_random_episode(env),
                 limit=training_wave_limit(budget, n_warmup_eps - warmup_counted),
                 retry_scalar=_rollout_with_retry,
+                phase="dqn_warmup",
             )
             counted = budget.record(episode.terminal_key)
             warmup_counted += int(counted)
@@ -693,7 +718,9 @@ def train_dqn_online(
                     "budget_counted": counted,
                     "training_budget_history_complete": budget_history_complete,
                     **budget.snapshot(),
+                    **_episode_timing_row(episode),
                 })
+                _record_episode_timing(timer, warmup_rows[-1])
             if augment_permutations > 0:
                 _augment_episode_in_buffer(
                     env, episode.path, buffer, elem_feats_scaled, fraction_set,
@@ -787,11 +814,14 @@ def train_dqn_online(
             ),
             retry_scalar=_rollout_with_retry,
             metadata={"epsilon_used": eps},
+            phase="dqn_train",
         )
         counted = budget.record(episode.terminal_key)
         completed += int(counted)
         train_attempts += 1
 
+        _sync_training_device(device)
+        update_started = time.perf_counter()
         episode_reward = float(episode.path[-1].reward)
         if augment_permutations > 0:
             _augment_episode_in_buffer(
@@ -822,6 +852,8 @@ def train_dqn_online(
 
         # 4. Linear epsilon anneal.
         eps = max(dqn_eps_min, 1.0 - (train_attempts - 1) / dqn_eps_anneal_eps)
+        _sync_training_device(device)
+        update_s = time.perf_counter() - update_started
 
         _row = {
             "phase": "dqn_train",
@@ -841,10 +873,12 @@ def train_dqn_online(
             "epsilon": eps,
             "epsilon_used": episode.metadata["epsilon_used"],
             "buffer_rows": len(buffer),
+            **_episode_timing_row(episode, update_s),
         }
         if timer is not None:
             _row.update(timer.snapshot())
         metrics.append(_row)
+        _record_episode_timing(timer, _row)
         pbar.update(int(counted))
         pbar.set_postfix(
             eps=f"{eps:.3f}",
@@ -1274,7 +1308,7 @@ def train_pg(
         print("[WARN] Legacy checkpoint has no training budget history: new diagnostic "
               "counters start at this resume; the existing episode schedule is preserved.", flush=True)
 
-    evaluator = EpisodeBatchEvaluator(env, max_retries=_MAX_CANDIDATE_RETRIES)
+    evaluator = EpisodeBatchEvaluator(env, max_retries=_MAX_CANDIDATE_RETRIES, timer=timer)
     policy.train()
     opt_actor = torch.optim.Adam(policy.parameters(), lr=lr_actor)
     if value_net is not None:
@@ -1368,15 +1402,24 @@ def train_pg(
                                     if max_train_attempts is not None else None),
             )
             attempted += 1
-            episode = evaluator.next(
-                lambda: _rollout_pg_episode(
-                    env=env, policy=policy, scaler=scaler,
-                    elem_feats_scaled=elem_feats_scaled, fraction_set=fraction_set,
-                    device=device,
-                ),
-                limit=wave_limit,
-                retry_scalar=_rollout_with_retry,
-            )
+            try:
+                episode = evaluator.next(
+                    lambda: _rollout_pg_episode(
+                        env=env, policy=policy, scaler=scaler,
+                        elem_feats_scaled=elem_feats_scaled, fraction_set=fraction_set,
+                        device=device,
+                    ),
+                    limit=wave_limit,
+                    retry_scalar=_rollout_with_retry,
+                    phase="pg_episode",
+                )
+            except BaseException:
+                # Collection can stop at the failure guard (or interruption)
+                # before this on-policy batch reaches its learning update.
+                # Preserve already-scored episodes with zero update cost.
+                for row in batch_ep_rows:
+                    _record_episode_timing(timer, row)
+                raise
             path = episode.path
             if not path:
                 continue
@@ -1433,6 +1476,7 @@ def train_pg(
                 "budget_counted": budget_counted,
                 **budget.snapshot(),
                 "training_budget_history_complete": budget_history_complete,
+                **_episode_timing_row(episode),
             })
 
         if train_count_duplicates:
@@ -1440,6 +1484,8 @@ def train_pg(
         if not batch_paths:
             continue
 
+        _sync_training_device(device)
+        update_started = time.perf_counter()
         all_logp: List[torch.Tensor] = []
         all_adv_raw: List[float] = []
         all_penalty: List[float] = []
@@ -1465,6 +1511,8 @@ def train_pg(
             all_critic.extend(c_terms)
 
         if not all_logp:
+            for row in batch_ep_rows:
+                _record_episode_timing(timer, row)
             continue
 
         # --- advantage standardisation (the whole point; see docstring) -------
@@ -1506,6 +1554,13 @@ def train_pg(
             opt_critic.step()
             critic_loss_val = float(critic_loss.item())
 
+        _sync_training_device(device)
+        update_s = time.perf_counter() - update_started
+        for row in batch_ep_rows:
+            row["rl_update_s"] = update_s / len(batch_ep_rows)
+            row["episode_wall_share_s"] += row["rl_update_s"]
+            _record_episode_timing(timer, row)
+
         update_idx += 1
         ep_actor_loss = float(actor_loss.item())
         ep_entropy    = float(entropy_bonus.item())
@@ -1542,6 +1597,7 @@ def train_pg(
             "adv_mean_raw": adv_mean,
             "adv_std_raw": adv_std,
             "critic_loss": critic_loss_val,
+            "rl_update_s": update_s,
             **budget.snapshot(),
             "training_budget_history_complete": budget_history_complete,
         }
@@ -1713,7 +1769,7 @@ def generate_candidates(
     else:
         qnet.eval()
 
-    evaluator = EpisodeBatchEvaluator(env, max_retries=_MAX_CANDIDATE_RETRIES)
+    evaluator = EpisodeBatchEvaluator(env, max_retries=_MAX_CANDIDATE_RETRIES, timer=predictor)
 
     def rollout_generation():
         if use_pg:
@@ -1763,6 +1819,7 @@ def generate_candidates(
                 episode = evaluator.next(
                     rollout_generation,
                     limit=min(n_target - accepted, max_att - attempted + 1),
+                    phase="generate",
                 )
             except CandidateEvaluationFailed as exc:
                 # Unlike training, generation already has a generous, separate
@@ -1774,6 +1831,10 @@ def generate_candidates(
                       f"skipping: {exc}")
                 continue
 
+            _record_episode_timing(predictor, {
+                **_episode_timing_row(episode),
+                "phase": "generate", "episode": attempted,
+            })
             comp     = episode.composition
             comp_key = episode.terminal_key
 

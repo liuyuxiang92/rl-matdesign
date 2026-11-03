@@ -596,5 +596,61 @@ To silence the warnings, rename the keys in your YAML — the values are unchang
 | `value_net.pt` | — | A2C | Critic (ValueNet) weights |
 | `checkpoint.pt` | ✓ | ✓ | Latest mid-training checkpoint (symlink to numbered file) |
 | `training_log.csv` | ✓ | ✓ | Per-episode: return, actor_loss, entropy, critic_loss, … |
+| `episode_timing.csv` | ✓ | ✓ | Incremental per-attempt wall time, MD/optimization task time, and RL update time |
+| `timing.json` | ✓ | ✓ | Run/phase totals and the current invocation's episode timing totals |
 | `generated.csv` | ✓ | ✓ | Candidates: formula, reward, dp_mean, dp_std |
 | `run_config.json` | ✓ | ✓ | Full config + argparse namespace for reproducibility |
+
+### Per-episode timing
+
+Timing is enabled automatically; no YAML option is required. `episode_timing.csv`
+is written during training and generation, including failed evaluations and
+repeated candidates. It remains available if a later episode stops the run.
+Successful training rows also carry these fields in `training_log.csv`.
+
+| Column | Meaning |
+|---|---|
+| `episode_wall_share_s` | Rollout time + the episode's share of evaluation wall time + its RL update time |
+| `eval_wall_share_s` | The complete evaluation wave's elapsed time divided by its attempted episodes |
+| `rollout_s` | Action selection/environment work, excluding terminal reward evaluation |
+| `rl_update_s` | DQN replay insertion, gradient updates and target copy; for PG, a share of the actual actor/critic update batch |
+| `md_task_s`, `opt_task_s` | Elapsed MD/optimization time summed over configurations, including unsuccessful work |
+| `property_s` | Property model evaluation and per-objective statistics for that candidate |
+| `structure_other_task_s` | Remaining structure-task time when MD and optimization are both instrumented |
+| `config_attempted`, `config_succeeded` | Configurations attempted and successfully returned during this evaluation |
+
+**Task seconds and wall seconds are different under parallel execution.** Do not
+add `md_task_s` or `opt_task_s` to `episode_wall_share_s`. For example, a 100-second
+evaluation wave containing two chemical formulas assigns 50 evaluation wall
+seconds to each, while their configuration task times can sum to more than
+100 seconds. Cached/duplicate candidates share the wave's wall interval but
+report zero new MD/optimization work. A failed formula has `status=failed`, no
+training-budget charge, and zero RL update time; its spent evaluation time is
+still recorded. A blank stage value means unavailable, not zero.
+Configuration counts can also be blank when a serial external builder does not
+report its actual attempts; requested counts are not substituted for measurements.
+Parallel workers report their dispatched attempts and returned successes directly.
+
+`episode_wall_share_s` excludes global setup, scaler fitting, checkpoint/file
+writes and generation's later output diagnostics. These remain in the run-level
+timing/overhead. PG's `pg_train` row contains the whole batch's `rl_update_s`;
+its `pg_episode` rows split the same time across the actual collected episodes,
+so do not sum both kinds of training-log rows. The timing CSV contains episode
+rows only. On resume it appends new rows with a new `timing_session` identifier;
+`wall_elapsed_s` and wave IDs restart for that invocation. Identify a wave using
+`timing_session`, `phase` and `evaluation_wave_id`.
+
+For the external CLC perovskite builder, apply the included MD instrumentation
+patch **from the CLC_workflow repository root**, using your rl-matdesign path:
+
+```bash
+git apply --check /path/to/rl-matdesign/integrations/clc_workflow_stage_timing.patch
+git apply /path/to/rl-matdesign/integrations/clc_workflow_stage_timing.patch
+```
+
+Deploy that patched builder together with this rl-matdesign version. The patch
+times the LAMMPS subprocess, including failed runs; the shared relaxation helper
+times optimization. Without the external patch, MD duration remains unavailable
+rather than being estimated from the whole structure-building time. Other
+external builders can use the optional hooks in
+[`stage_timing.py`](src/rl_matdesign/utils/stage_timing.py).

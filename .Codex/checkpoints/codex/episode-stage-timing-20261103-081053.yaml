@@ -1,0 +1,51 @@
+checkpoint_version: 3.0.0
+created_at: '2026-11-03T08:10:53.795028+00:00'
+branch: codex/episode-stage-timing
+phase:
+  current: publication
+  completed:
+  - implementation
+  - independent_review
+  - regression_tests
+  - reflection
+  next:
+  - commit_and_push
+  - remote_gpu_deployment
+state:
+  worktree: /private/tmp/rl-matdesign-cross-formula-20261103
+  base_commit: 42e1e1335b92f0113e170450a94bcbc6f76e163a
+  parameters:
+  - name: new_yaml_parameters
+    value: 0
+    source: user preference; automatic PredictorTimer CSV wiring
+    confidence: high
+  experiments:
+  - name: full_regression
+    status: completed
+    result: 768 passed, 4 skipped, existing SMACT warning; 216.00s
+  - name: new_predictor_and_abort_cases
+    status: completed
+    result: 16 predictor timing cases in 44-test targeted run; PG abort case in 34-test
+      targeted run
+  - name: real_gpu_physics
+    status: pending
+    reason: No H20/MD runtime in local verification environment
+  decisions:
+  - decision: Keep per-wave wall shares separate from MD/OPT task seconds
+    rationale: Tasks overlap across GPUs; adding them double counts elapsed time
+  - decision: Add optional hook to external CLC LAMMPS subprocess and ship patch
+    rationale: rl-matdesign cannot distinguish uninstrumented external MD from setup/IO
+blockers: []
+artifacts:
+- path: integrations/clc_workflow_stage_timing.patch
+  role: deploy this in external CLC_workflow source
+- path: README.md
+  role: output column definitions, limits and deployment instructions
+- path: /Users/liuyuxiang/Dropbox/Macbook_air/aisi/chemical_looping_beyond_combustion/code/structures/CLC_workflow/src/clc_workflow/rl_builder.py
+  role: local external patch applied; not committed to that separate repository
+resume_instructions: Verify git status/log/upstream before repeating a commit; EARS
+  may report tool error after a successful commit. Preserve the unrelated original
+  checkout. Deploy this branch and the external CLC patch together on H20; inspect
+  episode_timing.csv from a small actual run. Do not interpret task-seconds as additive
+  episode wall time. Earlier HPO question about MC vs bootstrap remains optional and
+  unresolved; saved private YAML retains bootstrap.

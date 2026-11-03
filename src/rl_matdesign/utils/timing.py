@@ -21,7 +21,10 @@ best-reward-vs-time curve can be plotted after the fact without re-running.
 """
 from __future__ import annotations
 
+import csv
 import time
+import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .composition import composition_key
@@ -68,7 +71,16 @@ class PredictorTimer:
     therefore the number of calls that a correctly-keyed cache could serve.
     """
 
-    def __init__(self, inner: Any, t0: Optional[float] = None) -> None:
+    EPISODE_COLUMNS = (
+        "timing_session", "phase", "episode", "formula", "status", "wall_elapsed_s",
+        "evaluation_wave_id", "evaluation_wave_size", "rollout_s",
+        "eval_wall_share_s", "rl_update_s", "episode_wall_share_s",
+        "md_task_s", "opt_task_s", "structure_other_task_s", "property_s",
+        "config_attempted", "config_succeeded", "cache_hit", "timing_incomplete",
+    )
+
+    def __init__(self, inner: Any, t0: Optional[float] = None, *,
+                 episode_log_path: Optional[str] = None, append: bool = False) -> None:
         self._inner = inner
         self._t0 = time.perf_counter() if t0 is None else float(t0)
         self.n_calls = 0
@@ -77,6 +89,48 @@ class PredictorTimer:
         self.best_mean: Optional[float] = None
         self._seen: set = set()
         self._marks: List[Dict[str, Any]] = []
+        self.last_evaluation_timings: List[Dict[str, Any]] = []
+        self._episode_log_path = Path(episode_log_path) if episode_log_path else None
+        self._timing_session = uuid.uuid4().hex
+        self._episode_totals: Dict[str, Any] = {
+            "timing_session": self._timing_session, "n_records": 0, "n_failed": 0,
+        }
+        if self._episode_log_path is not None:
+            self._episode_log_path.parent.mkdir(parents=True, exist_ok=True)
+            if not append or not self._episode_log_path.exists() or not self._episode_log_path.stat().st_size:
+                with self._episode_log_path.open("w", newline="") as stream:
+                    csv.DictWriter(stream, fieldnames=self.EPISODE_COLUMNS).writeheader()
+
+    def _take_evaluation_timings(self, count: int) -> None:
+        rows = getattr(self._inner, "last_evaluation_timings", None)
+        self.last_evaluation_timings = (
+            [dict(row) if isinstance(row, dict) else {} for row in rows]
+            if isinstance(rows, (list, tuple)) and len(rows) == count
+            else [{} for _ in range(count)]
+        )
+
+    def record_episode(self, row: Dict[str, Any]) -> None:
+        """Persist one attempt immediately, including failed or cached attempts.
+
+        Wall shares are attributable elapsed time. Task seconds sum overlapping
+        configuration work and must never be added to those wall shares.
+        """
+        record = {**row, "wall_elapsed_s": self.t_wall_s,
+                  "timing_session": self._timing_session}
+        self._episode_totals["n_records"] += 1
+        self._episode_totals["n_failed"] += int(row.get("status") == "failed")
+        for key in ("rollout_s", "eval_wall_share_s", "rl_update_s", "episode_wall_share_s",
+                    "md_task_s", "opt_task_s", "structure_other_task_s", "property_s"):
+            value = row.get(key)
+            if value is None:
+                missing = key + "_unavailable_records"
+                self._episode_totals[missing] = self._episode_totals.get(missing, 0) + 1
+            else:
+                self._episode_totals[key] = self._episode_totals.get(key, 0.0) + float(value)
+        if self._episode_log_path is not None:
+            with self._episode_log_path.open("a", newline="") as stream:
+                csv.DictWriter(stream, fieldnames=self.EPISODE_COLUMNS,
+                               extrasaction="ignore").writerow(record)
 
     # ------------------------------------------------------------------
     # Timed pass-throughs
@@ -98,8 +152,15 @@ class PredictorTimer:
             self.best_mean = m
 
     def predict(self, candidate: Any) -> Tuple[float, float]:
+        self.last_evaluation_timings = []
         t = time.perf_counter()
-        out = self._inner.predict(candidate)
+        try:
+            out = self._inner.predict(candidate)
+        except BaseException:
+            self.t_predict_s += time.perf_counter() - t
+            raise
+        finally:
+            self._take_evaluation_timings(1)
         dt = time.perf_counter() - t
         self._record(candidate, out[0], dt)
         return out
@@ -108,6 +169,7 @@ class PredictorTimer:
         self, candidates: List[Any], *, return_exceptions: bool = False,
     ) -> List[Any]:
         candidates = list(candidates)
+        self.last_evaluation_timings = []
         if not candidates:
             return []
         t = time.perf_counter()
@@ -120,15 +182,29 @@ class PredictorTimer:
                     out = [exc] * len(candidates)
             else:
                 out = []
+                timings = []
                 for candidate in candidates:
                     try:
                         out.append(self._inner.predict(candidate))
                     except Exception as exc:
                         out.append(exc)
+                    finally:
+                        self._take_evaluation_timings(1)
+                        timings.extend(self.last_evaluation_timings)
         else:
-            out = self._inner.batch_predict(candidates)
+            try:
+                out = self._inner.batch_predict(candidates)
+            except BaseException:
+                self.t_predict_s += time.perf_counter() - t
+                self._take_evaluation_timings(len(candidates))
+                raise
         dt = time.perf_counter() - t
+        if return_exceptions and not supports_partial_batch_prediction(self._inner):
+            self.last_evaluation_timings = timings
+        else:
+            self._take_evaluation_timings(len(candidates))
         if len(out) != len(candidates):
+            self.t_predict_s += dt
             raise ValueError("batch_predict must return one result per candidate")
         # Attribute the batch cost evenly; the per-call figure stays honest and
         # the total is exact, which is what the comparison needs.
@@ -153,9 +229,11 @@ class PredictorTimer:
         if name == "predict_raw":
             def _timed_predict_raw(candidate: Any) -> Tuple[float, float]:
                 t = time.perf_counter()
-                out = attr(candidate)
+                try:
+                    out = attr(candidate)
+                finally:
+                    self.t_predict_s += time.perf_counter() - t
                 self.n_calls += 1
-                self.t_predict_s += time.perf_counter() - t
                 key = candidate_key(candidate)
                 if key not in self._seen:
                     self._seen.add(key)
@@ -202,6 +280,7 @@ class PredictorTimer:
             "mean_s_per_unique": (round(self.t_predict_s / self.n_unique, 6)
                                   if self.n_unique else 0.0),
             "best_reward": self.best_mean,
+            "episode_timings": dict(self._episode_totals),
         }
 
     @property

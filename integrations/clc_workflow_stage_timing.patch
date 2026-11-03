@@ -1,0 +1,21 @@
+--- a/src/clc_workflow/rl_builder.py
++++ b/src/clc_workflow/rl_builder.py
+@@ -81,2 +81,5 @@
+ class MDAveragedOptBuilder:
++    # Shared relaxation records opt; the subprocess scope below records MD.
++    timing_stages = ("md", "opt")
++
+     def __init__(self, cfg: Dict[str, Any], *, seed: Optional[int] = None) -> None:
+@@ -299,3 +302,11 @@
+             run_env = {**os.environ, **{str(k): str(v) for k, v in (self.md.get("env") or {}).items()}}
+-            result = subprocess.run(cmd, cwd=scratch, capture_output=True, text=True, env=run_env)
++            # Optional instrumentation keeps this builder usable with older RL installs.
++            try:
++                from rl_matdesign.utils.stage_timing import timed_stage
++            except ImportError:
++                from contextlib import nullcontext
++                def timed_stage(_name):
++                    return nullcontext()
++            with timed_stage("md"):
++                result = subprocess.run(cmd, cwd=scratch, capture_output=True, text=True, env=run_env)
+             if result.returncode != 0:

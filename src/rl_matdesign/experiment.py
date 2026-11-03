@@ -229,7 +229,11 @@ def _run_experiment(resources: ExitStack) -> None:
         # produced, so this single wrap accounts for every predictor call in
         # every phase. The proxy delegates unknown attributes to the real
         # predictor, so `_cache` checkpointing and `predict_raw` still work.
-        predictor = PredictorTimer(build_predictor(cfg, seed=args.dp_seed), t0=t_start)
+        predictor = PredictorTimer(
+            build_predictor(cfg, seed=args.dp_seed), t0=t_start,
+            episode_log_path=os.path.join(args.out, "episode_timing.csv"),
+            append=args.resume_training,
+        )
         resources.callback(_close_predictor, predictor)
 
         # Build the env + reward_fn + constraint filter (shared with baselines).

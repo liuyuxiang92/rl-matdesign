@@ -92,6 +92,7 @@ Config keys
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
+import time
 
 import numpy as np
 
@@ -135,6 +136,22 @@ def _fold_models_structures(arr: "np.ndarray") -> Tuple[float, float]:
     return float(per_model.mean()), float(per_model.std())
 
 
+def _empty_timing(*, cache_hit=False):
+    return {"md_task_s": 0.0, "opt_task_s": 0.0, "structure_other_task_s": 0.0,
+            "property_s": 0.0, "config_attempted": 0, "config_succeeded": 0,
+            "cache_hit": cache_hit, "timing_incomplete": False}
+
+
+def _add_timing(target, source):
+    for name in ("md_task_s", "opt_task_s", "structure_other_task_s",
+                 "property_s", "config_attempted", "config_succeeded"):
+        value = source.get(name, 0)
+        target[name] = (None if target.get(name) is None or value is None
+                        else target.get(name, 0) + value)
+    target["timing_incomplete"] = bool(
+        target.get("timing_incomplete") or source.get("timing_incomplete"))
+
+
 class StructureScorePredictor:
     supports_partial_batch = True
 
@@ -151,15 +168,20 @@ class StructureScorePredictor:
         self.geo_opt: Dict[str, Any] = dict(go)
         self.geo_opt_enabled: bool = bool(go) and bool(go.get("enabled", True))
 
+        self._builder_configs = {}
+
         def make_builder(kind, builder_cfg, *, seed):
             if builder_cfg.get("structure_parallel") is not None:
                 from ..utils.parallel_structures import ParallelStructureBuilder
                 # Geometry optimization remains a top-level shared setting, as
                 # in the serial path; run it on the same GPU as the builder.
-                return ParallelStructureBuilder(
+                builder = ParallelStructureBuilder(
                     kind, {**builder_cfg, "geo_opt": self.geo_opt}, seed=seed
                 )
-            return resolve_builder(kind, builder_cfg, seed=seed)
+            else:
+                builder = resolve_builder(kind, builder_cfg, seed=seed)
+            self._builder_configs[id(builder)] = builder_cfg
+            return builder
 
         # Optional inner optimization over a shared operating condition (e.g.
         # temperature). For each candidate we score every property at each sweep
@@ -433,6 +455,9 @@ class StructureScorePredictor:
         # Retain the most recent evaluation wave until consumers have logged its
         # raw/property statistics, even when the persistent LRU is smaller.
         self._batch_stats: Dict[tuple, Dict[str, Tuple[float, float]]] = {}
+        self.last_evaluation_timings: List[dict] = []
+        self._materialization_timings: List[dict] = []
+        self._last_build_timing: dict = {}
 
     # ------------------------------------------------------------------
     # PropertyPredictor protocol
@@ -515,6 +540,7 @@ class StructureScorePredictor:
         returned as an exception without discarding other candidates' results.
         """
         candidates = list(candidates)
+        self.last_evaluation_timings = [_empty_timing() for _ in candidates]
         if not candidates:
             return []
         # Preserve recent diagnostics while checking for hits in this new wave.
@@ -523,6 +549,7 @@ class StructureScorePredictor:
         results: Dict[tuple, Any] = {}
         pending: Dict[tuple, Any] = {}
         keys: List[Any] = []
+        timings = {}
         for candidate in candidates:
             try:
                 key = self._key(candidate)
@@ -538,6 +565,7 @@ class StructureScorePredictor:
                     pending[key] = candidate
                 else:
                     results[key] = self._prediction_from_stats(stats)
+                    timings[key] = _empty_timing(cache_hit=True)
                     self._batch_stats[key] = stats
                     if key in self._stats_cache:
                         self._stats_cache.move_to_end(key)
@@ -545,22 +573,40 @@ class StructureScorePredictor:
                 results[key] = exc
 
         if pending:
+            self._materialization_timings = [_empty_timing() for _ in pending]
             try:
                 inputs = self._materialize_structures_many(list(pending.values()))
             except Exception as exc:
                 # A pool crash/timeout closes that pool. Nothing from an
                 # incomplete wave is misreported as a successful evaluation.
                 inputs = [exc] * len(pending)
-            for (key, _candidate), prop_inputs in zip(pending.items(), inputs):
+            for index, ((key, _candidate), prop_inputs) in enumerate(zip(pending.items(), inputs)):
+                timing = dict(self._materialization_timings[index])
+                timings[key] = timing
                 try:
                     if isinstance(prop_inputs, Exception):
                         raise prop_inputs
-                    stats = self._stats_from_inputs(prop_inputs)
+                    started = time.perf_counter()
+                    try:
+                        stats = self._stats_from_inputs(prop_inputs)
+                    finally:
+                        timing["property_s"] = time.perf_counter() - started
                     results[key] = self._prediction_from_stats(stats)
                     self._cache_stats(key, stats)
                     self._batch_stats[key] = stats
                 except Exception as exc:
                     results[key] = exc
+        seen = set()
+        for index, key in enumerate(keys):
+            if isinstance(key, Exception):
+                continue
+            if key in seen:
+                # A coalesced duplicate did not launch another physical task.
+                self.last_evaluation_timings[index] = _empty_timing(
+                    cache_hit=not isinstance(results[key], Exception))
+            else:
+                self.last_evaluation_timings[index] = timings.get(key, _empty_timing())
+                seen.add(key)
         out = [key if isinstance(key, Exception) else results[key] for key in keys]
         if not return_exceptions:
             for result in out:
@@ -671,35 +717,71 @@ class StructureScorePredictor:
         the builder is never touched (so ``base_poscar`` is not required).
         """
         prop_inputs: Dict[str, Any] = {}
+        self._materialization_timings = [_empty_timing()]
         structure_props = [p for p in self.properties if p["backend"] != "composition"]
         self._preload_parallel_models()
         if structure_props:
             if self.share_structure:
-                structures = self._build_structures(
-                    self._shared_builder, candidate, self.n_random_configs
-                )
+                try:
+                    structures = self._build_structures(
+                        self._shared_builder, candidate, self.n_random_configs)
+                finally:
+                    _add_timing(self._materialization_timings[0], self._last_build_timing)
                 for prop in structure_props:
                     prop_inputs[prop["name"]] = structures
             else:
                 for prop in structure_props:
                     builder = self._builders[prop["name"]]
-                    structures = self._build_structures(
-                        builder, candidate, prop["n_random_configs"]
-                    )
+                    try:
+                        structures = self._build_structures(builder, candidate, prop["n_random_configs"])
+                    finally:
+                        _add_timing(self._materialization_timings[0], self._last_build_timing)
                     prop_inputs[prop["name"]] = structures
         for prop in self.properties:
             if prop["backend"] == "composition":
                 prop_inputs[prop["name"]] = candidate
         return prop_inputs
 
+    def _stage_summary(self, builder, capture, elapsed, attempted, succeeded):
+        from ..utils.stage_timing import summarize_stage_times
+
+        cfg = self._builder_configs.get(id(builder), self.cfg)
+        supported = getattr(builder, "timing_stages", ()) or ()
+        supported = {supported} if isinstance(supported, str) else set(supported)
+        if self.geo_opt_enabled and not getattr(builder, "handles_geo_opt", False):
+            supported.add("opt")
+        return summarize_stage_times(
+            capture, elapsed,
+            md_expected=bool(cfg.get("md") or getattr(builder, "md", None)),
+            opt_expected=bool(self.geo_opt_enabled or cfg.get("opt") or getattr(builder, "opt", None)),
+            supported_stages=supported, config_attempted=attempted, config_succeeded=succeeded)
+
     def _build_structures(self, builder: Any, candidate: Any, n_configs: int) -> List[Any]:
         from ..utils.structure import strict_relaxation_errors
+        from ..utils.stage_timing import capture_stage_times
 
-        # External MD builders can catch these errors per configuration and
-        # return their surviving ensemble, just as the GPU workers do.
-        with strict_relaxation_errors():
-            structures = builder.build(candidate, n_configs=n_configs, rng=self._rng)
-        return self._usable_structures(builder, structures)
+        self._last_build_timing = {}
+        succeeded = 0
+        started = time.perf_counter()
+        with capture_stage_times() as capture:
+            try:
+                # Keep a serial builder's native ensemble call (including its
+                # multi-template and partial-failure behavior).
+                with strict_relaxation_errors():
+                    structures = builder.build(candidate, n_configs=n_configs, rng=self._rng)
+                structures = self._usable_structures(builder, structures)
+                succeeded = len(structures)
+                return structures
+            finally:
+                if getattr(builder, "parallel_execution", False):
+                    records = getattr(builder, "last_build_timings", [])
+                    self._last_build_timing = dict(records[0]) if len(records) == 1 else {
+                        "md_task_s": None, "opt_task_s": None, "structure_other_task_s": None,
+                        "config_attempted": 0, "config_succeeded": succeeded, "timing_incomplete": True}
+                else:
+                    self._last_build_timing = self._stage_summary(
+                        builder, capture, time.perf_counter() - started,
+                        None, succeeded)
 
     def _usable_structures(self, builder: Any, structures: Any) -> List[Any]:
         from ..utils.structure import strict_relaxation_errors
@@ -736,6 +818,7 @@ class StructureScorePredictor:
             self._parallel_models_ready = True
 
     def _materialize_structures_many(self, candidates: List[Any]) -> List[Any]:
+        self._materialization_timings = [_empty_timing() for _ in candidates]
         self._preload_parallel_models()
         inputs: List[Any] = [
             {p["name"]: candidate for p in self.properties if p["backend"] == "composition"}
@@ -753,10 +836,23 @@ class StructureScorePredictor:
             if callable(build_many):
                 from ..utils.structure import strict_relaxation_errors
 
-                with strict_relaxation_errors():
-                    built = build_many([candidates[i] for i in active], n_configs=n_configs, rng=self._rng)
-                if len(built) != len(active):
-                    raise ValueError("build_many must return one result per candidate")
+                try:
+                    with strict_relaxation_errors():
+                        built = build_many([candidates[i] for i in active], n_configs=n_configs, rng=self._rng)
+                    if len(built) != len(active):
+                        raise ValueError("build_many must return one result per candidate")
+                except Exception as exc:
+                    built = [exc] * len(active)
+                finally:
+                    records = getattr(builder, "last_build_timings", [])
+                    for offset, i in enumerate(active):
+                        # A custom batch builder must supply aligned timings;
+                        # wall time alone cannot identify each candidate's work.
+                        record = records[offset] if len(records) == len(active) else {
+                            "md_task_s": None, "opt_task_s": None, "structure_other_task_s": None,
+                            "config_attempted": None, "config_succeeded": 0,
+                            "timing_incomplete": True}
+                        _add_timing(self._materialization_timings[i], record)
             else:
                 built = []
                 for i in active:
@@ -764,13 +860,36 @@ class StructureScorePredictor:
                         built.append(self._build_structures(builder, candidates[i], n_configs))
                     except Exception as exc:
                         built.append(exc)
+                    finally:
+                        _add_timing(self._materialization_timings[i], self._last_build_timing)
             for i, structures in zip(active, built):
                 try:
                     if isinstance(structures, Exception):
                         raise structures
                     # The scalar fallback already handled top-level relaxation.
                     if callable(build_many):
-                        structures = self._usable_structures(builder, structures)
+                        from ..utils.stage_timing import capture_stage_times
+
+                        started = time.perf_counter()
+                        survived = 0
+                        with capture_stage_times() as capture:
+                            try:
+                                structures = self._usable_structures(builder, structures)
+                                survived = len(structures)
+                            finally:
+                                record = self._materialization_timings[i]
+                                # Top-level OPT runs in the parent only for
+                                # builders which have not already handled it.
+                                if record["opt_task_s"] is not None:
+                                    record["opt_task_s"] += capture.seconds.get("opt", 0.0)
+                                if record["structure_other_task_s"] is not None:
+                                    record["structure_other_task_s"] += max(
+                                        0.0, time.perf_counter() - started - capture.seconds.get("opt", 0.0))
+                                # Replace this group's reported survivors after
+                                # optional parent relaxation, preserving earlier groups.
+                                records = getattr(builder, "last_build_timings", [])
+                                previous = records[active.index(i)].get("config_succeeded", 0) if len(records) == len(active) else 0
+                                record["config_succeeded"] += survived - previous
                     for prop in props:
                         inputs[i][prop["name"]] = structures
                 except Exception as exc:
@@ -778,18 +897,28 @@ class StructureScorePredictor:
         return inputs
 
     def _raw_stats(self, candidate: Any) -> Dict[str, Tuple[float, float]]:
+        timing = _empty_timing()
+        self.last_evaluation_timings = [timing]
         key = self._key(candidate)
         cached = self._stats_cache.get(key)
         if cached is not None:
-            self._stats_cache.move_to_end(key)   # LRU: mark most-recently used
+            self._stats_cache.move_to_end(key)
+            timing["cache_hit"] = True
             return cached
         if key in self._batch_stats:
+            timing["cache_hit"] = True
             return self._batch_stats[key]
 
-        # 1. Materialize structures once (build + optional relax) — independent
-        #    of any sweep value.
-        prop_structures = self._materialize_structures(candidate)
-        stats = self._stats_from_inputs(prop_structures)
+        self._materialization_timings = [_empty_timing()]
+        try:
+            prop_structures = self._materialize_structures(candidate)
+        finally:
+            _add_timing(timing, self._materialization_timings[0])
+        started = time.perf_counter()
+        try:
+            stats = self._stats_from_inputs(prop_structures)
+        finally:
+            timing["property_s"] = time.perf_counter() - started
         self._cache_stats(key, stats)
         return stats
 

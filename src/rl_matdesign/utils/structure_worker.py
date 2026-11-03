@@ -6,8 +6,11 @@ This module must not import experiment.py or execute the user's training script.
 from __future__ import annotations
 
 import sys
+import time
 import traceback
 from multiprocessing.connection import Connection
+
+from .stage_timing import capture_stage_times, summarize_stage_times
 
 
 def main(fd: int) -> None:
@@ -44,15 +47,18 @@ def main(fd: int) -> None:
                 break
             if task["op"] == "close":
                 break
+            stage_times = None
+            started = None
             try:
                 if task["op"] == "formula":
                     fn = getattr(builder, "composition_formula", None)
                     formula = fn(task["candidate"]) if callable(fn) else None
                     connection.send({"ok": True, "formula": formula})
                     continue
+                started = time.perf_counter()
                 from rl_matdesign.utils.structure import strict_relaxation_errors
 
-                with strict_relaxation_errors():
+                with capture_stage_times() as stage_times, strict_relaxation_errors():
                     atoms_list = builder.build(
                         task["candidate"], n_configs=1, rng=np.random.default_rng(task["seed"])
                     )
@@ -79,9 +85,22 @@ def main(fd: int) -> None:
                 # model/CUDA allocation or move it back into the parent process.
                 detached = atoms.copy()
                 detached.calc = None
-                connection.send({"ok": True, "atoms": detached})
+                reply = {"ok": True, "atoms": detached}
             except Exception:
-                connection.send({"ok": False, "error": traceback.format_exc()})
+                reply = {"ok": False, "error": traceback.format_exc()}
+            if stage_times is not None:
+                supported = getattr(builder, "timing_stages", ()) or ()
+                supported = [supported] if isinstance(supported, str) else list(supported)
+                if geo_enabled:
+                    supported.append("opt")
+                reply["timing"] = summarize_stage_times(
+                    stage_times, time.perf_counter() - started,
+                    md_expected=bool(cfg.get("md") or getattr(builder, "md", None)),
+                    opt_expected=bool(geo_enabled or cfg.get("opt") or getattr(builder, "opt", None)),
+                    supported_stages=supported,
+                    config_succeeded=int(reply["ok"]),
+                )
+            connection.send(reply)
     finally:
         try:
             close = getattr(builder, "close", None)
