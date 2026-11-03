@@ -1,13 +1,15 @@
 """Shared YAML loading and environment construction for RL and baselines."""
 from __future__ import annotations
 
+import math
+import re
 import warnings
 
 import yaml
 
 from .env import CompositionEnv
 from .env_integer import IntegerRatioEnv
-from .training import CandidateEvaluationFailed
+from .utils.episode_batch import CandidateEvaluationFailed, supports_partial_batch_prediction
 
 
 # Old YAML key → new YAML key. Old keys still work but emit a one-time
@@ -86,6 +88,96 @@ def build_constraint_filter(cfg: dict, env=None):
 _FAILED_CANDIDATE_REWARD = -2000.0
 
 
+class _TerminalReward:
+    """One conversion/error policy for immediate and deferred terminal rewards."""
+
+    def __init__(self, predictor, env_type: str, anion_formula: str = ""):
+        self.predictor = predictor
+        self.env_type = env_type
+        self.anion_formula = anion_formula
+
+    def evaluation_batch_size(self) -> int:
+        size = getattr(self.predictor, "evaluation_batch_size", None)
+        return size() if callable(size) else 1
+
+    def _candidate(self, payload):
+        if self.env_type == "multi_group":
+            return payload
+        if self.env_type == "integer_ratio":
+            from pymatgen.core.composition import Composition
+            try:
+                comp = dict(Composition(payload).fractional_composition.as_dict())
+                return {str(k): float(v) for k, v in comp.items()}
+            except Exception:
+                return None  # Preserve the existing invalid-formula penalty.
+        parts = re.findall(r"([A-Z][a-z]?)([0-9]*\.?[0-9]+)", payload)
+        comp = {el: float(frac) for el, frac in parts}
+        if self.anion_formula:
+            for el, _ in re.findall(r"([A-Z][a-z]?)([0-9]*\.?[0-9]+)", self.anion_formula):
+                comp.pop(el, None)
+        return comp
+
+    def _failure(self, payload, exc):
+        label = "candidate" if self.env_type == "multi_group" else "formula"
+        return CandidateEvaluationFailed(
+            f"predictor.predict failed for {label} {payload!r}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    @staticmethod
+    def _mean(result):
+        mean, _ = result
+        mean = float(mean)
+        if not math.isfinite(mean):
+            raise ValueError(f"predictor returned nonfinite reward: {mean}")
+        return mean
+
+    def __call__(self, payload) -> float:
+        candidate = self._candidate(payload)
+        if candidate is None:
+            return _FAILED_CANDIDATE_REWARD
+        try:
+            return self._mean(self.predictor.predict(candidate))
+        except Exception as exc:
+            raise self._failure(payload, exc) from exc
+
+    def evaluate_many(self, payloads) -> list:
+        results = [_FAILED_CANDIDATE_REWARD] * len(payloads)
+        candidates, indices = [], []
+        for index, payload in enumerate(payloads):
+            candidate = self._candidate(payload)
+            if candidate is not None:
+                indices.append(index)
+                candidates.append(candidate)
+        if not candidates:
+            return results
+        batch_fn = getattr(self.predictor, "batch_predict", None)
+        if supports_partial_batch_prediction(self.predictor):
+            try:
+                predicted = list(batch_fn(candidates, return_exceptions=True))
+            except Exception as exc:
+                predicted = [exc] * len(candidates)
+            if len(predicted) != len(candidates):
+                raise RuntimeError("predictor.batch_predict returned the wrong number of results")
+        else:
+            # A legacy plug-in need only implement predict; do not assume it
+            # inherits the Protocol's default batch implementation.
+            predicted = []
+            for candidate in candidates:
+                try:
+                    predicted.append(self.predictor.predict(candidate))
+                except Exception as exc:
+                    predicted.append(exc)
+        for index, result in zip(indices, predicted):
+            try:
+                if isinstance(result, Exception):
+                    raise result
+                results[index] = self._mean(result)
+            except Exception as exc:
+                results[index] = self._failure(payloads[index], exc)
+        return results
+
+
 def build_env(cfg: dict, predictor):
     """Build the env + reward_fn + constraint filter used by an experiment run.
 
@@ -134,51 +226,7 @@ def build_env(cfg: dict, predictor):
               f"{groups[0].get('name', '?')!r} -> collapsed to flat "
               f"{'IntegerRatioEnv' if collapse_kind == 'integer' else 'CompositionEnv'}")
 
-    def reward_fn(formula: str) -> float:
-        if env_type == "integer_ratio":
-            from pymatgen.core.composition import Composition
-            try:
-                comp = dict(Composition(formula).fractional_composition.as_dict())
-                comp = {str(k): float(v) for k, v in comp.items()}
-            except Exception:
-                return _FAILED_CANDIDATE_REWARD
-        else:
-            import re
-            parts = re.findall(r"([A-Z][a-z]?)([0-9]*\.?[0-9]+)", formula)
-            comp = {el: float(frac) for el, frac in parts}
-            anion_formula = cfg.get("anion_formula", "")
-            if anion_formula:
-                for el, _ in re.findall(r"([A-Z][a-z]?)([0-9]*\.?[0-9]+)", anion_formula):
-                    comp.pop(el, None)
-        # A valid, well-formed composition can still fail downstream (a
-        # structure builder's random realizations all failing MD/relax, a
-        # flaky external subprocess, ...) -- that must not crash a run that
-        # may be hours into training, NOR silently consume a real
-        # episode-budget slot on a candidate that was never actually scored.
-        # Raise so the rollout call site (training.py) discards this attempt
-        # and retries with a fresh candidate instead.
-        try:
-            mean, _ = predictor.predict(comp)
-        except Exception as exc:  # noqa: BLE001 - any predictor/builder failure
-            raise CandidateEvaluationFailed(
-                f"predictor.predict failed for formula {formula!r}: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
-        return mean
-
-    def mg_reward_fn(groups: dict) -> float:
-        # MultiGroupEnv hands the predictor the structured {group: {el: frac}}
-        # mapping; the (recipe) predictor assembles the full structure from it.
-        # See reward_fn's matching try/except for why this raises rather than
-        # returning a fallback reward.
-        try:
-            mean, _ = predictor.predict(groups)
-        except Exception as exc:  # noqa: BLE001 - any predictor/builder failure
-            raise CandidateEvaluationFailed(
-                f"predictor.predict failed for candidate {groups!r}: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
-        return mean
+    reward_fn = _TerminalReward(predictor, env_type, cfg.get("anion_formula", ""))
 
     # Build env first (without filter), then build the filter using env's
     # feasibility tables (_allowed_units, _possible_sums_by_k), then attach.
@@ -203,7 +251,7 @@ def build_env(cfg: dict, predictor):
             gspec = normalize_group_spec(g)
             gspec["constraint_filter"] = build_constraint_filter(gspec, env=None)
             built_groups.append(gspec)
-        env = MultiGroupEnv(groups=built_groups, reward_fn=mg_reward_fn)
+        env = MultiGroupEnv(groups=built_groups, reward_fn=reward_fn)
     else:
         env = CompositionEnv(
             species_set=flat_cfg["species_set"],

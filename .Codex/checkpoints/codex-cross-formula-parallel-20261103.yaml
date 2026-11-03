@@ -1,0 +1,48 @@
+checkpoint_version: '3.0.0'
+created_at: '2026-11-03'
+branch: codex/cross-formula-parallel
+base_commit: d1727c50
+phase:
+  current: implementation_validated
+  completed: [worker_queue, predictor_batches, training_and_generation, documentation, full_regression, independent_review, reflection]
+  next: [commit_and_push]
+state:
+  worktree: /private/tmp/rl-matdesign-cross-formula-20261103
+  parameters:
+    structure_parallel.candidate_batch_size:
+      source: user_requested_cross_formula_parallelism
+      default: 1
+      accepted: [positive_integer, auto]
+    structure_parallel.min_successful_configs:
+      default: 1
+      meaning: Per-formula acceptance threshold, independent of worker concurrency.
+  decisions:
+  - decision: Queue configurations from several formulas and restore per-formula outputs in input order.
+    rationale: Spare GPUs can process other candidates without mixing reward statistics or introducing shared mutable environment state.
+  - decision: Keep default batch size 1 and make wider DQN collection opt-in.
+    rationale: DQN policy and epsilon remain fixed while collecting a wave; subsequent per-episode learning is retained but sampling trajectories change.
+  - decision: Cap waves at budgets, duplicate/failure guards, checkpoints and existing PG learning batches.
+    rationale: Avoid overrun, unconsumed checkpoint work and off-policy PG collection.
+  experiments:
+  - name: full_regression
+    status: completed
+    result: 773 passed, 4 skipped, one pre-existing SMACT warning in 226.30 seconds.
+    command: PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 /opt/anaconda3/bin/python -m pytest -p no:cacheprovider -o addopts='' -q
+  - name: process_parallelism_and_integration
+    status: completed
+    result: Real subprocess IPC and barriers confirm overlap across formulas, gated aggregation and cache reuse; CUDA and physical calculations are simulated.
+  - name: hardware_benchmark
+    status: not_run
+    result: No real GPU/MD performance claim.
+  private_config: /Users/liuyuxiang/Dropbox/Macbook_air/aisi/shanghai/reinforcement_learning/rl-matdesign/runs/config_templates/perovskite_gated_binary_cross_formula.yaml
+blockers: []
+resume_instructions: |
+  Inspect git status and log in the isolated worktree before any publication; this
+  checkpoint was written before commit. Preserve unrelated original checkout edits.
+  Commit and push codex/cross-formula-parallel to origin, then verify the remote SHA.
+  Do not infer a main merge from publication. The ignored private YAML adds only
+  candidate_batch_size: auto to the user's prior multigpu config (5 configs/formula).
+  A 4-GPU / 2-config example can run 2 formulas with one worker/GPU or 4 formulas
+  with two workers/GPU, subject to auto calibration and boundary caps. Fixed waves
+  with cache hits can leave slots idle. Property inference remains sequential in
+  the parent. Failed/nonconverged structure semantics otherwise remain unchanged.
