@@ -16,8 +16,11 @@
   choice: reward.type defaults to weighted_sum; gated compares weighted native-unit
     property scores against inclusive bounds and applies the adjusted weighted objective
     only when every gate passes. Explicit objective terms replace property weights.
-    Classification selects an explicit model class index, averages surviving configurations
-    per model, then computes ensemble mean and population std. At the user's request,
+    Classification selects an explicit model class index or a list of distinct indices.
+    Lists sum class probabilities within each model/configuration before averaging
+    surviving configurations per model and computing ensemble mean and population std.
+    The existing output_index setting owns both forms; lists require aggregator index.
+    At the user's request,
     dp_classification gate inputs automatically use mean minus std with coefficient one,
     independent of k or property objective, without a new configuration parameter.
     Other gate properties retain raw means; objective semantics remain unchanged.
@@ -43,9 +46,13 @@
     with positive weights, not universally for upper-bound or negative-weight gates.
     Ensemble disagreement is a proxy, not a calibrated confidence interval;
     all models can share an overconfident error.
+    Merged-class uncertainty must be computed after summing probabilities per model;
+    adding separately computed class stds loses covariance and overpenalizes models
+    that agree on the accepted class union but disagree within it.
   files:
   - src/rl_matdesign/rewards.py
   - src/rl_matdesign/predictors/structure_score.py
+  - src/rl_matdesign/utils/dp_eval.py
   - docs/yaml_config_reference.md
   tags:
   - reward-design
