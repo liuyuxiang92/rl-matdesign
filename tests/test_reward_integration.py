@@ -117,6 +117,24 @@ def test_classification_requires_explicit_class_index(index):
         StructureScorePredictor(cfg)
 
 
+@pytest.mark.parametrize('index', [[], [1, 1], [-1, 1], [True], [1.0], [[1]], [None]])
+def test_classification_rejects_invalid_class_index_lists_before_structure_building(index):
+    with pytest.raises(ValueError, match='output_index'):
+        StructureScorePredictor(_class_cfg(index=index))
+
+
+@pytest.mark.parametrize('aggregator', ['mean', 'max'])
+def test_classification_class_list_cannot_silently_ignore_requested_classes(aggregator):
+    with pytest.raises(ValueError, match='output_aggregator|output_index'):
+        StructureScorePredictor(_class_cfg(index=[1, 2], output_aggregator=aggregator))
+
+
+@pytest.mark.parametrize('index', [[0], [1], [1, 2], [2, 1], [0, 1, 2]])
+def test_classification_config_preserves_explicit_class_index_list(index):
+    predictor = StructureScorePredictor(_class_cfg(index=index))
+    assert predictor.properties[0]['output_index'] == index
+
+
 @pytest.mark.parametrize('override,match', [
     ({'head': 1}, 'head'), ({'transform': 'exp'}, 'transform'),
     ({'models': 'model.pt'}, 'models'), ({'output_kind': 'logits'}, 'predict_proba'),
@@ -372,3 +390,102 @@ def test_classification_ensemble_gate_and_generated_csv_preserve_probability_sta
     assert float(row['reward_objective']) == pytest.approx(20.0)
     # Generation and raw diagnostics reuse the same evaluated configurations.
     assert len(built) == (1 if shared else 2)
+
+
+@pytest.mark.parametrize('probabilities,expected_mean,expected_std', [
+    # Models disagree strongly about nearly pure versus pure, but agree that
+    # their combined probability is 0.9. Summing separate class stds is wrong.
+    ([[[0.1, 0.8, 0.1], [0.1, 0.7, 0.2]],
+      [[0.1, 0.1, 0.8], [0.1, 0.2, 0.7]]], 0.9, 0.0),
+    # Three models, two surviving configs: model means are 0.9, 0.7, 0.9.
+    ([[[0.2, 0.3, 0.5], [0.0, 0.9, 0.1]],
+      [[0.4, 0.5, 0.1], [0.2, 0.3, 0.5]],
+      [[0.1, 0.2, 0.7], [0.1, 0.7, 0.2]]], 2.5 / 3.0, np.sqrt(0.08 / 9.0)),
+])
+def test_combined_class_probability_reaches_ensemble_gate_and_generated_csv(
+    monkeypatch, tmp_path, probabilities, expected_mean, expected_std,
+):
+    """Exercise actual class selection before folding, with no repeated inference."""
+    import csv
+    import torch
+    import rl_matdesign.training as training
+    import rl_matdesign.utils.dp_eval as dp_eval
+
+    class Atoms:
+        def __len__(self):
+            return 1
+
+        def get_positions(self):
+            return np.zeros((1, 3))
+
+        def get_cell(self):
+            return SimpleNamespace(array=np.eye(3))
+
+        def get_chemical_symbols(self):
+            return ['Fe']
+
+    cfg = _classification_gate_cfg(n_models=len(probabilities))
+    cfg['properties'][1]['output_index'] = [1, 2]
+    predictor = StructureScorePredictor(cfg)
+    built = []
+    model_calls = []
+
+    def build(candidate, *, n_configs, rng):
+        assert n_configs == 3
+        built.append(candidate)
+        return [Atoms(), Atoms()]  # One requested config was unusable.
+
+    def classifier(values, index):
+        def predict_proba(**kwargs):
+            assert kwargs['coords'].shape == (2, 1, 3)
+            model_calls.append(index)
+            return np.asarray(values)
+        return SimpleNamespace(predict_proba=predict_proba, get_num_classes=lambda: 3)
+
+    models = [classifier(values, i) for i, values in enumerate(probabilities)]
+    predictor._shared_builder = SimpleNamespace(build=build)
+    predictor._get_prop_models = lambda prop: (
+        models if prop['name'] == 'pure' else [object(), object()], {'Fe': 0},
+    )
+    monkeypatch.setattr(dp_eval, 'eval_property_ensemble',
+                        lambda *args, **kwargs: np.array([[40.0, 60.0], [50.0, 70.0]]))
+    candidate = {'Fe': 1.0}
+    stats = predictor.per_objective_stats(candidate)
+    assert stats['pure'] == pytest.approx((expected_mean, expected_std))
+    assert stats['delta'] == pytest.approx((55.0, 5.0))
+    gate_score = expected_mean - expected_std
+    gate_passed = gate_score >= 0.8
+    expected_reward = 20.0 if gate_passed else -10.0 - 2.0 * (0.8 - gate_score)
+    expected_raw_reward = 55.0 if gate_passed else expected_reward
+    assert predictor.predict(candidate)[0] == pytest.approx(expected_reward)
+    assert predictor.predict_raw(candidate)[0] == pytest.approx(expected_raw_reward)
+
+    env = SimpleNamespace(
+        terminal_formula='Fe1', path=[], terminal_cation_fractions=lambda: candidate,
+        terminal_comp_key=lambda: (('Fe', 1),),
+    )
+
+    def rollout(**kwargs):
+        env.path = [SimpleNamespace(reward=predictor.predict(candidate)[0])]
+
+    monkeypatch.setattr(training, '_rollout_policy_episode', rollout)
+    rows = training.generate_candidates(
+        env=env, predictor=predictor, scaler=None, device=torch.device('cpu'),
+        elem_feats_scaled=np.empty((0, 0)), fraction_set=[],
+        qnet=SimpleNamespace(eval=lambda: None), n_exploit=1, max_attempts=1,
+    )
+    path = tmp_path / 'generated.csv'
+    with path.open('w', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+    with path.open(newline='') as stream:
+        row = next(csv.DictReader(stream))
+    assert float(row['obj_pure_mean']) == pytest.approx(expected_mean)
+    assert float(row['obj_pure_std']) == pytest.approx(expected_std)
+    assert float(row['gate_synthesis_value']) == pytest.approx(gate_score)
+    assert row['gate_passed'] == str(gate_passed)
+    assert float(row['reward']) == pytest.approx(expected_reward)
+    assert float(row['dp_mean']) == pytest.approx(expected_raw_reward)
+    assert len(built) == 1
+    assert model_calls == list(range(len(models)))

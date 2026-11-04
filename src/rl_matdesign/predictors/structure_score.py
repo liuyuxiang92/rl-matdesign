@@ -332,12 +332,17 @@ class StructureScorePredictor:
                     if aggregator not in ("index", "mean", "max"):
                         raise ValueError(f"properties[{i}].output_aggregator must be index, mean, or max.")
                     index = p.get("output_index")
-                    if aggregator == "index" and (
+                    if isinstance(index, list):
+                        from ..utils.dp_eval import validate_classification_indices
+
+                        validate_classification_indices(index, output_aggregator=aggregator)
+                    elif aggregator == "index" and (
                         isinstance(index, bool) or not isinstance(index, int) or index < 0
                     ):
                         raise ValueError(
                             f"properties[{i}] dp_classification needs an explicit non-negative "
-                            "integer output_index matching the model's class order."
+                            "integer output_index or a list of unique class indices "
+                            "matching the model's class order."
                         )
                     if transform != "none":
                         raise ValueError("dp_classification probabilities require transform: none.")
@@ -394,7 +399,11 @@ class StructureScorePredictor:
                 "instance": instance,
                 "models": list(models) if models else None,
                 "head": p.get("head"),
-                "output_index": int(p.get("output_index", 0)),
+                "output_index": (
+                    list(p["output_index"])
+                    if backend == "classification" and isinstance(p.get("output_index"), list)
+                    else int(p.get("output_index", 0))
+                ),
                 "output_aggregator": str(p.get("output_aggregator", "index")),
                 "energy_per_atom": bool(p.get("energy_per_atom", True)),
                 "fparam": fparam,

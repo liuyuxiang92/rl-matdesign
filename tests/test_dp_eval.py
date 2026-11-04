@@ -241,6 +241,69 @@ def test_classification_ternary_single_frame_selects_pure_probability_directly()
     np.testing.assert_array_equal(actual, [[0.8]])
 
 
+@pytest.mark.parametrize("probabilities,output_index,expected", [
+    ([[0.2, 0.8], [0.7, 0.3]], [1], [[0.8, 0.3]]),
+    ([[0.2, 0.8], [0.7, 0.3]], [0, 1], [[1.0, 1.0]]),
+    ([[0.05, 0.15, 0.8], [0.4, 0.5, 0.1]], [1, 2], [[0.95, 0.6]]),
+    ([[0.05, 0.15, 0.8], [0.4, 0.5, 0.1]], [2, 1], [[0.95, 0.6]]),
+    ([[0.05, 0.15, 0.8], [0.4, 0.5, 0.1]], [0, 1, 2], [[1.0, 1.0]]),
+])
+def test_classification_sums_selected_class_probabilities_per_config(
+    probabilities, output_index, expected,
+):
+    from rl_matdesign.utils.dp_eval import eval_classification_ensemble
+
+    model = _ClassificationModel(probabilities)
+    actual = eval_classification_ensemble(
+        [_PredictionAtoms()] * 2, [model], {"H": 0, "O": 1},
+        output_index=output_index,
+    )
+    np.testing.assert_allclose(actual, expected)
+    assert len(model.calls) == 1
+
+
+@pytest.mark.parametrize("output_index", [[], [1, 1], [-1, 1], [True], [1.0], [[1]]])
+def test_classification_rejects_malformed_class_selection_list(output_index):
+    from rl_matdesign.utils.dp_eval import eval_classification_ensemble
+
+    with pytest.raises(ValueError, match="output_index"):
+        eval_classification_ensemble(
+            [_PredictionAtoms()], [_ClassificationModel([[0.05, 0.15, 0.8]])],
+            {"H": 0, "O": 1}, output_index=output_index,
+        )
+
+
+@pytest.mark.parametrize("aggregator", ["mean", "max"])
+def test_classification_class_list_rejects_conflicting_aggregator(aggregator):
+    from rl_matdesign.utils.dp_eval import eval_classification_ensemble
+
+    with pytest.raises(ValueError, match="output_aggregator|output_index"):
+        eval_classification_ensemble(
+            [_PredictionAtoms()], [_ClassificationModel([[0.05, 0.15, 0.8]])],
+            {"H": 0, "O": 1}, output_index=[1, 2], output_aggregator=aggregator,
+        )
+
+
+def test_classification_rejects_any_out_of_range_index_in_class_list():
+    from rl_matdesign.utils.dp_eval import eval_classification_ensemble
+
+    with pytest.raises(IndexError, match="out of range"):
+        eval_classification_ensemble(
+            [_PredictionAtoms()], [_ClassificationModel([[0.2, 0.8]])],
+            {"H": 0, "O": 1}, output_index=[1, 2],
+        )
+
+
+def test_property_output_index_list_does_not_gain_class_probability_sum_semantics():
+    from rl_matdesign.utils.dp_eval import eval_property_ensemble
+
+    with pytest.raises((TypeError, ValueError)):
+        eval_property_ensemble(
+            [_PredictionAtoms()], [_PropertyModel(np.array([[7., 9.]]))],
+            {"H": 0, "O": 1}, output_index=[0, 1],
+        )
+
+
 @pytest.mark.parametrize("aggregator,expected", [("mean", 1 / 3), ("max", 0.8)])
 def test_classification_preserves_property_selector_interface(aggregator, expected):
     from rl_matdesign.utils.dp_eval import eval_classification_ensemble

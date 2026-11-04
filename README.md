@@ -336,11 +336,11 @@ properties:
     direction: max
     objective: mean
     scale: 1.0                       # delta stays in its original units
-  - name: pure_probability
+  - name: synthesizability_probability
     predictor: dp_classification
     models: [models/synthesizability.pt]
     head: synthesizability
-    output_index: 2                  # [impure, nearly pure, pure]
+    output_index: [1, 2]             # nearly pure + pure; class 0 is impure
     direction: max
     objective: mean
 
@@ -350,7 +350,7 @@ reward:
     - name: synthesis
       score:
         type: weighted_sum
-        terms: {pure_probability: 1.0}
+        terms: {synthesizability_probability: 1.0}
       min: 0.8
       penalty_weight: 1.0
   objective:
@@ -360,12 +360,16 @@ reward:
     reward: -10.0
 ```
 
-For a binary model trained with labels `[impure, pure]`, change `output_index`
-to `1`; class meanings must match the model's training labels. The classifier
-uses DeepMD's Python `predict_proba()` directly, requiring a classification-enabled
-DeepMD installation. No `dp test` output or probability conversion in
-rl-matdesign is needed. The selected probability is averaged across the
-successfully prepared configurations, using the same structures for every
+The example accepts both nearly pure and pure structures. Use `output_index: 2`
+to select only pure, or `output_index: 1` for a binary model trained with labels
+`[impure, pure]`; class meanings must match the model's training labels. A list
+must be nonempty, contain distinct nonnegative class indices, and use the
+default `output_aggregator: index`. The classifier uses DeepMD's Python
+`predict_proba()` directly, requiring a classification-enabled DeepMD
+installation. No `dp test` output or probability conversion in
+rl-matdesign is needed. With a list, selected class probabilities are summed
+within each model/configuration first. The resulting probability is averaged
+across the successfully prepared configurations, using the same structures for every
 checkpoint. With several model files, the engine then computes the mean and
 population standard deviation across those model averages; one file gives
 `std = 0`. All checkpoints must use the same class order. This standard deviation
@@ -374,11 +378,12 @@ is not `1 - p`.
 Classification properties automatically contribute `mean - std` to gate
 scores, with coefficient `1` independent of `k`; adding model files to `models`
 requires no new parameter. Other property types still contribute their raw
-mean. Here a pure-probability score `S = mean - std` of at least `0.8` gives
+mean. Here a synthesizability score `S = mean - std` of at least `0.8` gives
 reward `delta`; otherwise, reward is `-10 - (0.8 - S)`.
 `S` is a conservative score, not a calibrated probability. In `generated.csv`,
-`obj_pure_probability_mean` and `obj_pure_probability_std` retain the raw model
-statistics, while `gate_synthesis_value` records `S`.
+`obj_synthesizability_probability_mean` and
+`obj_synthesizability_probability_std` retain the mean and model standard
+deviation of the combined probability, while `gate_synthesis_value` records `S`.
 The failure value is configurable.
 To guarantee that every passing candidate outranks every failing candidate,
 choose it below the lowest possible feasible objective; a fixed value cannot

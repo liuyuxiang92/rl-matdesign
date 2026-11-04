@@ -179,7 +179,7 @@ combiner supports any property names, independent of the material system.
 | `weight` / `scale` | Combine weight / unit scale | `1.0` / `1.0` |
 | `objective` | `mean_minus_kstd` / `mean` / `mean_plus_kstd` | `mean_minus_kstd` |
 | `energy_per_atom` *(`dp_energy`)* | Normalize by atom count | `true` |
-| `output_index` / `output_aggregator` *(`dp_property`, `dp_classification`)* | Select a vector component, or collapse output channels using `mean` / `max` | aggregator `index`; index `0` for regression, **explicit index required for classification in `index` mode** |
+| `output_index` / `output_aggregator` *(`dp_property`, `dp_classification`)* | Select a vector component, or collapse output channels using `mean` / `max`. Classification also accepts a list of class indices to sum, with aggregator `index` | aggregator `index`; index `0` for regression, **explicit index or list required for classification in `index` mode** |
 | `transform` | `none`, or `exp` for regression heads predicting log-values; classification uses `none` | `none` |
 | `fparam` / `aparam` *(`dp_property`, `dp_classification`)* | Frame / atomic parameters for heads trained with them. A `null` in `fparam` marks the slot filled by the `sweep` value (requires a top-level `sweep`) | none |
 
@@ -387,15 +387,24 @@ classes; the user must supply its meaning from the training labels. Class
 count alone cannot identify which class means "pure". For ensembles, all
 checkpoints must use the same class order and meaning.
 
+To accept both nearly pure and pure with the class order shown above, use
+`output_index: [1, 2]` and preferably name the property
+`synthesizability_probability`. This list must be nonempty and contain distinct
+nonnegative integers, each within the model's class range. Lists are supported
+only for `dp_classification` with `output_aggregator: index` (the default);
+regression selectors are unchanged.
+
 `output_aggregator` acts on the class channels **within one frame**:
-`index` selects the requested class; `max` selects the most confident class
-regardless of its identity; `mean` averages the classes and is always `1/K`
+`index` selects one class or sums the listed classes; `max` selects the most
+confident class regardless of its identity; `mean` averages the classes and is always `1/K`
 for `K` classes, so it is unsuitable as a synthesizability score. It does not
 control averaging across configurations.
 
 For class `k`, each checkpoint's composition probability is the mean of
-`p[j,k]` across the successfully prepared configurations. All checkpoints
-evaluate the same surviving structures. Multiple checkpoints then follow the
+`p[j,k]` across the successfully prepared configurations. With a list such as
+`[1, 2]`, sum `p[j,1] + p[j,2]` first, then average across configurations for
+each model; do not combine separately computed class standard deviations.
+All checkpoints evaluate the same surviving structures. Multiple checkpoints then follow the
 model mean/std fold above, using the population standard deviation (`ddof=0`).
 A single checkpoint gives `std = 0`, even when its
 configuration probabilities differ. `1 - p_pure` means predicted probability
@@ -412,6 +421,11 @@ single checkpoint the gate value remains the mean probability.
 The conservative interpretation applies to lower bounds on desired-class
 probabilities with positive gate coefficients; an upper bound still compares
 against the same `mean - std` score.
+
+In `generated.csv`, `obj_<name>_mean` and `obj_<name>_std` report the mean and
+model standard deviation of the selected or combined probability. For a gate
+named `synthesis` with that property as its sole term of weight `1`,
+`gate_synthesis_value` reports `mean - std`.
 
 ### `reward`: weighted sum or gated
 

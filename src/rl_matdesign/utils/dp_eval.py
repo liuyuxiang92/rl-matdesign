@@ -13,8 +13,8 @@ Three evaluation paths share structure preparation and model-major results:
   pipeline takes (multiple binding energies → Sabatier formula).
 
 * **Raw DeepClassification** — calls ``predict_proba`` directly, then selects
-  a class probability via ``output_index``. Probability conversion belongs to
-  DeepMD, rather than this module.
+  a class probability or sums selected classes via ``output_index``.
+  Probability conversion belongs to DeepMD, rather than this module.
 
 All paths are kept lazy so importing this module does not require deepmd-kit.
 """
@@ -244,12 +244,32 @@ def eval_property_ensemble(
     return out
 
 
+def validate_classification_indices(
+    indices: List[int], *, output_aggregator: str = "index",
+) -> None:
+    """Validate a class subset before model loading or inference."""
+    if output_aggregator != "index":
+        raise ValueError(
+            "dp_classification output_index lists require output_aggregator: index."
+        )
+    if not indices or any(
+        isinstance(index, bool) or not isinstance(index, int) or index < 0
+        for index in indices
+    ):
+        raise ValueError(
+            "dp_classification output_index must be a non-empty list of "
+            "non-negative integer class indices."
+        )
+    if len(set(indices)) != len(indices):
+        raise ValueError("dp_classification output_index list must contain unique indices.")
+
+
 def eval_classification_ensemble(
     structures: List[Any],
     models: List[Any],
     elem_to_type: dict,
     *,
-    output_index: int = 0,
+    output_index: int | List[int] = 0,
     output_aggregator: str = "index",
     fparam: Optional[Any] = None,
     aparam: Optional[Any] = None,
@@ -260,12 +280,16 @@ def eval_classification_ensemble(
     ``(nframes, n_classes)`` with at least two classes. Binary and multiclass
     models follow the same path; this helper never transforms logits. Models
     in an ensemble must share class count and class ordering (the latter is a
-    caller-provided semantic contract). ``index`` selects the requested class;
-    ``mean`` and ``max`` aggregate probabilities across classes.
+    caller-provided semantic contract). ``index`` selects one class for an
+    integer output_index, or sums the classes in an output_index list for each
+    model/frame before any ensemble averaging. ``mean`` and ``max`` aggregate
+    probabilities across all classes and cannot be combined with a list.
 
     Returned values retain the separate model and configuration axes, just as
     :func:`eval_property_ensemble`. They are not yet averaged across either.
     """
+    if isinstance(output_index, list):
+        validate_classification_indices(output_index, output_aggregator=output_aggregator)
     coords, cells, atom_types, eval_kwargs = _prepare_dp_inputs(
         structures, elem_to_type, fparam=fparam, aparam=aparam,
     )
@@ -312,8 +336,15 @@ def eval_classification_ensemble(
             raise ValueError("DeepMD predict_proba probabilities must lie in [0, 1].")
         if not np.allclose(probabilities.sum(axis=1), 1.0, rtol=1e-6, atol=1e-7):
             raise ValueError("DeepMD predict_proba probabilities must sum to 1 for every frame.")
-        for j, frame_vec in enumerate(probabilities):
-            out[i, j] = pick_scalar(
-                frame_vec, output_index=output_index, output_aggregator=output_aggregator
-            )
+        if isinstance(output_index, list):
+            if max(output_index) >= nclasses:
+                raise IndexError(
+                    f"output_index={output_index} is out of range for {nclasses} classes."
+                )
+            out[i] = probabilities[:, output_index].sum(axis=1)
+        else:
+            for j, frame_vec in enumerate(probabilities):
+                out[i, j] = pick_scalar(
+                    frame_vec, output_index=output_index, output_aggregator=output_aggregator
+                )
     return out
