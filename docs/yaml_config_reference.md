@@ -393,12 +393,25 @@ regardless of its identity; `mean` averages the classes and is always `1/K`
 for `K` classes, so it is unsuitable as a synthesizability score. It does not
 control averaging across configurations.
 
-For class `k`, the composition score is the mean of `p[j,k]` across the
-`n_random_configs` structures. Multiple checkpoints then follow the model
-mean/std fold above. A single checkpoint gives `std = 0`, even when its
+For class `k`, each checkpoint's composition probability is the mean of
+`p[j,k]` across the successfully prepared configurations. All checkpoints
+evaluate the same surviving structures. Multiple checkpoints then follow the
+model mean/std fold above, using the population standard deviation (`ddof=0`).
+A single checkpoint gives `std = 0`, even when its
 configuration probabilities differ. `1 - p_pure` means predicted probability
 of a different class; it is not the model-ensemble standard deviation. The
 probabilities themselves do not provide an independent uncertainty estimate.
+
+When a `dp_classification` property contributes to a gate, its value is
+automatically `mean - std`. Add checkpoints to the existing `models` list to
+use this conservative ensemble score; no extra setting is needed. The standard
+deviation coefficient is fixed at `1`, independent of `k` and the property's
+`objective`. This score is not a calibrated probability or confidence bound,
+and it can be negative; the raw predicted mean is kept separately. With a
+single checkpoint the gate value remains the mean probability.
+The conservative interpretation applies to lower bounds on desired-class
+probabilities with positive gate coefficients; an upper bound still compares
+against the same `mean - std` score.
 
 ### `reward`: weighted sum or gated
 
@@ -437,7 +450,7 @@ reward:
 
 The names and numeric thresholds above are illustrative; choose coefficients
 and thresholds for your properties' units and meaning. No environment,
-builder, predictor, or property name is hard-coded in the combination rule.
+builder, or property name is hard-coded in the combination rule.
 
 | Setting | Meaning |
 |---|---|
@@ -450,10 +463,11 @@ builder, predictor, or property name is hard-coded in the combination rule.
 | `gates[].penalty_weight` | Nonnegative coefficient multiplying this gate's violation; default `1.0` |
 | `reward.failure.reward` | Required for `gated`; base reward for any failing candidate, chosen for the objective's range |
 
-Gate scores use **raw property means**: property `direction`, `objective`,
-`weight`, and `scale` are not applied. Thus a gate on `pure_probability` compares
-the actual averaged probability to its threshold. Its score is
-`g = sum(coefficient * property_mean)` and its violation is
+Gate scores use **`mean - std` for `dp_classification` properties** and
+**raw means for other property types**. Property `direction`, `objective`,
+`weight`, `scale`, and `k` are not applied to these gate inputs. Thus a gate on
+`pure_probability` compares its conservative ensemble score to its threshold.
+Its combined score is `g = sum(coefficient * property_gate_value)` and its violation is
 `max(min - g, 0) + max(g - max, 0)`, omitting a term when that bound is absent.
 This also permits multi-property requirements without assigning their signs
 implicitly.
@@ -468,7 +482,8 @@ also available with `type: weighted_sum`.
 
 If every gate passes, reward equals the objective. Otherwise it equals
 `failure.reward - sum(penalty_weight * violation)` over all gates. With only a
-pure-probability gate at `0.8` and base `-10`, a candidate at `0.7` gets `-10.1`.
+pure-probability gate at `0.8` and base `-10`, a candidate with
+`mean - std = 0.7` gets `-10.1`.
 Penalties use the gate score's raw units. They do not rescale delta or the
 objective. A fixed failure base guarantees that every passing candidate ranks
 higher only when it is below a known lower bound of the feasible objective.
@@ -479,7 +494,12 @@ The same reward is used for training, generation, and operating-condition
 sweeps. The predictor's `reward_details` exposes objective and gate diagnostics.
 Generated candidate CSVs include `reward_objective`, `gate_passed`, and
 `gate_<name>_value`, `gate_<name>_passed`, `gate_<name>_violation`; per-property
-`obj_<name>_mean/std` retain their original meaning. `dp_mean` applies the same
+`obj_<name>_mean/std` retain their original meaning: the raw ensemble probability
+mean and the standard deviation across checkpoint averages for a classification
+property. They are not overwritten by `mean - std`.
+For a single-property gate with coefficient `1`, `gate_<name>_value` records
+that conservative score; for a mixed gate it records the combined weighted score.
+`dp_mean` applies the same
 reward rule with objective standard deviations set to zero, including the
 same gates and failure branch; it is not an individual property's mean.
 Changing the reward does not rewrite saved replay-buffer targets. Start a new run or recompute those targets

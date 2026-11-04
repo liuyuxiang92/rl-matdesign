@@ -55,7 +55,7 @@ then averages the structures axis and takes mean/std across models, so a single
 :func:`_fold_models_structures`.
 
 Consumer contract (``training.py``): exposes ``predict`` (reward, std),
-``predict_raw`` (same reward rule without std penalties, for ``dp_mean``),
+``predict_raw`` (same gates without objective std penalties, for ``dp_mean``),
 and ``per_objective_stats`` ({name: (mean, std)} for per-objective CSV columns).
 
 Config keys
@@ -467,14 +467,22 @@ class StructureScorePredictor:
         self, stats: Dict[str, Tuple[float, float]], *, raw: bool = False,
     ) -> Dict[str, Any]:
         """Use one reward rule for training, generation, sweeps and diagnostics."""
-        means = {p["name"]: stats[p["name"]][0] for p in self.properties}
+        # Classifier gates use a fixed one-std margin across model means.
+        # Keep this independent of objective direction/scale/k and of `raw`,
+        # so training, CSV diagnostics and raw_combine agree on feasibility.
+        gate_values = {
+            p["name"]: stats[p["name"]][0] - (
+                stats[p["name"]][1] if p["backend"] == "classification" else 0.0
+            )
+            for p in self.properties
+        }
         values = {
             p["name"]: self._property_value(
                 p, stats[p["name"]][0], 0.0 if raw else stats[p["name"]][1]
             ) / p["scale"]
             for p in self.properties
         }
-        return self._reward_combiner.evaluate(means, values)
+        return self._reward_combiner.evaluate(gate_values, values)
 
     def _combine(self, stats: Dict[str, Tuple[float, float]]) -> float:
         return self._reward_details(stats)["reward"]
@@ -509,7 +517,7 @@ class StructureScorePredictor:
         return reward, float(np.mean(stds)) if stds else 0.0
 
     def predict_raw(self, candidate: Any) -> Tuple[float, float]:
-        """Same reward rule with std set to zero — for the dp_mean column."""
+        """Unpenalized objective with the same gates — for the dp_mean column."""
         return float(self.raw_combine(self._raw_stats(candidate))), 0.0
 
     def per_objective_stats(self, candidate: Any) -> Dict[str, Tuple[float, float]]:
@@ -694,11 +702,12 @@ class StructureScorePredictor:
         return {"rows": rows, "best": best, "structures": prop_structures}
 
     def raw_combine(self, stats: Dict[str, Tuple[float, float]]) -> float:
-        """Apply the configured reward rule without std penalties.
+        """Apply the configured reward rule without objective std penalties.
 
         For the default weighted sum this preserves the historical dp_mean.
-        For gated rewards it uses the same gates and failure branch; individual
-        physical means remain available through per_objective_stats.
+        For gated rewards it retains classification mean-minus-std scores and
+        the same failure branch; individual physical means remain available
+        through per_objective_stats.
         """
         return self._reward_details(stats, raw=True)["reward"]
 
