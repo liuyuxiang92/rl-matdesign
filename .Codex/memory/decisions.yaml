@@ -10,14 +10,19 @@
   files: [src/abcde_ooh/constraints/phase_sampler.py, src/abcde_ooh/constraints/primary_phase.py, src/rl_matdesign/registry.py, docs/validation/ooh_phase_revert_20261015.md]
   tags: [cleanup-scope, constraint-design, compatibility]
 - id: decision-reward-001
-  date: '2026-10-27'
-  expires: '2027-04-27'
-  title: Separate raw feasibility scores from adjusted reward objectives
-  choice: reward.type defaults to weighted_sum; gated compares weighted raw property
-    means against inclusive bounds and applies the adjusted weighted objective only
-    when every gate passes. Explicit objective terms replace property weights. Classification
-    selects an explicit model class index and averages probabilities across configurations
-    before ensemble mean/std.
+  date: '2026-11-04'
+  expires: '2027-05-04'
+  title: Separate native-unit gate statistics from adjusted reward objectives
+  choice: reward.type defaults to weighted_sum; gated compares weighted native-unit
+    property scores against inclusive bounds and applies the adjusted weighted objective
+    only when every gate passes. Explicit objective terms replace property weights.
+    Classification selects an explicit model class index, averages surviving configurations
+    per model, then computes ensemble mean and population std. At the user's request,
+    dp_classification gate inputs automatically use mean minus std with coefficient one,
+    independent of k or property objective, without a new configuration parameter.
+    Other gate properties retain raw means; objective semantics remain unchanged.
+    Raw classification mean/std remain in generated CSV and the gate column reports
+    the adjusted score. predict_raw retains the same gate decision.
   alternatives_considered:
   - Product rewards, automatic delta normalization and Pareto-driven training were
     excluded by the user.
@@ -26,7 +31,18 @@
   trade_off: A failure baseline gives strict feasible dominance only below a known
     lower bound of the feasible objective. Classification requires a compatible DeepMD
     runtime and correct training class order. One checkpoint has zero ensemble std;
-    1-p is not this uncertainty.
+    1-p is not this uncertainty. generate_candidates currently records gate_passed
+    and failed rewards without filtering failed gates from generated.csv; a final
+    feasible-only list requires an explicit output filter. Configuration averaging
+    uses surviving structures and cannot turn moderate probabilities into near-one
+    values. Inspect raw CSV precision and per-configuration probabilities before
+    interpreting saturation or zero ensemble std as reliable synthesis certainty.
+    The automatic classification gate rule changes multi-model thresholds relative
+    to older runs; a single checkpoint still has zero std and unchanged scores.
+    Mean minus std is conservative for lower bounds on desired-class probabilities
+    with positive weights, not universally for upper-bound or negative-weight gates.
+    Ensemble disagreement is a proxy, not a calibrated confidence interval;
+    all models can share an overconfident error.
   files:
   - src/rl_matdesign/rewards.py
   - src/rl_matdesign/predictors/structure_score.py

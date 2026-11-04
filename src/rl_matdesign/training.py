@@ -1758,7 +1758,8 @@ def generate_candidates(
     ``predictor.predict()`` otherwise.  This ensures ``dp_mean`` stores the
     raw property value for a single predictor (e.g. overpotential in mV for
     OOH). The multi-property engine instead records its configured combination
-    without std penalties; obj_<name>_mean columns retain physical values.
+    without objective std penalties but with the same gates;
+    obj_<name>_mean columns retain physical values.
     """
     if policy is None and qnet is None:
         raise ValueError("Provide either policy (PG) or qnet (DQN).")

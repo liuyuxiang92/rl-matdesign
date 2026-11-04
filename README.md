@@ -365,12 +365,21 @@ to `1`; class meanings must match the model's training labels. The classifier
 uses DeepMD's Python `predict_proba()` directly, requiring a classification-enabled
 DeepMD installation. No `dp test` output or probability conversion in
 rl-matdesign is needed. The selected probability is averaged across the
-`n_random_configs` structures. With several model files, the engine then
-computes mean and standard deviation across those model averages; one file
-gives `std = 0`. This standard deviation is not `1 - p`.
+successfully prepared configurations, using the same structures for every
+checkpoint. With several model files, the engine then computes the mean and
+population standard deviation across those model averages; one file gives
+`std = 0`. All checkpoints must use the same class order. This standard deviation
+is not `1 - p`.
 
-Here a mean pure probability of at least `0.8` gives reward `delta`; otherwise,
-reward is `-10 - (0.8 - pure_probability)`. The failure value is configurable.
+Classification properties automatically contribute `mean - std` to gate
+scores, with coefficient `1` independent of `k`; adding model files to `models`
+requires no new parameter. Other property types still contribute their raw
+mean. Here a pure-probability score `S = mean - std` of at least `0.8` gives
+reward `delta`; otherwise, reward is `-10 - (0.8 - S)`.
+`S` is a conservative score, not a calibrated probability. In `generated.csv`,
+`obj_pure_probability_mean` and `obj_pure_probability_std` retain the raw model
+statistics, while `gate_synthesis_value` records `S`.
+The failure value is configurable.
 To guarantee that every passing candidate outranks every failing candidate,
 choose it below the lowest possible feasible objective; a fixed value cannot
 guarantee this when the objective has no known lower bound.

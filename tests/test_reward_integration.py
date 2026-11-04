@@ -233,3 +233,142 @@ def test_gated_reward_reaches_training_and_generated_csv(tmp_path, method):
         assert float(row['reward_objective']) == pytest.approx(objective)
         assert float(row['reward']) == pytest.approx(expected)
         assert float(row['dp_mean']) == pytest.approx(expected)
+
+
+def _classification_gate_cfg(*, n_models=3, k=7.0):
+    cfg = _class_cfg(index=1, models=[f'classifier_{i}.pt' for i in range(n_models)])
+    cfg['k'] = k
+    cfg['properties'].insert(0, {
+        'name': 'delta', 'predictor': 'dp_property', 'models': ['delta_a.pt', 'delta_b.pt'],
+        'direction': 'max', 'objective': 'mean_minus_kstd',
+    })
+    cfg['reward'] = {
+        'type': 'gated',
+        'gates': [{'name': 'synthesis', 'score': {'terms': {'pure': 1.0}},
+                   'min': 0.8, 'penalty_weight': 2.0}],
+        'objective': {'terms': {'delta': 1.0}},
+        'failure': {'reward': -10.0},
+    }
+    return cfg
+
+
+@pytest.mark.parametrize('k', [0.0, 7.0])
+def test_classification_gate_uses_mean_minus_std_independent_of_objective_k(k):
+    predictor = StructureScorePredictor(_classification_gate_cfg(k=k))
+    stats = {'delta': (55.0, 5.0), 'pure': (0.85, 0.1)}
+    details = predictor._reward_details(stats)
+    raw_details = predictor._reward_details(stats, raw=True)
+    # The mean alone passes, but model disagreement lowers the gate score.
+    assert stats['pure'][0] > 0.8
+    assert details['gate_passed'] is False
+    assert details['gates'][0]['score'] == pytest.approx(0.75)
+    assert details['gates'] == raw_details['gates']
+    assert details['objective'] == pytest.approx(55.0 - k * 5.0)
+    assert raw_details['objective'] == 55.0
+    assert predictor._combine(stats) == pytest.approx(-10.1)
+    assert predictor.raw_combine(stats) == pytest.approx(-10.1)
+
+
+def test_weighted_gate_combines_conservative_classification_with_raw_regression_mean():
+    cfg = _classification_gate_cfg()
+    cfg['reward']['gates'][0]['score']['terms'] = {'pure': 0.5, 'delta': 0.5}
+    predictor = StructureScorePredictor(cfg)
+    # Regression's large std remains relevant to its objective, not its gate term.
+    stats = {'delta': (0.9, 5.0), 'pure': (0.85, 0.1)}
+    details = predictor._reward_details(stats)
+    assert details['gates'][0]['score'] == pytest.approx(0.825)
+    assert details['gate_passed'] is True
+    assert predictor._reward_details(stats, raw=True)['gates'] == details['gates']
+
+
+def test_classification_weighted_sum_keeps_explicit_property_objective():
+    cfg = _classification_gate_cfg()
+    cfg['reward'] = {'type': 'weighted_sum', 'objective': {'terms': {'pure': 1.0}}}
+    predictor = StructureScorePredictor(cfg)
+    stats = {'delta': (55.0, 5.0), 'pure': (0.85, 0.1)}
+    assert predictor._combine(stats) == pytest.approx(0.85)
+    assert predictor.raw_combine(stats) == pytest.approx(0.85)
+
+
+@pytest.mark.parametrize('probabilities,expected_mean,expected_std', [
+    ([[0.9, 1.0], [0.7, 0.8], [0.8, 0.9]], 0.85, np.sqrt(0.02 / 3.0)),
+    ([[0.8, 1.0]], 0.9, 0.0),
+])
+@pytest.mark.parametrize('shared', [True, False])
+def test_classification_ensemble_gate_and_generated_csv_preserve_probability_stats(
+    monkeypatch, tmp_path, probabilities, expected_mean, expected_std, shared,
+):
+    """Use surviving configs, average each model first, and export raw statistics."""
+    import csv
+    import torch
+    import rl_matdesign.training as training
+    import rl_matdesign.utils.dp_eval as dp_eval
+
+    cfg = _classification_gate_cfg(n_models=len(probabilities))
+    cfg['share_structure'] = shared
+    predictor = StructureScorePredictor(cfg)
+    built = []
+
+    def build(candidate, *, n_configs, rng):
+        assert n_configs == 3
+        built.append(candidate)
+        return [object(), object()]  # One of three requested configs was unusable.
+
+    if shared:
+        predictor._shared_builder = SimpleNamespace(build=build)
+    else:
+        predictor._builders = {prop['name']: SimpleNamespace(build=build)
+                               for prop in predictor.properties}
+    predictor._get_prop_models = lambda prop: ([object()] * len(prop['models']), {})
+
+    def classify(structures, models, elements, **kwargs):
+        assert len(structures) == 2
+        assert len(models) == len(probabilities)
+        assert kwargs['output_index'] == 1
+        return np.asarray(probabilities)
+
+    monkeypatch.setattr(dp_eval, 'eval_classification_ensemble', classify)
+    monkeypatch.setattr(dp_eval, 'eval_property_ensemble',
+                        lambda *args, **kwargs: np.array([[40.0, 60.0], [50.0, 70.0]]))
+    candidate = {'Fe': 1.0}
+    stats = predictor.per_objective_stats(candidate)
+    assert stats['pure'] == pytest.approx((expected_mean, expected_std))
+    assert stats['delta'] == pytest.approx((55.0, 5.0))
+    gate_score = expected_mean - expected_std
+    gate_passed = gate_score >= 0.8
+    failure_reward = -10.0 - 2.0 * max(0.0, 0.8 - gate_score)
+    expected_reward = 20.0 if gate_passed else failure_reward
+    expected_raw_reward = 55.0 if gate_passed else failure_reward
+    assert predictor.predict(candidate)[0] == pytest.approx(expected_reward)
+    assert predictor.predict_raw(candidate)[0] == pytest.approx(expected_raw_reward)
+
+    env = SimpleNamespace(
+        terminal_formula='Fe1', path=[], terminal_cation_fractions=lambda: candidate,
+        terminal_comp_key=lambda: (('Fe', 1),),
+    )
+
+    def rollout(**kwargs):
+        env.path = [SimpleNamespace(reward=predictor.predict(candidate)[0])]
+
+    monkeypatch.setattr(training, '_rollout_policy_episode', rollout)
+    rows = training.generate_candidates(
+        env=env, predictor=predictor, scaler=None, device=torch.device('cpu'),
+        elem_feats_scaled=np.empty((0, 0)), fraction_set=[],
+        qnet=SimpleNamespace(eval=lambda: None), n_exploit=1, max_attempts=1,
+    )
+    path = tmp_path / 'generated.csv'
+    with path.open('w', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+    with path.open(newline='') as stream:
+        row = next(csv.DictReader(stream))
+    assert float(row['obj_pure_mean']) == pytest.approx(expected_mean)
+    assert float(row['obj_pure_std']) == pytest.approx(expected_std)
+    assert float(row['gate_synthesis_value']) == pytest.approx(gate_score)
+    assert row['gate_passed'] == str(gate_passed)
+    assert float(row['reward']) == pytest.approx(expected_reward)
+    assert float(row['dp_mean']) == pytest.approx(expected_raw_reward)
+    assert float(row['reward_objective']) == pytest.approx(20.0)
+    # Generation and raw diagnostics reuse the same evaluated configurations.
+    assert len(built) == (1 if shared else 2)

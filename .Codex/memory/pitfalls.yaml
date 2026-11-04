@@ -29,6 +29,9 @@
     the shared helper. Propagate execution errors and reject nonconvergence using
     the optimizer's full result (including cell stress), not just atomic forces.
     Inspect cached quantities for non-finite values without another DP evaluation.
+    CLC debug MD-average structures are written before optimization; their presence
+    does not establish convergence or a scored episode. An all-failed candidate is
+    retried without increasing warmup progress, up to 11 consecutive failures.
     Filter per-config failures and average any survivors; reject the formula only
     when none survive. External serial builders must isolate their own per-config
     failures. Direct helper callers outside the context retain legacy handling.
@@ -58,6 +61,8 @@
   right: Inspect deepmd.__file__ and deepmd.pt.model.model.__file__ using the same Python
     interpreter as rl-matdesign. The supplied DeepMD commit c856a77bfddce66afd0956c24487999a5c69c7cd
     adds classification to get_sezm_model and provides DeepClassification.predict_proba.
+    Also inspect rl_matdesign.__file__ with the CLI interpreter. Changing cwd to a
+    newer checkout does not change an editable installation pointing elsewhere.
     Verify the selected checkpoint and head load before launching MD-backed RL. A version
     string alone may not distinguish custom source revisions.
   impact: The old factory raises 'DPA4/SeZM model supports `dpa4_ener`, `sezm_ener`, or `property`

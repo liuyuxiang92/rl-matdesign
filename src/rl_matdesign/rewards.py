@@ -1,8 +1,10 @@
-"""Generic scalar reward composition and raw-property feasibility gates.
+"""Generic scalar reward composition and property feasibility gates.
 
-The caller supplies raw property means for gates and separately supplies
+The caller supplies gate scores in native property units and separately supplies
 property values with direction, uncertainty objective, and scale already
 applied for reward optimization. This module never normalizes either input.
+Structure scoring uses mean minus std for classification gates, raw means for
+other gates; those statistics are selected by the caller.
 An omitted reward configuration preserves the existing property-weighted sum.
 
 A gated reward is a piecewise scalar objective, not a guarantee that every
@@ -58,8 +60,9 @@ class RewardCombiner:
     ``cfg`` is the optional ``reward:`` mapping, not the whole experiment
     configuration. ``property_weights`` maps every available property name to
     its legacy weight. An explicit ``objective.terms`` replaces those weights;
-    it never multiplies them a second time. Every gate scores raw property
-    means, regardless of the property's direction, scale, or uncertainty mode.
+    it never multiplies them a second time. Every gate scores the supplied
+    ``raw_values`` in native units; the caller selects their statistics without
+    applying objective direction, scale, or uncertainty mode.
 
     Gate bounds are inclusive. All gates must pass; otherwise the reward is
     ``failure.reward - sum(penalty_weight * bound_violation)``. A gate's omitted
