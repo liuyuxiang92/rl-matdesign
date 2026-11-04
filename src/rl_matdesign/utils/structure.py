@@ -35,6 +35,8 @@ import numpy as np
 # import ...` would not create a patchable module attribute.
 from scipy.spatial import QhullError, Voronoi, cKDTree
 
+from .stage_timing import timed_stage
+
 
 _STRICT_RELAXATION_ERRORS: ContextVar[bool] = ContextVar(
     "rl_matdesign_strict_relaxation_errors", default=False
@@ -707,7 +709,8 @@ def relax_structure(
         # The optimizer includes the cell-filter degrees of freedom in this
         # result. Checking only work.get_forces() could accept an unconverged
         # cell despite converged atomic positions.
-        converged = bool(opt.run(fmax=fmax, steps=steps))
+        with timed_stage("opt"):
+            converged = bool(opt.run(fmax=fmax, steps=steps))
         if _STRICT_RELAXATION_ERRORS.get():
             for name, value in (
                 ("positions", work.get_positions()),

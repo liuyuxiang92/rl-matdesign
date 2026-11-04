@@ -120,3 +120,35 @@
   - gpu-scheduling
   - batched-rewards
   - episode-budgeting
+- id: decision-episode-timing-001
+  date: '2026-11-03'
+  expires: '2027-05-03'
+  title: Keep episode wall shares separate from structure task seconds
+  choice: >-
+    Automatically write episode_timing.csv through PredictorTimer.record_episode.
+    Measure each evaluation wave once and divide its elapsed time among attempted
+    episodes; record rollout and actual RL update time separately. Capture MD and
+    optimization scopes inside each worker or serial builder, preserving failed
+    work, and sum task seconds per chemical formula. Cache hits and coalesced
+    duplicates own no new structure or property work. DQN updates are measured per
+    episode; PG updates are shared over the actual learning batch. Synchronize only
+    the active CUDA training device around updates.
+  alternatives_considered:
+  - Adding parallel task seconds to episode wall time double counts overlapping work.
+  - Timing each evaluator.next call charges an entire wave to its first returned episode.
+  - Inferring MD time from total builder time minus optimization mislabels setup and I/O.
+  trade_off: >-
+    Parallel wall shares are accounting allocations, not each formula's latency.
+    Third-party builders need optional stage hooks or aligned timing records;
+    unavailable measurements and unknown serial attempt counts remain blank.
+    Arbitrary stage-hook invocation counts cannot identify configuration attempts.
+    External CLC deployments need the accompanying MD subprocess patch. Global
+    setup, scaler fitting, checkpoint writes and post-generation diagnostics remain
+    run-level overhead. Resume appends with a new timing_session identifier.
+  files:
+  - src/rl_matdesign/utils/stage_timing.py
+  - src/rl_matdesign/utils/timing.py
+  - src/rl_matdesign/utils/episode_batch.py
+  - src/rl_matdesign/predictors/structure_score.py
+  - integrations/clc_workflow_stage_timing.patch
+  tags: [performance-instrumentation, gpu-scheduling, episode-accounting]

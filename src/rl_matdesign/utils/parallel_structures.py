@@ -240,6 +240,9 @@ class ParallelStructureBuilder:
         self._closed = False
         self._registered = False
         self._run_id = uuid.uuid4().hex[:12]
+        self.last_build_timings: list[dict] = []
+        self.last_build_job_timings: list[dict] = []
+        self.last_build_wall_s = 0.0
         go = cfg.get("geo_opt") or {}
         self.handles_geo_opt = bool(go) and bool(go.get("enabled", True))
 
@@ -298,6 +301,7 @@ class ParallelStructureBuilder:
                                     "seed": seed, "index": index,
                                     "candidate_index": candidate_index,
                                     "config_index": config_index})
+            self.last_build_job_timings[index]["dispatched"] = True
             active[worker.connection] = (worker, index, time.monotonic())
             print(f"[structure_parallel] {context(index)} started on GPU {worker.token}", flush=True)
 
@@ -318,6 +322,10 @@ class ParallelStructureBuilder:
                     reply = worker.receive()
                     reply["elapsed"] = time.monotonic() - t
                     replies[index] = reply
+                    self.last_build_job_timings[index].update(
+                        completed=True, succeeded=bool(reply.get("ok")),
+                        timing=reply.get("timing"), elapsed_s=reply["elapsed"],
+                    )
                     status = "done" if reply.get("ok") else "FAILED"
                     print(f"[structure_parallel] {context(index)} {status} on GPU {worker.token} ({reply['elapsed']:.1f}s)", flush=True)
                     if not reply.get("ok"):
@@ -364,8 +372,19 @@ class ParallelStructureBuilder:
         """
         n_configs = self._validate_n_configs(n_configs)
         candidates = list(candidates)
+        self.last_build_timings = []
+        self.last_build_job_timings = []
+        self.last_build_wall_s = 0.0
         if not candidates:
             return []
+        started = time.monotonic()
+        self.last_build_job_timings = [
+            {"candidate_index": candidate_index, "config_index": config_index,
+             "dispatched": False, "completed": False, "succeeded": False,
+             "timing": None}
+            for candidate_index in range(len(candidates))
+            for config_index in range(n_configs)
+        ]
         rng = self._rng if rng is None else rng
         total_configs = len(candidates) * n_configs
         seeds = [int(s) for s in rng.integers(0, 2**32, size=total_configs, dtype=np.uint64)]
@@ -376,10 +395,29 @@ class ParallelStructureBuilder:
         print(f"[structure_parallel] scheduling {len(candidates)} candidates x "
               f"{n_configs} configurations on "
               f"{len(targets)} GPUs (one structure per GPU)", flush=True)
-        started = time.monotonic()
         jobs = [(index // n_configs, index % n_configs, seed)
                 for index, seed in enumerate(seeds)]
-        replies = self._run_jobs(candidates, jobs, targets, label="config")
+        try:
+            replies = self._run_jobs(candidates, jobs, targets, label="config")
+        finally:
+            # Keep completed work visible even if a worker exits or times out.
+            # Unknown in-flight stage costs must never look like measured zeros.
+            self.last_build_wall_s = time.monotonic() - started
+            for index in range(len(candidates)):
+                records = self.last_build_job_timings[index * n_configs:(index + 1) * n_configs]
+                incomplete = any(not record["completed"] for record in records)
+                timing = {
+                    "config_attempted": sum(int(record["dispatched"]) for record in records),
+                    "config_succeeded": sum(int(record["succeeded"]) for record in records),
+                    "timing_incomplete": incomplete,
+                }
+                for stage in ("md_task_s", "opt_task_s", "structure_other_task_s"):
+                    values = [(record["timing"] or {}).get(stage) for record in records]
+                    timing[stage] = (
+                        None if incomplete or any(value is None for value in values)
+                        else sum(values)
+                    )
+                self.last_build_timings.append(timing)
         results: list[list[Atoms] | Exception] = []
         for index in range(len(candidates)):
             candidate_replies = replies[index * n_configs:(index + 1) * n_configs]

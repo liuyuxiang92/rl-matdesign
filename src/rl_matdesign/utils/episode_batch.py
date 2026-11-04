@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -40,6 +41,7 @@ class EpisodeSnapshot:
     composition: Any
     formula: str
     metadata: dict = field(default_factory=dict)
+    timing: dict = field(default_factory=dict)
 
 
 def snapshot_episode(env, metadata: dict | None = None) -> EpisodeSnapshot:
@@ -62,7 +64,7 @@ class EpisodeBatchEvaluator:
     counting. Batch size one calls the original rollout directly.
     """
 
-    def __init__(self, env, *, max_retries: int = 10):
+    def __init__(self, env, *, max_retries: int = 10, timer=None):
         self.env = env
         self.reward_fn = getattr(env, "reward_fn", None)
         self.size = 1
@@ -70,6 +72,62 @@ class EpisodeBatchEvaluator:
         self.max_retries = max_retries
         self.failures = 0
         self.pending = deque()
+        self.timer = timer
+        self.wave_id = 0
+
+    def _record_failure(self, failure, phase):
+        record = getattr(self.timer, "record_episode", None)
+        if callable(record):
+            record({
+                **getattr(failure, "episode_timing", {}),
+                "phase": phase, "status": "failed", "episode": None,
+                "formula": getattr(failure, "episode_formula", ""),
+                "rl_update_s": 0.0,
+            })
+
+    def _failed_formula(self):
+        # A rollout may fail before a custom environment reaches a valid
+        # terminal state. Diagnostics must preserve the original exception.
+        try:
+            return getattr(self.env, "terminal_formula", "")
+        except Exception:
+            return ""
+
+    def _timing(self, rollout_s, eval_share, count, details=None):
+        return {
+            **(details or {}),
+            "evaluation_wave_id": self.wave_id,
+            "evaluation_wave_size": count,
+            "rollout_s": rollout_s,
+            "eval_wall_share_s": eval_share,
+            "rl_update_s": 0.0,
+            "episode_wall_share_s": rollout_s + eval_share,
+        }
+
+    def _scalar_rollout(self, rollout, phase):
+        self.wave_id += 1
+        reset = getattr(self.reward_fn, "reset_evaluation_timing", None)
+        if callable(reset):
+            reset()
+        started = time.perf_counter()
+        failure = None
+        try:
+            rollout()
+        except CandidateEvaluationFailed as exc:
+            failure = exc
+            raise
+        finally:
+            elapsed = time.perf_counter() - started
+            evaluation = float(getattr(self.reward_fn, "last_evaluation_wall_s", 0.0))
+            details = getattr(self.reward_fn, "last_evaluation_timings", [])
+            self._scalar_timing = self._timing(
+                max(0.0, elapsed - evaluation), evaluation, 1,
+                details[0] if len(details) == 1 else {},
+            )
+            if failure is not None:
+                failure.episode_timing = self._scalar_timing
+                failure.episode_formula = self._failed_formula()
+                self._record_failure(failure, phase)
 
     def _refresh_size(self):
         size_fn = getattr(self.reward_fn, "evaluation_batch_size", None)
@@ -80,10 +138,12 @@ class EpisodeBatchEvaluator:
             raise ValueError("batched rewards require an evaluate_many adapter")
 
     def _collect(self, rollout: Callable[[], None], count: int, metadata: dict | None):
+        self.wave_id += 1
         outcomes = []
         payloads = []
         indices = []
         for _ in range(count):
+            started = time.perf_counter()
             captured = []
 
             def defer(payload):
@@ -97,27 +157,48 @@ class EpisodeBatchEvaluator:
                     raise RuntimeError("deferred rollout must produce exactly one terminal reward")
                 episode = snapshot_episode(self.env, metadata)
             except CandidateEvaluationFailed as exc:
+                exc.episode_formula = self._failed_formula()
+                exc.episode_timing = self._timing(time.perf_counter() - started, 0.0, count)
                 outcomes.append(exc)
                 continue
             finally:
                 self.env.reward_fn = self.reward_fn
             indices.append(len(outcomes))
+            episode.timing = self._timing(time.perf_counter() - started, 0.0, count)
             payloads.append(captured[0])
             outcomes.append(episode)
         if payloads:
+            started = time.perf_counter()
             rewards = list(self.reward_fn.evaluate_many(payloads))
+            elapsed = time.perf_counter() - started
+            details = getattr(self.reward_fn, "last_evaluation_timings", [])
+            if len(details) != len(payloads):
+                details = [{} for _ in payloads]
             if len(rewards) != len(payloads):
                 raise RuntimeError("batched rewards returned the wrong number of results")
-            for index, reward in zip(indices, rewards):
+            for index, reward, timing in zip(indices, rewards, details):
+                episode = outcomes[index]
+                episode.timing.update(timing)
                 if isinstance(reward, Exception):
+                    reward.episode_timing = episode.timing
+                    reward.episode_formula = episode.formula
                     outcomes[index] = reward
                 else:
                     outcomes[index].path[-1].reward = float(reward)
+            # A wave is one shared wall interval. Charge every attempted
+            # episode an equal share, including failed and cached candidates;
+            # task-seconds in details remain each candidate's actual work.
+            share = elapsed / len(outcomes)
+            for outcome in outcomes:
+                timing = (outcome.episode_timing if isinstance(outcome, Exception)
+                          else outcome.timing)
+                timing["eval_wall_share_s"] = share
+                timing["episode_wall_share_s"] = timing["rollout_s"] + share
         return outcomes
 
     def next(self, rollout: Callable[[], None], *, limit: int,
              retry_scalar: Callable | None = None,
-             metadata: dict | None = None) -> EpisodeSnapshot:
+             metadata: dict | None = None, phase: str = "") -> EpisodeSnapshot:
         if limit < 1:
             raise ValueError("evaluation wave has no remaining budget")
         while True:
@@ -127,10 +208,12 @@ class EpisodeBatchEvaluator:
                 self._refresh_size()
                 if self.size == 1 and self.failures == 0:
                     if retry_scalar is None:
-                        rollout()
+                        self._scalar_rollout(rollout, phase)
                     else:
-                        retry_scalar(rollout)
-                    return snapshot_episode(self.env, metadata)
+                        retry_scalar(lambda: self._scalar_rollout(rollout, phase))
+                    episode = snapshot_episode(self.env, metadata)
+                    episode.timing = dict(self._scalar_timing)
+                    return episode
                 count = min(self.size, limit, self.max_retries + 1 - self.failures)
                 self.pending.extend(self._collect(rollout, count, metadata))
             outcome = self.pending.popleft()
@@ -139,6 +222,7 @@ class EpisodeBatchEvaluator:
                 return outcome
             if not isinstance(outcome, CandidateEvaluationFailed):
                 raise outcome
+            self._record_failure(outcome, phase)
             if retry_scalar is None:
                 # Generation counts failed candidates in its own attempts budget.
                 self.failures = 0

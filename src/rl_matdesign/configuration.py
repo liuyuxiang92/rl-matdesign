@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 import warnings
 
 import yaml
@@ -95,6 +96,18 @@ class _TerminalReward:
         self.predictor = predictor
         self.env_type = env_type
         self.anion_formula = anion_formula
+        self.last_evaluation_timings = []
+        self.last_evaluation_wall_s = 0.0
+
+    def reset_evaluation_timing(self):
+        self.last_evaluation_timings = []
+        self.last_evaluation_wall_s = 0.0
+
+    def _prediction_timings(self, count):
+        rows = getattr(self.predictor, "last_evaluation_timings", None)
+        if isinstance(rows, (list, tuple)) and len(rows) == count:
+            return [dict(row) if isinstance(row, dict) else {} for row in rows]
+        return [{} for _ in range(count)]
 
     def evaluation_batch_size(self) -> int:
         size = getattr(self.predictor, "evaluation_batch_size", None)
@@ -133,15 +146,25 @@ class _TerminalReward:
         return mean
 
     def __call__(self, payload) -> float:
+        self.reset_evaluation_timing()
+        started = time.perf_counter()
         candidate = self._candidate(payload)
         if candidate is None:
+            self.last_evaluation_timings = [{}]
+            self.last_evaluation_wall_s = time.perf_counter() - started
             return _FAILED_CANDIDATE_REWARD
         try:
             return self._mean(self.predictor.predict(candidate))
         except Exception as exc:
             raise self._failure(payload, exc) from exc
+        finally:
+            self.last_evaluation_wall_s = time.perf_counter() - started
+            self.last_evaluation_timings = self._prediction_timings(1)
 
     def evaluate_many(self, payloads) -> list:
+        self.reset_evaluation_timing()
+        started = time.perf_counter()
+        self.last_evaluation_timings = [{} for _ in payloads]
         results = [_FAILED_CANDIDATE_REWARD] * len(payloads)
         candidates, indices = [], []
         for index, payload in enumerate(payloads):
@@ -150,6 +173,7 @@ class _TerminalReward:
                 indices.append(index)
                 candidates.append(candidate)
         if not candidates:
+            self.last_evaluation_wall_s = time.perf_counter() - started
             return results
         batch_fn = getattr(self.predictor, "batch_predict", None)
         if supports_partial_batch_prediction(self.predictor):
@@ -159,15 +183,20 @@ class _TerminalReward:
                 predicted = [exc] * len(candidates)
             if len(predicted) != len(candidates):
                 raise RuntimeError("predictor.batch_predict returned the wrong number of results")
+            timings = self._prediction_timings(len(candidates))
         else:
             # A legacy plug-in need only implement predict; do not assume it
             # inherits the Protocol's default batch implementation.
             predicted = []
+            timings = []
             for candidate in candidates:
                 try:
                     predicted.append(self.predictor.predict(candidate))
                 except Exception as exc:
                     predicted.append(exc)
+                timings.extend(self._prediction_timings(1))
+        for index, timing in zip(indices, timings):
+            self.last_evaluation_timings[index] = timing
         for index, result in zip(indices, predicted):
             try:
                 if isinstance(result, Exception):
@@ -175,6 +204,7 @@ class _TerminalReward:
                 results[index] = self._mean(result)
             except Exception as exc:
                 results[index] = self._failure(payloads[index], exc)
+        self.last_evaluation_wall_s = time.perf_counter() - started
         return results
 
 

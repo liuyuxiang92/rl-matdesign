@@ -135,3 +135,30 @@
   - wrapper-contracts
   - batched-rewards
   - performance-accounting
+- id: pitfall-expensive-hpo-001
+  date: '2026-11-03'
+  expires: '2027-02-03'
+  title: HPO stage and GPU defaults do not provide cross-trial simulation reuse
+  wrong: Assuming stage2 restores full MD/configuration fidelity, resumes stage1
+    training, or reuses expensive rewards across trials; assuming parallel HPO
+    trials automatically receive distinct GPU groups.
+  right: scripts/hpo.py shallow-merges base and fixed overrides, so replace nested
+    MD mappings only in full. Stage2 retains fixed overrides and starts fresh seed
+    processes; StructureScorePredictor caches are process-local. For one multi-GPU
+    structure queue per trial, use n_parallel_trials 1 and inherit the GPU allocation.
+    Multiple trials require explicit single-GPU IDs under the current driver;
+    stage2 then also uses only one GPU. Preserve MD/optimization/reward settings
+    during the initial reduced-episode screen and measure one representative trial
+    before promising a wall-clock budget. No intermediate pruning is wired up.
+  impact: A nominally cheap search can rerun the same expensive warmup, replace
+    required MD settings, oversubscribe GPUs, or mistake low-fidelity confirmation
+    for final validation. Interrupted stage1 also schedules a fresh n_trials on
+    restart rather than only the remaining count.
+  files:
+  - scripts/hpo.py
+  - src/rl_matdesign/hpo/runner.py
+  - src/rl_matdesign/predictors/structure_score.py
+  tags:
+  - hpo-budgeting
+  - gpu-allocation
+  - configuration-merging
