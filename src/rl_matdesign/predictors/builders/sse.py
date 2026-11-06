@@ -37,7 +37,10 @@ Single vs multi-template is **auto-detected** from ``base_poscar`` (mirrors
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    import ase
 
 import numpy as np
 

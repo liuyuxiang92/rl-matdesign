@@ -12,7 +12,8 @@ Plugs into the ``phase_filter`` slot of either :class:`CompositionEnv` or
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence, Tuple
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .base import ConstraintFilter
 
@@ -25,9 +26,8 @@ class LastStepElementFilter(ConstraintFilter):
     required_elements:
         Element symbols allowed at the final step (e.g. ``["O"]``).
     nonzero_ratio:
-        If True (default), disallow ratio/fraction values that decode to
-        ``"0"`` at the final step — matches the reference rule where
-        oxygen always has a digit in 1–9.
+        If True (default), disallow numerically zero ratio/fraction values at
+        the final step, regardless of their string representation.
     reserve_for_last:
         If True (default), prune earlier-step actions that pick any
         element in ``required_elements`` so it is reserved for the last
@@ -57,6 +57,7 @@ class LastStepElementFilter(ConstraintFilter):
         possible_sums_by_k: List[Any],
         species_set: List[str],
         fraction_set: List[str],
+        code_to_value: Optional[Dict[str, Any]] = None,
         **_: Any,
     ) -> List[Tuple[Tuple[float, ...], Tuple[float, ...]]]:
         from ..encoding import decode_one_hot
@@ -66,17 +67,28 @@ class LastStepElementFilter(ConstraintFilter):
         filtered = []
         for elem_oh, comp_oh in actions:
             elem = decode_one_hot(elem_oh, species_set)
-            digit_str = decode_one_hot(comp_oh, fraction_set)
-
             if is_last_step:
                 if elem not in self.required_elements:
                     continue
-                if self.nonzero_ratio and digit_str == "0":
-                    continue
+                if self.nonzero_ratio:
+                    code = decode_one_hot(comp_oh, fraction_set)
+                    value = code_to_value[code] if code_to_value is not None else code
+                    try:
+                        amount = Decimal(str(value))
+                    except InvalidOperation as exc:
+                        raise ValueError(
+                            f"LastStepElementFilter requires numeric amounts, got {value!r}."
+                        ) from exc
+                    if not amount.is_finite():
+                        raise ValueError(
+                            f"LastStepElementFilter requires finite amounts, got {value!r}."
+                        )
+                    if amount == 0:
+                        continue
             else:
                 if self.reserve_for_last and elem in self.required_elements:
                     continue
 
             filtered.append((elem_oh, comp_oh))
 
-        return filtered if filtered else actions
+        return filtered

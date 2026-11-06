@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rl-matdesign"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.10"
 # Dependencies are managed by the conda environment files (environment.yml /
 # environment-gpu.yml). Only the package structure is declared here.
@@ -13,9 +13,9 @@ requires-python = ">=3.10"
 rl-matdesign = "rl_matdesign.cli:main"
 
 [project.optional-dependencies]
-# Lightweight test extras — install via `pip install -e .[dev]`. Tests are
-# designed to run without DeepMD or ASE (uses dummy predictor + pure helpers).
-dev = ["pytest>=7"]
+# CPU development tools; scientific/runtime dependencies remain separate.
+# Install with `pip install -e '.[dev]'` alongside requirements.txt and ASE.
+dev = ["pytest>=7", "ruff==0.14.3"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -23,3 +23,11 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q"
+
+[tool.ruff]
+target-version = "py310"
+required-version = "==0.14.3"
+
+[tool.ruff.lint]
+# Actual errors first: no formatting, import-order or broad style migration.
+select = ["E9", "F63", "F7", "F82"]

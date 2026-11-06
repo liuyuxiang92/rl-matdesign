@@ -41,12 +41,20 @@ through :func:`rl_matdesign.registry.resolve_builder`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    import ase
 
 import numpy as np
 
+from ...utils.structure_samples import (
+    StructureSample, attach_sample_identity, canonical_sample_candidate,
+    execute_many_seeded_samples, execute_seeded_samples,
+    positive_sample_count, sample_plan as make_sample_plan,
+)
 
-@dataclass
+@dataclass(frozen=True)
 class _TemplateSpec:
     """One POSCAR template + how many cells to build from it."""
 
@@ -94,6 +102,7 @@ class SubstituteBuilder:
         # form keeps the original single-template behavior bit-for-bit.
         self.multi: bool = len(self.specs) > 1
         self._seed = seed
+        self.last_sample_records: List[List[dict]] = []
 
     # ------------------------------------------------------------------
 
@@ -132,7 +141,7 @@ class SubstituteBuilder:
                 _TemplateSpec(
                     path=str(path),
                     site_symbol=str(entry.get("site_symbol", self.site_symbol)),
-                    n_configs=None if n_cfg is None else int(n_cfg),
+                    n_configs=None if n_cfg is None else positive_sample_count(n_cfg),
                 )
             )
         if not specs:
@@ -182,6 +191,45 @@ class SubstituteBuilder:
             )
         return structures
 
+    def sample_plan(self, candidate, *, n_configs, source_spec, eval_seed):
+        """Expand the same template-local samples for serial and GPU workers."""
+        if self.site_map is not None and len(self.specs) != 1:
+            raise ValueError("SubstituteBuilder site_map requires a single base_poscar")
+        templates = [{"path": spec.path, "site_symbol": spec.site_symbol,
+                      "n_configs": spec.n_configs} for spec in self.specs]
+        return make_sample_plan(candidate, n_configs=n_configs, source_spec=source_spec,
+                                eval_seed=eval_seed, templates=templates)
+
+    def build_sample(self, candidate, *, sample: StructureSample):
+        """Build one explicitly identified template/sample, with its own RNG."""
+        from ...utils.structure import substitute_sites
+
+        index = sample.template_index
+        if index is None or not 0 <= index < len(self.specs):
+            raise ValueError("Substitute sample has an unknown template index")
+        spec = self.specs[index]
+        if sample.template_path != spec.path or sample.site_symbol != spec.site_symbol:
+            raise ValueError("Substitute sample does not match its configured template")
+        candidate = canonical_sample_candidate(candidate)
+        rng = np.random.default_rng(sample.seed)
+        if self.site_map is not None:
+            structures = self._build_multi(candidate, n_configs=1, rng=rng, canonical_order=True)
+        else:
+            structures = substitute_sites(spec.path, candidate, site_symbol=spec.site_symbol,
+                                          n_configs=1, rng=rng)
+        if len(structures) != 1:
+            raise ValueError("One substitute sample must produce exactly one structure")
+        attach_sample_identity(structures[0], sample)
+        return structures[0]
+
+    def build_seeded(self, candidate, *, n_configs, source_spec, eval_seed):
+        return execute_seeded_samples(self, candidate, n_configs=n_configs,
+                                       source_spec=source_spec, eval_seed=eval_seed)
+
+    def build_many_seeded(self, candidates, *, n_configs, source_spec, eval_seed):
+        return execute_many_seeded_samples(self, candidates, n_configs=n_configs,
+                                            source_spec=source_spec, eval_seed=eval_seed)
+
     # ------------------------------------------------------------------
     # Multi-sublattice mode (site_map)
     # ------------------------------------------------------------------
@@ -192,6 +240,7 @@ class SubstituteBuilder:
         *,
         n_configs: int,
         rng: np.random.Generator,
+        canonical_order: bool = False,
     ) -> List["ase.Atoms"]:
         """Fill several sublattices at once from a structured multi-group candidate.
 
@@ -219,7 +268,8 @@ class SubstituteBuilder:
         symbols = template.get_chemical_symbols()
 
         ops: List[SublatticeOp] = []
-        for group, site_symbol in self.site_map.items():
+        sites = sorted(self.site_map.items()) if canonical_order else self.site_map.items()
+        for group, site_symbol in sites:
             if group not in candidate:
                 raise KeyError(
                     f"SubstituteBuilder's site_map names group {group!r}, but the "

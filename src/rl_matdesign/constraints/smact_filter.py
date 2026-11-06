@@ -229,8 +229,7 @@ class SMACTChargeFilter(ConstraintFilter):
             ):
                 filtered.append((elem_oh, comp_oh))
 
-        # Safety: never strand the agent with zero legal actions.
-        return filtered if filtered else actions
+        return filtered
 
     def _filter_categorical(
         self,
@@ -276,7 +275,7 @@ class SMACTChargeFilter(ConstraintFilter):
             ):
                 filtered.append((elem_oh, comp_oh))
 
-        return filtered if filtered else actions
+        return filtered
 
     # ------------------------------------------------------------------
     # Internal helpers

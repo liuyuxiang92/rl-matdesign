@@ -180,7 +180,7 @@ def test_dqn_checkpoint_resume_retains_seen_candidates_and_rejects_mode_change(t
     assert "train_count_duplicates" in proc.stdout + proc.stderr
 
 
-def test_dqn_duplicate_guard_saves_resumable_state_before_regular_checkpoint(tmp_path):
+def test_dqn_duplicate_guard_saves_state_and_rejects_changed_learning_protocol(tmp_path):
     cfg = _config()
     cfg["train_max_duplicate_attempts"] = 1
     source_scaler = tmp_path / "source_scaler.bin"
@@ -200,13 +200,12 @@ def test_dqn_duplicate_guard_saves_resumable_state_before_regular_checkpoint(tmp
     cfg["train_max_duplicate_attempts"] = 100
     proc, out = _run(tmp_path, cfg, "--resume-training",
                      "--save-checkpoint-freq", "1000", out=out)
-    rows = _successful_rows(proc, out)
-    finished = torch.load(out / "checkpoint.pt", map_location="cpu", weights_only=False)
-    final_budget = finished["training_budget_state"]
-    assert final_budget["counted"] == final_budget["unique"] == 3
-    assert set(stopped_budget["seen_keys"]) <= set(final_budget["seen_keys"])
-    assert final_budget["attempted"] > stopped_budget["attempted"]
-    assert len(finished["buffer"]) == final_budget["attempted"]
-    episodes = [r for r in rows if r["phase"] == "dqn_train"]
-    assert int(episodes[0]["training_attempts"]) == stopped_budget["attempted"] + 1
-    assert int(episodes[-1]["training_budget_used"]) == 3
+    assert proc.returncode != 0
+    assert "train_max_duplicate_attempts" in proc.stdout + proc.stderr
+    # The guard participates in prefetch-wave sizing, so changing it is a new
+    # sampling protocol. Preserve the stopped evidence instead of silently
+    # claiming exact continuation under changed settings.
+    after = torch.load(out / "checkpoint.pt", map_location="cpu", weights_only=False)
+    assert after["training_budget_state"] == stopped_budget
+    assert len(after["buffer"]) == len(stopped["buffer"])
+    assert torch.equal(after["rng_state"]["torch_cpu"], stopped["rng_state"]["torch_cpu"])

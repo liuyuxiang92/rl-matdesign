@@ -58,14 +58,19 @@ def test_lips_masking_and_charge_neutrality():
     cfg = _load_cfg()
     env = _build_env(cfg)
     # counts() with an explicit formula_units (so it needn't read the POSCAR here)
-    builder = SSESupercellBuilder({**cfg, "formula_units": 500})
+    from rl_matdesign.structure_sources import normalize_structure_sources
+    plan = normalize_structure_sources(cfg, needs_structure=["conductivity", "stability"])
+    source_id = plan.property_sources["conductivity"]
+    assert plan.property_sources["stability"] == source_id
+    builder_cfg = plan.source(source_id).builder_config
+    builder = SSESupercellBuilder({**builder_cfg, "formula_units": 500})
 
     s_group = next(g for g in cfg["groups"] if g["name"] == "S_site")
     sse_filter_cfg = next(f for f in s_group["filters"] if f.get("type") == "sse_doping")
     metal_only, oxide_only = set(sse_filter_cfg["metal_only"]), set(sse_filter_cfg["oxide_only"])
     o_form_slots = [str(c.get("name", c["element"])) for c in s_group["choices"]
                     if str(c["element"]) == sse_filter_cfg.get("o_element", "O")]
-    valences = cfg["valences"]
+    valences = builder_cfg["valences"]
 
     rng = np.random.default_rng(0)
     seen_metals = set()

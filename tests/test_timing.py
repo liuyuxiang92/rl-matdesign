@@ -97,8 +97,9 @@ def test_counts_calls_and_uniques_separately():
     assert t.n_calls == 3
     assert t.n_unique == 2
     s = t.summary()
-    assert s["n_cache_hits"] == 1
-    assert s["cache_hit_rate"] == pytest.approx(1 / 3)
+    assert s["n_repeated_requests"] == 1
+    assert s["n_cache_hits"] == 0  # No adapter has reported an actual hit.
+    assert s["cache_hit_rate"] is None
 
 
 def test_tracks_running_best_mean():
@@ -118,7 +119,8 @@ def test_nan_prediction_cannot_poison_best_mean():
     t = PredictorTimer(_Bare())
     t.predict({"A": 2.0})
     t._inner = _Nan()
-    t.predict({"B": 1.0})
+    with pytest.raises(ValueError, match="nonfinite"):
+        t.predict({"B": 1.0})
     assert t.best_mean == pytest.approx(2.0)
 
 
@@ -174,8 +176,9 @@ def test_delegates_optional_methods():
 def test_predict_raw_is_timed_and_counted():
     t = PredictorTimer(_Rich())
     assert t.predict_raw({"A": 1.0}) == (99.0, 0.5)
-    assert t.n_calls == 1
-    assert t.n_unique == 1
+    assert t.n_calls == 0  # Report reads do not add successful reward observations.
+    assert t.n_unique == 0
+    assert t.summary()["diagnostic_requests"] == 1
 
 
 def test_missing_predict_raw_stays_missing():
@@ -188,7 +191,7 @@ def test_missing_predict_raw_stays_missing():
 def test_summary_is_safe_with_zero_calls():
     s = PredictorTimer(_Bare()).summary()
     assert s["n_calls"] == 0
-    assert s["cache_hit_rate"] == 0.0
+    assert s["cache_hit_rate"] is None
     assert s["mean_s_per_call"] == 0.0
     assert s["best_reward"] is None
 
@@ -248,7 +251,8 @@ def test_run_writes_timing_json(tmp_path, method, target_mode):
     pred = timing["predictor"]
     assert pred["n_calls"] > 0
     assert pred["n_unique"] <= pred["n_calls"]
-    assert pred["n_cache_hits"] == pred["n_calls"] - pred["n_unique"]
+    assert pred["n_repeated_requests"] == pred["n_calls"] - pred["n_unique"]
+    assert pred["cache_hit_rate"] is None  # Dummy has no cache telemetry.
     assert pred["t_predict_s"] >= 0.0
     # The predictor is part of the run, so it cannot have taken longer than it.
     assert pred["t_predict_s"] <= timing["total_s"]

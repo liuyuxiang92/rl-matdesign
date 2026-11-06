@@ -26,8 +26,9 @@ from rl_matdesign.encoding import decode_one_hot  # noqa: E402
 def _pick(env, element, value):
     """Step the allowed action whose (element/slot-name, value-code) match."""
     for a in env.allowed_actions():
-        el = decode_one_hot(a[0], env.species_set)
-        code = decode_one_hot(a[1], env.fraction_set)
+        local = env._from_union(a)
+        el = decode_one_hot(local[0], env._active().species_set)
+        code = decode_one_hot(local[1], env._active().fraction_set)
         if el == element and abs(float(code) - float(value)) < 1e-9:
             env.step(a)
             return
@@ -37,9 +38,9 @@ def _pick(env, element, value):
 def _allowed_values(env, slot_name):
     """Decoded value-codes available for a given slot/element at the current step."""
     return {
-        decode_one_hot(a[1], env.fraction_set)
+        f"{float(decode_one_hot(env._from_union(a)[1], env._active().fraction_set)):.2f}"
         for a in env.allowed_actions()
-        if decode_one_hot(a[0], env.species_set) == slot_name
+        if decode_one_hot(env._from_union(a)[0], env._active().species_set) == slot_name
     }
 
 
@@ -67,8 +68,11 @@ def test_n1_reproduces_composition_env():
     mg = _drive_first_allowed(MultiGroupEnv(groups=[dict(name="g", **kw)]))
 
     assert mg.n_components == ce.n_components
-    assert mg.species_set == ce.species_set
-    assert mg.fraction_set == ce.fraction_set
+    assert mg._inners[0].species_set == ce.species_set
+    assert mg._inners[0].fraction_set == ce.fraction_set
+    # Labels and value codes have an explicit group namespace; vectors retain
+    # identical order/dimensions in this single-group case.
+    assert mg.species_set != ce.species_set
     assert len(mg.path) == len(ce.path) == 4
     for a, b in zip(ce.path, mg.path):
         assert np.allclose(a.state_material_features, b.state_material_features)
@@ -92,7 +96,8 @@ def test_n2_groups_each_sum_to_one_and_structured_terminal():
     assert abs(sum(term["P_site"].values()) - 1.0) < 1e-9
     assert abs(sum(term["S_site"].values()) - 1.0) < 1e-9
     # Union alphabet spans both groups.
-    assert set(mg.species_set) == {"Mn", "Ni", "P", "S", "O", "Cl"}
+    assert len(mg.species_set) == 6
+    assert len(set(mg.species_set)) == 6
     # Dedup key is structured + hashable.
     assert hash(mg.terminal_comp_key())
 

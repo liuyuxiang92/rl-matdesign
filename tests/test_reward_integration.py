@@ -41,14 +41,14 @@ def test_composition_only_gate_has_no_builder_and_preserves_raw_delta():
     cfg = _cfg()
     cfg['properties'][2]['direction'] = 'min'
     predictor = build_reward(cfg)
-    assert predictor._shared_builder is None
+    assert not predictor._source_builders
     good = {'delta': 1200.0, 'pure': 0.8, 'cost': 20.0}
     bad = {'delta': 100000.0, 'pure': 0.6, 'cost': 0.0}
     # Explicit reward weights replace each property's 17, with no delta scaling.
-    assert predictor.predict(good) == (1190.0, 0.0)
+    assert predictor.predict(good) == (1190.0, None)
     assert predictor.predict(bad)[0] == pytest.approx(-10.4)
     assert predictor.predict_raw(bad)[0] == pytest.approx(-10.4)
-    assert predictor.per_objective_stats(good)['delta'] == (1200.0, 0.0)
+    assert predictor.per_objective_stats(good)['delta'] == (1200.0, None)
     assert predictor.reward_details(bad)['gates'][0]['violation'] == pytest.approx(0.2)
 
 
@@ -84,7 +84,7 @@ def test_gated_sweep_and_breakdown_choose_feasible_value_and_reuse_build():
         prop.update(predictor='dp_property', models=['unused'], fparam=[None])
     p = StructureScorePredictor(cfg)
     builds = []
-    p._shared_builder = SimpleNamespace(build=lambda *a, **k: builds.append(1) or [object()])
+    p._source_builders["default"] = SimpleNamespace(build=lambda *a, **k: builds.append(1) or [object()])
     def score(prop, structures, *, fparam=None):
         values = {'delta': 1000 if fparam[0] == 500 else 20,
                   'pure': 0.2 if fparam[0] == 500 else 0.9, 'cost': 0}
@@ -92,7 +92,7 @@ def test_gated_sweep_and_breakdown_choose_feasible_value_and_reuse_build():
     p._score = score
     candidate = {'Fe': 1}
     assert p.predict(candidate)[0] == 20.0
-    assert p.per_objective_stats(candidate)['temperature'] == (300.0, 0.0)
+    assert p.per_objective_stats(candidate)['temperature'] == (300.0, None)
     assert p.reward_details(candidate)['gate_passed'] is True
     assert len(builds) == 1  # diagnostics used the cached stats
     breakdown = p.score_breakdown(candidate)
@@ -149,24 +149,27 @@ def test_classification_rejects_ambiguous_or_non_probability_config(override, ma
 def test_classification_probability_fold_for_each_structure_regime(monkeypatch, nclasses, shared):
     import rl_matdesign.utils.dp_eval as dp_eval
     cfg = _class_cfg(index=nclasses - 1)
-    cfg['share_structure'] = shared
+    if not shared:
+        from tests.test_cross_formula_predictor import independent_source_config
+        cfg = independent_source_config(cfg)
     p = StructureScorePredictor(cfg)
     seen = []
     def build(candidate, *, n_configs, rng):
         seen.append(n_configs)
         return [object()] * n_configs
     if shared:
-        p._shared_builder = SimpleNamespace(build=build)
+        p._source_builders["default"] = SimpleNamespace(build=build)
     else:
-        p._builders['pure'] = SimpleNamespace(build=build)
+        p._source_builders['pure'] = SimpleNamespace(build=build)
     p._get_prop_models = lambda prop: ([object()], {})
     def evaluate(structures, models, elements, **kwargs):
         assert len(structures) == 3
         assert kwargs['output_index'] == nclasses - 1
         return np.array([[0.1, 0.9, 0.8]])
     monkeypatch.setattr(dp_eval, 'eval_classification_ensemble', evaluate)
-    assert p.predict({'Fe': 1}) == pytest.approx((0.6, 0.0))
-    assert p.per_objective_stats({'Fe': 1})['pure'] == pytest.approx((0.6, 0.0))
+    assert p.predict({'Fe': 1}) == pytest.approx((0.6, None))
+    assert p.per_objective_stats({'Fe': 1})['pure'] == pytest.approx((0.6, None))
+    assert p.predict_outputs({'Fe': 1})['pure'].config_spread == pytest.approx(np.std([0.1, 0.9, 0.8]))
     assert seen == [3]
 
 
@@ -310,7 +313,7 @@ def test_classification_weighted_sum_keeps_explicit_property_objective():
 
 @pytest.mark.parametrize('probabilities,expected_mean,expected_std', [
     ([[0.9, 1.0], [0.7, 0.8], [0.8, 0.9]], 0.85, np.sqrt(0.02 / 3.0)),
-    ([[0.8, 1.0]], 0.9, 0.0),
+    ([[0.8, 1.0]], 0.9, None),
 ])
 @pytest.mark.parametrize('shared', [True, False])
 def test_classification_ensemble_gate_and_generated_csv_preserve_probability_stats(
@@ -323,7 +326,9 @@ def test_classification_ensemble_gate_and_generated_csv_preserve_probability_sta
     import rl_matdesign.utils.dp_eval as dp_eval
 
     cfg = _classification_gate_cfg(n_models=len(probabilities))
-    cfg['share_structure'] = shared
+    if not shared:
+        from tests.test_cross_formula_predictor import independent_source_config
+        cfg = independent_source_config(cfg)
     predictor = StructureScorePredictor(cfg)
     built = []
 
@@ -333,9 +338,9 @@ def test_classification_ensemble_gate_and_generated_csv_preserve_probability_sta
         return [object(), object()]  # One of three requested configs was unusable.
 
     if shared:
-        predictor._shared_builder = SimpleNamespace(build=build)
+        predictor._source_builders["default"] = SimpleNamespace(build=build)
     else:
-        predictor._builders = {prop['name']: SimpleNamespace(build=build)
+        predictor._source_builders = {prop['name']: SimpleNamespace(build=build)
                                for prop in predictor.properties}
     predictor._get_prop_models = lambda prop: ([object()] * len(prop['models']), {})
 
@@ -352,7 +357,7 @@ def test_classification_ensemble_gate_and_generated_csv_preserve_probability_sta
     stats = predictor.per_objective_stats(candidate)
     assert stats['pure'] == pytest.approx((expected_mean, expected_std))
     assert stats['delta'] == pytest.approx((55.0, 5.0))
-    gate_score = expected_mean - expected_std
+    gate_score = expected_mean - (expected_std or 0.0)
     gate_passed = gate_score >= 0.8
     failure_reward = -10.0 - 2.0 * max(0.0, 0.8 - gate_score)
     expected_reward = 20.0 if gate_passed else failure_reward
@@ -382,7 +387,10 @@ def test_classification_ensemble_gate_and_generated_csv_preserve_probability_sta
     with path.open(newline='') as stream:
         row = next(csv.DictReader(stream))
     assert float(row['obj_pure_mean']) == pytest.approx(expected_mean)
-    assert float(row['obj_pure_std']) == pytest.approx(expected_std)
+    if expected_std is None:
+        assert row['obj_pure_std'] == ''  # An unavailable spread must remain missing in CSV.
+    else:
+        assert float(row['obj_pure_std']) == pytest.approx(expected_std)
     assert float(row['gate_synthesis_value']) == pytest.approx(gate_score)
     assert row['gate_passed'] == str(gate_passed)
     assert float(row['reward']) == pytest.approx(expected_reward)
@@ -443,7 +451,7 @@ def test_combined_class_probability_reaches_ensemble_gate_and_generated_csv(
         return SimpleNamespace(predict_proba=predict_proba, get_num_classes=lambda: 3)
 
     models = [classifier(values, i) for i, values in enumerate(probabilities)]
-    predictor._shared_builder = SimpleNamespace(build=build)
+    predictor._source_builders["default"] = SimpleNamespace(build=build)
     predictor._get_prop_models = lambda prop: (
         models if prop['name'] == 'pure' else [object(), object()], {'Fe': 0},
     )
@@ -453,7 +461,7 @@ def test_combined_class_probability_reaches_ensemble_gate_and_generated_csv(
     stats = predictor.per_objective_stats(candidate)
     assert stats['pure'] == pytest.approx((expected_mean, expected_std))
     assert stats['delta'] == pytest.approx((55.0, 5.0))
-    gate_score = expected_mean - expected_std
+    gate_score = expected_mean - (expected_std or 0.0)
     gate_passed = gate_score >= 0.8
     expected_reward = 20.0 if gate_passed else -10.0 - 2.0 * (0.8 - gate_score)
     expected_raw_reward = 55.0 if gate_passed else expected_reward
@@ -482,7 +490,10 @@ def test_combined_class_probability_reaches_ensemble_gate_and_generated_csv(
     with path.open(newline='') as stream:
         row = next(csv.DictReader(stream))
     assert float(row['obj_pure_mean']) == pytest.approx(expected_mean)
-    assert float(row['obj_pure_std']) == pytest.approx(expected_std)
+    if expected_std is None:
+        assert row['obj_pure_std'] == ''  # An unavailable spread must remain missing in CSV.
+    else:
+        assert float(row['obj_pure_std']) == pytest.approx(expected_std)
     assert float(row['gate_synthesis_value']) == pytest.approx(gate_score)
     assert row['gate_passed'] == str(gate_passed)
     assert float(row['reward']) == pytest.approx(expected_reward)

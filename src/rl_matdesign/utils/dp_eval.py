@@ -244,6 +244,31 @@ def eval_property_ensemble(
     return out
 
 
+def eval_property_outputs(structures: List[Any], models: List[Any], elem_to_type: dict,
+                          *, fparam=None, aparam=None) -> np.ndarray:
+    """Evaluate all output columns once as (model, configuration, output).
+
+    Output selection and inverse transformations occur after this shared call.
+    Every configured member must return the same finite rectangular output.
+    """
+    from .rollout_errors import EvaluationProtocolError
+    if not models:
+        raise EvaluationProtocolError("A property ensemble requires at least one model")
+    coords, cells, atom_types, kwargs = _prepare_dp_inputs(
+        structures, elem_to_type, fparam=fparam, aparam=aparam)
+    rows = []
+    for model in models:
+        try:
+            values = _property_output_matrix(model.eval(
+                coords=coords, cells=cells, atom_types=atom_types, **kwargs), len(structures))
+        except (TypeError, ValueError) as exc:
+            raise EvaluationProtocolError(str(exc)) from exc
+        if not np.isfinite(values).all() or (rows and rows[0].shape != values.shape):
+            raise EvaluationProtocolError("Property models returned nonfinite or inconsistent output columns")
+        rows.append(values)
+    return np.stack(rows)
+
+
 def validate_classification_indices(
     indices: List[int], *, output_aggregator: str = "index",
 ) -> None:

@@ -13,6 +13,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .rollout_errors import InfeasibleEpisode
+
 
 def supports_partial_batch_prediction(predictor) -> bool:
     """Recognize the opt-in batch protocol without requiring plug-in inheritance."""
@@ -42,16 +44,19 @@ class EpisodeSnapshot:
     formula: str
     metadata: dict = field(default_factory=dict)
     timing: dict = field(default_factory=dict)
+    prediction: tuple | None = None
 
 
 def snapshot_episode(env, metadata: dict | None = None) -> EpisodeSnapshot:
     composition_fn = getattr(env, "terminal_cation_fractions", None)
+    predictions = getattr(getattr(env, "reward_fn", None), "last_predictions", [])
     return EpisodeSnapshot(
         path=copy.deepcopy(env.path),
         terminal_key=copy.deepcopy(env.terminal_comp_key()),
         composition=copy.deepcopy(composition_fn()) if callable(composition_fn) else None,
         formula=getattr(env, "terminal_formula", ""),
         metadata=dict(metadata or {}),
+        prediction=copy.deepcopy(predictions[0]) if len(predictions) == 1 else None,
     )
 
 
@@ -80,7 +85,7 @@ class EpisodeBatchEvaluator:
         if callable(record):
             record({
                 **getattr(failure, "episode_timing", {}),
-                "phase": phase, "status": "failed", "episode": None,
+                "phase": phase, "status": "infeasible" if isinstance(failure, InfeasibleEpisode) else "failed", "episode": None,
                 "formula": getattr(failure, "episode_formula", ""),
                 "rl_update_s": 0.0,
             })
@@ -113,7 +118,7 @@ class EpisodeBatchEvaluator:
         failure = None
         try:
             rollout()
-        except CandidateEvaluationFailed as exc:
+        except (CandidateEvaluationFailed, InfeasibleEpisode) as exc:
             failure = exc
             raise
         finally:
@@ -150,13 +155,15 @@ class EpisodeBatchEvaluator:
                 captured.append(copy.deepcopy(payload))
                 return 0.0
 
+            if callable(getattr(self.reward_fn, "evaluate_candidate", None)):
+                defer.evaluate_candidate = defer
             self.env.reward_fn = defer
             try:
                 rollout()
                 if len(captured) != 1 or not self.env.path:
                     raise RuntimeError("deferred rollout must produce exactly one terminal reward")
                 episode = snapshot_episode(self.env, metadata)
-            except CandidateEvaluationFailed as exc:
+            except (CandidateEvaluationFailed, InfeasibleEpisode) as exc:
                 exc.episode_formula = self._failed_formula()
                 exc.episode_timing = self._timing(time.perf_counter() - started, 0.0, count)
                 outcomes.append(exc)
@@ -171,12 +178,15 @@ class EpisodeBatchEvaluator:
             started = time.perf_counter()
             rewards = list(self.reward_fn.evaluate_many(payloads))
             elapsed = time.perf_counter() - started
+            predictions = getattr(self.reward_fn, "last_predictions", [])
+            if len(predictions) != len(payloads):
+                predictions = [None] * len(payloads)
             details = getattr(self.reward_fn, "last_evaluation_timings", [])
             if len(details) != len(payloads):
                 details = [{} for _ in payloads]
             if len(rewards) != len(payloads):
                 raise RuntimeError("batched rewards returned the wrong number of results")
-            for index, reward, timing in zip(indices, rewards, details):
+            for index, reward, timing, prediction in zip(indices, rewards, details, predictions):
                 episode = outcomes[index]
                 episode.timing.update(timing)
                 if isinstance(reward, Exception):
@@ -185,6 +195,7 @@ class EpisodeBatchEvaluator:
                     outcomes[index] = reward
                 else:
                     outcomes[index].path[-1].reward = float(reward)
+                    outcomes[index].prediction = copy.deepcopy(prediction)
             # A wave is one shared wall interval. Charge every attempted
             # episode an equal share, including failed and cached candidates;
             # task-seconds in details remain each candidate's actual work.
@@ -220,7 +231,7 @@ class EpisodeBatchEvaluator:
             if not isinstance(outcome, Exception):
                 self.failures = 0
                 return outcome
-            if not isinstance(outcome, CandidateEvaluationFailed):
+            if not isinstance(outcome, (CandidateEvaluationFailed, InfeasibleEpisode)):
                 raise outcome
             self._record_failure(outcome, phase)
             if retry_scalar is None:
@@ -234,7 +245,8 @@ class EpisodeBatchEvaluator:
                     "giving up rather than spending the rest of the run on unscored "
                     f"candidates. Last failure: {outcome}"
                 ) from outcome
-            print(f"[WARN] candidate evaluation failed (retry "
+            kind = "infeasible construction" if isinstance(outcome, InfeasibleEpisode) else "candidate evaluation failed"
+            print(f"[WARN] {kind} (retry "
                   f"{self.failures}/{self.max_retries}), discarding and "
                   f"trying a new candidate: {outcome}")
 

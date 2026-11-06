@@ -44,7 +44,7 @@ def _make_ooh(cfg: dict, *, seed: Optional[int] = None, **_):
     return OOHCatalystPredictor(
         base_poscar=cfg["base_poscar"],
         dp_models=cfg["dp_models"],
-        objective=cfg.get("objective", "mean_minus_kstd"),
+        objective=cfg.get("objective", "mean"),
         k=float(cfg.get("k", 1.0)),
         n_random_configs=int(cfg.get("n_random_configs", 10)),
         ads_height=float(cfg.get("ads_height", 1.9)),
@@ -61,12 +61,14 @@ def _make_ooh(cfg: dict, *, seed: Optional[int] = None, **_):
     )
 
 
-def _make_dummy(cfg: dict, **_):
+def _make_dummy(cfg: dict, *, seed: Optional[int] = None, **_):
     import random as _random
+    from .utils.seeding import candidate_seed
 
     class _DummyPredictor:
         def predict(self, composition):
-            return float(_random.gauss(0.5, 0.1)), float(abs(_random.gauss(0.05, 0.01)))
+            rng = _random.Random(candidate_seed(0 if seed is None else seed, composition))
+            return float(rng.gauss(0.5, 0.1)), float(abs(rng.gauss(0.05, 0.01)))
 
         def batch_predict(self, compositions):
             return [self.predict(c) for c in compositions]
@@ -83,11 +85,25 @@ def _make_mgtransformer(cfg: dict, *, seed: Optional[int] = None, **_):
     return MGTransformerPredictor(cfg, seed=seed)
 
 
+def _make_lookup(cfg: dict, *, seed: Optional[int] = None, **_):
+    from .predictors.lookup import LookupPredictor
+    return LookupPredictor(cfg, seed=seed)
+
+
+def _make_glassnet(cfg: dict, **_):
+    from .predictors.glassnet import GlassNetPredictor
+    # Only adapter-owned settings; property selectors and rewards stay in the
+    # engine, and omitted settings use the audited adapter's own defaults.
+    return GlassNetPredictor(**{key: cfg[key] for key in ("oxide_basis", "cache_size", "batch_size") if key in cfg})
+
+
 PREDICTORS: Dict[str, Factory] = {
     "structure_score":    _make_structure_score,   # the multi-objective reward engine
     "rf_magpie":          _make_rf_magpie,
     "ooh":                _make_ooh,
     "mgtransformer":      _make_mgtransformer,     # bridge to ../MGTransformer
+    "lookup":             _make_lookup,
+    "glassnet":           _make_glassnet,
     "dummy":              _make_dummy,
 }
 

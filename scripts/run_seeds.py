@@ -16,8 +16,8 @@ Usage
         --out runs/hea_a2c --seeds 0 1 2 3 4 --parallel
 
     # DQN Monte-Carlo-target ablation arm:
-    python scripts/run_seeds.py --config configs/ooh_dqn.yaml --method dqn \\
-        --dqn-target-mode mc --out runs/ooh_dqn_mc --seeds 0 1 2
+    python scripts/run_seeds.py --config /path/to/local/experiment.yaml --method dqn \\
+        --dqn-target-mode mc --out runs/dqn_mc --seeds 0 1 2
 """
 
 from __future__ import annotations
@@ -63,11 +63,9 @@ def run_one_seed(args_tuple) -> Tuple[int, int]:
         "--config", config,
         "--method", method,
         "--out", seed_dir,
-        # run_experiment.py has no --seed flag; it takes three decorrelated
-        # seeds. Passing all three the same value reproduces the single-seed
-        # intent, and passing --train-seed explicitly is what enables GPU
-        # determinism (see set_global_seed in run_experiment.main).
-        "--dp-seed", str(seed),
+        # Use one explicit value for the three named seed responsibilities.
+        # The experiment enables determinism equally for YAML and CLI seeds.
+        "--eval-seed", str(seed),
         "--train-seed", str(seed),
         "--gen-seed", str(seed),
     ]

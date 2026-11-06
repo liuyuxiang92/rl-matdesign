@@ -165,7 +165,7 @@ def _comp_cache_key(comp) -> object:
     """
     from rl_matdesign.utils.composition import composition_key
 
-    return composition_key(comp, decimals=6)
+    return composition_key(comp)
 
 
 def score_composition(predictor, comp, cache: dict,

@@ -10,6 +10,8 @@ model call is faked. Mirrors the stubbing style of ``tests/test_structure_score.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -114,10 +116,13 @@ def make_predictor(monkeypatch, slab_poscar):
         lambda: (Atoms, ase_read, ase_write, chemical_symbols, _FakeDeepProperty),
     )
 
+    model = Path(slab_poscar).parent / 'fake_model.pt'
+    model.write_bytes(b'explicit unit-test fake model asset')
+
     def _make(**kwargs):
         cfg = DPConfig(
             base_poscar=slab_poscar,
-            model_files=("fake_model.pt",),
+            model_files=(str(model),),
             n_random_configs=kwargs.pop("n_random_configs", 1),
             seed=7,
             **kwargs,
@@ -213,8 +218,10 @@ def _ooh_wrapper(monkeypatch, slab_poscar, **kwargs):
         lambda: (Atoms, ase_read, ase_write, chemical_symbols, _FakeDeepProperty),
     )
     from rl_matdesign.predictors.ooh import OOHCatalystPredictor
+    model = Path(slab_poscar).parent / 'fake_model.pt'
+    model.write_bytes(b'explicit unit-test fake model asset')
     return OOHCatalystPredictor(
-        base_poscar=slab_poscar, dp_models=["fake_model.pt"],
+        base_poscar=slab_poscar, dp_models=[str(model)],
         n_random_configs=1, **kwargs,
     )
 

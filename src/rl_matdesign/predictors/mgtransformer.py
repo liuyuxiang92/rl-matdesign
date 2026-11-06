@@ -64,7 +64,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    import ase
 
 import numpy as np
 

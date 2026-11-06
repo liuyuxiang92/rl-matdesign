@@ -21,6 +21,8 @@ import copy
 import json
 import os
 import random
+import sys
+from pathlib import Path
 import signal
 import threading
 import time
@@ -49,6 +51,10 @@ from rl_matdesign.configuration import (
     build_predictor,
     load_config,
 )
+from rl_matdesign.config_schema import load_yaml_config, resolve_config
+from rl_matdesign.utils.provenance import write_run_manifest
+from rl_matdesign.utils.model_contract import load_artifact, save_weights, validate_scaler
+from rl_matdesign.action_features import value_alphabet
 from rl_matdesign.model import PolicyNet, QRegressor, ValueNet
 from rl_matdesign.training import (
     _fit_scaler_from_warmup,
@@ -58,7 +64,8 @@ from rl_matdesign.training import (
     train_pg,
 )
 from rl_matdesign.utils.metrics import RunMetrics
-from rl_matdesign.utils.seeding import set_global_seed
+from rl_matdesign.utils.seeding import set_global_seed, isolated_rng
+from rl_matdesign.utils.execution_contract import execution_contract, require_execution_contract
 from rl_matdesign.utils.timing import PhaseTimer, PredictorTimer
 from rl_matdesign.utils.training_budget import TrainingBudget
 
@@ -67,18 +74,25 @@ from rl_matdesign.utils.training_budget import TrainingBudget
 # CLI
 # ---------------------------------------------------------------------------
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="General RL material design experiment")
     p.add_argument("--config", required=True, help="Path to YAML config file")
     p.add_argument("--method", choices=["dqn", "reinforce", "a2c"], default=None,
                    help="RL method (overrides config 'method' field)")
-    p.add_argument("--out", required=True, help="Output directory")
-    p.add_argument("--dp-seed", type=int, default=0,
-                   help="Base RNG seed for the predictor and fallback for --train-seed/--gen-seed")
+    p.add_argument("--out", help="Output directory (required unless --validate-config)")
+    p.add_argument("--validate-config", action="store_true",
+                   help="Print resolved settings and their sources without loading a predictor.")
+    evaluation_seed = p.add_mutually_exclusive_group()
+    evaluation_seed.add_argument("--eval-seed", type=int, default=None,
+                   help="Evaluation/structure-sampling seed; overrides YAML (default 0).")
+    evaluation_seed.add_argument("--dp-seed", dest="eval_seed", type=int, default=None,
+                   help="Deprecated alias of --eval-seed.")
     p.add_argument("--train-seed", type=int, default=None,
-                   help="RNG seed for the training phase. Enables GPU determinism when set. Falls back to --dp-seed.")
+                   help="Training RNG seed; overrides YAML, otherwise falls back to eval_seed.")
+    p.add_argument("--train-budget", type=int, default=None,
+                   help="Shared paid training-candidate budget, including rewarded warmup.")
     p.add_argument("--gen-seed", type=int, default=None,
-                   help="RNG seed for the generation phase. Falls back to --dp-seed.")
+                   help="Generation RNG seed; overrides YAML, otherwise falls back to eval_seed.")
     p.add_argument("--device", default=None, help="torch device (default: auto)")
     p.add_argument("--save-checkpoint-freq", type=int, default=0, metavar="N",
                    dest="save_checkpoint_freq",
@@ -89,7 +103,7 @@ def parse_args() -> argparse.Namespace:
                         "Defaults to loading <out>/policy.pt (PG) or <out>/qnet.pt (DQN) and <out>/std_scaler.bin.")
     p.add_argument("--resume-training", action="store_true",
                    help="Load an existing model/checkpoint and continue training. "
-                        "For PG: loads std_scaler.bin + checkpoint.pt (or policy.pt) and runs more iterations. "
+                        "For PG: loads std_scaler.bin + checkpoint.pt and continues toward the total budget. "
                         "For DQN: loads std_scaler.bin + checkpoint.pt (qnet, target_net, optimizer, replay "
                         "buffer, dp_cache, epsilon, episode counter) for exact-state resume; falls back to "
                         "qnet.pt (weights only — buffer/epsilon/episode reset) when no mid-checkpoint exists. "
@@ -141,7 +155,10 @@ def parse_args() -> argparse.Namespace:
                    action="store_false",
                    help="Skip in-episode constraint filters during training "
                         "(generation stays constrained). For A/B comparison.")
-    return p.parse_args()
+    args = p.parse_args(argv)
+    if not args.out and not args.validate_config:
+        p.error("--out is required unless --validate-config is used")
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -183,44 +200,49 @@ def _run_experiment(resources: ExitStack) -> None:
     if args.only_generate and args.resume_training:
         raise SystemExit("--only-generate and --resume-training are mutually exclusive.")
 
-    cfg = load_config(args.config)
-    train_count_duplicates = (
-        args.train_count_duplicates if args.train_count_duplicates is not None
-        else cfg.get("train_count_duplicates", True)
+    raw_cfg = load_yaml_config(args.config)
+    override_keys = (
+        "method", "eval_seed", "train_seed", "gen_seed", "dqn_loss", "train_budget",
+        "dqn_augment_permutations", "dqn_target_mode", "max_gen_attempts",
+        "train_count_duplicates", "train_max_duplicate_attempts", "constrain_training",
     )
-    train_max_duplicate_attempts = (
-        args.train_max_duplicate_attempts if args.train_max_duplicate_attempts is not None
-        else cfg.get("train_max_duplicate_attempts", 1000)
-    )
-    # Validate before constructing models or running expensive structure builders.
+    resolved = resolve_config(raw_cfg, {key: getattr(args, key) for key in override_keys})
+    cfg = resolved.config
+    if args.validate_config:
+        print(json.dumps({"config": cfg, "sources": resolved.sources}, indent=2))
+        return
+    train_count_duplicates = cfg["train_count_duplicates"]
+    train_max_duplicate_attempts = cfg["train_max_duplicate_attempts"]
     TrainingBudget(count_duplicates=train_count_duplicates,
                    max_duplicate_attempts=train_max_duplicate_attempts)
-
-    method = args.method or cfg.get("method", "a2c")
-    train_seed = args.train_seed if args.train_seed is not None else args.dp_seed
-    gen_seed   = args.gen_seed   if args.gen_seed   is not None else args.dp_seed
-
-    set_global_seed(train_seed, deterministic=(args.train_seed is not None))
+    method = cfg["method"]
+    eval_seed, train_seed, gen_seed = (cfg[key] for key in ("eval_seed", "train_seed", "gen_seed"))
+    # Determinism must not depend on whether the same seed came from YAML or CLI.
+    set_global_seed(train_seed, deterministic=True)
     os.makedirs(args.out, exist_ok=True)
-
-    # cfg FIRST so the resolved runtime values win. With **cfg spread last, a YAML
-    # `method: dqn` overwrote the real method whenever --method selected a different
-    # arm on the command line — the run was correct (it wrote policy.pt/value_net.pt)
-    # but run_config.json recorded "dqn" for an A2C run. Same hazard for the seeds if
-    # a config happens to define them.
-    run_config = {
-        **cfg,
-        "config_file": args.config, "method": method,
-        "dp_seed": args.dp_seed, "train_seed": train_seed, "gen_seed": gen_seed,
-        "train_count_duplicates": train_count_duplicates,
-        "train_max_duplicate_attempts": train_max_duplicate_attempts,
-    }
-    with open(os.path.join(args.out, "run_config.json"), "w") as f:
-        json.dump(run_config, f, indent=2)
-
     device_str = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_str)
-    print(f"[INFO] device={device}, method={method}, dp_seed={args.dp_seed}, "
+    phase = "generate" if args.only_generate else "resume" if args.resume_training else "train"
+    input_files = [path for path in (args.load_qnet, args.load_policy, args.load_scaler,
+                                     args.load_value_net) if path]
+    if args.only_generate or args.resume_training:
+        for name in ("qnet.pt", "policy.pt", "value_net.pt", "std_scaler.bin", "checkpoint.pt"):
+            path = Path(args.out) / name
+            if path.is_file():
+                input_files.append(str(path))
+    manifest_path = write_run_manifest(
+        args.out, cfg, config_path=args.config, argv=sys.argv,
+        seeds={"eval": eval_seed, "train": train_seed, "gen": gen_seed},
+        phase=phase, input_files=input_files,
+        runtime_args={**vars(args), "resolved_device": str(device)},
+        config_sources=resolved.sources, repo_dir=Path(__file__).resolve().parents[2],
+    )
+    run_config = {**cfg, "config_file": args.config, "config_schema_version": 1}
+    with open(os.path.join(args.out, "run_config.json"), "w") as f:
+        json.dump(run_config, f, indent=2)
+    with open(os.path.join(args.out, "config_sources.json"), "w") as f:
+        json.dump(resolved.sources, f, indent=2)
+    print(f"[INFO] device={device}, method={method}, eval_seed={eval_seed}, "
           f"train_seed={train_seed}, gen_seed={gen_seed}")
 
     with phases("setup"):
@@ -229,54 +251,67 @@ def _run_experiment(resources: ExitStack) -> None:
         # produced, so this single wrap accounts for every predictor call in
         # every phase. The proxy delegates unknown attributes to the real
         # predictor, so `_cache` checkpointing and `predict_raw` still work.
+        with isolated_rng(eval_seed):
+            inner_predictor = build_predictor(cfg, seed=eval_seed)
         predictor = PredictorTimer(
-            build_predictor(cfg, seed=args.dp_seed), t0=t_start,
-            episode_log_path=os.path.join(args.out, "episode_timing.csv"),
+            inner_predictor, t0=t_start, eval_seed=eval_seed,
+            episode_log_path=os.path.join(
+                args.out, "generation_episode_timing.csv" if args.only_generate else "episode_timing.csv"
+            ),
             append=args.resume_training,
         )
         resources.callback(_close_predictor, predictor)
+        source_identity = getattr(predictor, "source_identity", None)
+        if callable(source_identity):
+            # This invocation's resolved protocol complements the declarations
+            # captured before loading resources; prior invocations stay intact.
+            with (manifest_path.parent / "source_identity.json").open("w") as stream:
+                json.dump(source_identity(), stream, indent=2, allow_nan=False)
 
         # Build the env + reward_fn + constraint filter (shared with baselines).
         env, env_type, flat_cfg = build_env(cfg, predictor)
+        with isolated_rng(eval_seed):
+            run_contract = execution_contract(cfg, predictor, manifest_path, device)
+        env.evaluation_contract = run_contract["evaluation"]
+        with (manifest_path.parent / "execution_contract.json").open("w") as stream:
+            json.dump(run_contract, stream, indent=2, allow_nan=False)
 
     # Whether to apply in-episode constraint filters DURING TRAINING. Generation
     # always stays constrained (+ post-episode drop). CLI overrides the config;
     # default True = current behavior. Used for the constrain_training A/B test.
-    constrain_training = (
-        args.constrain_training
-        if args.constrain_training is not None
-        else bool(cfg.get("constrain_training", True))
-    )
+    constrain_training = cfg["constrain_training"]
     if not constrain_training:
         print("[INFO] constrain_training=False: in-episode constraint filtering is "
               "DISABLED during training (generation still constrained).", flush=True)
 
     step_dim     = env.n_components
-    fraction_set = list(env.fraction_set)
+    fraction_set = value_alphabet(env)
 
-    # Precompute Magpie element features (replaces one-hot element encoding).
+    # Labels retain identity; values use numeric or categorical features.
     elem_feats_scaled, _elem_scaler = _precompute_elem_features(
-        env.species_set, env.state_featurizer
+        env.species_set, env.state_featurizer, env=env
     )
     elem_dim = int(elem_feats_scaled.shape[1])
-    frac_dim = 1
+    frac_dim = fraction_set.feature_dim
 
-    print(f"[INFO] step_dim={step_dim}, elem_dim(Magpie)={elem_dim}, frac_dim={frac_dim}")
+    print(f"[INFO] step_dim={step_dim}, label_dim={elem_dim}, frac_dim={frac_dim}")
 
     metrics = RunMetrics()
 
     ckpt_path = os.path.join(args.out, "checkpoint.pt")
-    checkpoint_cfg = {"path": ckpt_path, "freq": args.save_checkpoint_freq} if args.save_checkpoint_freq > 0 else None
+    checkpoint_cfg = {"path": ckpt_path, "freq": args.save_checkpoint_freq,
+                      "execution_contract": run_contract}
+    if method != "dqn":
+        checkpoint_cfg.update(total_budget=cfg.get("train_budget") or cfg["pg_num_iters"] * cfg["pg_batch_eps"],
+                              total_iterations=cfg["pg_num_iters"])
 
     # Generation strategy (unified across DQN and PG).
-    gen_temperature = float(cfg.get("gen_temperature", 1.0))
-    gen_top_frac    = float(cfg.get("gen_top_frac", 0.0))
-    gen_epsilon_gen = float(cfg.get("gen_epsilon", 0.0))
+    gen_temperature = float(cfg["gen_temperature"])
+    gen_top_frac    = float(cfg["gen_top_frac"])
+    gen_epsilon_gen = float(cfg["gen_epsilon"])
 
     # Warn-and-ignore: augmentation only makes sense for off-policy DQN.
-    _aug_K_request = args.dqn_augment_permutations
-    if _aug_K_request is None:
-        _aug_K_request = int(cfg.get("dqn_augment_permutations", 0))
+    _aug_K_request = cfg["dqn_augment_permutations"]
     if method != "dqn" and int(_aug_K_request) > 0:
         print(
             f"[WARN] dqn_augment_permutations={_aug_K_request} is ignored for "
@@ -298,6 +333,7 @@ def _run_experiment(resources: ExitStack) -> None:
             if not os.path.exists(qnet_path):
                 raise SystemExit(f"--only-generate requires {qnet_path} (use --load-qnet to override)")
             scaler = joblib.load(scaler_path)
+            validate_scaler(scaler, env, scaler_path)
             state_dim = int(getattr(scaler, "n_features_in_", scaler.mean_.shape[0]))
             # NB: no local `from rl_matdesign.model import QRegressor` here. A local
             # import binds the name for the WHOLE of main(), shadowing the
@@ -307,22 +343,22 @@ def _run_experiment(resources: ExitStack) -> None:
             # from the SAME cfg default (256) as the training path below;
             # otherwise the QRegressor class default (128) is used and the saved
             # state_dict fails to load with a size mismatch.
-            _hidden = int(cfg.get("dqn_hidden_dim", 256))
+            _hidden = int(cfg["dqn_hidden_dim"])
             qnet = QRegressor(
                 state_dim=state_dim, step_dim=step_dim,
-                elem_dim=elem_dim, frac_dim=1, hidden_dim=_hidden,
+                elem_dim=elem_dim, frac_dim=frac_dim, hidden_dim=_hidden,
             ).to(device)
-            _raw = torch.load(qnet_path, map_location=device)
+            _raw = load_artifact(qnet_path, env, device=device, scaler=scaler)
             qnet.load_state_dict(_raw["qnet_state"] if isinstance(_raw, dict) and "qnet_state" in _raw else _raw)
             print(f"[INFO] Loaded qnet from {qnet_path}", flush=True)
         else:
             # Resolve hyperparameters early so resume + fresh paths share them.
-            _hidden       = int(cfg.get("dqn_hidden_dim", 256))
-            _lr_dqn       = float(cfg.get("dqn_lr", 1e-3))
-            _buf_size     = int(cfg.get("dqn_buffer_size", 50000))
-            _eps_anneal   = int(cfg.get("dqn_eps_anneal_eps", 10000))
-            _eps_min      = float(cfg.get("dqn_eps_min", 0.05))
-            _n_train_eps  = int(cfg.get("dqn_num_train_eps", 20000))
+            _hidden       = int(cfg["dqn_hidden_dim"])
+            _lr_dqn       = float(cfg["dqn_lr"])
+            _buf_size     = int(cfg["dqn_buffer_size"])
+            _eps_anneal   = int(cfg["dqn_eps_anneal_eps"])
+            _eps_min      = float(cfg["dqn_eps_min"])
+            _n_train_eps  = int(cfg["dqn_num_train_eps"])
 
             resume_state = None
             if args.resume_training:
@@ -331,12 +367,13 @@ def _run_experiment(resources: ExitStack) -> None:
                         f"--resume-training (dqn) requires {scaler_path} (use --load-scaler to override)"
                     )
                 scaler = joblib.load(scaler_path)
+                validate_scaler(scaler, env, scaler_path)
                 state_dim_loaded = int(getattr(scaler, "n_features_in_", scaler.mean_.shape[0]))
                 print(f"[INFO] Loaded scaler from {scaler_path}", flush=True)
 
                 qnet = QRegressor(
                     state_dim=state_dim_loaded, step_dim=step_dim,
-                    elem_dim=elem_dim, frac_dim=1, hidden_dim=_hidden,
+                    elem_dim=elem_dim, frac_dim=frac_dim, hidden_dim=_hidden,
                 ).to(device)
                 target_net = copy.deepcopy(qnet)
                 target_net.eval()
@@ -346,7 +383,7 @@ def _run_experiment(resources: ExitStack) -> None:
                 _resume_src = args.load_qnet if args.load_qnet else ckpt_path
                 _mid = None
                 if os.path.exists(_resume_src):
-                    _raw_ckpt = torch.load(_resume_src, map_location=device, weights_only=False)
+                    _raw_ckpt = load_artifact(_resume_src, env, device=device, checkpoint=True, scaler=scaler)
                     if (
                         isinstance(_raw_ckpt, dict)
                         and _raw_ckpt.get("type") == "dqn"
@@ -366,6 +403,10 @@ def _run_experiment(resources: ExitStack) -> None:
                 _predictor_cache = getattr(predictor, "_cache", None)
 
                 if _mid is not None:
+                    require_execution_contract(_mid.get("execution_contract"), run_contract)
+                    if _mid.get("rng_state") is None or _mid.get("predictor_ledger") is None:
+                        raise ValueError("Exact resume requires RNG state and predictor ledger")
+                    predictor.load_state_dict(_mid["predictor_ledger"])
                     qnet.load_state_dict(_mid["qnet_state"])
                     target_net.load_state_dict(_mid["target_net_state"])
                     optimizer.load_state_dict(_mid["opt_state"])
@@ -395,7 +436,7 @@ def _run_experiment(resources: ExitStack) -> None:
                             f"--resume-training (dqn) requires checkpoint.pt or {qnet_path} "
                             "(use --load-qnet to override)"
                         )
-                    _raw_q = torch.load(qnet_path, map_location=device)
+                    _raw_q = load_artifact(qnet_path, env, device=device, scaler=scaler)
                     qnet.load_state_dict(
                         _raw_q["qnet_state"] if isinstance(_raw_q, dict) and "qnet_state" in _raw_q else _raw_q
                     )
@@ -416,6 +457,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     "buffer": buffer,
                     "start_ep": start_ep,
                     "eps": eps_val,
+                    "rng_state": _mid.get("rng_state") if _mid else None,
                     "training_episodes_completed": (
                         _mid.get("training_episodes_completed", start_ep) if _mid else start_ep
                     ),
@@ -433,10 +475,8 @@ def _run_experiment(resources: ExitStack) -> None:
                 if _pcache is not None:
                     checkpoint_cfg["dp_cache"] = _pcache
 
-            _dqn_loss = args.dqn_loss or cfg.get("dqn_loss", "smoothl1")
-            _aug_K = args.dqn_augment_permutations
-            if _aug_K is None:
-                _aug_K = int(cfg.get("dqn_augment_permutations", 0))
+            _dqn_loss = cfg["dqn_loss"]
+            _aug_K = cfg["dqn_augment_permutations"]
             env.constraints_enabled = constrain_training  # toggle in-episode filter for training
             _t_train_start = time.perf_counter() - t_start
             with phases("train"):
@@ -445,15 +485,15 @@ def _run_experiment(resources: ExitStack) -> None:
                     elem_feats_scaled=elem_feats_scaled,
                     fraction_set=fraction_set,
                     device=device,
-                    n_warmup_eps=int(cfg.get("dqn_warmup_eps", cfg.get("pg_warmup_eps", 500))),
+                    n_warmup_eps=int(cfg["dqn_warmup_eps"]),
                     dqn_num_train_eps=_n_train_eps,
                     dqn_buffer_size=_buf_size,
-                    batch_size=int(cfg.get("dqn_batch_size", 256)),
-                    dqn_grad_steps_per_ep=int(cfg.get("dqn_grad_steps_per_ep", 5)),
-                    dqn_target_update_freq=int(cfg.get("dqn_target_update_freq", 100)),
+                    batch_size=int(cfg["dqn_batch_size"]),
+                    dqn_grad_steps_per_ep=int(cfg["dqn_grad_steps_per_ep"]),
+                    dqn_target_update_freq=int(cfg["dqn_target_update_freq"]),
                     dqn_eps_anneal_eps=_eps_anneal,
                     dqn_eps_min=_eps_min,
-                    gamma=float(cfg.get("dqn_gamma", cfg.get("gamma", 0.9))),
+                    gamma=float(cfg["dqn_gamma"]),
                     hidden_dim=_hidden,
                     lr=_lr_dqn,
                     loss_name=_dqn_loss,
@@ -464,11 +504,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     train_count_duplicates=train_count_duplicates,
                     train_max_duplicate_attempts=train_max_duplicate_attempts,
                     # --- BEGIN mc-target experiment (removable) ---
-                    dqn_target_mode=(
-                        args.dqn_target_mode
-                        if args.dqn_target_mode is not None
-                        else str(cfg.get("dqn_target_mode", "bootstrap"))
-                    ),
+                    dqn_target_mode=cfg["dqn_target_mode"],
                     # --- END mc-target experiment ---
                 )
             # DQN's warmup runs inside train_dqn_online, so split it back out of
@@ -484,19 +520,15 @@ def _run_experiment(resources: ExitStack) -> None:
 
             for r in train_rows:
                 metrics.log(**r)
-            torch.save(qnet.state_dict(), os.path.join(args.out, "qnet.pt"))
+            save_weights(os.path.join(args.out, "qnet.pt"), qnet, env, "qnet", scaler=scaler)
             joblib.dump(scaler, os.path.join(args.out, "std_scaler.bin"))
 
         if not args.skip_generation:
-            np.random.seed(gen_seed)
-            random.seed(gen_seed)
+            predictor.set_phase("generate")
+            set_global_seed(gen_seed, deterministic=True)
             env.constraints_enabled = True  # generation is always constrained
-            _n_exploit = int(cfg.get("num_gen_eps", 200))
-            _max_attempts = (
-                args.max_gen_attempts
-                if args.max_gen_attempts is not None
-                else int(cfg.get("max_gen_attempts", 10 * _n_exploit))
-            )
+            _n_exploit = int(cfg["num_gen_eps"])
+            _max_attempts = cfg["max_gen_attempts"]
             from rl_matdesign.registry import charge_check_enabled, charge_use_pauling
             with phases("generate"):
                 gen_rows = generate_candidates(
@@ -505,11 +537,11 @@ def _run_experiment(resources: ExitStack) -> None:
                     elem_feats_scaled=elem_feats_scaled,
                     fraction_set=fraction_set,
                     n_exploit=_n_exploit,
-                    n_explore=int(cfg.get("exploration_gen_eps", 0)),
+                    n_explore=int(cfg["exploration_gen_eps"]),
                     gen_temperature=gen_temperature,
                     gen_top_frac=gen_top_frac,
                     gen_epsilon=gen_epsilon_gen,
-                    k=float(cfg.get("k", 1.0)),
+                    k=float(cfg["k"]),
                     max_attempts=_max_attempts,
                     charge_filter=charge_check_enabled(cfg),
                     charge_use_pauling=charge_use_pauling(cfg),
@@ -521,16 +553,16 @@ def _run_experiment(resources: ExitStack) -> None:
     # PG paths (REINFORCE / A2C)
     # ------------------------------------------------------------------
     else:
-        pg_warmup            = int(cfg.get("pg_warmup_eps", 200))
-        pg_num_iters         = int(cfg.get("pg_num_iters", 1000))
-        pg_batch_eps         = int(cfg.get("pg_batch_eps", 15))
-        lr_actor             = float(cfg.get("pg_lr_actor", 1e-3))
-        lr_critic            = float(cfg.get("pg_lr_critic", 1e-3))
-        pg_entropy_coef         = float(cfg.get("pg_entropy_coef", 0.01))
-        pg_entropy_min          = float(cfg.get("pg_entropy_min", 0.3))
-        gamma                   = float(cfg.get("pg_gamma", cfg.get("gamma", 0.9)))
-        pg_repeat_penalty_coef  = float(cfg.get("pg_repeat_penalty_coef", 0.0))
-        pg_repeat_penalty_shape = cfg.get("pg_repeat_penalty_shape", "log")
+        pg_warmup            = int(cfg["pg_warmup_eps"])
+        pg_num_iters         = int(cfg["pg_num_iters"])
+        pg_batch_eps         = int(cfg["pg_batch_eps"])
+        lr_actor             = float(cfg["pg_lr_actor"])
+        lr_critic            = float(cfg["pg_lr_critic"])
+        pg_entropy_coef         = float(cfg["pg_entropy_coef"])
+        pg_entropy_min          = float(cfg["pg_entropy_min"])
+        gamma                   = float(cfg["pg_gamma"])
+        pg_repeat_penalty_coef  = float(cfg["pg_repeat_penalty_coef"])
+        pg_repeat_penalty_shape = cfg["pg_repeat_penalty_shape"]
 
         scaler_path  = args.load_scaler    or os.path.join(args.out, "std_scaler.bin")
         policy_path  = args.load_policy    or os.path.join(args.out, "policy.pt")
@@ -543,12 +575,13 @@ def _run_experiment(resources: ExitStack) -> None:
             if not os.path.exists(policy_path):
                 raise SystemExit(f"--only-generate requires {policy_path} (use --load-policy to override)")
             scaler = joblib.load(scaler_path)
+            validate_scaler(scaler, env, scaler_path)
             state_dim_loaded = int(getattr(scaler, "n_features_in_", scaler.mean_.shape[0]))
             policy = PolicyNet(
                 state_dim=state_dim_loaded, step_dim=step_dim,
                 elem_dim=elem_dim, frac_dim=frac_dim,
             ).to(device)
-            _raw = torch.load(policy_path, map_location=device)
+            _raw = load_artifact(policy_path, env, device=device, scaler=scaler)
             policy.load_state_dict(_raw["policy_state"] if isinstance(_raw, dict) and "policy_state" in _raw else _raw)
             print(f"[INFO] Loaded policy from {policy_path}", flush=True)
             value_net = None
@@ -557,6 +590,7 @@ def _run_experiment(resources: ExitStack) -> None:
             if not os.path.exists(scaler_path):
                 raise SystemExit(f"--resume-training requires {scaler_path} (use --load-scaler to override)")
             scaler = joblib.load(scaler_path)
+            validate_scaler(scaler, env, scaler_path)
             print(f"[INFO] Loaded scaler from {scaler_path}", flush=True)
             state_dim_loaded = int(getattr(scaler, "n_features_in_", scaler.mean_.shape[0]))
             policy = PolicyNet(
@@ -569,9 +603,13 @@ def _run_experiment(resources: ExitStack) -> None:
             _mid_ckpt = None
             _resume_src = args.load_policy if args.load_policy else ckpt_path_pg
             if os.path.exists(_resume_src):
-                _raw = torch.load(_resume_src, map_location=device)
+                _raw = load_artifact(_resume_src, env, device=device, checkpoint=True, scaler=scaler)
                 if isinstance(_raw, dict) and _raw.get("type") == "pg":
                     _mid_ckpt = _raw
+                    require_execution_contract(_raw.get("execution_contract"), run_contract)
+                    if _raw.get("rng_state") is None or _raw.get("predictor_ledger") is None:
+                        raise ValueError("Exact resume requires RNG state and predictor ledger")
+                    predictor.load_state_dict(_raw["predictor_ledger"])
                     policy.load_state_dict(_raw["policy_state"])
                     if value_net is not None and _raw.get("value_net_state") is not None:
                         value_net.load_state_dict(_raw["value_net_state"])
@@ -585,12 +623,12 @@ def _run_experiment(resources: ExitStack) -> None:
             if _mid_ckpt is None:
                 if not os.path.exists(policy_path):
                     raise SystemExit(f"--resume-training requires {policy_path} (use --load-policy to override)")
-                policy.load_state_dict(torch.load(policy_path, map_location=device))
+                policy.load_state_dict(load_artifact(policy_path, env, device=device, scaler=scaler)["policy_state"])
                 print(f"[INFO] Loaded policy from {policy_path}", flush=True)
                 if value_net is not None:
                     if not os.path.exists(vnet_path):
                         raise SystemExit(f"--resume-training (a2c) requires {vnet_path} (use --load-value-net to override)")
-                    value_net.load_state_dict(torch.load(vnet_path, map_location=device))
+                    value_net.load_state_dict(load_artifact(vnet_path, env, device=device, scaler=scaler)["value_net_state"])
                     print(f"[INFO] Loaded value_net from {vnet_path}", flush=True)
 
             # Build checkpoint_cfg with resume data so train_pg restores optimizer + visit_counts.
@@ -609,6 +647,10 @@ def _run_experiment(resources: ExitStack) -> None:
                 ),
                 "start_iteration": _mid_ckpt.get("iteration", 0) if _mid_ckpt else 0,
                 "is_resume": True,
+                "rng_state": _mid_ckpt.get("rng_state") if _mid_ckpt else None,
+                "execution_contract": run_contract,
+                "total_budget": cfg.get("train_budget") or cfg["pg_num_iters"] * cfg["pg_batch_eps"],
+                "total_iterations": cfg["pg_num_iters"],
             }
 
         else:
@@ -656,20 +698,16 @@ def _run_experiment(resources: ExitStack) -> None:
                 )
             for r in train_rows:
                 metrics.log(**r)
-            torch.save(policy.state_dict(), os.path.join(args.out, "policy.pt"))
+            save_weights(os.path.join(args.out, "policy.pt"), policy, env, "policy", scaler=scaler)
             if value_net is not None:
-                torch.save(value_net.state_dict(), os.path.join(args.out, "value_net.pt"))
+                save_weights(os.path.join(args.out, "value_net.pt"), value_net, env, "value_net", scaler=scaler)
 
         if not args.skip_generation:
-            np.random.seed(gen_seed)
-            random.seed(gen_seed)
+            predictor.set_phase("generate")
+            set_global_seed(gen_seed, deterministic=True)
             env.constraints_enabled = True  # generation is always constrained
-            _n_exploit = int(cfg.get("num_gen_eps", 200))
-            _max_attempts = (
-                args.max_gen_attempts
-                if args.max_gen_attempts is not None
-                else int(cfg.get("max_gen_attempts", 10 * _n_exploit))
-            )
+            _n_exploit = int(cfg["num_gen_eps"])
+            _max_attempts = cfg["max_gen_attempts"]
             from rl_matdesign.registry import charge_check_enabled, charge_use_pauling
             with phases("generate"):
                 gen_rows = generate_candidates(
@@ -678,11 +716,11 @@ def _run_experiment(resources: ExitStack) -> None:
                     elem_feats_scaled=elem_feats_scaled,
                     fraction_set=fraction_set,
                     n_exploit=_n_exploit,
-                    n_explore=int(cfg.get("exploration_gen_eps", 0)),
+                    n_explore=int(cfg["exploration_gen_eps"]),
                     gen_temperature=gen_temperature,
                     gen_top_frac=gen_top_frac,
                     gen_epsilon=gen_epsilon_gen,
-                    k=float(cfg.get("k", 1.0)),
+                    k=float(cfg["k"]),
                     max_attempts=_max_attempts,
                     charge_filter=charge_check_enabled(cfg),
                     charge_use_pauling=charge_use_pauling(cfg),
@@ -693,23 +731,16 @@ def _run_experiment(resources: ExitStack) -> None:
     # ------------------------------------------------------------------
     # Write outputs
     # ------------------------------------------------------------------
-    _log_path = os.path.join(args.out, "training_log.csv")
+    # Generating from a saved model must not erase its training evidence.
+    _log_name = "generation_log.csv" if args.only_generate else "training_log.csv"
+    _log_path = os.path.join(args.out, _log_name)
     _log_mode = "a" if args.resume_training else "w"
     metrics.to_csv(_log_path, mode=_log_mode)
     print(f"[INFO] Training log {'appended to' if _log_mode == 'a' else 'written to'} {_log_path}", flush=True)
 
-    gen_rows_only = sorted(
-        [r for r in metrics.rows if r.get("phase") == "generate"],
-        key=lambda r: float(r["reward"]),
-        reverse=True,
+    metrics.to_generated_csv(
+        os.path.join(args.out, "generated.csv"), columns=cfg.get("generated_columns"),
     )
-    if gen_rows_only:
-        import csv
-        fieldnames = [k for k in gen_rows_only[0].keys() if k != "phase"]
-        with open(os.path.join(args.out, "generated.csv"), "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(gen_rows_only)
 
     top10     = metrics.top_k("dp_mean", k=10, phase="generate")
     diversity = metrics.diversity(phase="generate")
@@ -731,13 +762,12 @@ def _run_experiment(resources: ExitStack) -> None:
         # mc is a DQN ablation, not a fourth method — record it alongside the
         # method so the comparison can label the arm DQN(bootstrap) / DQN(mc).
         "dqn_target_mode": (
-            (args.dqn_target_mode if args.dqn_target_mode is not None
-             else str(cfg.get("dqn_target_mode", "bootstrap")))
+            cfg["dqn_target_mode"]
             if method == "dqn" else None
         ),
         "config": args.config,
         "device": str(device),
-        "seeds": {"dp": args.dp_seed, "train": train_seed, "gen": gen_seed},
+        "seeds": {"eval": eval_seed, "train": train_seed, "gen": gen_seed},
         "resumed": bool(args.resume_training),
         "phases_s": dict(phases.totals),
         "total_s": round(_total_s, 4),
@@ -745,14 +775,16 @@ def _run_experiment(resources: ExitStack) -> None:
         # Everything that is NOT the reward model: rollouts, featurization,
         # gradient steps. This is the number that separates DQN's replay updates
         # from A2C's single batch update once predictor cost is factored out.
-        "overhead_s": round(_total_s - _pred["t_predict_s"], 4),
+        "overhead_s": round(_total_s - _pred["invocation_predict_s"], 4),
         "marks": predictor.marks,
     }
-    with open(os.path.join(args.out, "timing.json"), "w") as f:
+    timing_name = "generation_timing.json" if args.only_generate else "timing.json"
+    with open(os.path.join(args.out, timing_name), "w") as f:
         json.dump(timing, f, indent=2)
+    hit_rate = "unavailable" if _pred["cache_hit_rate"] is None else f"{_pred['cache_hit_rate']:.3f}"
     print(f"[TIMING] total={_total_s:.1f}s | predictor={_pred['t_predict_s']:.1f}s "
           f"({_pred['n_calls']} calls, {_pred['n_unique']} unique, "
-          f"hit_rate={_pred['cache_hit_rate']:.3f}) | "
+          f"hit_rate={hit_rate}) | "
           f"overhead={timing['overhead_s']:.1f}s")
     print(f"[INFO] Results saved to {args.out}")
 

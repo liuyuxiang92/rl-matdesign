@@ -4,22 +4,22 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from tests.test_cross_formula_predictor import RecordingBuilder, _candidate, _predictor
+from tests.test_cross_formula_predictor import enable_source_geo_opt, RecordingBuilder, _candidate, _predictor
 
 
 @pytest.mark.parametrize("mode", ["scalar", "batch", "batch_scalar_builder"])
 @pytest.mark.parametrize("shared", [True, False])
 def test_top_level_relaxation_drops_failed_configs_once_and_averages_survivors(mode, shared):
     predictor = _predictor(n_random_configs=4, share_structure=shared)
-    predictor.geo_opt_enabled = True
+    enable_source_geo_opt(predictor)
     relaxed = []
     scored = []
-    builders = ([predictor._shared_builder] if shared else list(predictor._builders.values()))
+    builders = ([predictor._source_builders["default"]] if shared else list(predictor._source_builders.values()))
     if mode == "batch_scalar_builder":
         for builder in builders:
-            builder.build_many = None
+            builder.build_many_seeded = None
 
-    def relax(cell):
+    def relax(cell, *, source_id):
         relaxed.append((cell.candidate, cell.index))
         if cell.candidate["Fe"] == 0.1 or cell.index < 2:
             raise RuntimeError("MD/optimizer failed or did not converge")
@@ -42,7 +42,7 @@ def test_top_level_relaxation_drops_failed_configs_once_and_averages_survivors(m
         result = results[1]
 
     # Each raw mean is (20+30)/2=25, with no denominator contribution from failures.
-    assert result == pytest.approx((2 * 25 - 25 / 5, 0.0))
+    assert result == pytest.approx((2 * 25 - 25 / 5, None))
     assert predictor.per_objective_stats(good) == {"benefit": (25.0, 0.0), "cost": (25.0, 0.0)}
     assert all(candidate == good and indices == [2, 3] for _, candidate, indices in scored)
     assert predictor._key(bad) not in predictor._stats_cache
@@ -79,8 +79,8 @@ def test_serial_external_md_builder_observes_strict_nonconvergence(mode, monkeyp
 
     builder.build = build
     if mode == "batch_scalar_builder":
-        builder.build_many = None
-    predictor._shared_builder = builder
+        builder.build_many_seeded = None
+    predictor._source_builders["default"] = builder
     seen = []
     predictor._score = lambda prop, cells: (seen.append([c.index for c in cells]) or 1.0, 0.0)
     candidate = _candidate(0.2)

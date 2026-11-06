@@ -63,6 +63,8 @@ class UnpickleableCalculator:
 class Builder:
     def __init__(self, cfg, *, seed=None):
         self.cfg = cfg
+        if cfg.get("test_no_sample_protocol"):
+            self.build_sample = None
         if cfg.get("test_preload_marker"):
             loaded = json.loads(Path(cfg["test_preload_marker"]).read_text())
             assert set(loaded) == {"delta", "pure"}, "parent models must load before builder"
@@ -79,6 +81,23 @@ class Builder:
 
     def composition_formula(self, candidate):
         return "H2"
+
+    def sample_plan(self, candidate, *, n_configs, source_spec, eval_seed):
+        from rl_matdesign.utils.structure_samples import sample_plan
+        if candidate.get("mode") == "plan_fail":
+            raise ValueError("sample plan failed for candidate")
+        templates = self.cfg.get("test_templates")
+        return sample_plan(candidate, n_configs=n_configs, source_spec=source_spec,
+                           eval_seed=eval_seed, templates=templates)
+
+    def build_sample(self, candidate, *, sample):
+        structures = self.build(candidate, n_configs=1, rng=np.random.default_rng(sample.seed))
+        if len(structures) != 1:
+            return structures  # Deliberately malformed capability for contract test.
+        atoms = structures[0]
+        atoms.positions[1, 0] = float(np.random.default_rng(sample.seed).random())
+        atoms.info["canonical_keys"] = list(candidate)
+        return atoms
 
     def build(self, candidate, *, n_configs=1, rng=None):
         if not self.cfg.get("test_track_execution"):
@@ -159,12 +178,12 @@ class Builder:
             pid=os.getpid(), device=self.device, call=self.calls, draw=value,
             candidate_id=candidate.get("id"),
             env={key: os.environ.get(key) for key in keys},
-            import_env={key: torch.IMPORT_ENV.get(key) for key in keys},
-            torch_threads=torch.THREADS,
+            import_env={key: getattr(torch, "IMPORT_ENV", {}).get(key) for key in keys},
+            torch_threads=getattr(torch, "THREADS", None),
         )
         if mode == "calculator":
             atoms.calc = UnpickleableCalculator()
-        return [atoms]
+        return [atoms, atoms.copy()] if self.cfg.get("test_expanded") else [atoms]
 '''
 
 
@@ -181,7 +200,9 @@ class DP(Calculator):
 
     def __init__(self, model, head=None, **kwargs):
         super().__init__(**kwargs)
-        with Path(model).open("a") as out:
+        # Keep the model asset immutable, as a real calculator does. Diagnostics
+        # belong in a separate sidecar, never in the checkpoint being validated.
+        with Path(model).with_suffix(".jsonl").open("a") as out:
             out.write(json.dumps({"pid": os.getpid(), "head": head,
                                   "device": os.environ["CUDA_VISIBLE_DEVICES"]}) + "\\n")
 
@@ -440,8 +461,10 @@ def test_attached_calculator_is_not_serialized(pool_factory):
 
 def test_optional_relaxation_runs_in_workers_and_reuses_calculators(pool_factory, tmp_path):
     calculator_log = tmp_path / "calculator_initializations.jsonl"
+    model_path = calculator_log.with_suffix(".pt")
+    model_path.write_bytes(b"fake DeepMD checkpoint")
     pool, _ = pool_factory(cfg_extra={"geo_opt": {
-        "model": str(calculator_log), "head": "perovskite", "relax_cell": False,
+        "model": str(model_path), "head": "perovskite", "relax_cell": False,
         "fmax": .01, "steps": 2,
     }})
     assert pool.handles_geo_opt is True
@@ -582,6 +605,8 @@ def test_predictor_builds_parallel_then_scores_gated_properties_and_closes(
 
     root = tmp_path / "predictor_builds"
     calculator_log = tmp_path / "predictor_calculators.jsonl"
+    model_path = calculator_log.with_suffix(".pt")
+    model_path.write_bytes(b"fake DeepMD checkpoint")
     preload_marker = tmp_path / "preloaded_models.json"
     cfg = {
         "builder": "parallel_test_builder:Builder",
@@ -590,7 +615,7 @@ def test_predictor_builds_parallel_then_scores_gated_properties_and_closes(
         "test_preload_marker": str(preload_marker),
         "n_random_configs": 5,
         "structure_parallel": {"devices": [0, 1], "workers_per_device": 1, "timeout_s": 15},
-        "geo_opt": {"model": str(calculator_log), "relax_cell": False, "steps": 2},
+        "geo_opt": {"model": str(model_path), "relax_cell": False, "steps": 2},
         "properties": [
             {"name": "delta", "predictor": "dp_property", "models": ["delta.pt"],
              "direction": "max", "objective": "mean", "weight": 1,
@@ -606,6 +631,22 @@ def test_predictor_builds_parallel_then_scores_gated_properties_and_closes(
             "failure": {"reward": -10},
         },
     }
+    if not share_structure:
+        # Independent ensembles are explicit named sources; the removed legacy
+        # boolean is no longer silently interpreted as a scientific choice.
+        common = {key: cfg.pop(key) for key in
+                  ("builder", "n_random_configs", "structure_parallel", "geo_opt")}
+        cfg.pop("share_structure")
+        cfg.pop("test_root")
+        cfg.pop("test_preload_marker")
+        cfg["structure_sources"] = {}
+        for prop in cfg["properties"]:
+            name = prop["name"]
+            cfg["structure_sources"][name] = {
+                **common, "test_root": prop.pop("test_root"),
+                "test_preload_marker": prop.pop("test_preload_marker"),
+            }
+            prop["source"] = name
     seen = {"delta": [], "pure": []}
 
     def evaluate(name, value):
@@ -626,16 +667,16 @@ def test_predictor_builds_parallel_then_scores_gated_properties_and_closes(
 
     monkeypatch.setattr(predictor, "_get_prop_models", load_models)
 
-    def forbidden_parent_relax(atoms):
+    def forbidden_parent_relax(atoms, *, source_id=None):
         raise AssertionError("parallel structures must not be optimized again in parent")
 
     monkeypatch.setattr(predictor, "_relax", forbidden_parent_relax)
     pids = set()
     try:
         candidate = {"A": {"H": 1.0}}
-        assert predictor.predict(candidate) == pytest.approx((5.0, 0.0))
-        assert predictor.predict(candidate) == pytest.approx((5.0, 0.0))
-        assert predictor.composition_formula(candidate) == "H2"
+        assert predictor.predict(candidate) == (5.0, None)
+        assert predictor.predict(candidate) == (5.0, None)
+        assert predictor.composition_formula(candidate) == ("H2" if share_structure else None)
         assert len(seen["delta"]) == len(seen["pure"]) == 1
         delta_atoms, pure_atoms = seen["delta"][0], seen["pure"][0]
         assert len(delta_atoms) == len(pure_atoms) == 5
@@ -680,13 +721,13 @@ def test_absent_parallel_config_preserves_serial_batch_and_relaxation(
                         "direction": "max", "objective": "mean"}],
     })
 
-    def relax(atoms):
+    def relax(atoms, *, source_id=None):
         relaxations.append(atoms)
         return atoms
 
     monkeypatch.setattr(predictor, "_relax", relax)
     monkeypatch.setattr(predictor, "_score", lambda prop, atoms: (float(len(atoms)), 0.0))
-    assert predictor.predict({"H": 1.0}) == (5.0, 0.0)
+    assert predictor.predict({"H": 1.0}) == (5.0, None)
     assert calls == [5]
     assert len(relaxations) == (5 if geo_opt_enabled else 0)
     predictor.close()
@@ -753,3 +794,145 @@ experiment.main()
                     os.killpg(pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
+
+
+def test_source_seeded_jobs_ignore_candidate_order_batching_and_worker_count(pool_factory):
+    from rl_matdesign.structure_sources import StructureSourceSpec
+    from rl_matdesign.utils.structure_samples import SAMPLE_INFO_KEY
+
+    source = StructureSourceSpec('native', {'builder': 'parallel_test_builder:Builder'})
+    first, _ = pool_factory(cfg_extra={'test_delays': {'3': .02}})
+    second, _ = pool_factory(parallel_extra={'devices': [0]})
+    a, b = {'id': 'a', 'value': 1}, {'id': 'b', 'value': 2}
+    kwargs = dict(n_configs=3, source_spec=source, eval_seed=23)
+    original = first.build_many_seeded([a, b], **kwargs)
+    reordered = second.build_many_seeded([b, dict(reversed(list(a.items())))], **kwargs)
+    scalar = first.build_seeded(a, **kwargs)
+
+    def values(cells):
+        return [(cell.info['draw'], cell.info[SAMPLE_INFO_KEY]) for cell in cells]
+    assert values(original[0]) == values(reordered[1]) == values(scalar)
+    assert values(original[1]) == values(reordered[0])
+    for cell in original[0]:
+        assert cell.info['draw'] == int(np.random.default_rng(cell.info[SAMPLE_INFO_KEY]['seed']).integers(0, 2**31))
+    assert [record['status'] for record in first.last_sample_records[0]] == ['succeeded'] * 3
+
+
+def test_substitute_source_plan_matches_real_serial_structures_on_one_and_two_workers(pool_factory):
+    from contextlib import ExitStack
+    from tests.test_seeded_substitute import _builder_and_source, signature
+    from rl_matdesign.utils.parallel_structures import ParallelStructureBuilder
+
+    # Install the child-only torch/CUDA shim, while building actual ASE structures.
+    unused, root = pool_factory()
+    root.mkdir(parents=True, exist_ok=True)
+    builder, source = _builder_and_source(root)
+    candidates = [{'Ni': .5, 'Co': .5}, {'Co': .3, 'Ni': .7}]
+    kwargs = dict(n_configs=3, source_spec=source, eval_seed=31)
+    serial = builder.build_many_seeded(candidates, **kwargs)
+    with ExitStack() as resources:
+        for devices in ([0], [0, 1]):
+            cfg = {**source.builder_config,
+                   'structure_parallel': {'devices': devices, 'timeout_s': 15, 'startup_timeout_s': 15}}
+            pool = ParallelStructureBuilder('substitute', cfg)
+            resources.callback(pool.close)
+            parallel = pool.build_many_seeded(list(reversed(candidates)), **kwargs)
+            assert signature(serial[0]) == signature(parallel[1])
+            assert signature(serial[1]) == signature(parallel[0])
+            assert [len(cells) for cells in parallel] == [5, 5]
+            assert [record['template_id']['index'] for record in pool.last_sample_records[0]] == [0, 0, 1, 1, 1]
+
+
+def test_seeded_partial_failure_preserves_failed_and_successful_sample_identity(pool_factory):
+    from rl_matdesign.structure_sources import StructureSourceSpec
+    from rl_matdesign.utils.structure_samples import SAMPLE_INFO_KEY
+
+    source = StructureSourceSpec('native', {'builder': 'parallel_test_builder:Builder'})
+    pool, _ = pool_factory()
+    cells = pool.build_seeded({'mode': 'one_fail'}, n_configs=2, source_spec=source, eval_seed=8)
+    assert len(cells) == 1
+    records = pool.last_sample_records[0]
+    assert [record['status'] for record in records] == ['failed', 'succeeded']
+    assert [record['sample_index'] for record in records] == [0, 1]
+    assert all(record['source_id'] == 'native' for record in records)
+    assert 'simulated MD failure' in records[0]['error']
+    assert cells[0].info[SAMPLE_INFO_KEY]['sample_index'] == 1
+
+
+def test_external_sample_protocol_rejects_expanded_result(pool_factory):
+    from rl_matdesign.structure_sources import StructureSourceSpec
+
+    source = StructureSourceSpec('native', {'builder': 'parallel_test_builder:Builder'})
+    pool, _ = pool_factory(cfg_extra={'test_expanded': True})
+    with pytest.raises(ValueError, match='exactly one ASE Atoms'):
+        pool.build_seeded({'id': 'a'}, n_configs=2, source_spec=source, eval_seed=8)
+    assert not pool._workers
+
+
+
+def test_seeded_external_without_capability_rejected_before_scientific_build(pool_factory):
+    from rl_matdesign.structure_sources import StructureSourceSpec
+    from rl_matdesign.utils.structure_samples import SamplingProtocolError
+
+    source = StructureSourceSpec('native', {'builder': 'parallel_test_builder:Builder'})
+    pool, root = pool_factory(cfg_extra={'test_no_sample_protocol': True})
+    with pytest.raises(SamplingProtocolError, match='explicit build_sample'):
+        pool.build_many_seeded([{'id': 'a'}, {'id': 'b'}], n_configs=2,
+                               source_spec=source, eval_seed=8)
+    assert not (root / 'build_calls.jsonl').exists()
+    assert not pool._workers
+    assert pool.last_sample_records == []
+    # The historical, explicitly caller-owned RNG entry point remains usable.
+    assert len(pool.build({'id': 'legacy'}, n_configs=1)) == 1
+
+
+@pytest.mark.parametrize('templates', [None, [
+    {'path': 'first', 'site_symbol': 'Fe', 'n_configs': 2},
+    {'path': 'second', 'site_symbol': 'Ni', 'n_configs': 3},
+]])
+def test_explicit_external_protocol_serial_parallel_scalar_batch_and_order_parity(pool_factory, templates):
+    import importlib
+    from rl_matdesign.structure_sources import StructureSourceSpec
+    from rl_matdesign.utils.structure_samples import execute_many_seeded_samples, SAMPLE_INFO_KEY
+
+    first, _ = pool_factory(cfg_extra={'test_templates': templates})
+    second, second_root = pool_factory(cfg_extra={'test_templates': templates},
+                                       parallel_extra={'devices': [0]})
+    module = importlib.import_module('parallel_test_builder')
+    serial = module.Builder({'test_root': str(second_root / 'serial'), 'test_templates': templates})
+    source = StructureSourceSpec('native', {'builder': 'parallel_test_builder:Builder',
+                                           'test_templates': templates})
+    kwargs = dict(n_configs=3, source_spec=source, eval_seed=17)
+    a, b = {'z': 2, 'id': 'a'}, {'id': 'b', 'z': 3}
+    original = execute_many_seeded_samples(serial, [a, b], **kwargs)
+    reversed_parallel = first.build_many_seeded([b, dict(reversed(list(a.items())))], **kwargs)
+    batched_parallel = second.build_many_seeded([a, b], **kwargs)
+    scalar = first.build_seeded(a, **kwargs)
+
+    def signature(cells):
+        return [(cell.get_chemical_symbols(), cell.positions.tolist(), cell.info['draw'],
+                 cell.info['canonical_keys'], cell.info[SAMPLE_INFO_KEY]) for cell in cells]
+    assert signature(original[0]) == signature(reversed_parallel[1]) == signature(batched_parallel[0]) == signature(scalar)
+    assert signature(original[1]) == signature(reversed_parallel[0]) == signature(batched_parallel[1])
+    assert len(original[0]) == (3 if templates is None else 5)
+    assert serial.last_sample_records[0] == first.last_sample_records[0]
+
+
+def test_seeded_parallel_plan_failure_preserves_neighbor_results_and_diagnostics(pool_factory):
+    from rl_matdesign.structure_sources import StructureSourceSpec
+
+    pool, root = pool_factory()
+    source = StructureSourceSpec('native', {'builder': 'parallel_test_builder:Builder'})
+    result = pool.build_many_seeded([{'id': 'a'}, {'mode': 'plan_fail'}, {'id': 'c'}],
+                                    n_configs=2, source_spec=source, eval_seed=9)
+    assert [len(result[0]), len(result[2])] == [2, 2]
+    assert isinstance(result[1], RuntimeError)
+    assert 'sample plan failed' in str(result[1])
+    assert pool.last_sample_records[1][0]['status'] == 'plan_failed'
+    assert 'sample_index' not in pool.last_sample_records[1][0]
+    assert [row['config_attempted'] for row in pool.last_build_timings] == [2, 0, 2]
+    assert len((root / 'build_calls.jsonl').read_text().splitlines()) == 4
+    failed = pool.build_many_seeded([{'mode': 'plan_fail'}], n_configs=2,
+                                   source_spec=source, eval_seed=9)
+    assert isinstance(failed[0], RuntimeError)
+    assert pool.last_sample_records[0][0]['status'] == 'plan_failed'

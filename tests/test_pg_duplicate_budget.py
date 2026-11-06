@@ -64,7 +64,7 @@ def _setup(monkeypatch, sequence, *, method="reinforce"):
     value_net = _Value() if method == "a2c" else None
     kwargs = dict(
         policy=policy, value_net=value_net, env=env,
-        scaler=StandardScaler().fit([[0.0], [1.0]]),
+        scaler=StandardScaler().fit([env.current_state_features()]),
         elem_feats_scaled=np.eye(4), fraction_set=["1.00"],
         device=torch.device("cpu"), num_iters=2, batch_eps=2,
         pg_repeat_penalty_coef=0.2, rl_method=method,

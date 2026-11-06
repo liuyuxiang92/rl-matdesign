@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import json
 
 import pytest
 
@@ -24,7 +25,7 @@ def _fail_during_env_setup(monkeypatch, tmp_path, predictor, error):
         "run_experiment.py", "--config", "unused.yaml",
         "--out", str(tmp_path / "run"), "--device", "cpu",
     ])
-    monkeypatch.setattr(experiment, "load_config", lambda path: {})
+    monkeypatch.setattr(experiment, "load_yaml_config", lambda path: {})
     monkeypatch.setattr(experiment, "set_global_seed", lambda *a, **k: None)
     monkeypatch.setattr(
         experiment, "build_predictor", lambda cfg, seed: predictor,
@@ -66,3 +67,18 @@ def test_cleanup_failure_preserves_original_keyboard_interrupt(
     assert caught.value is error
     assert predictor.close_calls == 1
     assert "predictor.close() failed: RuntimeError: cleanup failed" in capsys.readouterr().out
+
+
+def test_actual_source_identity_persisted_before_environment_setup(monkeypatch, tmp_path):
+    predictor = _ClosablePredictor()
+    identity = {"eval_seed": 42, "sources": [{"source_id": "resolved_source"}]}
+    predictor.source_identity = lambda: identity
+    _fail_during_env_setup(monkeypatch, tmp_path, predictor, ValueError("after source load"))
+    for _ in range(2):
+        predictor.close_calls = 0
+        with pytest.raises(ValueError, match="after source load"):
+            experiment.main()
+    evidence = list((tmp_path / "run" / "provenance").glob("*/source_identity.json"))
+    assert len(evidence) == 2
+    assert all(json.loads(path.read_text()) == identity for path in evidence)
+    assert predictor.close_calls == 1

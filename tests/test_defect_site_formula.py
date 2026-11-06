@@ -137,12 +137,16 @@ def test_generation_exports_full_formula_through_predictor(
     import rl_matdesign.constraints.charge as charge
     from rl_matdesign.predictors.structure_score import StructureScorePredictor
 
-    predictor = StructureScorePredictor({
+    cfg = {
         "builder": "defect_site", "base_poscar": _template(tmp_path),
         "share_structure": share_structure, "n_random_configs": 2,
         "properties": [{"name": "delta", "predictor": "dp_property", "models": ["unused"],
                         "direction": "max", "objective": "mean"}],
-    })
+    }
+    if not share_structure:
+        from tests.test_cross_formula_predictor import independent_source_config
+        cfg = independent_source_config(cfg)
+    predictor = StructureScorePredictor(cfg)
     scored = []
 
     def score(prop, structures, **kwargs):

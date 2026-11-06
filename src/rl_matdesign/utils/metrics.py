@@ -12,6 +12,22 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+def validate_generated_columns(columns: Any) -> Optional[Dict[str, str]]:
+    """Validate an optional ordered output-name to recorded-field mapping."""
+    if columns is None:
+        return None
+    if not isinstance(columns, dict) or not columns:
+        raise ValueError("generated_columns must be a non-empty mapping of output names to source fields")
+    if any(
+        not isinstance(name, str) or not name or name != name.strip()
+        for pair in columns.items() for name in pair
+    ):
+        raise ValueError("generated_columns names and source fields must be non-empty strings without surrounding whitespace")
+    if any(columns.get(name) != name for name in ("formula", "reward")):
+        raise ValueError("generated_columns must preserve formula: formula and reward: reward")
+    return dict(columns)
+
+
 @dataclass
 class RunMetrics:
     """Collect per-episode / per-step metrics and compute summaries.
@@ -71,6 +87,40 @@ class RunMetrics:
             if write_header:
                 writer.writeheader()
             writer.writerows(self.rows)
+
+    def to_generated_csv(
+        self, path: str | Path, columns: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Export ranked candidates without changing the full metrics log.
+
+        A mapping selects and renames recorded fields in its declared order.
+        Validate every row before opening the destination, so missing metadata
+        cannot silently replace a previous result with incomplete data.
+        """
+        columns = validate_generated_columns(columns)
+        rows = sorted(
+            [row for row in self.rows if row.get("phase") == "generate"],
+            key=lambda row: float(row["reward"]), reverse=True,
+        )
+        if not rows:
+            return
+        if columns is None:
+            # Optional diagnostics may only occur on a later candidate. Deriving
+            # the header from the best row would silently discard those fields.
+            fieldnames = list(dict.fromkeys(
+                name for row in rows for name in row if name != "phase"
+            ))
+        else:
+            for index, row in enumerate(rows, start=1):
+                missing = [source for source in columns.values() if source not in row]
+                if missing:
+                    raise ValueError(f"generated_columns references missing source fields in row {index}: {missing}")
+            fieldnames = list(columns)
+            rows = [{name: row[source] for name, source in columns.items()} for row in rows]
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
 
     # ------------------------------------------------------------------
     # Summary statistics

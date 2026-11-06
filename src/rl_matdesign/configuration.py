@@ -1,63 +1,47 @@
 """Shared YAML loading and environment construction for RL and baselines."""
 from __future__ import annotations
 
+from collections.abc import Mapping
+from copy import deepcopy
 import math
 import re
 import time
 import warnings
 
-import yaml
-
 from .env import CompositionEnv
-from .env_integer import IntegerRatioEnv
+from .env_integer import IntegerRatioEnv, normalize_integer_group_spec
 from .utils.episode_batch import CandidateEvaluationFailed, supports_partial_batch_prediction
-
-
-# Old YAML key → new YAML key. Old keys still work but emit a one-time
-# deprecation warning. Conventions:
-#   dqn_*  → used only by train_dqn_online
-#   pg_*   → used only by train_pg (REINFORCE / A2C)
-#   (no prefix) → shared across both methods
-_FLAG_ALIASES = {
-    "buffer_size":          "dqn_buffer_size",
-    "num_train_eps":        "dqn_num_train_eps",
-    "grad_steps_per_ep":    "dqn_grad_steps_per_ep",
-    "target_update_freq":   "dqn_target_update_freq",
-    "eps_anneal_eps":       "dqn_eps_anneal_eps",
-    "eps_min":              "dqn_eps_min",
-    "entropy_coef":         "pg_entropy_coef",
-    "repeat_penalty_coef":  "pg_repeat_penalty_coef",
-    "repeat_penalty_shape": "pg_repeat_penalty_shape",
-}
+from .utils.rollout_errors import EvaluationProtocolError
+from .config_schema import (
+    ALIASES as _FLAG_ALIASES,
+    load_yaml_config,
+    normalize_aliases,
+    validate_config,
+)
 
 
 def _apply_flag_aliases(cfg: dict) -> dict:
-    """Map deprecated flag names to their new prefixed forms.
-
-    If both old and new appear, the new value wins and a warning is emitted.
-    """
-    for old, new in _FLAG_ALIASES.items():
-        if old in cfg:
-            if new in cfg:
-                warnings.warn(
-                    f"Config key '{old}' is deprecated (renamed to '{new}'); "
-                    f"both keys are present — using '{new}' and ignoring '{old}'.",
-                    DeprecationWarning, stacklevel=2,
-                )
-            else:
-                warnings.warn(
-                    f"Config key '{old}' is deprecated; rename to '{new}'.",
-                    DeprecationWarning, stacklevel=2,
-                )
-                cfg[new] = cfg[old]
-            del cfg[old]
-    return cfg
+    """Compatibility import for the shared, non-mutating alias normalizer."""
+    return normalize_aliases(cfg)
 
 
 def load_config(path: str) -> dict:
-    with open(path) as f:
-        cfg = yaml.safe_load(f)
-    return _apply_flag_aliases(cfg)
+    """Read and validate authored settings without materializing defaults."""
+    cfg = normalize_aliases(load_yaml_config(path))
+    validate_config(cfg)
+    if "generated_columns" in cfg:
+        from .utils.metrics import validate_generated_columns
+        validate_generated_columns(cfg["generated_columns"])
+    return _normalize_integer_domains(cfg)
+
+
+def _normalize_integer_domains(cfg: dict) -> dict:
+    """Resolve known legacy domain declarations before recording run settings."""
+    if "groups" not in cfg:
+        return cfg
+    return {**cfg, "groups": [normalize_integer_group_spec(group)
+                              if group.get("kind") == "integer" else group
+                              for group in cfg["groups"]]}
 
 
 # ---------------------------------------------------------------------------
@@ -98,10 +82,12 @@ class _TerminalReward:
         self.anion_formula = anion_formula
         self.last_evaluation_timings = []
         self.last_evaluation_wall_s = 0.0
+        self.last_predictions = []
 
     def reset_evaluation_timing(self):
         self.last_evaluation_timings = []
         self.last_evaluation_wall_s = 0.0
+        self.last_predictions = []
 
     def _prediction_timings(self, count):
         rows = getattr(self.predictor, "last_evaluation_timings", None)
@@ -114,6 +100,8 @@ class _TerminalReward:
         return size() if callable(size) else 1
 
     def _candidate(self, payload):
+        if isinstance(payload, Mapping):
+            return deepcopy(payload)
         if self.env_type == "multi_group":
             return payload
         if self.env_type == "integer_ratio":
@@ -154,18 +142,28 @@ class _TerminalReward:
             self.last_evaluation_wall_s = time.perf_counter() - started
             return _FAILED_CANDIDATE_REWARD
         try:
-            return self._mean(self.predictor.predict(candidate))
+            result = self.predictor.predict(candidate)
+            mean = self._mean(result)
+            self.last_predictions = [tuple(result)]
+            return mean
+        except EvaluationProtocolError:
+            raise
         except Exception as exc:
             raise self._failure(payload, exc) from exc
         finally:
             self.last_evaluation_wall_s = time.perf_counter() - started
             self.last_evaluation_timings = self._prediction_timings(1)
 
+    def evaluate_candidate(self, candidate) -> float:
+        """Evaluate the environment's canonical mapping without formula parsing."""
+        return self(candidate)
+
     def evaluate_many(self, payloads) -> list:
         self.reset_evaluation_timing()
         started = time.perf_counter()
         self.last_evaluation_timings = [{} for _ in payloads]
         results = [_FAILED_CANDIDATE_REWARD] * len(payloads)
+        self.last_predictions = [None] * len(payloads)
         candidates, indices = [], []
         for index, payload in enumerate(payloads):
             candidate = self._candidate(payload)
@@ -179,10 +177,12 @@ class _TerminalReward:
         if supports_partial_batch_prediction(self.predictor):
             try:
                 predicted = list(batch_fn(candidates, return_exceptions=True))
+            except EvaluationProtocolError:
+                raise
             except Exception as exc:
                 predicted = [exc] * len(candidates)
             if len(predicted) != len(candidates):
-                raise RuntimeError("predictor.batch_predict returned the wrong number of results")
+                raise EvaluationProtocolError("predictor.batch_predict returned the wrong number of results")
             timings = self._prediction_timings(len(candidates))
         else:
             # A legacy plug-in need only implement predict; do not assume it
@@ -192,6 +192,8 @@ class _TerminalReward:
             for candidate in candidates:
                 try:
                     predicted.append(self.predictor.predict(candidate))
+                except EvaluationProtocolError:
+                    raise
                 except Exception as exc:
                     predicted.append(exc)
                 timings.extend(self._prediction_timings(1))
@@ -202,6 +204,9 @@ class _TerminalReward:
                 if isinstance(result, Exception):
                     raise result
                 results[index] = self._mean(result)
+                self.last_predictions[index] = tuple(result)
+            except EvaluationProtocolError:
+                raise
             except Exception as exc:
                 results[index] = self._failure(payloads[index], exc)
         self.last_evaluation_wall_s = time.perf_counter() - started
@@ -224,11 +229,15 @@ def build_env(cfg: dict, predictor):
     params are merged in). The returned env already has its ``phase_filter``
     attached (per-group for ``multi_group``).
     """
+    cfg = _normalize_integer_domains(cfg)
+    if "generated_columns" in cfg:
+        from .utils.metrics import validate_generated_columns
+        validate_generated_columns(cfg["generated_columns"])
     if not cfg.get("groups"):
         raise ValueError(
             "Config has no 'groups:' — every scenario is expressed as one or "
             "more sublattice groups now (kind: composition / categorical / "
-            "integer). See CLAUDE.md's proposed schema / any configs/*.yaml "
+            "integer / sequence). See any configs/*.yaml "
             "for examples."
         )
 
@@ -266,9 +275,10 @@ def build_env(cfg: dict, predictor):
         env = IntegerRatioEnv(
             species_set=flat_cfg["species_set"],
             ratio_set=flat_cfg["ratio_set"],
-            n_components=int(flat_cfg.get("n_components", 5)),
+            n_components=flat_cfg.get("n_components", 5),
             reward_fn=reward_fn,
             phase_filter=None,
+            token_requirements=flat_cfg.get("token_requirements"),
         )
     elif env_type == "multi_group":
         from rl_matdesign.env_multigroup import MultiGroupEnv
@@ -279,6 +289,26 @@ def build_env(cfg: dict, predictor):
         built_groups = []
         for g in groups:
             gspec = normalize_group_spec(g)
+            if gspec.get("kind") == "sequence":
+                # Retained parent IDs belong to the predictor's chemical
+                # universe but never silently become replacement actions.
+                from .sequence import _token_list
+                tokens = _token_list(gspec.get("tokens"), label="sequence tokens")
+                parent = (_token_list(gspec["parent"], label="sequence parent", unique=False)
+                          if "parent" in gspec else [])
+                hook = getattr(predictor, "sequence_constraints", None)
+                if callable(hook):
+                    inferred = hook(gspec.get("name", ""), list(dict.fromkeys(tokens + parent)))
+                    if not isinstance(inferred, list) or any(not isinstance(bound, dict) for bound in inferred):
+                        raise ValueError("sequence_constraints must return a list of count-constraint mappings")
+                    configured = gspec.get("count_constraints", [])
+                    if not isinstance(configured, list):
+                        raise ValueError("count_constraints must be a list")
+                    bounds = deepcopy(configured)
+                    for bound in inferred:
+                        if bound not in bounds:
+                            bounds.append(deepcopy(bound))
+                    gspec["count_constraints"] = bounds
             gspec["constraint_filter"] = build_constraint_filter(gspec, env=None)
             built_groups.append(gspec)
         env = MultiGroupEnv(groups=built_groups, reward_fn=reward_fn)
@@ -287,10 +317,10 @@ def build_env(cfg: dict, predictor):
             species_set=flat_cfg["species_set"],
             fraction_set=flat_cfg["fraction_set"],
             anion_formula=flat_cfg.get("anion_formula", ""),
-            n_components=int(flat_cfg.get("n_components", 5)),
+            n_components=flat_cfg.get("n_components", 5),
             reward_fn=reward_fn,
             phase_filter=None,
-            total_units=int(flat_cfg["total_units"]),
+            total_units=flat_cfg["total_units"],
             element_bounds=flat_cfg.get("element_bounds"),
             episode_style=flat_cfg.get("episode_style", "element_then_amount"),
         )
@@ -301,5 +331,23 @@ def build_env(cfg: dict, predictor):
     # (so the group's own filters: entries are preserved).
     if env_type != "multi_group":
         env.phase_filter = build_constraint_filter(flat_cfg, env=env)
+        from .action_encoding import ValueSpec
+        env.value_specs = [ValueSpec(float(value), "numeric") for value in env.fraction_set]
 
+    # Keep declarative design constraints in artifact compatibility checks;
+    # mutable filter caches and RNG state are not part of this contract.
+    env.design_spec = {
+        key: deepcopy(cfg[key]) for key in (
+            "groups", "filters", "anion_formula", "episode_style",
+            "scaffold_formula", "scaffold_poscar", "scaffold_site_symbol",
+            "site_symbol", "constrain_training",
+        ) if key in cfg
+    }
+    if env_type == "multi_group":
+        # Include predictor-supplied intrinsic bounds in checkpoint contracts;
+        # transient filter objects and caches must never enter serialization.
+        env.design_spec["groups"] = [
+            {key: deepcopy(value) for key, value in group.items() if key != "constraint_filter"}
+            for group in built_groups
+        ]
     return env, env_type, flat_cfg

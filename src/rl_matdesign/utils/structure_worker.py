@@ -35,7 +35,8 @@ def main(fd: int) -> None:
             geo_opt = cfg.get("geo_opt") or {}
             geo_enabled = bool(geo_opt) and bool(geo_opt.get("enabled", True))
             geo_calc = None
-            connection.send({"ok": True})
+            connection.send({"ok": True,
+                             "sample_protocol": callable(getattr(builder, "build_sample", None))})
         except Exception:
             connection.send({"ok": False, "error": traceback.format_exc()})
             return
@@ -55,18 +56,33 @@ def main(fd: int) -> None:
                     formula = fn(task["candidate"]) if callable(fn) else None
                     connection.send({"ok": True, "formula": formula})
                     continue
+                from rl_matdesign.utils.structure_samples import (
+                    attach_sample_identity, execute_structure_sample, resolve_sample_plan,
+                )
+                if task["op"] == "plan":
+                    samples = resolve_sample_plan(builder, task["candidate"],
+                                                  n_configs=task["n_configs"],
+                                                  source_spec=task["source_spec"],
+                                                  eval_seed=task["eval_seed"])
+                    connection.send({"ok": True, "samples": samples})
+                    continue
                 started = time.perf_counter()
                 from rl_matdesign.utils.structure import strict_relaxation_errors
 
                 with capture_stage_times() as stage_times, strict_relaxation_errors():
-                    atoms_list = builder.build(
-                        task["candidate"], n_configs=1, rng=np.random.default_rng(task["seed"])
-                    )
+                    sample = task.get("sample")
+                    if sample is not None:
+                        atoms_list = [execute_structure_sample(builder, task["candidate"], sample=sample)]
+                    else:
+                        atoms_list = builder.build(
+                            task["candidate"], n_configs=1, rng=np.random.default_rng(task["seed"])
+                        )
                     if len(atoms_list) != 1:
                         raise ValueError(
                             "structure_parallel requires a builder returning exactly one "
                             f"structure for n_configs=1; got {len(atoms_list)}. "
-                            "Multi-template/expanded ensembles must use the serial path."
+                            "Expanded ensembles require an explicit template/sample protocol "
+                            "(supported by the built-in substitute builder), or the native serial path."
                         )
                     atoms = atoms_list[0]
                     if geo_enabled:
@@ -81,13 +97,17 @@ def main(fd: int) -> None:
                             steps=int(geo_opt.get("steps", 1000)),
                             relax_cell=bool(geo_opt.get("relax_cell", True)),
                         )
+                    if sample is not None:
+                        attach_sample_identity(atoms, sample)
                 # ASE copy drops the calculator. Do not serialize a live DeepMD
                 # model/CUDA allocation or move it back into the parent process.
                 detached = atoms.copy()
                 detached.calc = None
                 reply = {"ok": True, "atoms": detached}
-            except Exception:
-                reply = {"ok": False, "error": traceback.format_exc()}
+            except Exception as exc:
+                from rl_matdesign.utils.rollout_errors import EvaluationProtocolError
+                reply = {"ok": False, "error": traceback.format_exc(),
+                         "sampling_protocol_error": isinstance(exc, EvaluationProtocolError)}
             if stage_times is not None:
                 supported = getattr(builder, "timing_stages", ()) or ()
                 supported = [supported] if isinstance(supported, str) else list(supported)

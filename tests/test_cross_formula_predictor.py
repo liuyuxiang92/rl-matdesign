@@ -22,12 +22,14 @@ class RecordingBuilder:
             raise RuntimeError(f"build failed for {candidate['Fe']}")
         return [SimpleNamespace(candidate=candidate, index=i) for i in range(n_configs)]
 
-    def build_many(self, candidates, *, n_configs, rng):
+    def build_many_seeded(self, candidates, *, n_configs, source_spec, eval_seed):
+        import numpy as np
         self.waves.append(list(candidates))
         results = []
         for candidate in candidates:
             try:
-                results.append(self.build(candidate, n_configs=n_configs, rng=rng))
+                results.append(self.build(candidate, n_configs=n_configs, rng=np.random.default_rng(
+                    source_spec.seed_for(candidate, eval_seed=eval_seed))))
             except Exception as exc:
                 results.append(exc)
         return results
@@ -53,12 +55,15 @@ def _config(**overrides):
 
 
 def _predictor(**overrides):
-    predictor = StructureScorePredictor(_config(**overrides), seed=17)
+    cfg = _config(**overrides)
+    if cfg.get("share_structure") is False:
+        cfg = independent_source_config(cfg)
+    predictor = StructureScorePredictor(cfg, seed=17)
     builder = RecordingBuilder()
-    if predictor.share_structure:
-        predictor._shared_builder = builder
+    if len(predictor.source_plan.sources) == 1:
+        predictor._source_builders["default"] = builder
     else:
-        predictor._builders = {prop["name"]: RecordingBuilder()
+        predictor._source_builders = {prop["name"]: RecordingBuilder()
                                for prop in predictor.properties}
     predictor._score = lambda prop, structures: (
         float(structures[0].candidate["Fe"]) * (10 if prop["name"] == "benefit" else 5),
@@ -73,12 +78,12 @@ def _candidate(value):
 
 def test_batch_coalesces_duplicates_and_cache_hits_preserving_input_order():
     predictor = _predictor()
-    builder = predictor._shared_builder
+    builder = predictor._source_builders["default"]
     first, second, cached = map(_candidate, [0.1, 0.2, 0.3])
     cached_result = predictor.predict(cached)
     results = predictor.batch_predict([second, cached, first, second.copy()])
 
-    assert results == pytest.approx([(2.8, 0.25), cached_result, (0.9, 0.25), (2.8, 0.25)])
+    assert results == pytest.approx([(2.8, None), cached_result, (0.9, None), (2.8, None)])
     assert builder.waves == [[second, first]]
     assert builder.calls == [(cached, 2), (second, 2), (first, 2)]
     assert predictor.batch_predict([first, second, cached]) == [results[2], results[0], cached_result]
@@ -96,7 +101,7 @@ def test_shared_batch_builds_once_and_passes_same_structures_to_each_property():
     predictor._score = score
     candidates = [_candidate(0.1), _candidate(0.2)]
     predictor.batch_predict(candidates)
-    assert predictor._shared_builder.waves == [candidates]
+    assert predictor._source_builders["default"].waves == [candidates]
     assert [name for name, _ in seen] == ["benefit", "cost", "benefit", "cost"]
     assert seen[0][1] is seen[1][1]
     assert seen[2][1] is seen[3][1]
@@ -109,41 +114,41 @@ def test_independent_properties_batch_build_with_their_own_config_counts():
     predictor = _predictor(**cfg)
     candidates = [_candidate(0.1), _candidate(0.2)]
     results = predictor.batch_predict(candidates)
-    assert results == pytest.approx([(0.9, 0.25), (2.8, 0.25)])
+    assert results == pytest.approx([(0.9, None), (2.8, None)])
     for name, count in [("benefit", 3), ("cost", 2)]:
-        assert predictor._builders[name].waves == [candidates]
-        assert predictor._builders[name].calls == [(c, count) for c in candidates]
+        assert predictor._source_builders[name].waves == [candidates]
+        assert predictor._source_builders[name].calls == [(c, count) for c in candidates]
 
 
 @pytest.mark.parametrize("shared", [True, False])
 def test_failed_formula_does_not_discard_neighbors_or_enter_cache(shared):
     predictor = _predictor(share_structure=shared)
     bad, good = _candidate(0.1), _candidate(0.2)
-    builder = predictor._shared_builder if shared else predictor._builders["benefit"]
+    builder = predictor._source_builders["default"] if shared else predictor._source_builders["benefit"]
     builder.failures.add(0.1)
     results = predictor.batch_predict([bad, good, bad.copy()], return_exceptions=True)
 
     assert isinstance(results[0], RuntimeError)
     assert results[0] is results[2]
-    assert results[1] == pytest.approx((2.8, 0.25))
+    assert results[1] == pytest.approx((2.8, None))
     assert predictor._key(bad) not in predictor._stats_cache
     assert predictor._key(bad) not in predictor._batch_stats
     assert predictor._key(good) in predictor._stats_cache
     if not shared:
-        assert predictor._builders["cost"].waves == [[good]]
+        assert predictor._source_builders["cost"].waves == [[good]]
     builder.failures.clear()
-    assert predictor.batch_predict([bad, good]) == pytest.approx([(0.9, 0.25), (2.8, 0.25)])
+    assert predictor.batch_predict([bad, good]) == pytest.approx([(0.9, None), (2.8, None)])
     assert builder.waves == [[bad, good], [bad]]
 
 
 def test_scalar_builder_fallback_also_isolates_formula_errors():
     predictor = _predictor()
     builder = RecordingBuilder(failures={0.1})
-    predictor._shared_builder = SimpleNamespace(build=builder.build)
+    predictor._source_builders["default"] = SimpleNamespace(build=builder.build)
     bad, good = _candidate(0.1), _candidate(0.2)
     results = predictor.batch_predict([bad, good], return_exceptions=True)
     assert isinstance(results[0], RuntimeError)
-    assert results[1] == pytest.approx((2.8, 0.25))
+    assert results[1] == pytest.approx((2.8, None))
     assert builder.calls == [(bad, 2), (good, 2)]
 
 
@@ -160,12 +165,12 @@ def test_scoring_failure_does_not_cache_partial_property_results():
     predictor._score = failing_score
     results = predictor.batch_predict([bad, good], return_exceptions=True)
     assert isinstance(results[0], ValueError)
-    assert results[1] == pytest.approx((2.8, 0.25))
+    assert results[1] == pytest.approx((2.8, None))
     assert predictor._key(bad) not in predictor._stats_cache
     assert predictor._key(bad) not in predictor._batch_stats
     predictor._score = original_score
-    assert predictor.batch_predict([bad])[0] == pytest.approx((0.9, 0.25))
-    assert predictor._shared_builder.waves == [[bad, good], [bad]]
+    assert predictor.batch_predict([bad])[0] == pytest.approx((0.9, None))
+    assert predictor._source_builders["default"].waves == [[bad, good], [bad]]
 
 
 def test_nonfinite_reward_is_rejected_without_caching_its_statistics():
@@ -178,7 +183,7 @@ def test_nonfinite_reward_is_rejected_without_caching_its_statistics():
     )
     results = predictor.batch_predict([bad, good], return_exceptions=True)
     assert isinstance(results[0], ValueError)
-    assert results[1] == pytest.approx((2.8, 0.25))
+    assert results[1] == pytest.approx((2.8, None))
     assert predictor._key(bad) not in predictor._stats_cache
     assert predictor._key(bad) not in predictor._batch_stats
 
@@ -186,11 +191,11 @@ def test_nonfinite_reward_is_rejected_without_caching_its_statistics():
 def test_default_error_mode_raises_but_keeps_successful_neighbor_result():
     predictor = _predictor()
     bad, good = _candidate(0.1), _candidate(0.2)
-    predictor._shared_builder.failures.add(0.1)
+    predictor._source_builders["default"].failures.add(0.1)
     with pytest.raises(RuntimeError, match="build failed"):
         predictor.batch_predict([bad, good])
-    assert predictor.predict(good) == pytest.approx((2.8, 0.25))
-    assert len(predictor._shared_builder.calls) == 2
+    assert predictor.predict(good) == pytest.approx((2.8, None))
+    assert len(predictor._source_builders["default"].calls) == 2
 
 
 def test_batch_diagnostics_do_not_rebuild_when_wave_exceeds_lru_capacity():
@@ -205,7 +210,7 @@ def test_batch_diagnostics_do_not_rebuild_when_wave_exceeds_lru_capacity():
         assert predictor.reward_details(candidate)["reward"] == pytest.approx(result[0])
     # The next wave can also reuse the previous wave's evicted diagnostics.
     assert predictor.batch_predict(candidates[::-1]) == results[::-1]
-    assert len(predictor._shared_builder.calls) == 3
+    assert len(predictor._source_builders["default"].calls) == 3
 
 
 def test_batch_preserves_gated_sweep_choice_for_each_formula():
@@ -231,22 +236,22 @@ def test_batch_preserves_gated_sweep_choice_for_each_formula():
 
     predictor._score = score
     first, second = _candidate(0.1), _candidate(0.2)
-    assert predictor.batch_predict([first, second]) == [(30.0, 0.0), (100.0, 0.0)]
-    assert predictor.per_objective_stats(first)["temperature"] == (300.0, 0.0)
-    assert predictor.per_objective_stats(second)["temperature"] == (500.0, 0.0)
+    assert predictor.batch_predict([first, second]) == [(30.0, None), (100.0, None)]
+    assert predictor.per_objective_stats(first)["temperature"] == (300.0, None)
+    assert predictor.per_objective_stats(second)["temperature"] == (500.0, None)
     assert predictor.reward_details(first)["gate_passed"] is True
     assert len(calls) == 8
-    assert len(predictor._shared_builder.calls) == 2
+    assert len(predictor._source_builders["default"].calls) == 2
 
 
 def test_recommended_wave_size_delegates_to_structure_builders():
     predictor = _predictor()
     assert predictor.evaluation_batch_size() == 1
-    predictor._shared_builder.batch_size = 4
+    predictor._source_builders["default"].batch_size = 4
     assert predictor.evaluation_batch_size() == 4
     independent = _predictor(share_structure=False)
-    independent._builders["benefit"].batch_size = 2
-    independent._builders["cost"].batch_size = 3
+    independent._source_builders["benefit"].batch_size = 2
+    independent._source_builders["cost"].batch_size = 3
     assert independent.evaluation_batch_size() == 3
 
 
@@ -256,8 +261,8 @@ def test_empty_predictor_batch_keeps_previous_wave_diagnostics():
     predictor.batch_predict(candidates)
     assert predictor.batch_predict([]) == []
     predictor.per_objective_stats(candidates[0])
-    assert predictor._shared_builder.waves == [candidates]
-    assert len(predictor._shared_builder.calls) == 2
+    assert predictor._source_builders["default"].waves == [candidates]
+    assert len(predictor._source_builders["default"].calls) == 2
 
 
 def test_empty_timer_batch_does_not_call_predictor_or_clock(monkeypatch):
@@ -280,7 +285,7 @@ def test_timer_partial_batch_records_successes_and_all_elapsed_cost(monkeypatch)
         seen.append((candidates, return_exceptions))
         return [(3.0, 0.0), error, (7.0, 0.1), (3.0, 0.0)]
 
-    inner = SimpleNamespace(supports_partial_batch=True, batch_predict=batch)
+    inner = SimpleNamespace(candidate_seeded_batch=True, supports_partial_batch=True, batch_predict=batch)
     timer = PredictorTimer(inner, t0=0)
     ticks = iter([10.0, 22.0])
     monkeypatch.setattr("rl_matdesign.utils.timing.time.perf_counter", lambda: next(ticks))
@@ -307,7 +312,7 @@ def test_timer_partial_mode_uses_scalar_fallback_for_legacy_batch(monkeypatch):
         pytest.fail("legacy batch cannot isolate formula errors")
 
     timer = PredictorTimer(SimpleNamespace(predict=predict, batch_predict=legacy_batch), t0=0)
-    ticks = iter([1.0, 7.0])
+    ticks = iter([1.0, 3.0, 3.0, 5.0, 5.0, 7.0])
     monkeypatch.setattr("rl_matdesign.utils.timing.time.perf_counter", lambda: next(ticks))
     candidates = list(map(_candidate, [0.1, 0.2, 0.3]))
     results = timer.batch_predict(candidates, return_exceptions=True)
@@ -318,11 +323,13 @@ def test_timer_partial_mode_uses_scalar_fallback_for_legacy_batch(monkeypatch):
     assert (timer.n_calls, timer.n_unique, timer.t_predict_s) == (2, 2, 6.0)
 
 
-def test_timer_honors_partial_batch_signature_without_capability_marker(monkeypatch):
+def test_seeded_timer_honors_partial_batch_signature_without_partial_marker(monkeypatch):
     calls = []
     failure = RuntimeError("one plugin candidate failed")
 
     class CustomPlugin:
+        candidate_seeded_batch = True
+
         def evaluation_batch_size(self):
             return 3
 
@@ -349,7 +356,7 @@ def test_timer_batch_failure_records_elapsed_cost_without_observations(monkeypat
     def fail(candidates, *, return_exceptions):
         raise TimeoutError("worker pool failed")
 
-    timer = PredictorTimer(SimpleNamespace(supports_partial_batch=True, batch_predict=fail), t0=0)
+    timer = PredictorTimer(SimpleNamespace(candidate_seeded_batch=True, supports_partial_batch=True, batch_predict=fail), t0=0)
     ticks = iter([2.0, 7.0])
     monkeypatch.setattr("rl_matdesign.utils.timing.time.perf_counter", lambda: next(ticks))
     results = timer.batch_predict([_candidate(0.1), _candidate(0.2)], return_exceptions=True)
@@ -365,10 +372,36 @@ def test_timer_default_mode_preserves_legacy_batch_api(monkeypatch):
         calls.append(candidates)
         return [(1.0, 0.0)] * len(candidates)
 
-    timer = PredictorTimer(SimpleNamespace(batch_predict=batch), t0=0)
+    timer = PredictorTimer(SimpleNamespace(candidate_seeded_batch=True, batch_predict=batch), t0=0)
     ticks = iter([1.0, 5.0])
     monkeypatch.setattr("rl_matdesign.utils.timing.time.perf_counter", lambda: next(ticks))
     candidates = [_candidate(0.1), _candidate(0.2)]
     assert timer.batch_predict(candidates) == [(1.0, 0.0), (1.0, 0.0)]
     assert calls == [candidates]
     assert (timer.n_calls, timer.n_unique, timer.t_predict_s) == (2, 2, 4.0)
+
+
+def independent_source_config(cfg):
+    """Explicit independent-source fixture; production does not infer this choice."""
+    from copy import deepcopy
+    cfg = deepcopy(cfg)
+    source_keys = ("builder", "base_poscar", "site_symbol", "n_random_configs", "geo_opt", "structure_parallel")
+    common = {key: cfg.pop(key) for key in source_keys if key in cfg}
+    cfg.pop("share_structure", None)
+    cfg["structure_sources"] = {}
+    for prop in cfg["properties"]:
+        source_id = prop["name"]
+        source = {**common, **{key: prop.pop(key) for key in source_keys if key in prop}}
+        cfg["structure_sources"][source_id] = source
+        prop["source"] = source_id
+    return cfg
+
+
+def enable_source_geo_opt(predictor):
+    """Configure relaxation before any evaluation in a fake-source fixture."""
+    from dataclasses import replace
+    from rl_matdesign.structure_sources import StructureSourceSpec
+    predictor.source_plan = replace(predictor.source_plan, sources=tuple(
+        StructureSourceSpec(spec.source_id, {**spec.effective_config, "geo_opt": {"enabled": True}})
+        for spec in predictor.source_plan.sources
+    ))

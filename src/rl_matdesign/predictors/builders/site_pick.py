@@ -27,7 +27,10 @@ as every other builder, so it resolves through
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    import ase
 
 import numpy as np
 

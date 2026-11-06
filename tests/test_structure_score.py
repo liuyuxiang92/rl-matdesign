@@ -138,7 +138,7 @@ def test_default_builder_is_substitute():
     from rl_matdesign.predictors.builders.substitute import SubstituteBuilder
     p = StructureScorePredictor({"base_poscar": "x", "properties": [
         {"name": "p", "predictor": "dp_energy", "models": ["m"], "direction": "min"}]})
-    assert isinstance(p._shared_builder, SubstituteBuilder)
+    assert isinstance(p._source_builders["default"], SubstituteBuilder)
 
 
 # --------------------------------------------------------------------------- #
@@ -147,11 +147,11 @@ def test_default_builder_is_substitute():
 
 def test_shared_structure_weighted_combine():
     p = StructureScorePredictor(_shared_cfg())
-    assert p.share_structure is True
-    assert p.geo_opt_enabled is False
+    assert len(p.source_plan.sources) == 1
+    assert not p._geo_opt_enabled("default")
 
     # Stub: one shared build; per-property score fixed by name.
-    p._shared_builder = type("B", (), {
+    p._source_builders["default"] = type("B", (), {
         "build": lambda self, cand, *, n_configs, rng: [object()]})()
     fixed = {"conductivity": (10.0, 1.0), "stability": (5.0, 0.5)}
     p._score = lambda prop, structures: fixed[prop["name"]]
@@ -161,12 +161,12 @@ def test_shared_structure_weighted_combine():
     #   conductivity: 2 * (10 - 1) / 1   = 18.0
     #   stability:    1 * (5  - 0.5) / 5 = 0.9
     assert abs(reward - 18.9) < 1e-9
-    assert abs(std - (1.0 + 0.5) / 2) < 1e-9   # mean of per-property stds
+    assert std is None  # Different physical units cannot be averaged into a reward uncertainty.
 
 
 def test_per_objective_stats_and_predict_raw():
     p = StructureScorePredictor(_shared_cfg())
-    p._shared_builder = type("B", (), {
+    p._source_builders["default"] = type("B", (), {
         "build": lambda self, cand, *, n_configs, rng: [object()]})()
     fixed = {"conductivity": (10.0, 1.0), "stability": (5.0, 0.5)}
     p._score = lambda prop, structures: fixed[prop["name"]]
@@ -176,7 +176,7 @@ def test_per_objective_stats_and_predict_raw():
 
     # predict_raw ignores std: 2 * (+1)*10 / 1 + 1 * (+1)*5 / 5 = 20 + 1 = 21.0
     raw, slot = p.predict_raw({"x": 1.0})
-    assert slot == 0.0
+    assert slot is None
     assert abs(raw - 21.0) < 1e-9
 
 
@@ -188,7 +188,7 @@ def test_persistent_cache_recomputes_each_composition_once():
         calls["build"] += 1
         return [object()]
 
-    p._shared_builder = type("B", (), {"build": _build})()
+    p._source_builders["default"] = type("B", (), {"build": _build})()
     fixed = {"conductivity": (10.0, 1.0), "stability": (5.0, 0.5)}
     p._score = lambda prop, structures: fixed[prop["name"]]
 
@@ -204,7 +204,7 @@ def test_persistent_cache_recomputes_each_composition_once():
 
 def test_cache_size_cap_evicts_lru():
     p = StructureScorePredictor(_shared_cfg(predict_cache_size=2))
-    p._shared_builder = type("B", (), {
+    p._source_builders["default"] = type("B", (), {
         "build": lambda self, cand, *, n_configs, rng: [object()]})()
     fixed = {"conductivity": (10.0, 1.0), "stability": (5.0, 0.5)}
     p._score = lambda prop, structures: fixed[prop["name"]]
@@ -216,7 +216,7 @@ def test_cache_size_cap_evicts_lru():
 def test_score_breakdown_returns_structures_and_raw_combine_matches():
     p = StructureScorePredictor(_shared_cfg())
     sentinel = object()
-    p._shared_builder = type("B", (), {
+    p._source_builders["default"] = type("B", (), {
         "build": lambda self, cand, *, n_configs, rng: [sentinel]})()
     fixed = {"conductivity": (10.0, 1.0), "stability": (5.0, 0.5)}
     p._score = lambda prop, structures: fixed[prop["name"]]
@@ -236,15 +236,15 @@ def test_score_breakdown_returns_structures_and_raw_combine_matches():
 
 def _independent_cfg(child_objective="mean"):
     return {
-        "share_structure": False,
-        "builder": "substitute",
-        "base_poscar": "x",
-        "site_symbol": "Ti",
+        "structure_sources": {
+            name: {"builder": "substitute", "base_poscar": "x", "site_symbol": "Ti"}
+            for name in ("energy", "bulk")
+        },
         "k": 1.0,
         "properties": [
-            {"name": "energy", "predictor": "dp_property", "models": ["m"],
+            {"name": "energy", "source": "energy", "predictor": "dp_property", "models": ["m"],
              "direction": "min", "objective": child_objective, "weight": 1.0, "scale": 2.0},
-            {"name": "bulk", "predictor": "dp_property", "models": ["m"],
+            {"name": "bulk", "source": "bulk", "predictor": "dp_property", "models": ["m"],
              "direction": "max", "objective": child_objective, "weight": 0.5, "scale": 100.0},
         ],
     }
@@ -252,9 +252,9 @@ def _independent_cfg(child_objective="mean"):
 
 def test_independent_structures_built_per_objective():
     p = StructureScorePredictor(_independent_cfg())
-    assert p.share_structure is False
-    assert len(p._builders) == 2                       # one builder per objective
-    assert p._builders["energy"] is not p._builders["bulk"]
+    assert len(p.source_plan.sources) == 2
+    assert len(p._source_builders) == 2                       # one builder per objective
+    assert p._source_builders["energy"] is not p._source_builders["bulk"]
 
     calls = {"energy": 0, "bulk": 0}
 
@@ -264,7 +264,7 @@ def test_independent_structures_built_per_objective():
             return [object()]
         return type("B", (), {"build": _build})()
 
-    p._builders = {"energy": _mk("energy"), "bulk": _mk("bulk")}
+    p._source_builders = {"energy": _mk("energy"), "bulk": _mk("bulk")}
     fixed = {"energy": (4.0, 0.1), "bulk": (80.0, 5.0)}
     p._score = lambda prop, structures: fixed[prop["name"]]
 
@@ -277,7 +277,7 @@ def test_independent_structures_built_per_objective():
 def test_independent_mean_minus_kstd_matches_old_composite():
     p = StructureScorePredictor(_independent_cfg(child_objective="mean_minus_kstd"))
     _b = type("B", (), {"build": lambda self, c, *, n_configs, rng: [object()]})
-    p._builders = {"energy": _b(), "bulk": _b()}
+    p._source_builders = {"energy": _b(), "bulk": _b()}
     fixed = {"energy": (4.0, 0.1), "bulk": (80.0, 5.0)}
     p._score = lambda prop, structures: fixed[prop["name"]]
     # v_energy = (-1)*4 - 0.1 = -4.1 ; v_bulk = (+1)*80 - 5 = 75
@@ -312,7 +312,7 @@ def _sweep_cfg(**over):
 
 def _bind_sweep_stub(p):
     """Stub: build one shared cell; score depends on the swept T (fparam[1])."""
-    p._shared_builder = type("B", (), {
+    p._source_builders["default"] = type("B", (), {
         "build": lambda self, cand, *, n_configs, rng: [object()]})()
 
     def _score(prop, structures, *, fparam=None):
@@ -345,7 +345,7 @@ def test_sweep_reports_chosen_temperature_in_stats():
     _bind_sweep_stub(p)
 
     stats = p.per_objective_stats({"x": 1.0})
-    assert stats["temperature"] == (490.0, 0.0)        # chosen operating T
+    assert stats["temperature"] == (490.0, None)        # chosen operating T
     assert stats["conductivity"] == (490.0, 0.0)       # scored at that T
     assert stats["stability"] == (510.0, 0.0)
 
@@ -364,7 +364,7 @@ def test_sweep_with_temperature_independent_property():
     p = StructureScorePredictor(cfg)
     assert p.properties[1]["sweep_slots"] == []        # T-independent
 
-    p._shared_builder = type("B", (), {
+    p._source_builders["default"] = type("B", (), {
         "build": lambda self, cand, *, n_configs, rng: [object()]})()
 
     def _score(prop, structures, *, fparam=None):
@@ -376,7 +376,7 @@ def test_sweep_with_temperature_independent_property():
     # combined(T) = T + 3  -> max at 490; reward = 493; chosen T = 490.
     reward, _ = p.predict({"x": 1.0})
     assert abs(reward - 493.0) < 1e-9
-    assert p.per_objective_stats({"x": 1.0})["temperature"] == (490.0, 0.0)
+    assert p.per_objective_stats({"x": 1.0})["temperature"] == (490.0, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -421,7 +421,7 @@ def test_fqn_with_predict_structures_is_a_structure_objective(tmp_path, monkeypa
     prop = p.properties[0]
     assert prop["backend"] == "structure_fqn"
     assert p._has_structure is True          # a shared builder is required
-    assert p._shared_builder is not None
+    assert p._source_builders["default"] is not None
 
     mean, std = p._score(prop, [object(), object()])
     assert (mean, std) == (7.0, 0.3)
@@ -447,7 +447,7 @@ def test_fqn_without_predict_structures_stays_composition(tmp_path, monkeypatch)
     prop = p.properties[0]
     assert prop["backend"] == "composition"
     assert p._has_structure is False
-    assert p._shared_builder is None
+    assert not p._source_builders
 
     mean, std = p._score(prop, {"Fe": 1.0})
     assert (mean, std) == (1.0, 0.0)
@@ -474,7 +474,7 @@ def test_shared_structure_routes_built_cells_to_predict_structures(tmp_path, mon
         ],
     })
     sentinel_structures = [object(), object(), object()]
-    p._shared_builder = type(
+    p._source_builders["default"] = type(
         "B", (), {"build": lambda self, cand, *, n_configs, rng: sentinel_structures}
     )()
 
@@ -570,7 +570,7 @@ def test_target_and_min_objectives_combine():
 # The predictor contract — general, not MGTransformer-specific.
 #
 # These use TOY leaves defined right here, on purpose: the guarantee under test is
-# "any leaf wrapping one model gets std == 0 automatically", so exercising it
+# "a singleton model cannot estimate model spread", so exercising it
 # through a real predictor would prove much less.
 # --------------------------------------------------------------------------- #
 
@@ -619,13 +619,16 @@ def _leaf_cfg(predictor, model, **over):
     return {"base_poscar": "x", "properties": [prop]}
 
 
-def test_single_model_leaf_has_exactly_zero_std():
-    # THE guarantee: one model => no uncertainty, whatever the structure scatter.
+def test_single_model_leaf_has_no_model_spread_but_preserves_configuration_scatter():
+    # A singleton cannot estimate model disagreement; configuration scatter remains available.
     p = StructureScorePredictor(_leaf_cfg(_TOY_STRUCT, 10.0))
     structures = [_Struct(0.0), _Struct(2.0), _Struct(10.0)]   # wildly scattered
     mean, std = p._score(p.properties[0], structures)
     assert mean == pytest.approx(14.0)        # 10 + mean(0, 2, 10)
-    assert std == 0.0                          # exactly zero, not merely small
+    assert std is None
+    output = p._active_outputs["p"]
+    assert output.config_spread == pytest.approx(np.std([10., 12., 20.]))
+    assert output.samples[0].values == (10., 12., 20.)
 
 
 def test_model_list_builds_one_leaf_per_model_and_std_is_their_spread():
@@ -651,7 +654,7 @@ def test_structure_scatter_does_not_leak_into_std():
 def test_score_leaf_is_routed_as_a_composition_objective():
     p = StructureScorePredictor(_leaf_cfg(_TOY_COMP, 1.0))
     assert p.properties[0]["backend"] == "composition"
-    assert p._score(p.properties[0], {"Fe": 0.25, "Ni": 0.75}) == (pytest.approx(2.0), 0.0)
+    assert p._score(p.properties[0], {"Fe": 0.25, "Ni": 0.75}) == (pytest.approx(2.0), None)
 
 
 def test_score_structures_leaf_is_routed_as_a_structure_objective():
