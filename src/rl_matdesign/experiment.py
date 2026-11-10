@@ -68,6 +68,7 @@ from rl_matdesign.utils.seeding import set_global_seed, isolated_rng
 from rl_matdesign.utils.execution_contract import execution_contract, require_execution_contract
 from rl_matdesign.utils.timing import PhaseTimer, PredictorTimer
 from rl_matdesign.utils.training_budget import TrainingBudget
+from rl_matdesign.utils.training_samples import TrainingSampleWriter
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +221,10 @@ def _run_experiment(resources: ExitStack) -> None:
     # Determinism must not depend on whether the same seed came from YAML or CLI.
     set_global_seed(train_seed, deterministic=True)
     os.makedirs(args.out, exist_ok=True)
+    # Generation-only invocations must leave the training export untouched.
+    training_samples = None if args.only_generate else TrainingSampleWriter(
+        os.path.join(args.out, "training_samples.csv"), append=args.resume_training,
+    )
     device_str = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_str)
     phase = "generate" if args.only_generate else "resume" if args.resume_training else "train"
@@ -462,6 +467,7 @@ def _run_experiment(resources: ExitStack) -> None:
                         _mid.get("training_episodes_completed", start_ep) if _mid else start_ep
                     ),
                     "training_budget_state": _mid.get("training_budget_state") if _mid else None,
+                    "training_sample_session_id": _mid.get("training_sample_session_id") if _mid else None,
                     "training_budget_history_complete": (
                         _mid.get("training_budget_history_complete", "training_budget_state" in _mid)
                         if _mid else False
@@ -501,6 +507,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     resume_state=resume_state,
                     augment_permutations=_aug_K,
                     timer=predictor,
+                    training_samples=training_samples,
                     train_count_duplicates=train_count_duplicates,
                     train_max_duplicate_attempts=train_max_duplicate_attempts,
                     # --- BEGIN mc-target experiment (removable) ---
@@ -641,6 +648,7 @@ def _run_experiment(resources: ExitStack) -> None:
                 "visit_counts": _mid_ckpt.get("visit_counts") if _mid_ckpt else None,
                 "entropy_coef_eff": _mid_ckpt.get("entropy_coef_eff") if _mid_ckpt else None,
                 "training_budget_state": _mid_ckpt.get("training_budget_state") if _mid_ckpt else None,
+                "training_sample_session_id": _mid_ckpt.get("training_sample_session_id") if _mid_ckpt else None,
                 "training_budget_history_complete": (
                     _mid_ckpt.get("training_budget_history_complete", "training_budget_state" in _mid_ckpt)
                     if _mid_ckpt else False
@@ -693,6 +701,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     pg_repeat_penalty_shape=pg_repeat_penalty_shape,
                     checkpoint_cfg=checkpoint_cfg,
                     timer=predictor,
+                    training_samples=training_samples,
                     train_count_duplicates=train_count_duplicates,
                     train_max_duplicate_attempts=train_max_duplicate_attempts,
                 )

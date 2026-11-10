@@ -125,6 +125,30 @@ class OOHCatalystPredictor:
         output = self.predict_outputs(composition)['overpotential']
         return output.mean, select_output_spread(output, self.uncertainty)
 
+    def cached_outputs(self, composition: Dict[str, float]) -> dict[str, ScientificOutput] | None:
+        """Read a completed scientific output only; a cache miss never infers."""
+        with self._lock:
+            output = self._cache.get(self._comp_key(composition))
+            if not isinstance(output, ScientificOutput) or output.schema != self.output_schema['overpotential']:
+                return None
+            return {'overpotential': output}
+
+    def prediction_record(self, composition, prediction, *, k: float = 1.0) -> dict:
+        """Expose the exact cached positive overpotential and selected spread."""
+        from abcde_ooh.dp_predictor import select_output_spread
+
+        outputs = self.cached_outputs(composition)
+        if outputs is None:
+            raise KeyError("Completed OOH prediction missing from the scientific output cache")
+        output = outputs['overpotential']
+        std = select_output_spread(output, self.uncertainty)
+        phase_ok, phase_label = self.check_phase(composition)
+        return {
+            "dp_mean": output.mean, "dp_std": std,
+            "dp_mean_minus_std": None if std is None else output.mean - k * std,
+            "primary_ok": bool(phase_ok), "primary_label": phase_label or '',
+        }
+
     def predict(self, composition: Dict[str, float]) -> Tuple[float, float | None]:
         self._validate_reward_view()
         mean, spread = self.predict_raw(composition)

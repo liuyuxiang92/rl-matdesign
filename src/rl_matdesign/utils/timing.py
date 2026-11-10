@@ -236,6 +236,15 @@ class PredictorTimer:
         self._observation(candidate, out, timing=self.last_evaluation_timings[0])
         return out
 
+    @property
+    def scalar_batch_fallback(self) -> bool:
+        """Whether a batch is implemented as independent timed scalar calls.
+
+        Callers capturing per-evaluation diagnostics can perform this same loop
+        themselves so a later prediction cannot overwrite an earlier record.
+        """
+        return not getattr(self._inner, "candidate_seeded_batch", False)
+
     def batch_predict(self, candidates: List[Any], *, return_exceptions: bool = False) -> List[Any]:
         candidates = list(candidates)
         self.last_evaluation_timings = []
@@ -244,7 +253,7 @@ class PredictorTimer:
         # Merely having batch_predict says nothing about its random protocol.
         # Only adapters guaranteeing candidate-local, batch-invariant sampling
         # opt into one shared call; all other plugins retain scalar semantics.
-        if not getattr(self._inner, "candidate_seeded_batch", False):
+        if self.scalar_batch_fallback:
             results, timings = [], []
             for candidate in candidates:
                 try:

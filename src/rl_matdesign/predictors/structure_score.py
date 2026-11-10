@@ -587,6 +587,27 @@ class StructureScorePredictor:
         record = self._batch_stats.get(key, self._stats_cache.get(key))
         return None if record is None else dict(record.outputs)
 
+    def prediction_record(self, candidate: Any, prediction, *, k: float = 1.0) -> dict:
+        """Export the completed scientific record without inference or timing changes."""
+        from ..utils.prediction_records import metadata_record, objective_record
+
+        key = self._key(candidate)
+        record = self._batch_stats.get(key, self._stats_cache.get(key))
+        if record is None:
+            raise KeyError("Completed prediction missing from the current evaluation cache")
+        # stats keeps the selected uncertainty and its paired ScientificOutputs;
+        # metadata belongs to this exact (possibly sweep-winning) evaluation.
+        row = objective_record(self.raw_combine(record.stats), record.stats,
+                               self._reward_details(record.stats))
+        row.update(metadata_record(record.metadata))
+        try:
+            formula = self.composition_formula(candidate)
+        except Exception:
+            formula = None  # Same environment-formula fallback as generation.
+        if formula:
+            row["formula"] = formula
+        return row
+
     def sequence_constraints(self, group_name: str, tokens: List[str]) -> list[dict]:
         """Combine domain-owned count requirements before constructing an env.
 

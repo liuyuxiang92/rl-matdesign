@@ -45,6 +45,7 @@ class EpisodeSnapshot:
     metadata: dict = field(default_factory=dict)
     timing: dict = field(default_factory=dict)
     prediction: tuple | None = None
+    prediction_record: dict = field(default_factory=dict)
 
 
 def snapshot_episode(env, metadata: dict | None = None) -> EpisodeSnapshot:
@@ -69,7 +70,7 @@ class EpisodeBatchEvaluator:
     counting. Batch size one calls the original rollout directly.
     """
 
-    def __init__(self, env, *, max_retries: int = 10, timer=None):
+    def __init__(self, env, *, max_retries: int = 10, timer=None, capture_predictions=False):
         self.env = env
         self.reward_fn = getattr(env, "reward_fn", None)
         self.size = 1
@@ -79,6 +80,9 @@ class EpisodeBatchEvaluator:
         self.pending = deque()
         self.timer = timer
         self.wave_id = 0
+        self.capture_predictions = bool(capture_predictions)
+        if hasattr(self.reward_fn, "capture_prediction_records"):
+            self.reward_fn.capture_prediction_records = self.capture_predictions
 
     def _record_failure(self, failure, phase):
         record = getattr(self.timer, "record_episode", None)
@@ -181,12 +185,15 @@ class EpisodeBatchEvaluator:
             predictions = getattr(self.reward_fn, "last_predictions", [])
             if len(predictions) != len(payloads):
                 predictions = [None] * len(payloads)
+            records = getattr(self.reward_fn, "last_prediction_records", [])
+            if len(records) != len(payloads):
+                records = [{} for _ in payloads]
             details = getattr(self.reward_fn, "last_evaluation_timings", [])
             if len(details) != len(payloads):
                 details = [{} for _ in payloads]
             if len(rewards) != len(payloads):
                 raise RuntimeError("batched rewards returned the wrong number of results")
-            for index, reward, timing, prediction in zip(indices, rewards, details, predictions):
+            for index, reward, timing, prediction, record in zip(indices, rewards, details, predictions, records):
                 episode = outcomes[index]
                 episode.timing.update(timing)
                 if isinstance(reward, Exception):
@@ -196,6 +203,8 @@ class EpisodeBatchEvaluator:
                 else:
                     outcomes[index].path[-1].reward = float(reward)
                     outcomes[index].prediction = copy.deepcopy(prediction)
+                    if self.capture_predictions:
+                        outcomes[index].prediction_record = copy.deepcopy(record)
             # A wave is one shared wall interval. Charge every attempted
             # episode an equal share, including failed and cached candidates;
             # task-seconds in details remain each candidate's actual work.
@@ -224,6 +233,9 @@ class EpisodeBatchEvaluator:
                         retry_scalar(lambda: self._scalar_rollout(rollout, phase))
                     episode = snapshot_episode(self.env, metadata)
                     episode.timing = dict(self._scalar_timing)
+                    records = getattr(self.reward_fn, "last_prediction_records", [])
+                    if self.capture_predictions and len(records) == 1:
+                        episode.prediction_record = copy.deepcopy(records[0])
                     return episode
                 count = min(self.size, limit, self.max_retries + 1 - self.failures)
                 self.pending.extend(self._collect(rollout, count, metadata))

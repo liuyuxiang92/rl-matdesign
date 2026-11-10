@@ -692,12 +692,29 @@ To silence the warnings, rename the keys in your YAML — the values are unchang
 | `value_net.pt` | — | A2C | Critic (ValueNet) weights |
 | `checkpoint.pt` | ✓ | ✓ | Latest mid-training checkpoint (symlink to numbered file) |
 | `training_log.csv` | ✓ | ✓ | Per-episode: return, actor_loss, entropy, critic_loss, … |
+| `training_samples.csv` | ✓ | ✓ | One material/property record per budget-consuming training episode, using generated.csv column names |
 | `episode_timing.csv` | ✓ | ✓ | Incremental per-attempt wall time, MD/optimization task time, and RL update time |
 | `timing.json` | ✓ | ✓ | Run/phase totals and the current invocation's episode timing totals |
 | `generated.csv` | ✓ | ✓ | Candidates: formula, reward, dp_mean, dp_std |
 | `run_config.json` | ✓ | ✓ | Effective configuration after aliases, CLI overrides, defaults and fallbacks |
 | `config_sources.json` | ✓ | ✓ | Origin of each effective top-level configuration value |
 | `provenance/*/manifest.json` | ✓ | ✓ | Per-invocation command, runtime flags, code/environment evidence and input hashes |
+
+Training samples are saved automatically as episodes complete. DQN includes
+random warmup and online training; REINFORCE/A2C include policy training, while
+scaler warmup is outside their budget. Repeats are saved exactly when
+`budget_counted` is true. Property values come from that episode's evaluation,
+without another predictor call; unavailable scientific uncertainty stays blank.
+`candidate_json` retains sequence, categorical and multi-group structure.
+
+`--only-generate` preserves this file. Resume follows the saved checkpoint's
+sample session, preserves superseded records in a sibling backup, and marks
+missing sample history explicitly. Existing source-code and protocol checks
+still apply to checkpoint loading. See [training samples](docs/training_samples.md)
+for resume details and a training-versus-generation delta comparison. Use
+`obj_<name>_mean` for physical-property distributions when `reward` or `dp_mean`
+includes a synthesis-gate penalty. `generated_columns` controls the generated
+report; the training export retains all available properties.
 
 ### Per-episode timing
 
