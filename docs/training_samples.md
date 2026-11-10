@@ -5,6 +5,10 @@ Every training run through `scripts/run_experiment.py` writes
 material whose episode consumed the configured training budget. It uses the
 same material/property column names as `generated.csv`, so training and
 generation distributions can be compared directly.
+This applies to composition, categorical-field, sequence and multi-group
+search spaces. `candidate_json` retains the structured candidate, including
+sequence positions and typed field values, when a formula alone cannot
+describe it.
 
 ```bash
 python scripts/run_experiment.py \
@@ -48,6 +52,13 @@ their newly exported samples are also marked as incomplete. Compare samples
 within the intended session and inspect these flags before treating a CSV as
 the full training history.
 
+Sample export does not relax the existing resume checks. Exact continuation
+still requires a compatible checkpoint, environment, learning protocol, oracle
+and recorded source-code identity. A checkpoint from before this code change
+is rejected when its source identity differs; the history flags describe data
+availability, not permission to bypass that rejection. Generation-only model
+loading follows its existing compatibility checks.
+
 ## Columns and property meaning
 
 Common material columns include `formula`, `reward`, `dp_mean`, `dp_std`, and
@@ -56,6 +67,17 @@ Multi-property scenarios instead expose `obj_<name>_mean` and
 `obj_<name>_std`. Applicable gate and phase columns retain the names used by
 `generated.csv`, such as `gate_passed`, `gate_<name>_value`, `primary_ok`, and
 `primary_label`.
+`candidate_json`, `metadata_json`, and applicable `meta_<name>` columns use
+the same representation as generation. `generated_columns` can select or
+rename columns for the generated report; the training sample file keeps the
+full available property record.
+
+Unavailable uncertainty estimates remain blank in CSV. For example, one
+model cannot estimate model spread, so `obj_<name>_std` is blank rather than
+zero when model spread is selected. Model spread, configuration spread and a
+backend's native uncertainty are distinct quantities; use the same configured
+uncertainty definition when comparing runs. Composite rewards have no joint
+`dp_std` across properties with different units.
 
 Training metadata includes `phase`, `episode`, `budget_counted`, and
 `training_budget_used`. The budget position is the cumulative count across

@@ -211,7 +211,7 @@ class TrainingSampleWriter:
                 f"Training samples expected budget {self._last_budget + 1}, got {budget_used}; "
                 "record every counted episode exactly once"
             )
-        prediction = dict(getattr(episode, "prediction", {}) or {})
+        prediction = dict(getattr(episode, "prediction_record", {}) or {})
         metadata = getattr(episode, "metadata", {}) or {}
         row = {key: _csv_value(value) for key, value in prediction.items()
                if key not in _IDENTITY_FIELDS}

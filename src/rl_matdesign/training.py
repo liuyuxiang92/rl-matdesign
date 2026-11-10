@@ -9,10 +9,9 @@ Key improvements
 - Classical online DQN (``train_dqn_online``): FIFO replay buffer, TD Bellman
   targets, hard target-network copy, SmoothL1 loss.  Replaces offline MC
   Q-learning.
-- Magpie element features: ``_precompute_elem_features`` computes per-element
-  Magpie feature vectors (separately scaled), replacing one-hot element
-  encoding everywhere.  Fraction encoding is a scalar float, replacing
-  one-hot fraction encoding.
+- Action features: labelled choices retain explicit identity; material
+  descriptors supplement chemical labels. Numeric values use their actual
+  magnitude, while categorical values use identity rather than ordinal codes.
 - Unified generation flags (``gen_temperature / gen_top_frac / gen_epsilon``):
   same three-mode exploration strategy for DQN and PG generation.  Default
   Boltzmann T=1.0 prevents pure-greedy composition collapse.
@@ -27,6 +26,7 @@ from __future__ import annotations
 
 import collections
 import copy
+import json
 import math
 import random
 import time
@@ -39,8 +39,12 @@ from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
 from .env import CompositionEnv
+from .action_features import value_features, value_feature_dim
 from .predictors.base import PropertyPredictor
 from .utils.training_budget import TrainingBudget
+from .utils.rollout_errors import InfeasibleEpisode, EvaluationProtocolError
+from .utils.seeding import capture_rng_state, restore_rng_state
+from .utils.model_contract import bind_scaler, environment_contract, scaler_fingerprint
 from .utils.episode_batch import (
     CandidateEvaluationFailed, EpisodeBatchEvaluator, training_wave_limit,
 )
@@ -101,14 +105,15 @@ def _rollout_with_retry(rollout_fn: Callable[[], None]) -> None:
         try:
             rollout_fn()
             return
-        except CandidateEvaluationFailed as exc:
+        except (CandidateEvaluationFailed, InfeasibleEpisode) as exc:
             if attempt == _MAX_CANDIDATE_RETRIES:
                 raise RuntimeError(
                     f"{_MAX_CANDIDATE_RETRIES + 1} consecutive candidates all "
                     "failed evaluation -- giving up rather than spending the "
                     f"rest of the run on unscored candidates. Last failure: {exc}"
                 ) from exc
-            print(f"[WARN] candidate evaluation failed (retry "
+            kind = "infeasible construction" if isinstance(exc, InfeasibleEpisode) else "candidate evaluation failed"
+            print(f"[WARN] {kind} (retry "
                   f"{attempt + 1}/{_MAX_CANDIDATE_RETRIES}), discarding and "
                   f"trying a new candidate: {exc}")
 
@@ -139,7 +144,7 @@ def _save_checkpoint(path: str, data: dict, numbered_path: str | None = None) ->
     import os
     target = numbered_path if numbered_path else path
     tmp = target + ".tmp"
-    torch.save(data, tmp)
+    torch.save({**data, "rng_state": capture_rng_state()}, tmp)
     os.replace(tmp, target)
     if numbered_path:
         link_tmp = path + ".lnk"
@@ -174,23 +179,23 @@ def objective_from_mean_std(
 def _precompute_elem_features(
     species_set: List[str],
     featurizer: Callable,
-) -> Tuple[np.ndarray, StandardScaler]:
-    """Precompute and scale Magpie feature vectors for each cation.
+    env=None,
+) -> Tuple[np.ndarray, Optional[StandardScaler]]:
+    """Encode action labels, supplementing chemical identity with descriptors.
 
-    Uses a separate scaler from s_mat because single-element statistics differ
-    from composite material statistics (some features have zero variance for
-    single elements).
-
-    Returns
-    -------
-    (elem_feats_scaled, elem_scaler):
-        ``elem_feats_scaled`` has shape ``(n_elements, feature_dim)``.
-        Index ``i`` corresponds to ``species_set[i]``.
+    Structured environments supply their own label table. Their position/field
+    identifiers must never be interpreted as chemical formulae by Magpie.
     """
-    raw = np.asarray([featurizer(el + "1.00") for el in species_set], dtype=float)
+    custom = getattr(env, "action_features", None)
+    if callable(custom):
+        table = np.asarray(custom(), dtype=float)
+        if table.ndim != 2 or table.shape[0] != len(species_set) or not np.isfinite(table).all():
+            raise ValueError("Environment action label features must be a finite 2-D table")
+        return table, None
+    raw = np.asarray([featurizer(el) for el in species_set], dtype=float)
     elem_scaler = StandardScaler()
     elem_scaler.fit(raw)
-    return elem_scaler.transform(raw), elem_scaler
+    return np.concatenate((np.eye(len(species_set)), elem_scaler.transform(raw)), axis=1), elem_scaler
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +217,19 @@ def _attach_mc_returns(rows: list, path: list, gamma: float) -> None:
         G = float(path[k].reward) + gamma * G   # terminal step: G = reward
         rows[k]["mc_return"] = G
 # --- END mc-target experiment ---
+
+
+def _action_value_record(step, alphabet) -> dict:
+    index = int(np.argmax(step.action_comp_onehot))
+    features = value_features(alphabet, [index])[0]
+    encoding = getattr(alphabet, "encoding", None)
+    spec = encoding.specs[index] if encoding is not None else None
+    numeric = (float(spec.value) if spec.kind == "numeric" else None) if spec is not None else float(alphabet[index])
+    return {"a_comp_idx": index, "a_comp_features": features, "a_comp_val": numeric}
+
+
+def _row_value_features(row):
+    return row["a_comp_features"] if "a_comp_features" in row else [row["a_comp_val"]]
 
 
 def add_episode_to_buffer(
@@ -243,7 +261,7 @@ def add_episode_to_buffer(
             "s_mat_raw":       np.asarray(step.state_material_features, dtype=float),
             "s_step":          np.asarray(step.state_step_onehot, dtype=float),
             "a_elem_idx":      int(np.argmax(step.action_elem_onehot)),
-            "a_comp_val":      float(fraction_set[int(np.argmax(step.action_comp_onehot))]),
+            **_action_value_record(step, fraction_set),
             "reward":          float(step.reward),
             "s_mat_next_raw":  np.asarray(next_step.state_material_features, dtype=float)
                                if not done else np.zeros(len(step.state_material_features), dtype=float),
@@ -261,10 +279,10 @@ def add_episode_to_buffer(
 def _row_fingerprint(row: dict) -> tuple:
     """Hashable fingerprint of a buffer row, used for within-episode dedup."""
     return (
-        tuple(np.round(row["s_mat_raw"], 6).tolist()),
+        tuple(row["s_mat_raw"].tolist()),
         tuple(row["s_step"].tolist()),
         int(row["a_elem_idx"]),
-        float(row["a_comp_val"]),
+        tuple(np.asarray(_row_value_features(row)).tolist()),
         bool(row["done"]),
     )
 
@@ -278,7 +296,7 @@ def _detect_last_position_pin(env) -> Optional[set]:
     """
     from .constraints.last_step_element import LastStepElementFilter
 
-    if env.phase_filter is None:
+    if getattr(env, "phase_filter", None) is None:
         return None
 
     def _walk(f):
@@ -296,7 +314,7 @@ def _detect_last_position_pin(env) -> Optional[set]:
     return _walk(env.phase_filter)
 
 
-def _path_to_rows(path: list, fraction_set: List[str]) -> List[dict]:
+def _path_to_rows(path: list, fraction_set: List[str], gamma: float = 0.9) -> List[dict]:
     """Convert an env.path into row dicts (matching add_episode_to_buffer)."""
     rows: List[dict] = []
     n = len(path)
@@ -313,7 +331,7 @@ def _path_to_rows(path: list, fraction_set: List[str]) -> List[dict]:
             "s_mat_raw":       np.asarray(step.state_material_features, dtype=float),
             "s_step":          np.asarray(step.state_step_onehot, dtype=float),
             "a_elem_idx":      int(np.argmax(step.action_elem_onehot)),
-            "a_comp_val":      float(fraction_set[int(np.argmax(step.action_comp_onehot))]),
+            **_action_value_record(step, fraction_set),
             "reward":          float(step.reward),
             "s_mat_next_raw":  np.asarray(next_step.state_material_features, dtype=float)
                                if not done else np.zeros(len(step.state_material_features), dtype=float),
@@ -322,6 +340,7 @@ def _path_to_rows(path: list, fraction_set: List[str]) -> List[dict]:
             "next_allowed_idx": next_allowed_idx,
             "done":            done,
         })
+    _attach_mc_returns(rows, path, gamma)
     return rows
 
 
@@ -339,6 +358,7 @@ def _augment_episode_in_buffer(
     fraction_set: List[str],
     *,
     K: int,
+    gamma: float = 0.9,
 ) -> None:
     """Insert *original_path* plus up to *K* permutation-augmented copies.
 
@@ -357,7 +377,7 @@ def _augment_episode_in_buffer(
     global _AUG_WARNED_NO_ALTS, _AUG_WARNED_FIXED_ORDER
 
     # Always insert the original path first (zero risk when K == 0).
-    add_episode_to_buffer(original_path, buffer, elem_feats_scaled, fraction_set)
+    add_episode_to_buffer(original_path, buffer, elem_feats_scaled, fraction_set, gamma=gamma)
     if K <= 0:
         return
 
@@ -412,11 +432,21 @@ def _augment_episode_in_buffer(
         )
         _AUG_WARNED_NO_ALTS = True
 
-    all_perms = list(itertools.permutations(permutable))
     identity = tuple(permutable)
-    all_perms.remove(identity)
-    random.shuffle(all_perms)
-    chosen_perms = all_perms[:num_to_sample]
+    if len(permutable) <= 8:
+        all_perms = list(itertools.permutations(permutable))
+        all_perms.remove(identity)
+        random.shuffle(all_perms)
+        chosen_perms = all_perms[:num_to_sample]
+    else:
+        # Long sequences must not allocate N! trajectories to draw K examples.
+        seen_perms = {identity}
+        chosen_perms = []
+        while len(chosen_perms) < num_to_sample:
+            perm = tuple(random.sample(permutable, len(permutable)))
+            if perm not in seen_perms:
+                seen_perms.add(perm)
+                chosen_perms.append(perm)
 
     # Build the action sequence from original_path.
     original_actions = [
@@ -450,7 +480,9 @@ def _augment_episode_in_buffer(
                 # didn't anticipate): silently skip this augmentation.
                 continue
 
-            for row in _path_to_rows(env.path, fraction_set):
+            if not _env_terminal(env):
+                continue
+            for row in _path_to_rows(env.path, fraction_set, gamma=gamma):
                 fp = _row_fingerprint(row)
                 if fp in seen_fingerprints:
                     continue
@@ -476,7 +508,7 @@ def _compute_td_target(
     n = len(next_idxs)
     ns_mat = s_mat_scaler.transform(row["s_mat_next_raw"].reshape(1, -1))[0]
     a_e = np.asarray([elem_feats_scaled[ei] for ei, _ in next_idxs], dtype=float)
-    a_c = np.asarray([[float(fraction_set[fi])] for _, fi in next_idxs], dtype=float)
+    a_c = value_features(fraction_set, [fi for _, fi in next_idxs])
     ns_mat_b = np.repeat(ns_mat.reshape(1, -1), n, axis=0)
     ns_step_b = np.repeat(row["s_step_next"].reshape(1, -1), n, axis=0)
     with torch.no_grad():
@@ -531,7 +563,7 @@ def _dqn_gradient_step(
         dtype=torch.float32, device=device,
     )
     a_comp_b = torch.tensor(
-        np.asarray([[r["a_comp_val"]] for r in batch], dtype=float),
+        np.asarray([_row_value_features(r) for r in batch], dtype=float),
         dtype=torch.float32, device=device,
     )
     y_t = torch.tensor(y, dtype=torch.float32, device=device).reshape(-1, 1)
@@ -653,8 +685,8 @@ def train_dqn_online(
         if augment_permutations > 0:
             raise ValueError(
                 "dqn_target_mode='mc' does not support permutation augmentation "
-                "(augment_permutations>0); the mc-return field is only attached on "
-                "the non-augmented path. Set dqn_augment_permutations=0 for the "
+                "(augment_permutations>0) in the current benchmark protocol. "
+                "Set dqn_augment_permutations=0 for the "
                 "mc comparison run."
             )
     # --- END mc-target experiment ---
@@ -735,7 +767,7 @@ def train_dqn_online(
             if augment_permutations > 0:
                 _augment_episode_in_buffer(
                     env, episode.path, buffer, elem_feats_scaled, fraction_set,
-                    K=augment_permutations,
+                    K=augment_permutations, gamma=gamma,
                 )
             else:
                 add_episode_to_buffer(episode.path, buffer, elem_feats_scaled, fraction_set, gamma=gamma)
@@ -747,7 +779,7 @@ def train_dqn_online(
             timer.mark("warmup_end")
 
         s_mat_all = np.asarray([r["s_mat_raw"] for r in buffer], dtype=float)
-        scaler = StandardScaler().fit(s_mat_all)
+        scaler = bind_scaler(StandardScaler().fit(s_mat_all), env)
         if checkpoint_cfg and checkpoint_cfg.get("scaler_path"):
             # Mid-training checkpoints must be usable even if training later stops
             # at the duplicate guard, before the runner's final artifact save.
@@ -760,7 +792,7 @@ def train_dqn_online(
 
         qnet = QRegressor(
             state_dim=state_dim, step_dim=step_dim,
-            elem_dim=elem_dim, frac_dim=1, hidden_dim=hidden_dim,
+            elem_dim=elem_dim, frac_dim=value_feature_dim(fraction_set), hidden_dim=hidden_dim,
         ).to(device)
         target_net = copy.deepcopy(qnet)
         target_net.eval()
@@ -777,6 +809,8 @@ def train_dqn_online(
         ckpt_path    = checkpoint_cfg.get("path")
         ckpt_freq    = int(checkpoint_cfg.get("freq", 0))
         dp_cache_ref = checkpoint_cfg.get("dp_cache")
+    if resume_state and resume_state.get("rng_state") is not None:
+        restore_rng_state(resume_state["rng_state"])
 
     metrics: List[dict] = []
     metrics.extend(warmup_rows)
@@ -794,8 +828,8 @@ def train_dqn_online(
     def _rollout_eps_greedy_episode() -> None:
         # Collect one episode with epsilon-greedy policy.
         env.initialize()
-        for _t in range(env.n_components):
-            _allowed = env.allowed_actions()
+        for _t in _episode_steps(env):
+            _allowed = _legal_actions(env)
             _s_mat_sc = scaler.transform(
                 env.current_state_features().reshape(1, -1))[0]
             _s_step = np.zeros(env.n_components, dtype=float)
@@ -831,8 +865,7 @@ def train_dqn_online(
         completed += int(counted)
         train_attempts += 1
 
-        # Save the evaluated candidate before augmentation or optimizer updates
-        # can mutate the environment or fail. Budget semantics are owned above.
+        # Persist the evaluated sample before augmentation or updates can fail.
         if training_samples is not None:
             training_samples.record(episode, {
                 "phase": "dqn_train", "episode": train_attempts,
@@ -847,13 +880,14 @@ def train_dqn_online(
         if augment_permutations > 0:
             _augment_episode_in_buffer(
                 env, episode.path, buffer, elem_feats_scaled, fraction_set,
-                K=augment_permutations,
+                K=augment_permutations, gamma=gamma,
             )
         else:
             add_episode_to_buffer(episode.path, buffer, elem_feats_scaled, fraction_set, gamma=gamma)
 
         # 2. Gradient steps.
         mean_loss = float("nan")
+        optimizer_steps = 0
         if len(buffer) >= batch_size:
             buf_list = list(buffer)
             losses = []
@@ -865,6 +899,7 @@ def train_dqn_online(
                     target_mode=dqn_target_mode,
                 ))
             mean_loss = float(np.mean(losses))
+            optimizer_steps = len(losses)
 
         # 3. Hard target-net copy.
         if train_attempts % dqn_target_update_freq == 0:
@@ -890,6 +925,7 @@ def train_dqn_online(
             # is comparable across methods — see the PG rows, where they differ.
             "terminal_reward": episode_reward,
             "train_loss": mean_loss,
+            "optimizer_steps": optimizer_steps,
             "mse_loss": mean_loss,
             "epsilon": eps,
             "epsilon_used": episode.metadata["epsilon_used"],
@@ -916,6 +952,10 @@ def train_dqn_online(
             _numbered = ckpt_path.replace(".pt", f"-ep{train_attempts}.pt")
             _save_checkpoint(ckpt_path, {
                 "type": "dqn",
+                "scaler_fingerprint": scaler_fingerprint(scaler),
+                "execution_contract": (checkpoint_cfg or {}).get("execution_contract"),
+                "predictor_ledger": timer.state_dict() if callable(getattr(timer, "state_dict", None)) else None,
+                "environment_contract": environment_contract(env),
                 "episodes_completed": completed,
                 "training_episodes_completed": train_attempts,
                 "training_sample_session_id": training_samples.session_id if training_samples else None,
@@ -968,9 +1008,9 @@ def choose_action(
         Uniform sample from top-k% by Q-value. Ignored if higher-priority
         strategy fires.
     """
-    if not allowed_actions:
-        raise RuntimeError("No allowed actions.")
     n = len(allowed_actions)
+    if not n:
+        raise InfeasibleEpisode("Cannot choose an action from an empty legal set")
 
     if gen_epsilon > 0.0 and float(np.random.rand()) < gen_epsilon:
         return allowed_actions[int(np.random.randint(n))]
@@ -978,9 +1018,7 @@ def choose_action(
     a_elem = np.asarray(
         [elem_feats_scaled[int(np.argmax(a[0]))] for a in allowed_actions], dtype=float
     )
-    a_comp = np.asarray(
-        [[float(fraction_set[int(np.argmax(a[1]))])] for a in allowed_actions], dtype=float
-    )
+    a_comp = value_features(fraction_set, [int(np.argmax(a[1])) for a in allowed_actions])
     s_mat_b  = np.repeat(s_material.reshape(1, -1), n, axis=0)
     s_step_b = np.repeat(s_step.reshape(1, -1), n, axis=0)
 
@@ -1011,10 +1049,39 @@ def choose_action(
 # Rollout functions
 # ---------------------------------------------------------------------------
 
+def _legal_actions(env):
+    actions = env.allowed_actions()
+    if not actions:
+        raise InfeasibleEpisode(
+            f"{type(env).__name__}: no legal continuation at step "
+            f"{env.counter}/{env.n_components}; check domain and active constraints"
+        )
+    return actions
+
+
+def _env_terminal(env) -> bool:
+    for name in ("is_terminal", "_is_terminal", "is_done"):
+        marker = getattr(env, name, None)
+        if marker is not None:
+            return bool(marker() if callable(marker) else marker)
+    return int(env.counter) >= int(env.n_components)
+
+
+def _episode_steps(env):
+    """Allow STOP before the maximum horizon without inventing extra steps."""
+    for index in range(env.n_components):
+        if _env_terminal(env):
+            return
+        yield index
+    if not _env_terminal(env):
+        raise RuntimeError("Environment did not terminate within its declared maximum steps")
+
+
 def _rollout_random_episode(env: CompositionEnv) -> None:
     """Roll out one episode with uniformly random action selection."""
     env.initialize()
-    for _ in range(env.n_components):
+    for _ in _episode_steps(env):
+        _legal_actions(env)
         a = env.sample_random_action()
         env.step(a)
 
@@ -1033,8 +1100,8 @@ def _rollout_policy_episode(
 ) -> None:
     """Roll out one episode guided by a Q-network (used during generation)."""
     env.initialize()
-    for _ in range(env.n_components):
-        allowed = env.allowed_actions()
+    for _ in _episode_steps(env):
+        allowed = _legal_actions(env)
         s_mat = scaler.transform(env.current_state_features().reshape(1, -1))[0]
         s_step = np.zeros(env.n_components, dtype=float)
         if env.counter < env.n_components:
@@ -1065,7 +1132,7 @@ def _fit_scaler_from_warmup(env: CompositionEnv, n_warmup_eps: int) -> StandardS
     pbar = tqdm(total=n_warmup_eps, desc="Warmup (scaler fit)")
     try:
         for _ in range(n_warmup_eps):
-            _rollout_random_episode(env)
+            _rollout_with_retry(lambda: _rollout_random_episode(env))
             for step in env.path:
                 all_s_mat.append(np.asarray(step.state_material_features, dtype=float))
             pbar.update(1)
@@ -1074,6 +1141,7 @@ def _fit_scaler_from_warmup(env: CompositionEnv, n_warmup_eps: int) -> StandardS
         pbar.close()
     scaler = StandardScaler()
     scaler.fit(np.asarray(all_s_mat, dtype=float))
+    bind_scaler(scaler, env)
     print(f"[INFO] Scaler fitted on {len(all_s_mat)} warmup states.")
     return scaler
 
@@ -1089,8 +1157,8 @@ def _rollout_pg_episode(
 ) -> None:
     """Roll out one episode with pure softmax sampling (on-policy, no pg_epsilon)."""
     env.initialize()
-    for _ in range(env.n_components):
-        allowed = env.allowed_actions()
+    for _ in _episode_steps(env):
+        allowed = _legal_actions(env)
         s_mat = scaler.transform(env.current_state_features().reshape(1, -1))[0]
         s_step = np.zeros(env.n_components, dtype=float)
         if env.counter < env.n_components:
@@ -1099,9 +1167,7 @@ def _rollout_pg_episode(
         a_elem_batch = np.asarray(
             [elem_feats_scaled[int(np.argmax(a[0]))] for a in allowed], dtype=float
         )
-        a_comp_batch = np.asarray(
-            [[float(fraction_set[int(np.argmax(a[1]))])] for a in allowed], dtype=float
-        )
+        a_comp_batch = value_features(fraction_set, [int(np.argmax(a[1])) for a in allowed])
         s_mat_batch  = np.repeat(s_mat.reshape(1, -1), n, axis=0)
         s_step_batch = np.repeat(s_step.reshape(1, -1), n, axis=0)
         with torch.no_grad():
@@ -1186,9 +1252,7 @@ def _episode_pg_terms(
         a_elem_batch = np.asarray(
             [elem_feats_scaled[int(np.argmax(a[0]))] for a in allowed], dtype=float
         )
-        a_comp_batch = np.asarray(
-            [[float(fraction_set[int(np.argmax(a[1]))])] for a in allowed], dtype=float
-        )
+        a_comp_batch = value_features(fraction_set, [int(np.argmax(a[1])) for a in allowed])
         s_mat_batch  = np.repeat(s_mat.reshape(1, -1), n, axis=0)
         s_step_batch = np.repeat(s_step.reshape(1, -1), n, axis=0)
 
@@ -1322,6 +1386,8 @@ def train_pg(
     )
     budget_start = budget.counted
     budget_target = budget_start + max(0, int(num_iters)) * int(batch_eps)
+    if checkpoint_cfg and checkpoint_cfg.get("total_budget") is not None:
+        budget_target = int(checkpoint_cfg["total_budget"])
     if int(batch_eps) < 1:
         raise ValueError("batch_eps must be a positive integer")
     budget_history_complete = bool(checkpoint_cfg.get(
@@ -1377,6 +1443,10 @@ def train_pg(
     iteration_in_run = 0
 
     total_updates = max(0, int(num_iters))
+    if checkpoint_cfg and checkpoint_cfg.get("total_iterations") is not None:
+        total_updates = max(0, int(checkpoint_cfg["total_iterations"]) - start_iteration)
+    if checkpoint_cfg and checkpoint_cfg.get("rng_state") is not None:
+        restore_rng_state(checkpoint_cfg["rng_state"])
     budget_label = "episodes" if train_count_duplicates else "new compositions"
     print(
         f"[INFO] PG: budget={total_updates * batch_eps} {budget_label}, "
@@ -1388,7 +1458,7 @@ def train_pg(
         total=total_updates if train_count_duplicates else budget_target - budget_start,
         desc=f"{rl_method.upper()} " + ("iters" if train_count_duplicates else "new compositions"),
     )
-    while (iteration_in_run < total_updates if train_count_duplicates
+    while (iteration_in_run < total_updates and budget.counted < budget_target if train_count_duplicates
            else budget.counted < budget_target):
         # The previous batch has already learned from its duplicate episodes.
         # Only now may the duplicate guard stop the next batch.
@@ -1420,10 +1490,8 @@ def train_pg(
 
         collected = 0
         while collected < int(batch_eps):
-            if not train_count_duplicates and (
-                budget.counted >= budget_target
-                or budget.consecutive_duplicates >= train_max_duplicate_attempts
-            ):
+            if budget.counted >= budget_target or (not train_count_duplicates and
+                    budget.consecutive_duplicates >= train_max_duplicate_attempts):
                 break
             if max_train_attempts is not None and attempted >= max_train_attempts:
                 break
@@ -1609,6 +1677,8 @@ def train_pg(
             "phase": "pg_train",
             "iteration": it + 1,
             "update": update_idx,
+            "actor_optimizer_steps": 1,
+            "critic_optimizer_steps": int(opt_critic is not None and bool(all_critic)),
             "episode": accepted,
             "batch_eps": int(batch_eps),
             "batch_eps_actual": len(batch_paths),
@@ -1658,6 +1728,11 @@ def train_pg(
             _numbered = ckpt_path.replace(".pt", f"-iter{it + 1}.pt")
             _save_checkpoint(ckpt_path, {
                 "type": "pg",
+                "scaler_fingerprint": scaler_fingerprint(scaler),
+                "execution_contract": (checkpoint_cfg or {}).get("execution_contract"),
+                "predictor_ledger": timer.state_dict() if callable(getattr(timer, "state_dict", None)) else None,
+                "budget_target": budget_target,
+                "environment_contract": environment_contract(env),
                 "rl_method": rl_method,
                 "episodes_completed": accepted,
                 "iteration": it + 1,
@@ -1706,8 +1781,8 @@ def _pg_single_episode_generate(
     Default gen_temperature=1.0 prevents pure-greedy composition collapse.
     """
     env.initialize()
-    for _ in range(env.n_components):
-        allowed = env.allowed_actions()
+    for _ in _episode_steps(env):
+        allowed = _legal_actions(env)
         s_mat = scaler.transform(env.current_state_features().reshape(1, -1))[0]
         s_step = np.zeros(env.n_components, dtype=float)
         if env.counter < env.n_components:
@@ -1717,9 +1792,7 @@ def _pg_single_episode_generate(
         a_elem_batch = np.asarray(
             [elem_feats_scaled[int(np.argmax(a[0]))] for a in allowed], dtype=float
         )
-        a_comp_batch = np.asarray(
-            [[float(fraction_set[int(np.argmax(a[1]))])] for a in allowed], dtype=float
-        )
+        a_comp_batch = value_features(fraction_set, [int(np.argmax(a[1])) for a in allowed])
         s_mat_batch  = np.repeat(s_mat.reshape(1, -1), n, axis=0)
         s_step_batch = np.repeat(s_step.reshape(1, -1), n, axis=0)
 
@@ -1826,9 +1899,6 @@ def generate_candidates(
     use_check_phase = hasattr(predictor, "check_phase")
     use_per_obj_stats = hasattr(predictor, "per_objective_stats")
 
-    # Cache raw (mean, std) values: avoids a second DeepMD call for the same
-    # composition when the first was already made inside env.reward_fn.
-    predictor_raw_cache: Dict[tuple, Tuple[float, float]] = {}
     seen_comp_keys: set = set()
     rows: List[dict] = []
 
@@ -1856,7 +1926,7 @@ def generate_candidates(
                     limit=min(n_target - accepted, max_att - attempted + 1),
                     phase="generate",
                 )
-            except CandidateEvaluationFailed as exc:
+            except (CandidateEvaluationFailed, InfeasibleEpisode) as exc:
                 # Unlike training, generation already has a generous, separate
                 # attempts budget (max_att) distinct from `n_target` -- treat
                 # this exactly like a rejected duplicate/infeasible candidate
@@ -1921,14 +1991,23 @@ def generate_candidates(
             # don't mark comp_key as seen, so a later attempt on the same
             # composition can still succeed and be reported.
             try:
-                if comp_key in predictor_raw_cache:
-                    raw_mean, std = predictor_raw_cache[comp_key]
-                elif use_predict_raw:
+                if use_predict_raw:
                     raw_mean, std = predictor.predict_raw(comp)
-                    predictor_raw_cache[comp_key] = (raw_mean, std)
+                elif episode.prediction is not None:
+                    raw_mean, std = episode.prediction
                 else:
                     raw_mean, std = predictor.predict(comp)
-                    predictor_raw_cache[comp_key] = (raw_mean, std)
+                per_stats = predictor.per_objective_stats(comp) if use_per_obj_stats else {}
+                details_fn = getattr(predictor, "reward_details", None)
+                details = details_fn(comp) if callable(details_fn) else {}
+                metadata_fn = getattr(predictor, "candidate_metadata", None)
+                metadata = metadata_fn(comp) if callable(metadata_fn) else {}
+                if not isinstance(metadata, dict):
+                    raise TypeError("candidate_metadata must return a mapping")
+                candidate_json = json.dumps(comp, sort_keys=True, ensure_ascii=False, allow_nan=False)
+                metadata_json = json.dumps(metadata, sort_keys=True, ensure_ascii=False, allow_nan=False)
+            except EvaluationProtocolError:
+                raise
             except Exception as exc:  # noqa: BLE001 - any predictor/builder failure
                 print(f"[WARN] generation candidate failed fetching raw stats, "
                       f"skipping: {type(exc).__name__}: {exc}")
@@ -1953,22 +2032,25 @@ def generate_candidates(
                 "formula": formula,
                 "reward": reward,
                 "dp_mean": raw_mean,
+                "candidate_json": candidate_json,
+                "metadata_json": metadata_json,
             }
+            for name, value in metadata.items():
+                if value is None or isinstance(value, (str, bool, int, float)):
+                    row[f"meta_{name}"] = value
             if use_per_obj_stats:
                 # Composite predictor: each property keeps its own std in
                 # native physical units. A joint dp_std across mixed units
                 # would be meaningless, so dp_std / dp_mean_minus_std stay
                 # absent (pandas writes NaN). Per-property columns below.
-                for obj_name, (m, s) in predictor.per_objective_stats(comp).items():
+                for obj_name, (m, s) in per_stats.items():
                     row[f"obj_{obj_name}_mean"] = float(m)
-                    row[f"obj_{obj_name}_std"] = float(s)
+                    row[f"obj_{obj_name}_std"] = None if s is None else float(s)
             else:
                 row["dp_std"] = std
-                row["dp_mean_minus_std"] = raw_mean - k * std
-            details_fn = getattr(predictor, "reward_details", None)
-            if callable(details_fn):
-                details = details_fn(comp)
-                if details["type"] == "gated":
+                row["dp_mean_minus_std"] = None if std is None else raw_mean - k * std
+            if details:
+                if details.get("type") == "gated":
                     row["reward_objective"] = float(details["objective"])
                     row["gate_passed"] = bool(details["gate_passed"])
                     for gate in details["gates"]:

@@ -36,7 +36,10 @@ from __future__ import annotations
 import itertools
 import warnings
 from functools import lru_cache
-from typing import Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+
+if TYPE_CHECKING:
+    from pymatgen.core import Composition
 
 # Guard against pathological state-space blow-ups (distinct elements each with
 # many oxidation states). Typical compositions are 5-9 elements x 2-6 states,

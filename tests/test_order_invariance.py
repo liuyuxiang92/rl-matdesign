@@ -15,6 +15,7 @@ Three layers are covered separately so a regression points at the right place:
 from __future__ import annotations
 
 from pathlib import Path
+import os
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -343,10 +344,8 @@ def test_rf_magpie_predictor_is_order_invariant(filename):
     pytest.importorskip("matminer")
     pytest.importorskip("joblib")
 
-    rf_path = (
-        Path(__file__).resolve().parent.parent
-        / "models" / "sinter_calcine" / filename
-    )
+    rf_path = Path(os.environ.get("RL_MATDESIGN_RF_MODEL_DIR",
+        Path(__file__).resolve().parent.parent / "models" / "sinter_calcine")) / filename
     if not rf_path.exists():
         pytest.skip(f"model file not found at {rf_path}")
 
@@ -359,3 +358,5 @@ def test_rf_magpie_predictor_is_order_invariant(filename):
     pred._cache.clear()
     permuted = pred.predict(_permute_dict(comp, 2))
     assert base == pytest.approx(permuted)
+    pred._cache.clear()
+    assert base == pytest.approx(pred.predict({key: value * 10 for key, value in comp.items()}))

@@ -1,8 +1,25 @@
 # Reinforce Learning for Materials Design
 
-Config-driven RL runner for materials composition discovery.
+Config-driven RL runner for materials composition, peptide-position and typed-field design.
 Supports multiple material systems (OOH catalyst, HEA, perovskite, oxides) via YAML configs.
 Three RL algorithms: **DQN** (online, target-network, or MC targets), **REINFORCE**, and **A2C**.
+
+Version 0.2 uses labelled assignments, explicit structure sources and named
+scientific outputs. See the [migration and development contracts](docs/development_contracts.md)
+before loading older checkpoints. Historical paper results require their actual
+code and asset archive; a new-version run is not a replay of an old trajectory.
+
+The [benchmark guide](docs/glassnet_benchmark.md) describes shared query budgets,
+DQN-MC/DQN-bootstrap/A2C comparisons and uniform random search. Experiment YAMLs
+remain local; supply your own domain files when generating a plan:
+
+```bash
+python scripts/benchmark.py --config /path/to/local/small.yaml \
+  --config /path/to/local/large.yaml --out runs/benchmark --budget 1000
+```
+
+Add `--run` after preparing the scientific oracle and its assets. Stock GlassNet
+prediction runs on CPU; the RL device is selected separately.
 
 See [code layout and compatibility](docs/code_layout.md) for maintained entry
 points, module responsibilities, and regression checks.
@@ -47,7 +64,7 @@ file** under `configs/`. The CLI only takes the config path, output directory, m
 operational flags (seeds, resume, checkpoint). This means:
 
 - Switching material systems = swap `--config`
-- Reproducing a run = keep the same config + seeds
+- Reproducing a run = preserve the code, inputs, environment, effective config and seeds
 - Tuning = edit the YAML, re-run
 
 ---
@@ -63,8 +80,8 @@ operational flags (seeds, resume, checkpoint). This means:
 | `configs/test_dummy.yaml` | Fast smoke test (no real predictor) | dqn |
 | `configs/test_multigroup_dummy.yaml` | Multi-sublattice smoke test (no real predictor) | CLI selection |
 
-OOH, Ti-alloy, and perovskite scenario YAML files are intentionally local and
-gitignored. Examples below using those paths require your existing local configs
+New and migrated scenario YAML files are maintained locally. This release does
+not publish their contents or changes; previously published examples remain as-is. Examples below using those paths require your existing local configs
 and model/structure files. They are not included in a fresh checkout.
 
 ---
@@ -76,7 +93,7 @@ python scripts/run_experiment.py \
     --config configs/test_dummy.yaml \
     --method a2c \
     --out runs/smoke_a2c_seed0 \
-    --dp-seed 321 --train-seed 123 --gen-seed 213
+    --eval-seed 321 --train-seed 123 --gen-seed 213
 ```
 
 All hyperparameters (`pg_num_iters`, `pg_batch_eps`, `pg_entropy_coef`, `num_gen_eps`, etc.)
@@ -88,11 +105,32 @@ come from the YAML. Override them by editing the config or creating a copy for e
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--dp-seed N` | 0 | Predictor seed: controls random structure generation and alloy configs. Acts as fallback for the other two seeds. |
-| `--train-seed N` | *(uses dp-seed)* | Training RNG. Also enables GPU deterministic mode (`cudnn.deterministic`, `use_deterministic_algorithms`). |
-| `--gen-seed N` | *(uses dp-seed)* | Generation phase only — makes stochastic sampling reproducible independently of training. |
+| `--eval-seed N` | YAML `eval_seed`, otherwise 0 | Property evaluation and random structures; fallback for the other two seeds. |
+| `--train-seed N` | YAML `train_seed`, otherwise eval seed | Training random state. Deterministic Torch settings apply regardless of whether the seed is supplied by CLI or YAML. |
+| `--gen-seed N` | YAML `gen_seed`, otherwise eval seed | Generation random state, reset independently of training. |
 
-Fix all three for fully reproducible results. `--dp-seed` alone is sufficient for a quick sweep.
+`--dp-seed` and YAML `dp_seed` remain migration aliases for `eval_seed`; they do
+not create another random stream. CLI values override YAML. Fixed seeds support
+repeatability within the recorded code/input/software/hardware environment;
+they do not guarantee bitwise agreement across different environments.
+
+Validate and print effective settings before loading a predictor:
+
+```bash
+python scripts/run_experiment.py --config configs/test_dummy.yaml \
+    --method dqn --dqn-target-mode mc --validate-config
+```
+
+Shared defaults and validation now come from one [configuration contract](docs/configuration_schema.md).
+A single YAML can keep both DQN and A2C settings. Duplicate keys, conflicting old/new
+aliases, and unknown core parameters are rejected. Scientific plugin settings
+remain owned by their plugins; this is not yet a full nested scientific schema.
+Every invocation saves effective settings, their sources, and an append-only
+provenance record. `--only-generate` writes `generation_log.csv` and preserves the
+existing `training_log.csv`.
+
+See [experiment archiving and reproduction](docs/reproducibility.md) and
+[development contracts](docs/development_contracts.md).
 
 ---
 
@@ -103,7 +141,7 @@ python scripts/run_experiment.py \
     --config configs/ooh.yaml \
     --method reinforce \
     --out runs/ooh_reinforce_seed0 \
-    --dp-seed 321 --train-seed 123 --gen-seed 213 \
+    --eval-seed 321 --train-seed 123 --gen-seed 213 \
     --save-checkpoint-freq 50
 ```
 
@@ -138,7 +176,7 @@ python scripts/run_experiment.py \
     --config configs/ooh.yaml \
     --method a2c \
     --out runs/ooh_a2c_seed0 \
-    --dp-seed 0 --train-seed 42 --gen-seed 99
+    --eval-seed 0 --train-seed 42 --gen-seed 99
 ```
 
 A2C trains an additional critic (`value_net.pt`) to reduce gradient variance.
@@ -153,7 +191,7 @@ python scripts/run_experiment.py \
     --config configs/ooh.yaml \
     --method dqn \
     --out runs/ooh_dqn_seed0 \
-    --dp-seed 0 --train-seed 42 --gen-seed 99
+    --eval-seed 0 --train-seed 42 --gen-seed 99
 ```
 
 Key YAML fields:
@@ -214,45 +252,51 @@ disabled, `episode` tracks actual samples and can exceed the configured budget.
 
 ## Checkpointing and resume
 
+The following commands use a prepared model environment and a local
+configuration (`/path/to/local/experiment.yaml` is a placeholder). Keep the same code, numerical environment, model/scaler assets,
+training settings and checkpoint frequency when resuming.
+
 ```bash
-# 1. Save checkpoints every 50 PG iterations (or DQN episodes)
+# 1. Train toward 1,000 successful unique candidates.
 python scripts/run_experiment.py \
-    --config configs/ooh.yaml --method reinforce \
-    --out runs/ooh_reinforce_seed0 \
-    --dp-seed 321 --train-seed 123 \
+    --config /path/to/local/experiment.yaml --method a2c \
+    --out runs/a2c_repeat --train-budget 1000 \
+    --eval-seed 321 --train-seed 123 --gen-seed 213 \
     --save-checkpoint-freq 50
 
-# 2. Resume after interruption (loads checkpoint.pt, appends training_log.csv)
+# 2. Continue an interrupted run toward that same total.
 python scripts/run_experiment.py \
-    --config configs/ooh.yaml --method reinforce \
-    --out runs/ooh_reinforce_seed0 \
-    --dp-seed 321 --train-seed 123 \
-    --resume-training
+    --config /path/to/local/experiment.yaml --method a2c \
+    --out runs/a2c_repeat --train-budget 1000 \
+    --eval-seed 321 --train-seed 123 --gen-seed 213 \
+    --save-checkpoint-freq 50 --resume-training
 
-# 3. Generate candidates from a saved model without re-training
+# 3. Reproduce generation from the compatible saved model and scaler.
 python scripts/run_experiment.py \
-    --config configs/ooh.yaml --method reinforce \
-    --out runs/ooh_reinforce_seed0 \
-    --only-generate
+    --config /path/to/local/experiment.yaml --method a2c \
+    --out runs/a2c_repeat \
+    --eval-seed 321 --train-seed 123 --gen-seed 213 --only-generate
 
-# 4. Extend training without generating
+# 4. Extend the saved state to a larger total; omit extra generation.
 python scripts/run_experiment.py \
-    --config configs/ooh.yaml --method reinforce \
-    --out runs/ooh_reinforce_seed0 \
-    --resume-training --skip-generation
+    --config /path/to/local/experiment.yaml --method a2c \
+    --out runs/a2c_repeat --train-budget 2000 \
+    --eval-seed 321 --train-seed 123 --gen-seed 213 \
+    --save-checkpoint-freq 50 --resume-training --skip-generation
 ```
 
-Use `--load-policy`, `--load-qnet`, `--load-scaler`, `--load-value-net` to load
-model files from a non-default path.
+Use `--load-policy`, `--load-qnet`, `--load-scaler` and `--load-value-net` for
+non-default artifact paths. Full checkpoints preserve optimizer/replay, RNG,
+scaler fingerprint, unique-candidate history and evaluation/learning contracts.
+A budget extension continues saved state; it need not equal a run started with
+that larger budget, because an earlier partial final batch may already have
+updated the policy. Changing the duplicate guard or checkpoint frequency may
+change sampling boundaries and is rejected as exact continuation.
 
-New checkpoints preserve the training budget counters and seen-candidate set.
-Keep `train_count_duplicates` unchanged when resuming a checkpoint that has
-already collected episodes. Older checkpoints and weights-only resumes lack the
-history required for unique-candidate accounting: resume them with the default
-`train_count_duplicates: true`, or start a new run to use `false`.
-When resuming an older checkpoint, `training_budget_history_complete: false`
-marks budget diagnostics that cover only the resumed portion. Appending to an
-older CSV preserves its header, so new budget columns appear only in new logs.
+Old checkpoints require their archived implementation and assets. Setting
+`train_count_duplicates: true` does not bypass the new contracts. A compatible
+current-version weights-only fallback is explicitly a warm start, lacking the
+history and optimizer/RNG state needed for exact continuation.
 
 ---
 
@@ -268,7 +312,7 @@ under built-in short names (Tier 3).
 
 For any system whose reward is "substitute composition onto a base POSCAR,
 evaluate with one or more DeepMD models, aggregate to a scalar", use
-a `properties:` list with `builder: substitute` and a property whose
+a named `structure_sources` entry with `builder: substitute` and a property whose
 `predictor` is `dp_energy`, `dp_property`, or `dp_classification`. The list
 automatically selects the reward engine. Composition-only predictors can use
 the same engine without a builder; see `configs/oxides_sinter_calcine.yaml` for
@@ -276,28 +320,31 @@ a multi-objective example. A minimal YAML:
 
 ```yaml
 # Environment
-species_set: [Ti, Al, V, Cr, Fe, Zr, Nb, Mo, Sn, Hf, Ta]
-fraction_set: ["0.00", "0.01", ..., "0.90"]    # whatever step you want
-total_units: 100                                # step = 1/total_units
-n_components: 11
-episode_style: fixed_order_amount               # each step picks an amount;
-                                                # element is species_set[step]
-element_bounds:                                 # per-element [min, max]
-  Ti: [0.45, 0.90]
-  Al: [0.00, 0.25]
-  # ...
+groups:
+  - name: alloy
+    kind: composition
+    species_set: [Ni, Fe]
+    fraction_set: {min: 0.00, max: 1.00, step: 0.25}
+    n_components: 2
+    element_bounds:
+      Ni: [0.25, 0.75]
+      Fe: [0.25, 0.75]
 
 # Predictor
-builder: substitute                             # fixed-lattice element swap
-base_poscar: data/ti_alloy/FCC.POSCAR           # placeholder 'X' on sub sites
-site_symbol: X
+structure_sources:
+  bulk:
+    builder: substitute                         # fixed-lattice element swap
+    base_poscar: /path/to/template.POSCAR         # placeholder X on sub sites
+    site_symbol: X
 k: 1.0
 properties:
   - name: energy
+    source: bulk
     predictor: dp_energy                        # DP potential energy
-    models: [models/ti/m1.pt, models/ti/m2.pt]
+    models: [/path/to/member1.pt, /path/to/member2.pt]
     direction: min                              # lower energy = better
-    objective: mean_minus_kstd                  # reward = -mean - k*std
+    objective: mean_minus_kstd                   # reward = -mean - k*model_spread
+    uncertainty: model_spread                    # requires at least two models
 
 # Method + hyperparameters
 method: a2c
@@ -310,7 +357,7 @@ Run:
 ```bash
 python scripts/run_experiment.py \
     --config configs/your_system.yaml \
-    --out runs/my_run --dp-seed 0
+    --out runs/my_run --eval-seed 0
 ```
 
 **Zero Python required.**
@@ -327,9 +374,10 @@ This fragment assumes that the environment and structure builder have already
 been configured, and that you supply the two model files:
 
 ```yaml
-n_random_configs: 10
+# Set n_random_configs: 10 inside the declared bulk source.
 properties:
   - name: delta
+    source: bulk
     predictor: dp_property
     models: [models/delta.pt]
     output_index: 0
@@ -337,6 +385,7 @@ properties:
     objective: mean
     scale: 1.0                       # delta stays in its original units
   - name: synthesizability_probability
+    source: bulk
     predictor: dp_classification
     models: [models/synthesizability.pt]
     head: synthesizability
@@ -371,19 +420,20 @@ rl-matdesign is needed. With a list, selected class probabilities are summed
 within each model/configuration first. The resulting probability is averaged
 across the successfully prepared configurations, using the same structures for every
 checkpoint. With several model files, the engine then computes the mean and
-population standard deviation across those model averages; one file gives
-`std = 0`. All checkpoints must use the same class order. This standard deviation
-is not `1 - p`.
+population standard deviation across those model averages (`model_spread`); with
+one model that estimate is missing (`None`), rather than zero. All checkpoints
+must use the same class order. This standard deviation is not `1 - p`.
 
-Classification properties automatically contribute `mean - std` to gate
-scores, with coefficient `1` independent of `k`; adding model files to `models`
-requires no new parameter. Other property types still contribute their raw
+Classification properties contribute `mean - model_spread` to gate scores when
+at least two models are available, and their mean with one model. The coefficient
+is `1`, independent of `k`; the gate does not fabricate a missing spread. Other property types still contribute their raw
 mean. Here a synthesizability score `S = mean - std` of at least `0.8` gives
 reward `delta`; otherwise, reward is `-10 - (0.8 - S)`.
 `S` is a conservative score, not a calibrated probability. In `generated.csv`,
 `obj_synthesizability_probability_mean` and
-`obj_synthesizability_probability_std` retain the mean and model standard
-deviation of the combined probability, while `gate_synthesis_value` records `S`.
+`obj_synthesizability_probability_std` retain the mean and selected spread
+(default: model spread, blank when missing); named scientific outputs retain each
+spread separately. `gate_synthesis_value` records `S`.
 The failure value is configurable.
 To guarantee that every passing candidate outranks every failing candidate,
 choose it below the lowest possible feasible objective; a fixed value cannot
@@ -397,19 +447,25 @@ for multiple gates, multi-property gate scores, and diagnostics.
 
 ### Parallel structure preparation on multiple GPUs
 
-Add `structure_parallel` to a `properties:` configuration to prepare a candidate's
-configurations concurrently. The engine detects available GPUs and runs exactly
-one structure task per GPU, without concurrency calibration. Each persistent worker
-builds one configuration and completes its relaxation before returning it. An external
-builder that performs MD followed by optimization, such as
-`clc_workflow.rl_builder:MDAveragedOptBuilder`, runs that entire sequence in the
-worker; keep `geo_opt: null` when the builder already optimizes the structure.
-For other builders, optional top-level `geo_opt` also runs in the worker.
+Add `structure_parallel` to a named source to prepare its configurations
+concurrently. Each persistent worker executes one explicit sample and completes
+its source-owned relaxation before returning it. Built-in `substitute` supports
+this protocol, including multiple templates. An external builder must implement
+`build_sample(candidate, *, sample)` returning one ASE `Atoms`; merely having
+`build(..., n_configs=1)` is insufficient. Missing capability is a configuration
+error before scientific jobs run. An MD builder must expose the same explicit
+sample protocol before its MD-plus-optimization path can run in workers. Keep
+`geo_opt: null` within that source if the builder already performs optimization.
 
 ```yaml
-share_structure: true
-n_random_configs: 4
-structure_parallel: {}  # automatic GPUs and formula batches; one task per GPU
+structure_sources:
+  bulk:
+    builder: substitute
+    base_poscar: my.POSCAR
+    site_symbol: X
+    n_random_configs: 4
+    structure_parallel: {}  # automatic GPUs; one task per GPU
+# Each structure property refers to source: bulk.
 ```
 
 On eight selected GPUs, the example collects two formulas with four configurations
@@ -449,7 +505,7 @@ CPU property prediction may cost more time, so measure it before choosing this
 allocation. Alternatively, add `reserve_devices: [0]` to the block to leave visible
 GPU 0 for the parent and automatically use the remaining GPUs. Parent DeepMD
 scoring models are loaded before the first build. Their resident memory, external
-GPU load and additional property-specific worker pools still affect available
+GPU load and additional source-specific worker pools still affect available
 memory.
 
 Manual `devices: [1, 2]` is also supported. Indices are relative to the inherited
@@ -460,65 +516,90 @@ single-GPU arguments, such as `-k on g 1`; do not override `CUDA_VISIBLE_DEVICES
 feature does not need `torchrun` or distributed RL training.
 
 Property scoring and reward calculation wait for the completed structures and
-keep their existing averaging rules. `share_structure: true` lets all structure
-properties reuse the same prepared configurations. Omitting `structure_parallel`
-preserves serial execution. GPU execution requires the appropriate CUDA-enabled
+use the same model-by-configuration statistics. Properties with the same
+`source` reference reuse one prepared ensemble; distinct source IDs create
+independent ensembles. `share_structure` is a legacy migration input, not the
+recommended interface: old `true` can normalize to source `default`; old `false`
+requires explicit source definitions. Omitting `structure_parallel` uses serial
+execution. Source/sample seeds do not depend on candidate order, batch partition
+or worker count; GPU arithmetic can still vary across hardware/backends. GPU execution requires the appropriate CUDA-enabled
 DeepMD/LAMMPS installation; speedup depends on MD/optimization cost, CPU resources,
 and the work that remains serial. See the [YAML reference](docs/yaml_config_reference.md#structure_parallel-gpu-workers-and-automatic-formula-batches)
 for failure handling, supported builders, and reproducibility.
 
-### Tier 2 — YAML + ~30-line custom predictor
+### Tier 2 — YAML + a custom scientific predictor
 
-For novel reward physics (custom property, bespoke aggregation, model from a
-non-DeepMD framework), write a class implementing the `PropertyPredictor`
-protocol and point at it from YAML via fully-qualified name. No edits to
-`scripts/run_experiment.py`.
+A custom adapter returns physical predictions; the property engine applies
+reward signs, weights and penalties. Use `predict_outputs(candidate)` for a
+composition model, or `predict_structure_outputs(structures)` for structures
+prepared by a named source. This illustrative adapter exposes one checkpoint;
+its `_bulk_modulus` method must implement the actual physics and return GPa:
 
 ```python
 # my_pkg/elastic_predictor.py
-import numpy as np
-from rl_matdesign.utils.structure import substitute_sites
-from rl_matdesign.training import objective_from_mean_std
+import json
+from rl_matdesign.predictors.outputs import OutputSchema, ModelSamples, aggregate_samples
 
 class ElasticConstantPredictor:
+    output_schema = {"bulk_modulus": OutputSchema("bulk_modulus", "GPa")}
+
     def __init__(self, cfg, *, seed=None):
-        self.cfg = cfg
-        self._rng = np.random.default_rng(seed or 0)
         from deepmd.calculator import DP
-        self._calcs = [DP(model=p) for p in cfg["dp_models"]]
+        self.calc = DP(model=cfg["model"])
 
-    def predict(self, composition):
-        structs = substitute_sites(
-            self.cfg["base_poscar"], composition,
-            self.cfg.get("site_symbol", "X"), 5, self._rng,
-        )
-        vals = [self._bulk_modulus(a, c) for a in structs for c in self._calcs]
-        m, s = float(np.mean(vals)), float(np.std(vals))
-        reward = objective_from_mean_std(
-            m, s, self.cfg.get("objective", "mean_minus_kstd"),
-            float(self.cfg.get("k", 1.0)),
-        )
-        return reward, s
+    def predict_structure_outputs(self, structures):
+        # Source metadata identifies the same retained configurations in every model.
+        ids = tuple(json.dumps(a.info["_rl_matdesign_sample"], sort_keys=True)
+                    for a in structures)
+        values = tuple(self._bulk_modulus(a, self.calc) for a in structures)
+        row = ModelSamples("checkpoint", ids, values)
+        output = aggregate_samples(self.output_schema["bulk_modulus"], [row])
+        return {"bulk_modulus": output}
 
-    def _bulk_modulus(self, atoms, calc): ...     # your physics
+    def _bulk_modulus(self, atoms, calc):
+        raise NotImplementedError("Implement the scientific calculation in GPa")
 ```
 
-In the YAML:
+Declare the source and model once, then select its output:
+
 ```yaml
-predictor: "my_pkg.elastic_predictor:ElasticConstantPredictor"
-base_poscar: my.POSCAR
-dp_models: [my.pt]
-# ... any other keys your class reads from cfg
+structure_sources:
+  bulk:
+    builder: substitute
+    base_poscar: my.POSCAR
+    site_symbol: X
+    n_random_configs: 5
+models:
+  elastic:
+    predictor: "my_pkg.elastic_predictor:ElasticConstantPredictor"
+    model: my.pt
+properties:
+  - name: stiffness
+    model_ref: elastic
+    source: bulk
+    output: bulk_modulus
+    direction: max
+    objective: mean
 ```
 
-The runner uses `importlib` to load the class; install your package (or set
-`PYTHONPATH`) so it can be found. Helpful error messages name the registered
-built-ins if the FQN fails.
+Properties referencing the same model, source and operating conditions share one
+named-output inference. A singleton model has `model_spread=None`; configuration
+spread remains separate. An explicit uncertainty penalty requires an available
+statistic selected by `uncertainty`. Nonlinear inverse transforms act on retained
+raw samples before statistics, never on an already folded mean/std pair.
+
+Install your package or set `PYTHONPATH` so the FQN can be imported. Constructor
+options belong to the model definition; output/reward/source settings belong to
+the property. Existing inline properties remain supported. Legacy `score*` and
+`predict*` interfaces have narrower compatibility rules; see the
+[scientific output migration](docs/scientific_output_migration.md). Old adapters
+that returned already-negated or penalized rewards must expose scientific values
+before being used as properties.
 
 ### Tier 3 — specialized (OOH-like)
 
-For complex domain physics (e.g. OOH adsorbate placement → Sabatier
-overpotential) or constraints that exceed the declarative `phase_pattern`
+For complex domain physics (e.g. OOH slab and adsorbate construction before
+the trained property prediction) or constraints that exceed the declarative `phase_pattern`
 grammar (e.g. cross-element inequalities like `Fe ≤ max(Ni, Co)`), keep the
 logic in a dedicated class:
 
@@ -540,10 +621,10 @@ registry leaves also support a flat `predictor: <name>`:
 | `structure_score` | Reward engine selected automatically by a non-empty `properties:` list; optional shared build/relax, then weighted-sum or gated reward |
 | `dp_energy` / `dp_property` / `dp_classification` | DeepMD energy, regression, or class probabilities; use within `properties[].predictor` |
 | `rf_magpie` | RandomForest on Magpie features (no DeepMD); select the target with `model` |
-| `ooh` | OOH catalyst overpotential (adsorbate placement + Sabatier formula) |
+| `ooh` | OOH slab/adsorbate sampling and the trained DeepMD property; units require the model provenance |
 | `dummy` | Random-noise predictor for smoke testing |
 
-**Built-in constraint filters** — `constraint_filter: <name>`:
+**Built-in constraint filters** — `filters: [{type: <name>, ...}]`:
 
 | Name | What it does |
 |---|---|
@@ -555,18 +636,19 @@ registry leaves also support a flat `predictor: <name>`:
 **FQN form** for both predictors and constraints:
 `predictor: "pkg.module:ClassName"` — no repo edit needed.
 
-### Per-element fraction bounds + `fixed_order_amount`
+### Per-element fraction bounds and complete assignments
 
-`CompositionEnv` accepts:
+`element_bounds: {El: [min_frac, max_frac]}` intersects each species' exact menu
+with a closed physical interval. Positive lower bounds imply required species.
+Use `n_components` to choose a subset size, or assign the full declared list
+when every label is a design variable. No Ti-specific last action is needed.
 
-- `element_bounds: {El: [min_frac, max_frac]}` — per-element fractional range.
-- `episode_style: fixed_order_amount` — every element in `species_set` appears
-  in fixed order; the agent picks the amount per step; the last step's amount
-  is forced to satisfy the sum constraint.
-
-The two together enable the Ti-alloy-style use case. The default
-`episode_style: element_then_amount` (with `element_bounds` omitted) preserves
-the existing pick-element-then-pick-fraction behavior used by OOH/HEA/etc.
+The deprecated `episode_style: fixed_order_amount` spelling means assign every
+species once, in a freely chosen order. It no longer fixes the action order or
+makes the final species a special remainder variable. One complete label/value
+assignment consumes a transition; the feasible-action mask enforces the total.
+Integer oxides retain accumulation and their explicit one-positive-O-token rule;
+see [domain migration](docs/design_domain_migration.md).
 
 ### Flag-naming convention
 
@@ -610,20 +692,34 @@ To silence the warnings, rename the keys in your YAML — the values are unchang
 | `value_net.pt` | — | A2C | Critic (ValueNet) weights |
 | `checkpoint.pt` | ✓ | ✓ | Latest mid-training checkpoint (symlink to numbered file) |
 | `training_log.csv` | ✓ | ✓ | Per-episode: return, actor_loss, entropy, critic_loss, … |
-| `training_samples.csv` | ✓ | ✓ | Budget-consuming training materials in sampling order, with the same property fields as generated candidates |
+| `training_samples.csv` | ✓ | ✓ | One material/property record per budget-consuming training episode, using generated.csv column names |
 | `episode_timing.csv` | ✓ | ✓ | Incremental per-attempt wall time, MD/optimization task time, and RL update time |
 | `timing.json` | ✓ | ✓ | Run/phase totals and the current invocation's episode timing totals |
 | `generated.csv` | ✓ | ✓ | Candidates: formula, reward, dp_mean, dp_std |
-| `run_config.json` | ✓ | ✓ | Full config + argparse namespace for reproducibility |
+| `run_config.json` | ✓ | ✓ | Effective configuration after aliases, CLI overrides, defaults and fallbacks |
+| `config_sources.json` | ✓ | ✓ | Origin of each effective top-level configuration value |
+| `provenance/*/manifest.json` | ✓ | ✓ | Per-invocation command, runtime flags, code/environment evidence and input hashes |
+
+Training samples are saved automatically as episodes complete. DQN includes
+random warmup and online training; REINFORCE/A2C include policy training, while
+scaler warmup is outside their budget. Repeats are saved exactly when
+`budget_counted` is true. Property values come from that episode's evaluation,
+without another predictor call; unavailable scientific uncertainty stays blank.
+`candidate_json` retains sequence, categorical and multi-group structure.
+
+`--only-generate` preserves this file. Resume follows the saved checkpoint's
+sample session, preserves superseded records in a sibling backup, and marks
+missing sample history explicitly. Existing source-code and protocol checks
+still apply to checkpoint loading. See [training samples](docs/training_samples.md)
+for resume details and a training-versus-generation delta comparison. Use
+`obj_<name>_mean` for physical-property distributions when `reward` or `dp_mean`
+includes a synthesis-gate penalty. `generated_columns` controls the generated
+report; the training export retains all available properties.
 
 ### Per-episode timing
 
-Training samples are saved automatically, one row per episode with
-`budget_counted=True`. The file includes DQN random warmup and online training,
-or REINFORCE/A2C policy episodes. It preserves raw property means/stds and gate
-diagnostics without additional inference. Generation-only runs leave it intact.
-See [training sample export](docs/training_samples.md) for budget semantics,
-resume handling, and comparison with `generated.csv`.
+Generation-only invocations preserve training logs/timings and instead write
+`generation_log.csv`, `generation_episode_timing.csv` and `generation_timing.json`.
 
 Timing is enabled automatically; no YAML option is required. `episode_timing.csv`
 is written during training and generation, including failed evaluations and

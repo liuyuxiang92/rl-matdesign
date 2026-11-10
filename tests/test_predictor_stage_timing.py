@@ -9,7 +9,7 @@ from rl_matdesign.utils import stage_timing
 from rl_matdesign.utils.stage_timing import (
     capture_stage_times, summarize_stage_times, timed_stage,
 )
-from tests.test_cross_formula_predictor import _candidate, _predictor
+from tests.test_cross_formula_predictor import enable_source_geo_opt, _candidate, _predictor
 
 
 class Clock:
@@ -61,7 +61,8 @@ class TimedBatchBuilder(TimedSerialBuilder):
     parallel_execution = True
     handles_geo_opt = True
 
-    def build_many(self, candidates, *, n_configs, rng):
+    def build_many_seeded(self, candidates, *, n_configs, source_spec, eval_seed):
+        import numpy as np
         self.last_build_timings = []
         results = []
         for candidate in candidates:
@@ -69,7 +70,8 @@ class TimedBatchBuilder(TimedSerialBuilder):
             succeeded = 0
             with capture_stage_times() as capture:
                 try:
-                    structures = self.build(candidate, n_configs=n_configs, rng=rng)
+                    structures = self.build(candidate, n_configs=n_configs, rng=np.random.default_rng(
+                        source_spec.seed_for(candidate, eval_seed=eval_seed)))
                     succeeded = len(structures)
                     results.append(structures)
                 except Exception as exc:
@@ -86,9 +88,9 @@ def _timed_predictor(clock, *, shared=True, batch=False, failures=None):
     predictor = _predictor(share_structure=shared)
     factory = TimedBatchBuilder if batch else TimedSerialBuilder
     if shared:
-        predictor._shared_builder = factory(clock, failures=failures)
+        predictor._source_builders["default"] = factory(clock, failures=failures)
     else:
-        predictor._builders = {
+        predictor._source_builders = {
             prop["name"]: factory(clock, failures=failures if index == 0 else None)
             for index, prop in enumerate(predictor.properties)
         }
@@ -188,8 +190,8 @@ def test_property_failure_retains_build_and_elapsed_inference_time(clock):
 
 def test_multiple_optimization_passes_do_not_invent_extra_configuration_attempts(clock):
     predictor = _timed_predictor(clock)
-    predictor.geo_opt_enabled = True
-    def relax(atoms):
+    enable_source_geo_opt(predictor)
+    def relax(atoms, *, source_id):
         with timed_stage("opt"):
             clock.advance(11)
         return atoms
@@ -204,9 +206,9 @@ def test_multiple_optimization_passes_do_not_invent_extra_configuration_attempts
 @pytest.mark.parametrize("survivors", [0, 1])
 def test_parent_relaxation_after_batch_counts_failed_opt_time_and_actual_survivors(clock, survivors):
     predictor = _timed_predictor(clock, batch=True)
-    predictor.geo_opt_enabled = True
-    predictor._shared_builder.handles_geo_opt = False
-    def relax(atoms):
+    enable_source_geo_opt(predictor)
+    predictor._source_builders["default"].handles_geo_opt = False
+    def relax(atoms, *, source_id):
         with timed_stage("opt"):
             clock.advance(11)
             if atoms.index >= survivors:
@@ -231,7 +233,7 @@ def test_pool_timeout_sidechannel_stays_aligned_around_cache_hits_and_duplicates
     class TimeoutBuilder:
         parallel_execution = True
         handles_geo_opt = True
-        def build_many(self, candidates, **kwargs):
+        def build_many_seeded(self, candidates, **kwargs):
             assert candidates == [first, second]
             self.last_build_timings = [
                 {"md_task_s": 11, "opt_task_s": 22, "structure_other_task_s": 33,
@@ -241,7 +243,7 @@ def test_pool_timeout_sidechannel_stays_aligned_around_cache_hits_and_duplicates
             ]
             clock.advance(100)
             raise TimeoutError("worker timed out")
-    predictor._shared_builder = TimeoutBuilder()
+    predictor._source_builders["default"] = TimeoutBuilder()
     result = predictor.batch_predict([cached, first, second, first.copy()], return_exceptions=True)
     assert all(isinstance(item, TimeoutError) for item in result[1:])
     cache, finished, unfinished, duplicate = predictor.last_evaluation_timings
@@ -268,7 +270,7 @@ def test_separate_property_groups_keep_alignment_when_first_group_skips_a_formul
     assert good_row["md_task_s"] == 8
     assert good_row["opt_task_s"] == 12
     assert good_row["property_s"] == 12
-    assert predictor._builders["cost"].calls == [good]
+    assert predictor._source_builders["cost"].calls == [good]
 
 
 def test_uninstrumented_serial_physics_reports_unknown_stage_costs(clock):
@@ -279,7 +281,7 @@ def test_uninstrumented_serial_physics_reports_unknown_stage_costs(clock):
         def build(self, candidate, *, n_configs, rng):
             clock.advance(27)
             return [SimpleNamespace(candidate=candidate) for _ in range(n_configs)]
-    predictor._shared_builder = OldBuilder()
+    predictor._source_builders["default"] = OldBuilder()
     predictor.predict(_candidate(.1))
     row = predictor.last_evaluation_timings[0]
     assert row["md_task_s"] is None

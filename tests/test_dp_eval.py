@@ -97,23 +97,26 @@ def test_eval_energy_ase_returns_models_by_structures():
 
 
 def test_fold_averages_structures_then_spreads_over_models():
-    from rl_matdesign.predictors.structure_score import _fold_models_structures
+    from rl_matdesign.predictors.outputs import aggregate_samples, ModelSamples, OutputSchema
 
     # 2 models x 3 structures. Per-model means are 10 and 20 regardless of how
     # scattered the structures are within each model.
     arr = np.array([[0.0, 10.0, 20.0],
                     [19.0, 20.0, 21.0]])
-    mean, std = _fold_models_structures(arr)
-    assert mean == pytest.approx(15.0)             # mean(10, 20)
-    assert std == pytest.approx(5.0)               # population std of (10, 20)
+    output = aggregate_samples(OutputSchema('energy', 'eV'),
+        [ModelSamples(str(i), ('a', 'b', 'c'), tuple(row)) for i, row in enumerate(arr)])
+    assert output.mean == pytest.approx(15.0)
+    assert output.model_spread == pytest.approx(5.0)
 
 
-def test_fold_with_one_model_has_zero_std_however_scattered():
-    from rl_matdesign.predictors.structure_score import _fold_models_structures
+def test_fold_with_one_model_cannot_estimate_model_spread():
+    from rl_matdesign.predictors.outputs import aggregate_samples, ModelSamples, OutputSchema
 
-    mean, std = _fold_models_structures(np.array([[-100.0, 0.0, 100.0]]))
-    assert mean == pytest.approx(0.0)
-    assert std == 0.0
+    output = aggregate_samples(OutputSchema('energy', 'eV'),
+        [ModelSamples('model', ('a', 'b', 'c'), (-100., 0., 100.))])
+    assert output.mean == pytest.approx(0.0)
+    assert output.model_spread is None
+    assert output.config_spread == pytest.approx(np.std([-100., 0., 100.]))
 
 
 class _PredictionAtoms:
@@ -393,3 +396,26 @@ def test_dp_helpers_report_unknown_species_before_inference(helper_name):
 
     with pytest.raises(RuntimeError, match="not in the DP model type_map"):
         getattr(dp_eval, helper_name)([_PredictionAtoms()], [object()], {"H": 0})
+
+
+def test_full_property_outputs_reuse_one_inference_for_all_columns():
+    from rl_matdesign.utils.dp_eval import eval_property_outputs
+    class Counted(_PropertyModel):
+        calls = 0
+        def eval(self, **kwargs):
+            self.calls += 1
+            return self.result
+    models = [Counted(np.array([[1., 2.], [3., 4.]])), Counted(np.array([[5., 6.], [7., 8.]]))]
+    outputs = eval_property_outputs([_PredictionAtoms()] * 2, models, {'H': 0, 'O': 1})
+    assert outputs.shape == (2, 2, 2)
+    np.testing.assert_array_equal(outputs[:, :, 0], [[1., 3.], [5., 7.]])
+    np.testing.assert_array_equal(outputs[:, :, 1], [[2., 4.], [6., 8.]])
+    assert [m.calls for m in models] == [1, 1]
+
+
+@pytest.mark.parametrize('bad', [np.array([[float('nan'), 1.]]), np.ones((1, 3))])
+def test_full_property_outputs_reject_bad_ensemble_members(bad):
+    from rl_matdesign.utils.dp_eval import eval_property_outputs
+    from rl_matdesign.utils.rollout_errors import EvaluationProtocolError
+    with pytest.raises(EvaluationProtocolError):
+        eval_property_outputs([_PredictionAtoms()], [_PropertyModel(np.ones((1, 2))), _PropertyModel(bad)], {'H': 0, 'O': 1})

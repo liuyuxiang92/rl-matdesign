@@ -22,6 +22,9 @@ best-reward-vs-time curve can be plotted after the fact without re-running.
 from __future__ import annotations
 
 import csv
+import json
+import math
+from copy import deepcopy
 import time
 import uuid
 from pathlib import Path
@@ -29,29 +32,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .composition import composition_key
 from .episode_batch import supports_partial_batch_prediction
+from .rollout_errors import EvaluationProtocolError
+from .seeding import isolated_rng, candidate_seed
 
 
 def candidate_key(candidate: Any) -> tuple:
-    """Hashable canonical key for a predictor input.
+    """Use the same exact structured identity as prediction and domain caches.
 
-    Handles both the flat ``{element: fraction}`` mapping and the nested
-    ``{group: {element: fraction}}`` mapping that :class:`MultiGroupEnv` hands
-    to the predictor.  Mirrors ``StructureScorePredictor._key`` in shape, but
-    rounds fractions like ``baselines/_common.score_composition`` does so that
-    float round-off doesn't inflate the unique count.
-
-    Non-dict inputs (a custom predictor taking some other candidate object) fall
-    back to ``repr``, which keeps counting sane rather than raising.
-
-    A ``categorical`` group's leaf value need not be numeric either -- it can
-    be an element symbol or an O-form label stored verbatim (see
-    ``env_multigroup.py:230`` / ``CategoricalGroup``) -- so a leaf that
-    doesn't parse as a float falls back to its string form.
+    Domain adapters own physical normalization. Global decimal rounding could
+    merge distinct fine-grid values or numeric experimental conditions.
     """
-    if not isinstance(candidate, dict):
-        return ("__repr__", repr(candidate))
-
-    return composition_key(candidate, decimals=6)
+    return composition_key(candidate)
 
 
 class PredictorTimer:
@@ -80,15 +71,23 @@ class PredictorTimer:
     )
 
     def __init__(self, inner: Any, t0: Optional[float] = None, *,
-                 episode_log_path: Optional[str] = None, append: bool = False) -> None:
+                 episode_log_path: Optional[str] = None, append: bool = False,
+                 eval_seed: int = 0) -> None:
         self._inner = inner
         self._t0 = time.perf_counter() if t0 is None else float(t0)
         self.n_calls = 0
         self.n_unique = 0
         self.t_predict_s = 0.0
+        self._prior_predict_s = 0.0
         self.best_mean: Optional[float] = None
         self._seen: set = set()
         self._marks: List[Dict[str, Any]] = []
+        self.eval_seed = int(eval_seed)
+        self.phase = "train"
+        self._phase_costs: Dict[str, Any] = {}
+        self._diagnostic_requests = 0
+        self._diagnostic_failures = 0
+        self._ledger_path = None
         self.last_evaluation_timings: List[Dict[str, Any]] = []
         self._episode_log_path = Path(episode_log_path) if episode_log_path else None
         self._timing_session = uuid.uuid4().hex
@@ -97,9 +96,76 @@ class PredictorTimer:
         }
         if self._episode_log_path is not None:
             self._episode_log_path.parent.mkdir(parents=True, exist_ok=True)
+            prefix = "generation_" if self._episode_log_path.name.startswith("generation_") else ""
+            self._ledger_path = self._episode_log_path.with_name(prefix + "evaluations.jsonl")
+            if not append:
+                self._ledger_path.write_text("")
             if not append or not self._episode_log_path.exists() or not self._episode_log_path.stat().st_size:
                 with self._episode_log_path.open("w", newline="") as stream:
                     csv.DictWriter(stream, fieldnames=self.EPISODE_COLUMNS).writeheader()
+
+    def set_phase(self, phase: str) -> None:
+        self.phase = phase
+
+    def _observation(self, candidate, result=None, error=None, timing=None) -> None:
+        cost = self._phase_costs.setdefault(self.phase, {
+            "requests": 0, "successes": 0, "failures": 0, "seen": set(),
+            "best_reward": None, "known_cache_hits": 0, "cache_status_known": 0,
+        })
+        cost["requests"] += 1
+        key = candidate_key(candidate)
+        unique = result is not None and key not in cost["seen"]
+        if result is not None:
+            cost["successes"] += 1
+            cost["seen"].add(key)
+            reward = float(result[0])
+            if cost["best_reward"] is None or reward > cost["best_reward"]:
+                cost["best_reward"] = reward
+        else:
+            cost["failures"] += 1
+        timing = timing or {}
+        if isinstance(timing.get("cache_hit"), bool):
+            cost["cache_status_known"] += 1
+            cost["known_cache_hits"] += int(timing["cache_hit"])
+        row = {"phase": self.phase, "request": cost["requests"],
+               "candidate_key": repr(key), "candidate": candidate,
+               "status": "ok" if result is not None else "failed",
+               "new_successful_candidate": bool(unique), "unique": len(cost["seen"]),
+               "reward": result[0] if result is not None else None,
+               "best_reward": cost["best_reward"], "timing": timing,
+               "error": None if error is None else f"{type(error).__name__}: {error}"}
+        cached = getattr(self._inner, "cached_outputs", None)
+        outputs = cached(candidate) if result is not None and callable(cached) else None
+        row["outputs"] = {name: value.to_dict() for name, value in outputs.items()} if outputs else None
+        backend = getattr(self._inner, "cost_counters", None)
+        row["backend_costs"] = backend() if callable(backend) else None
+        row["invocation"] = self._timing_session
+        if self._ledger_path is not None:
+            row.update(wall_elapsed_s=self.t_wall_s, prediction_elapsed_s=self.t_predict_s)
+            with self._ledger_path.open("a") as stream:
+                stream.write(json.dumps(row, default=repr, allow_nan=False) + "\n")
+
+    def state_dict(self) -> dict:
+        """Cost ledger is separate from bounded prediction caches."""
+        return {"schema_version": 1, "n_calls": self.n_calls, "seen": sorted(self._seen, key=repr),
+                "t_predict_s": self.t_predict_s, "best_mean": self.best_mean,
+                "diagnostic_requests": self._diagnostic_requests,
+                "diagnostic_failures": self._diagnostic_failures,
+                "phase": self.phase, "phase_costs": {name: {**deepcopy(cost), "seen": sorted(cost["seen"], key=repr)}
+                    for name, cost in self._phase_costs.items()}}
+
+    def load_state_dict(self, state: dict) -> None:
+        if state.get("schema_version") != 1:
+            raise EvaluationProtocolError("Unsupported predictor ledger checkpoint")
+        self.n_calls, self._seen = int(state["n_calls"]), set(state["seen"])
+        self.n_unique = len(self._seen)
+        self.t_predict_s, self.best_mean = float(state["t_predict_s"]), state["best_mean"]
+        self._prior_predict_s = self.t_predict_s
+        self.phase = state["phase"]
+        self._diagnostic_requests = state.get("diagnostic_requests", 0)
+        self._diagnostic_failures = state.get("diagnostic_failures", 0)
+        self._phase_costs = {name: {**deepcopy(cost), "seen": set(cost["seen"])}
+                             for name, cost in state["phase_costs"].items()}
 
     def _take_evaluation_timings(self, count: int) -> None:
         rows = getattr(self._inner, "last_evaluation_timings", None)
@@ -155,67 +221,92 @@ class PredictorTimer:
         self.last_evaluation_timings = []
         t = time.perf_counter()
         try:
-            out = self._inner.predict(candidate)
-        except BaseException:
+            with isolated_rng(candidate_seed(self.eval_seed, candidate)):
+                out = self._inner.predict(candidate)
+            if not math.isfinite(float(out[0])):
+                raise ValueError("Predictor returned a nonfinite reward")
+        except BaseException as exc:
             self.t_predict_s += time.perf_counter() - t
-            raise
-        finally:
             self._take_evaluation_timings(1)
+            self._observation(candidate, error=exc, timing=self.last_evaluation_timings[0])
+            raise
+        self._take_evaluation_timings(1)
         dt = time.perf_counter() - t
         self._record(candidate, out[0], dt)
+        self._observation(candidate, out, timing=self.last_evaluation_timings[0])
         return out
 
-    def batch_predict(
-        self, candidates: List[Any], *, return_exceptions: bool = False,
-    ) -> List[Any]:
+    @property
+    def scalar_batch_fallback(self) -> bool:
+        """Whether a batch is implemented as independent timed scalar calls.
+
+        Callers capturing per-evaluation diagnostics can perform this same loop
+        themselves so a later prediction cannot overwrite an earlier record.
+        """
+        return not getattr(self._inner, "candidate_seeded_batch", False)
+
+    def batch_predict(self, candidates: List[Any], *, return_exceptions: bool = False) -> List[Any]:
         candidates = list(candidates)
         self.last_evaluation_timings = []
         if not candidates:
             return []
-        t = time.perf_counter()
-        if return_exceptions:
-            batch = getattr(self._inner, "batch_predict", None)
-            if supports_partial_batch_prediction(self._inner):
+        # Merely having batch_predict says nothing about its random protocol.
+        # Only adapters guaranteeing candidate-local, batch-invariant sampling
+        # opt into one shared call; all other plugins retain scalar semantics.
+        if self.scalar_batch_fallback:
+            results, timings = [], []
+            for candidate in candidates:
                 try:
-                    out = batch(candidates, return_exceptions=True)
+                    results.append(self.predict(candidate))
+                except EvaluationProtocolError:
+                    raise
                 except Exception as exc:
-                    out = [exc] * len(candidates)
-            else:
-                out = []
-                timings = []
-                for candidate in candidates:
-                    try:
-                        out.append(self._inner.predict(candidate))
-                    except Exception as exc:
-                        out.append(exc)
-                    finally:
-                        self._take_evaluation_timings(1)
-                        timings.extend(self.last_evaluation_timings)
-        else:
-            try:
-                out = self._inner.batch_predict(candidates)
-            except BaseException:
-                self.t_predict_s += time.perf_counter() - t
-                self._take_evaluation_timings(len(candidates))
-                raise
-        dt = time.perf_counter() - t
-        if return_exceptions and not supports_partial_batch_prediction(self._inner):
+                    if not return_exceptions:
+                        raise
+                    results.append(exc)
+                finally:
+                    timings.extend(self.last_evaluation_timings)
             self.last_evaluation_timings = timings
-        else:
-            self._take_evaluation_timings(len(candidates))
-        if len(out) != len(candidates):
-            self.t_predict_s += dt
-            raise ValueError("batch_predict must return one result per candidate")
-        # Attribute the batch cost evenly; the per-call figure stays honest and
-        # the total is exact, which is what the comparison needs.
-        share = dt / max(1, len(candidates))
-        for cand, res in zip(candidates, out):
-            if isinstance(res, Exception):
-                # Failed work costs wall time, but it is not a successful reward
-                # observation and must not advance unique/call counters.
+            return results
+        started = time.perf_counter()
+        fatal = None
+        try:
+            with isolated_rng(self.eval_seed):
+                batch = self._inner.batch_predict
+                out = list(batch(candidates, return_exceptions=True)
+                           if supports_partial_batch_prediction(self._inner) else batch(candidates))
+            if len(out) != len(candidates):
+                raise EvaluationProtocolError("batch_predict must return one result per candidate")
+        except BaseException as exc:
+            out = [exc] * len(candidates)
+            if not isinstance(exc, Exception) or isinstance(exc, EvaluationProtocolError):
+                fatal = exc
+        elapsed = time.perf_counter() - started
+        self._take_evaluation_timings(len(candidates))
+        share = elapsed / len(candidates)
+        for index, (candidate, result, timing) in enumerate(zip(candidates, out, self.last_evaluation_timings)):
+            if not isinstance(result, BaseException):
+                try:
+                    if not math.isfinite(float(result[0])):
+                        raise ValueError("Predictor returned a nonfinite reward")
+                except (TypeError, ValueError, IndexError) as exc:
+                    result = out[index] = exc
+            if isinstance(result, BaseException):
                 self.t_predict_s += share
+                self._observation(candidate, error=result, timing=timing)
+                if isinstance(result, EvaluationProtocolError):
+                    fatal = result
             else:
-                self._record(cand, res[0], share)
+                self._record(candidate, result[0], share)
+                self._observation(candidate, result, timing=timing)
+        # The full batch has already run. Preserve its entire cost record before
+        # surfacing a protocol error; never charge only the prefix before it.
+        if fatal is not None:
+            raise fatal
+        if not return_exceptions:
+            for result in out:
+                if isinstance(result, Exception):
+                    raise result
         return out
 
     def __getattr__(self, name: str) -> Any:
@@ -229,15 +320,24 @@ class PredictorTimer:
         if name == "predict_raw":
             def _timed_predict_raw(candidate: Any) -> Tuple[float, float]:
                 t = time.perf_counter()
+                self._diagnostic_requests += 1
+                out, error = None, None
                 try:
-                    out = attr(candidate)
+                    with isolated_rng(candidate_seed(self.eval_seed, candidate)):
+                        out = attr(candidate)
+                except BaseException as exc:
+                    self._diagnostic_failures += 1
+                    error = f"{type(exc).__name__}: {exc}"
+                    raise
                 finally:
-                    self.t_predict_s += time.perf_counter() - t
-                self.n_calls += 1
-                key = candidate_key(candidate)
-                if key not in self._seen:
-                    self._seen.add(key)
-                    self.n_unique += 1
+                    elapsed = time.perf_counter() - t
+                    self.t_predict_s += elapsed
+                    if self._ledger_path is not None:
+                        with self._ledger_path.open("a") as stream:
+                            stream.write(json.dumps({"purpose": "reporting", "phase": self.phase,
+                                "candidate_key": repr(candidate_key(candidate)), "raw_result": out,
+                                "elapsed_s": elapsed, "error": error,
+                                "invocation": self._timing_session}, default=repr, allow_nan=False) + "\n")
                 return out
             return _timed_predict_raw
         return attr
@@ -270,12 +370,25 @@ class PredictorTimer:
     def summary(self) -> Dict[str, Any]:
         """Aggregate predictor-cost report for ``timing.json``."""
         n = self.n_calls
+        backend = getattr(self._inner, "cost_counters", None)
         return {
             "t_predict_s": round(self.t_predict_s, 4),
+            "invocation_predict_s": round(self.t_predict_s - self._prior_predict_s, 4),
+            "backend_costs_this_invocation": backend() if callable(backend) else None,
             "n_calls": n,
+            "diagnostic_requests": self._diagnostic_requests,
+            "diagnostic_failures": self._diagnostic_failures,
             "n_unique": self.n_unique,
-            "n_cache_hits": n - self.n_unique,
-            "cache_hit_rate": round((n - self.n_unique) / n, 6) if n else 0.0,
+            "n_repeated_requests": n - self.n_unique,
+            "n_cache_hits": sum(cost["known_cache_hits"] for cost in self._phase_costs.values()),
+            "cache_status_known_requests": sum(cost["cache_status_known"] for cost in self._phase_costs.values()),
+            "cache_hit_rate": (sum(cost["known_cache_hits"] for cost in self._phase_costs.values()) /
+                               sum(cost["cache_status_known"] for cost in self._phase_costs.values()))
+                              if any(cost["cache_status_known"] for cost in self._phase_costs.values()) else None,
+            "phases": {name: {**{key: value for key, value in cost.items() if key != "seen"},
+                               "unique_successes": len(cost["seen"]),
+                               "duplicates": cost["successes"] - len(cost["seen"])}
+                       for name, cost in self._phase_costs.items()},
             "mean_s_per_call": round(self.t_predict_s / n, 6) if n else 0.0,
             "mean_s_per_unique": (round(self.t_predict_s / self.n_unique, 6)
                                   if self.n_unique else 0.0),

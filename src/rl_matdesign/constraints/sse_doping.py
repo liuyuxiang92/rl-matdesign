@@ -81,7 +81,7 @@ class SSEDopingFilter(ConstraintFilter):
             if metal in self.oxide_only and o == 0:
                 continue
             out.append((elem_oh, comp_oh))
-        return out if out else actions
+        return out
 
     def _metal_for_slot(
         self, slot_name: str, prior_groups: Optional[List[Dict[str, float]]]

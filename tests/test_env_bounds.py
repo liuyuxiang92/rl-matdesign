@@ -1,7 +1,7 @@
-"""CompositionEnv per-element bounds + fixed_order_amount tests.
+"""Composition bounds and the legacy all-species assignment alias.
 
-The default OOH-style path (no element_bounds, no episode_style override)
-must remain byte-identical to the pre-refactor behavior.
+The default OOH domain remains unchanged; the old fixed-order alias retains
+all species slots while allowing their assignment order to vary.
 """
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ def _ti_alloy_env(state_featurizer=_zero_feats):
 def test_ti_alloy_env_construction():
     env = _ti_alloy_env()
     assert env.n_components == 5
-    assert env.episode_style == "fixed_order_amount"
+    assert env.episode_style == "element_then_amount"
     assert env._element_unit_bounds == [(45, 90), (0, 25), (0, 15), (0, 10), (0, 10)]
     assert env._total_units == 100
 
@@ -81,17 +81,20 @@ def test_ti_alloy_100_random_episodes_respect_bounds():
         assert abs(sum(comp.values()) - 1.0) < 1e-9
 
 
-def test_fixed_order_amount_emits_element_at_step_index():
-    """Each step's available actions are pinned to species_set[counter]."""
+def test_all_species_alias_allows_free_order_without_repeated_assignments():
+    """Each remaining label can be selected when it has a feasible amount."""
     from rl_matdesign.encoding import decode_one_hot
     env = _ti_alloy_env()
     env.initialize()
-    for step_idx in range(env.n_components):
+    assert {decode_one_hot(action[0], env.species_set) for action in env.allowed_actions()} == set(env.species_set)
+    selected = set()
+    for _ in range(env.n_components):
         actions = env.allowed_actions()
-        for elem_oh, _ in actions:
-            elem = decode_one_hot(elem_oh, env.species_set)
-            assert elem == env.species_set[step_idx]
-        env.step(actions[0])
+        assert all(decode_one_hot(action[0], env.species_set) not in selected for action in actions)
+        action = actions[-1]
+        selected.add(decode_one_hot(action[0], env.species_set))
+        env.step(action)
+    assert selected == set(env.species_set)
 
 
 def test_infeasible_bounds_raise():
@@ -180,16 +183,17 @@ def test_element_then_amount_infeasible_total_raises():
         )
 
 
-def test_step_rejects_wrong_element_in_fixed_order_mode():
-    """In fixed_order_amount mode, the element at step k must be species_set[k]."""
+def test_all_species_alias_accepts_al_before_ti_but_rejects_repeat():
+    """The host template does not constrain assignment order."""
     from rl_matdesign.encoding import encode_choice
     env = _ti_alloy_env()
     env.initialize()
-    wrong_elem_oh = tuple(encode_choice("Al", env.species_set).tolist())   # step 0 expects Ti
+    elem_oh = tuple(encode_choice("Al", env.species_set).tolist())
     comp_oh = tuple(encode_choice("0.10", env.fraction_set).tolist())
-    with pytest.raises(ValueError) as info:
-        env.step((wrong_elem_oh, comp_oh))
-    assert "Ti" in str(info.value) or "fixed_order_amount" in str(info.value)
+    env.step((elem_oh, comp_oh))
+    assert env.cation_fractions() == {"Al": 0.10}
+    with pytest.raises(ValueError, match="Repeated"):
+        env.step((elem_oh, comp_oh))
 
 
 def test_lo_greater_than_hi_raises():

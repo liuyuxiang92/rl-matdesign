@@ -25,7 +25,10 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence, Union
+
+if TYPE_CHECKING:
+    import ase
 
 import numpy as np
 # Module-level (not lazy like the ASE imports elsewhere in this file): scipy is

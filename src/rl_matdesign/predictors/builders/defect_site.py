@@ -83,7 +83,10 @@ Config keys
 from __future__ import annotations
 
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    import ase
 
 import numpy as np
 

@@ -3,9 +3,8 @@
 Guards two invariants:
   1. Loading any deprecated YAML key emits exactly one DeprecationWarning
      naming the new key, and the value is remapped.
-  2. None of the bundled `configs/*.yaml` files contain old keys — they
-     must load with zero deprecation warnings (regression guard against
-     accidental re-introduction).
+  2. Published YAMLs contain no deprecated core flags. An intentionally retained
+     historical O-last domain may emit its separately tested migration warning.
 """
 from __future__ import annotations
 
@@ -42,18 +41,13 @@ def test_old_key_remapped_with_deprecation_warning(old_key, new_key):
     assert old_key in msg and new_key in msg
 
 
-def test_old_and_new_both_present_new_wins_with_conflict_warning():
+def test_conflicting_aliases_are_rejected_instead_of_silently_discarded():
     from run_experiment import _apply_flag_aliases
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        out = _apply_flag_aliases({"buffer_size": 999, "dqn_buffer_size": 50000})
-    assert out == {"dqn_buffer_size": 50000}
-    dep = [w for w in caught if issubclass(w.category, DeprecationWarning)]
-    assert len(dep) == 1
-    assert "both" in str(dep[0].message).lower() or "ignoring" in str(dep[0].message).lower()
+    with pytest.raises(ValueError, match="Conflicting config aliases"):
+        _apply_flag_aliases({"buffer_size": 999, "dqn_buffer_size": 50000})
 
 
-def test_all_bundled_configs_load_without_deprecation_warnings():
+def test_bundled_configs_have_no_deprecated_core_flags():
     from run_experiment import load_config
     repo_root = Path(__file__).resolve().parent.parent
     cfg_paths = sorted(glob.glob(str(repo_root / "configs" / "*.yaml")))
@@ -61,6 +55,9 @@ def test_all_bundled_configs_load_without_deprecation_warnings():
     for p in cfg_paths:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            load_config(p)
+            cfg = load_config(p)
         dep = [w for w in caught if issubclass(w.category, DeprecationWarning)]
-        assert not dep, f"{p} loads with deprecation warnings: {[str(w.message) for w in dep]}"
+        for warning in dep:
+            assert str(warning.message).startswith("Integer O-last construction is migrated"), (p, warning.message)
+            assert any(group.get("token_requirements", {}).get("O") == {"count": 1, "positive": True}
+                       for group in cfg.get("groups", []))

@@ -42,8 +42,9 @@ def run_trial_subprocess(
     out_dir: str,
     method: str,
     train_seed: int,
-    dp_seed: int,
+    dp_seed: Optional[int] = None,
     gen_seed: int,
+    eval_seed: Optional[int] = None,
     timeout_s: Optional[int] = None,
     env_extra: Optional[dict] = None,
 ) -> TrialResult:
@@ -53,6 +54,9 @@ def run_trial_subprocess(
     driver distinguish "missing generated.csv with exit 0" (bug, raise loudly)
     from "nonzero exit" (deterministic config issue, FAIL the trial).
     """
+    if eval_seed is not None and dp_seed is not None and eval_seed != dp_seed:
+        raise ValueError("Conflicting eval_seed and deprecated dp_seed")
+    evaluation_seed = eval_seed if eval_seed is not None else dp_seed if dp_seed is not None else 0
     os.makedirs(out_dir, exist_ok=True)
     cmd = [
         sys.executable, _RUN_EXPERIMENT,
@@ -60,7 +64,7 @@ def run_trial_subprocess(
         "--method", method,
         "--out", out_dir,
         "--train-seed", str(train_seed),
-        "--dp-seed", str(dp_seed),
+        "--eval-seed", str(evaluation_seed),
         "--gen-seed", str(gen_seed),
     ]
     env = os.environ.copy()

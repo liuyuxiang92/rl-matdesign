@@ -1,7 +1,7 @@
 ---
 title: "rl-matdesign — YAML Configuration Reference"
 subtitle: "Every config flag, what it does, and its choices"
-date: "2026-06-10"
+date: "2026-11-06"
 geometry: "margin=1.8cm"
 fontsize: 10pt
 mainfont: "Helvetica Neue"
@@ -14,118 +14,136 @@ colorlinks: true
 A run is configured by one YAML file plus a few CLI flags. The three pluggable
 layers configure the search space, property prediction, and action masking.
 A non-empty **`properties`** list selects the reward engine; each entry names
-its **`predictor`**. A flat top-level `predictor` is also supported for a single
+an inline **`predictor`** or a shared **`model_ref`**. A flat top-level `predictor` is also supported for a single
 standalone predictor. The RL and generation knobs are shared across scenarios.
 
 - The YAML is the base; a few CLI flags override matching keys.
-- **Seeds are CLI-only**: `--dp-seed` (predictor RNG), `--train-seed` (training;
-  defaults to `--dp-seed`), `--gen-seed` (generation; defaults to `--dp-seed`).
+- Seeds may be set in YAML: `eval_seed`, `train_seed`, `gen_seed`. Explicit CLI
+  flags override them; training/generation seeds fall back to `eval_seed`.
+  `--eval-seed` is canonical; `--dp-seed` is a deprecated CLI alias.
 - The full merged config is written to `<out>/run_config.json`.
 
 **CLI flags:** `--config` (required), `--out` (required), `--method`,
-`--dp-seed`, `--train-seed`, `--gen-seed`, `--device` (`cpu`/`cuda`),
+`--eval-seed` (legacy `--dp-seed`), `--train-seed`, `--gen-seed`, `--device` (`cpu`/`cuda`),
 `--dqn-loss`, `--dqn-augment-permutations`, `--save-checkpoint-freq`,
 `--train-count-duplicates` / `--no-train-count-duplicates`,
-`--train-max-duplicate-attempts`,
+`--train-max-duplicate-attempts`, `--train-budget`,
 `--resume-training`, `--only-generate`, `--skip-generation`, `--max-gen-attempts`,
 `--load-qnet` / `--load-policy` / `--load-value-net` / `--load-scaler`.
 
 \newpage
 
-# 1. Environment
+# 1. Environment — `groups:` is the public entry point
+
+Every scenario declares one or more named `groups`. A lone composition/integer
+group can use a flat internal environment; several groups preserve their names
+in the candidate. `env_type` is an internal derived label, not a public selector.
+See [configuration contract](configuration_schema.md) for executable core defaults
+and validation, and retain experiment-specific YAMLs locally. Older published examples may
+need an explicit migration before scientific use.
+
+## `kind: composition` group keys
 
 | Key | What it does | Choices / default |
 |---|---|---|
-| `env_type` | Selects the environment | `fraction` (default, `CompositionEnv`); `integer_ratio` (`IntegerRatioEnv`); `multi_group` (`MultiGroupEnv`) |
+| `name` | Group identity | explicit unique name |
+| `kind` | Composition domain | `composition` |
+| `species_set` | Allowed chemical species, including compound units where supported | required list |
+| `fraction_set` | Exact allowed amounts: a list, `{min, max, step}`, or species-to-menu mapping | required |
+| `n_components` | Component slots used by the domain | `5` |
+| `element_bounds` | Per-species `[min, max]`; a positive minimum makes that species mandatory | optional |
+| `sites` | Atoms/units per formula unit for chemical assembly | `1` |
+| `filters` | Optional ordered action filters | omitted/empty = none |
 
-## `fraction` env keys
+`fraction_set` is the single grid authority. Integer resolution is derived from
+its exact values; do not separately author `total_units`. Bounds intersect the
+menus: minimums round up to the next allowed value and maximums round down. A
+sparse menu stays sparse. A domain must admit an exact sum of one. Final candidate
+identity omits absent zero-valued species and ignores assignment order.
 
-| Key | What it does | Choices / default |
-|---|---|---|
-| `species_set` | Candidate element symbols | **required** (list) |
-| `fraction_set` | Allowed fraction strings (grid) | default = built-in `0.05 … 0.80` |
-| `total_units` | Grid resolution; step = `1/total_units` | `20` (->0.05); use `100` for 0.01 |
-| `n_components` | Distinct elements per episode | `5` |
-| `anion_formula` | Fixed suffix appended to the formula | `""` (e.g. `O2H1`, `O3`) |
-| `episode_style` | How each step picks | `element_then_amount` (default: choose element + amount); `fixed_order_amount` (order pinned to `species_set`, choose only amounts) |
-| `element_bounds` | Per-element `{el: [min,max]}` fraction caps | none; **only with `fixed_order_amount`** |
-| `constraint_filter` | Action-masking filter (see §3) | `null` |
+```yaml
+groups:
+  - name: alloy
+    kind: composition
+    species_set: [Ti, Al, V]
+    fraction_set: {min: 0, max: 1, step: 0.05}
+    n_components: 3
+    element_bounds: {Ti: [0.5, 0.9], Al: [0, 0.3], V: [0, 0.3]}
+```
 
-## `integer_ratio` env keys
+Old `episode_style: fixed_order_amount` is a compatibility spelling whose final
+domain is compiled into the current free assignment protocol; it does not retain
+an order-sensitive scientific identity. Historical `amount`, `host` and manually
+matched `total_units` are not recommended inputs: write the grid in `fraction_set`
+and put the host in `species_set` with its bounds.
 
-| Key | What it does | Choices / default |
-|---|---|---|
-| `species_set` | Candidate elements | **required** |
-| `ratio_set` | Allowed integer-ratio digits | default `"0" … "9"` |
-| `n_components` | Elements per episode | `5` |
-| `constraint_filter` | Action-masking filter | `null` |
-
-No sum-to-1 constraint; the composition is normalized afterward.
-
-\newpage
-
-# 2. `multi_group` env — `groups:`
-
-`groups:` is an **ordered list** of sublattice **groups**, filled in order. A group
-is the atomic unit; a single `fraction`/`integer_ratio` env is the one-group case.
-The predictor receives the structured `{group_name: {element: value}}`.
-
-**Common group keys**
+## `kind: integer` group keys
 
 | Key | What it does | Choices / default |
 |---|---|---|
-| `name` | Group label (appears in the structured terminal) | string |
-| `kind` | Group type | `composition` (default) or `categorical` |
-| `sites` | Sublattice size (atoms per formula unit) — bridges fraction<->count and assembles the chemical formula (`amount × sites`) | `1` |
-| `constraint_filter` + its kwargs | Per-group filter (sees `prior_groups` for cross-group coupling) | (see §3) |
+| `species_set` | Allowed element tokens | required |
+| `ratio_set` | Nonnegative integer token amounts | default `0 … 9` |
+| `n_components` | Number of token slots; species may repeat | `5` |
+| `token_requirements` | Explicit count/positive-presence requirements | optional |
+| `filters` | Optional ordered action filters | omitted/empty = none |
 
-**`kind: composition`** — pick N elements with amounts summing to 1. Reuses the
-`fraction`-env keys (`species_set`, `fraction_set`, `total_units`, `n_components`,
-`episode_style`, `element_bounds`) plus friendly knobs:
+There is no sum-to-one constraint. Token multiplicities and amounts determine the
+terminal material. For example, `token_requirements: {O: {count: 1, positive: true}}`
+requires one positive O token at any step. The known historical reserved-positive
+O-last filter migrates to that domain rule; it no longer forces an execution order.
 
-| Key | What it does | Choices / default |
+# 2. Multiple groups, categorical fields and sequences
+
+`groups` is an ordered list of subdomains. Group membership and sequence position
+remain part of scientific identity, while assignment order inside an unordered
+domain does not. A multi-group predictor receives `{group_name: group_payload}`;
+a single composition/integer group may be unwrapped for a flat predictor.
+
+`kind: categorical` assigns one typed value to each named slot, in any allowed
+assignment order. Use `choices: [{name: temperature, values: [300, 350]}, ...]`
+for generic fields. `values` also supports an exact `{min, max, step}` numerical
+grid. Strings, booleans and numbers remain typed: `true`, `1` and `"1"` are distinct,
+while equal numeric spellings such as `1` and `1.0` cannot be duplicated.
+
+Chemical categorical slots use `element` (optionally a separate `name`) instead
+of a generic name alone. Their chosen amounts remain chemical inputs: an SSE
+builder can read `Cl = 1.0` and the O-form choice directly. Generic fields are not
+converted into a chemical formula. Filters can couple slots to prior groups.
+
+`kind: sequence` preserves positional order and has its own edit/length domain;
+composition permutation rules do not apply. See [labelled assignments](labelled_assignments.md)
+for positional semantics; external model chemistry and intrinsic constraints
+must be validated through the actual plugin.
+
+# 3. Constraint filters — `filters: [{type: ...}]`
+
+Use the same ordered `filters` list at the applicable group/top-level boundary.
+The framework creates the chain; do not author `type: chain`. Historical non-null
+`constraint_filter` is rejected by current core configuration validation.
+
+| `type` | What it does | Its keys |
 |---|---|---|
-| `amount` | Generate the value grid instead of writing `fraction_set` | `{min, max, step}` or a list |
-| `host` | A host element auto-takes the leftover (list only the dopants; wires a `host_complement` filter) | element symbol |
-
-**`kind: categorical`** — pick discrete **real values**; no sum-to-1. Each slot is
-one element with its own value list; the terminal returns the chosen values
-unchanged (so a builder reads `Cl = 1.0` / `O = 1` directly).
-
-| Key | What it does |
-|---|---|
-| `choices` | `[{element, values: [...]}, …]` — one slot per element |
-
-A categorical filter may mask a slot by an earlier group (e.g. `sse_doping` masks
-the O slot by the P-site metal's category).
-
-# 3. Constraint filters (`constraint_filter:`)
-
-| Value | What it does | Its keys |
-|---|---|---|
-| `null` | No constraint (default) | — |
-| `smact_charge` | Keep only compositions that can be charge-neutral (SMACT oxidation states) | `smact_anions: [{symbol, charge, stoich}]` (or `smact_anion` / `smact_anion_charge` / `smact_anion_stoich`) |
-| `last_step_element` | Force the last step to a required element | `required_elements`; `nonzero_ratio_at_last` (true); `reserve_for_last` (true) |
-| `phase_pattern` | Keep compositions matching phase patterns | `phase_patterns` |
+| `smact_charge` | Keep charge-neutral compositions under the configured oxidation-state rules | `smact_anions: [{symbol, charge, stoich}]` or supported legacy single-anion keys |
+| `last_step_element` | Legacy construction restriction; prefer a domain requirement when equivalent | `required_elements`, `nonzero_ratio_at_last`, `reserve_for_last` |
+| `phase_pattern` | Keep compositions matching declared phase patterns | `phase_patterns` |
 | `ooh_phase` | OOH oxyhydroxide phase screen | `target_phases` (default `[any]`) |
-| `chain` | Apply several filters in sequence | `filters: [ {constraint_filter: …, …}, … ]` |
-| `host_complement` | Dopants at a level, host takes the rest (wired automatically by a composition group's `host` knob) | `host_element`, `levels` |
-| `sse_doping` | Mask the LiPS S-site O-form slot by the metal's category | `o_element` (`O`), `host_P` (`P`), `metal_only`, `oxide_only` |
-| `"pkg.mod:Class"` | Your own filter (FQN) | your class's keys |
+| `host_complement` | Legacy dopant/host construction filter | `host_element`, `levels`; explicit composition bounds are preferred |
+| `sse_doping` | Restrict the LiPS S-site O-form by metal category | `o_element`, `host_P`, `metal_only`, `oxide_only` |
+| `"pkg.mod:Class"` | External filter | adapter-specific settings |
 
 The `ooh_phase` sampler retains its five-cation rules: named primary elements
-must be selected for the requested phase. `any` accepts the union of these phases.
-
-The terminal OOH primary-phase checker counts every cation outside each primary
-set toward the dopant limit, including species absent from the historical dopant
-list. The dopant fraction must remain strictly below 25%.
+must be selected for the requested phase. `any` accepts their union. Its terminal
+checker counts every cation outside the primary set toward the dopant limit,
+including species absent from the historical dopant list; the dopant fraction
+must remain strictly below 25%.
 
 \newpage
 
 # 4. Property prediction and reward
 
 A non-empty `properties:` list selects the reward engine automatically, for
-one or many properties. Set `properties[].predictor` to one of the following:
+one or many properties. Set an inline `properties[].predictor`, or declare that
+predictor in `models.<id>` and use `properties[].model_ref`:
 
 | Value | What it does |
 |---|---|
@@ -151,16 +169,54 @@ combiner supports any property names, independent of the material system.
 
 | Key | What it does | Default |
 |---|---|---|
-| `builder` | Builder name/FQN (`substitute` = fixed-lattice element swap; `sse` = doped supercell; or `pkg.mod:Class`) | `substitute` |
-| `share_structure` | `true` = build+relax shared structures, score all structure properties on them; `false` = each property builds its own | `true` |
-| `n_random_configs` | Random placements per candidate | `1` |
-| `geo_opt` | Relaxation stage (see below); omit / `enabled: false` to skip | optional |
-| `structure_parallel` | Persistent GPU workers for independent configurations; see below | omitted: serial execution |
+| `structure_sources` | Named source definitions owning builder, templates, samples and relaxation | absent for composition-only models |
+| `models` | Named model definitions, selected by `properties[].model_ref` | optional; inline properties remain supported |
+| `structure_sources.<id>.builder` | `substitute`, `sse`, another registered builder, or an FQN | `substitute` |
+| `structure_sources.<id>.n_random_configs` | Random placements per candidate; template counts can override | `1` |
+| `structure_sources.<id>.geo_opt` | Source-owned relaxation; omit / `enabled: false` to skip | optional |
+| `structure_sources.<id>.structure_parallel` | Persistent GPU workers for explicit source samples | omitted: serial execution |
 | `properties` | Non-empty list of property specs (see below) | required |
 | `reward` | Combination rule: `type: weighted_sum` or `type: gated` | weighted sum |
 | `k` | Uncertainty coefficient for property objectives | `1.0` |
 | `sweep` | Optional `{name, values}` — optimize a shared operating condition (e.g. temperature) per composition (see below) | optional |
-| `base_poscar` / `site_symbol` | Builder knobs (for `substitute`); inherited by per-property builders when `share_structure: false` | — |
+| `structure_sources.<id>.base_poscar` / `site_symbol` | Template and substitution-site settings for that source | — |
+
+Properties sharing a `source` ID reuse the same built/relaxed ensemble. Distinct
+source IDs are independent even when definitions match. `source` may be omitted
+with exactly one declared source; several sources require explicit references.
+Composition-only properties must not declare a structure source.
+
+```yaml
+structure_sources:
+  bulk:
+    builder: substitute
+    base_poscar: bulk.POSCAR
+    site_symbol: X
+    n_random_configs: 4
+models:
+  potential:
+    predictor: dp_energy
+    models: [energy_a.pt, energy_b.pt]
+properties:
+  - name: energy
+    model_ref: potential
+    source: bulk
+    direction: min
+    objective: mean
+```
+
+A model definition owns its adapter/asset options. A property reference owns
+source, output selection and reward options. Do not duplicate `predictor`,
+`model`, `models`, `dp_models`, `head`, or another model-owned setting on a
+reference. Unknown/unused references and conflicting ownership are errors.
+One named model instance evaluates all its selected outputs once for the same
+candidate, source and operating condition.
+
+**Legacy migration only:** old top-level builder settings and
+`share_structure: true` can normalize to source `default`. `share_structure: false`
+is rejected with migration guidance: explicitly name the independent sources and
+reference them. Do not combine new source definitions with old per-property
+builder inheritance. See [source migration](structure_source_migration.md).
 
 `geo_opt:` sub-keys — `model` (default `models/DPA-3.1-3M.pt`), `head` (user-defined),
 `fmax` (`0.001`), `steps` (`1000`), `relax_cell` (`true`), `enabled` (`true`).
@@ -170,17 +226,21 @@ combiner supports any property names, independent of the material system.
 | Key | What it does | Default |
 |---|---|---|
 | `name` | Unique label (CSV column prefix) | `prop{i}` |
-| `predictor` | `dp_energy`, `dp_property`, `dp_classification`, a registry leaf, or an FQN | **required** |
+| `predictor` / `model_ref` | Inline adapter or reference to one top-level named model; mutually exclusive | one required |
+| `source` | Named structure source; forbidden for composition-only leaves | inferred only when unambiguous |
+| `output` | Named scientific output from an adapter | required if adapter returns multiple outputs |
 | `models` (or legacy `dp_models`) | DeepMD ensemble checkpoint list; registry leaves use their own keys such as `model` | required for `dp_*` |
 | `head` | DeepMD branch name; explicitly select the classification head in multi-head checkpoints | none |
 | `direction` | `max` / `min` / `target` (`dp_energy`: use `min` for "lower is better") | **required** |
 | `target_value` | Value to hit, in the property's real units. Required with `direction: target`. **Not** the leaf's `model:`/checkpoint key. | — |
 | `target_tolerance` | Deadband half-width; inside it the term is at its maximum (0) and stops competing with other objectives | `0.0` |
 | `weight` / `scale` | Combine weight / unit scale | `1.0` / `1.0` |
-| `objective` | `mean_minus_kstd` / `mean` / `mean_plus_kstd` | `mean_minus_kstd` |
+| `objective` | `mean` / `mean_minus_kstd` / `mean_plus_kstd` | `mean` |
+| `uncertainty` | `model_spread`, `config_spread`, `native_uncertainty`, `pooled_spread` | model spread; legacy self-folded tuples use native uncertainty |
+| `unit` / `representation` | Physical unit (`null` = unknown) and `physical`, `ln`, `log10`, `pIC50`; must agree with adapter schema | unknown unit; physical unless transform supplies a legacy log representation |
 | `energy_per_atom` *(`dp_energy`)* | Normalize by atom count | `true` |
 | `output_index` / `output_aggregator` *(`dp_property`, `dp_classification`)* | Select a vector component, or collapse output channels using `mean` / `max`. Classification also accepts a list of class indices to sum, with aggregator `index` | aggregator `index`; index `0` for regression, **explicit index or list required for classification in `index` mode** |
-| `transform` | `none`, or `exp` for regression heads predicting log-values; classification uses `none` | `none` |
+| `transform` | `none` / `identity`; `exp` for natural-log samples; `pow10` for log10 samples; classification uses identity | `none` |
 | `fparam` / `aparam` *(`dp_property`, `dp_classification`)* | Frame / atomic parameters for heads trained with them. A `null` in `fparam` marks the slot filled by the `sweep` value (requires a top-level `sweep`) | none |
 
 The default weighted-sum reward is `sum weight * value(prop) / scale`, where `value` is
@@ -193,20 +253,37 @@ i.e. a target objective scores the (deadbanded) **distance** to `target_value`, 
 closer is better. Routing it through the same helper keeps uncertainty handling identical:
 `mean_minus_kstd` reads as "effectively farther from the target when less certain".
 
-### What `mean` and `std` actually are
+### Named scientific outputs and uncertainty
 
-Two axes, folded separately and deliberately not pooled:
+`predict_outputs` returns `{name: ScientificOutput}` with a versioned schema,
+physical mean, optional retained samples and separate uncertainty quantities.
+For a rectangular model-by-configuration matrix `Y[m,c]`:
 
-- **structures** — the `n_random_configs` random decorations of one composition. Their
-  scatter is *configurational*: it is how the property is defined for a disordered
-  composition, so it is **averaged away**.
-- **models** — independent checkpoints of the same property. Their scatter is *epistemic
-  uncertainty*, and is what `k*std` penalises.
+- `mean = mean_m(mean_c(Y))`.
+- `model_spread = std_m(mean_c(Y), ddof=0)`.
+- `config_spread = std_c(mean_m(Y), ddof=0)`.
+- `pooled_spread = std(Y flattened, ddof=0)`, derived only from retained samples.
+- `native_uncertainty` preserves a backend's reported standard deviation.
 
-So `mean` is the mean of the per-model averages and `std` is the spread **across models**.
-A single model therefore gives `std == 0` exactly, whatever `n_random_configs` is, and
-`mean_minus_kstd` is then identical to `mean` — no flag needed.
-The same fold is used in both `share_structure` regimes.
+All models must evaluate the same identified configurations in the same order.
+An axis with one observation has no spread estimate (`None`); two identical
+observations have measured spread zero. These descriptive quantities are not
+interchangeable and are not automatically calibrated confidence intervals.
+
+The compatibility `(mean, std)` property view uses the selected uncertainty.
+`objective: mean` is the default. An explicit nonzero uncertainty penalty with a
+missing selected statistic raises `EvaluationProtocolError`; it does not silently
+turn into a mean objective. `predict` returns `(reward, None)` because unrelated
+property spreads cannot be averaged into uncertainty of a combined reward.
+
+`exp` and `pow10` act on each retained raw sample, then recompute mean and spreads.
+They require the matching `ln` or `log10` representation, finite positive inverse
+values, and no unresolved native uncertainty. Folded `(mean, std)` values alone
+cannot be nonlinearly inverted. Declare the destination `unit` explicitly when
+known; `null` means unknown. An adapter's unit/representation cannot be silently
+overridden. `pIC50` has no automatic inverse conversion. Historical singleton
+`std=0` and implicit `mean_minus_kstd` were old semantics; review those runs rather
+than treating them as equivalent to the current contract.
 
 ### `structure_parallel`: GPU workers and automatic formula batches
 
@@ -215,19 +292,26 @@ available GPUs and distributes configurations over persistent subprocesses,
 each pinned to one GPU. It automatically evaluates several formulas together
 when one formula has fewer configurations than the selected GPU count.
 Each GPU runs exactly one structure task at a time, without concurrency
-calibration or extra probe runs. Each task calls the configured builder with
-`n_configs=1` and a task-local RNG, then applies top-level `geo_opt` if enabled.
-For a builder that already runs MD and optimization, such as
-`clc_workflow.rl_builder:MDAveragedOptBuilder`, both
-stages run on the same worker; set `geo_opt: null` to avoid another relaxation.
-The external builder itself needs no parallel implementation.
+calibration or extra probe runs. The source's explicit sample plan supplies each
+worker task, which calls `build_sample(candidate, *, sample)` and applies that
+source's `geo_opt` if enabled. Built-in `substitute` supports this protocol,
+including multiple templates with their own counts. An external MD/optimization
+builder must implement the same sample capability; merely supporting
+`build(..., n_configs=1)` is insufficient. Set source `geo_opt: null` if its
+builder already optimizes each sample.
 
 ```yaml
-share_structure: true
-n_random_configs: 4
-structure_parallel: {}  # automatic GPUs and formula batches; one task per GPU
+structure_sources:
+  bulk:
+    builder: substitute
+    base_poscar: bulk.POSCAR
+    site_symbol: X
+    n_random_configs: 4
+    structure_parallel: {}  # automatic GPUs and formula batches
+# Properties select source: bulk.
 ```
 
+The following keys belong inside each source's `structure_parallel` block.
 No scheduling or success-threshold parameters are required. The following
 optional overrides are for device allocation, time limits and reproducing an
 older single-formula sampling schedule.
@@ -265,9 +349,9 @@ remaining two start as workers become free. It does not wait for an entire formu
 to finish before dispatching another queued task.
 Cache hits and duplicate formulas in a wave reuse predictions instead of
 submitting additional structure tasks. Consequently, a wave containing cached
-formulas may leave some slots idle. With `share_structure: true`, all structure
-properties reuse each formula's built ensemble; with `false`, each property
-builds its own ensembles in turn.
+formulas may leave some slots idle. Properties referring to the same named source
+reuse its ensemble; distinct sources build their own ensembles. Source sharing is
+independent of model reuse through `model_ref`.
 
 The training and generation loops defer terminal reward evaluation until the
 wave has been collected. DQN warmup, DQN online training, REINFORCE/A2C reward
@@ -312,7 +396,7 @@ CPU property inference. Alternatively, use `devices: auto` with
 such as `[1, 2, 3]`. At least one worker GPU must remain. The parent preloads its
 persistent DeepMD energy, regression, and classification models before the first
 parallel build. Their resident memory, external GPU load, or additional
-per-property worker pools can still affect available memory
+per-source worker pools can still affect available memory
 and throughput. Start one experiment process, without `torchrun`.
 The subprocess implementation targets POSIX systems; actual CUDA
 execution requires a compatible Linux GPU environment and the installed builder,
@@ -339,26 +423,29 @@ The CLI closes worker process groups on normal exit, exceptions, Ctrl+C, and
 SIGTERM termination. SIGKILL cannot run Python cleanup and provides no such
 guarantee.
 
-**Builder contract and reproducibility.** The builder must return exactly one
-ASE `Atoms` object in a sequence when called with `n_configs=1`; builders that
-return multiple templates from that call are unsupported and raise an error.
-Task seeds are assigned in candidate/configuration order before scheduling, so
-builders that honor the supplied RNG receive the same configuration seeds for
-the same ordered uncached candidates regardless of completion order or worker
-count. Changing wave sizes can change random-number consumption when properties
-use independent builders. Parallel samples differ from the legacy serial path
-for an identical predictor seed, and CUDA computations may still have numerical
-nondeterminism.
-For the MD builder, configured `md_debug_dir` output is separated by run and worker
-to prevent filename collisions.
+**Builder contract and reproducibility.** Seeded parallel execution requires
+`build_sample(candidate, *, sample: StructureSample) -> Atoms`. Missing capability
+raises `SamplingProtocolError` before scientific sample jobs; it is not a candidate
+failure to retry. An optional `sample_plan(candidate, *, n_configs, source_spec,
+eval_seed)` must return valid, identified samples with the source protocol's seeds.
+Serial and worker execution consume the same plan. Multi-template plans preserve
+each template's declared count and site symbol rather than averaging templates
+equally. Source, template and sample identities survive partial preparation
+failure; every scoring model receives the same remaining configurations.
 
-With `share_structure: false`, each structure property inherits the top-level
-`structure_parallel` block and may override it. Properties are still evaluated
-one after another, with formula/configuration tasks parallel within each
-property. The evaluation wave uses the largest batch size recommended by these
-builders. Independent pools can retain separate model copies on the same GPUs; prefer
-`share_structure: true` when properties can use the same structures.
-Omit `structure_parallel` entirely to preserve the existing serial behavior.
+Seeds derive from evaluation seed, source identity, canonical candidate, purpose,
+template and sample index. They do not depend on candidate iteration order, batch
+partition, worker count or completion order. This is a sampling contract, not a
+promise of identical GPU floating-point arithmetic across backends/hardware.
+An opaque legacy external `build(candidate, *, n_configs, rng)` can run serially
+with one source/candidate ensemble seed; it cannot claim sample-by-sample parallel
+parity. It must implement the explicit capability before parallel source use.
+Debug output remains separate by run/worker where the builder supports it.
+
+Independent named sources own their own pools and may retain separate model
+copies on the same GPUs. Refer to one source where properties should evaluate the
+same physical samples. Omit `structure_parallel` for serial execution. The old
+`share_structure` boolean is only a migration input, not a pool-selection API.
 
 ### `dp_classification`: class probabilities
 
@@ -406,13 +493,13 @@ For class `k`, each checkpoint's composition probability is the mean of
 each model; do not combine separately computed class standard deviations.
 All checkpoints evaluate the same surviving structures. Multiple checkpoints then follow the
 model mean/std fold above, using the population standard deviation (`ddof=0`).
-A single checkpoint gives `std = 0`, even when its
-configuration probabilities differ. `1 - p_pure` means predicted probability
+A single checkpoint has `model_spread=None`, even when its configuration
+probabilities differ; those differences belong to `config_spread`. `1 - p_pure` means predicted probability
 of a different class; it is not the model-ensemble standard deviation. The
 probabilities themselves do not provide an independent uncertainty estimate.
 
 When a `dp_classification` property contributes to a gate, its value is
-automatically `mean - std`. Add checkpoints to the existing `models` list to
+automatically `mean - model_spread` with multiple models, or `mean` with one. Add checkpoints to the existing `models` list to
 use this conservative ensemble score; no extra setting is needed. The standard
 deviation coefficient is fixed at `1`, independent of `k` and the property's
 `objective`. This score is not a calibrated probability or confidence bound,
@@ -420,12 +507,13 @@ and it can be negative; the raw predicted mean is kept separately. With a
 single checkpoint the gate value remains the mean probability.
 The conservative interpretation applies to lower bounds on desired-class
 probabilities with positive gate coefficients; an upper bound still compares
-against the same `mean - std` score.
+against the same gate score; it does not switch to an upper confidence bound.
 
 In `generated.csv`, `obj_<name>_mean` and `obj_<name>_std` report the mean and
-model standard deviation of the selected or combined probability. For a gate
+selected spread of the probability (default: model spread, blank when missing).
+Named output records retain every spread separately. For a gate
 named `synthesis` with that property as its sole term of weight `1`,
-`gate_synthesis_value` reports `mean - std`.
+`gate_synthesis_value` reports `mean - model_spread`, or `mean` with one model.
 
 ### `reward`: weighted sum or gated
 
@@ -477,8 +565,8 @@ builder, or property name is hard-coded in the combination rule.
 | `gates[].penalty_weight` | Nonnegative coefficient multiplying this gate's violation; default `1.0` |
 | `reward.failure.reward` | Required for `gated`; base reward for any failing candidate, chosen for the objective's range |
 
-Gate scores use **`mean - std` for `dp_classification` properties** and
-**raw means for other property types**. Property `direction`, `objective`,
+Gate scores use **`mean - model_spread` for multi-model `dp_classification`
+properties**, their mean for a single model, and **raw means for other types**. Property `direction`, `objective`,
 `weight`, `scale`, and `k` are not applied to these gate inputs. Thus a gate on
 `pure_probability` compares its conservative ensemble score to its threshold.
 Its combined score is `g = sum(coefficient * property_gate_value)` and its violation is
@@ -497,7 +585,7 @@ also available with `type: weighted_sum`.
 If every gate passes, reward equals the objective. Otherwise it equals
 `failure.reward - sum(penalty_weight * violation)` over all gates. With only a
 pure-probability gate at `0.8` and base `-10`, a candidate with
-`mean - std = 0.7` gets `-10.1`.
+`mean - model_spread = 0.7` gets `-10.1` (or a single-model mean of `0.7`).
 Penalties use the gate score's raw units. They do not rescale delta or the
 objective. A fixed failure base guarantees that every passing candidate ranks
 higher only when it is below a known lower bound of the feasible objective.
@@ -508,9 +596,10 @@ The same reward is used for training, generation, and operating-condition
 sweeps. The predictor's `reward_details` exposes objective and gate diagnostics.
 Generated candidate CSVs include `reward_objective`, `gate_passed`, and
 `gate_<name>_value`, `gate_<name>_passed`, `gate_<name>_violation`; per-property
-`obj_<name>_mean/std` retain their original meaning: the raw ensemble probability
-mean and the standard deviation across checkpoint averages for a classification
-property. They are not overwritten by `mean - std`.
+`obj_<name>_mean/std` retain the scientific mean and selected spread (missing
+spread is blank). The separate named outputs preserve all spread types. Gate
+values always use the classification model spread, independently of the spread
+selected for a property objective; they do not overwrite scientific statistics.
 For a single-property gate with coefficient `1`, `gate_<name>_value` records
 that conservative score; for a mixed gate it records the combined weighted score.
 `dp_mean` applies the same
@@ -554,17 +643,25 @@ contributing equally at every sweep value.
 
 | Old predictor | Now |
 |---|---|
-| `dp_structure` | `builder: substitute`, one property `predictor: dp_energy`, `direction: min` |
-| `dp_property` | `builder: substitute`, one property `predictor: dp_property` |
-| `hea` / `perovskite` | as `dp_structure`, with `site_symbol: X` / `Fe` |
-| `structure_pipeline` | `share_structure: true` (default), N `predictor: dp_property` properties |
-| `composite` | `share_structure: false`, the `objectives:` list becomes `properties:` |
+| `dp_structure` | Named substitute source; one `dp_energy` property with `source` and `direction: min` |
+| `dp_property` | Named substitute source; one `dp_property` property referring to it |
+| `hea` / `perovskite` | As above, source `site_symbol: X` / `Fe` |
+| `structure_pipeline` / legacy `share_structure: true` | One source ID referenced by all relevant properties |
+| `composite` / legacy `share_structure: false` | Explicit independent sources; migrate `objectives:` to `properties:` and attach references |
 
 ## `ooh` keys
 
 `base_poscar`, `dp_models`, `objective`, `k`, `n_random_configs`, `ads_height`,
 `ads_dz`, `geo_opt` (bool), `geo_opt_model`, `uncertainty`
-(`models`/`configs`/`total`), `output_index`, `adsorbates`, `target_phases`.
+(`models`/`configs`/`total` in the flat legacy adapter), `output_index`, `adsorbates`, `target_phases`.
+
+The named scientific output is `overpotential`, positive in its original direction,
+with unit explicitly unknown (`None`). In the property engine choose
+`output: overpotential`, `direction: min` and normally `objective: mean`; engine
+uncertainty selectors are `model_spread`, `config_spread`, `pooled_spread`, not the
+legacy spellings. The flat adapter maps `models`/`configs`/`total` to those three
+spreads and defaults to objective `mean`. `total` is pooled population spread,
+not native uncertainty. Singleton estimates remain missing.
 
 `adsorbates` selects which intermediates are placed on each doped slab, in frame
 order — default `[O, OH, OOH]`. An **empty list** means the bare parent slab (no
@@ -578,9 +675,10 @@ all frames in one batch must have the same atom count (an adsorbate frame has
 
 The list order matters: the batch is frame-major and `output_index` indexes the
 flattened output, so with the default list `output_index: 0` reads the **O\***
-frame. Changing `adsorbates` or `output_index` invalidates a saved `dp_cache`
-(they are folded into the cache key), so a resumed run pays a one-time recompute
-instead of returning values that describe a different structure.
+frame. Changing `adsorbates` or `output_index` defines a different oracle and invalidates
+its cached scientific outputs. Start a new run for that change; exact resume must
+not silently switch the oracle while retaining old replay targets. Model/template
+assets and the evaluation protocol are part of the recorded identity.
 
 ## `rf_magpie` keys
 
@@ -591,40 +689,40 @@ sintering and calcination, as in `configs/oxides_sinter_calcine.yaml`.
 
 ## Writing your own predictor — the leaf contract
 
-A **leaf represents exactly one model**; the reward engine owns all folding. That is what
-makes "one model => no uncertainty" automatic instead of a per-scenario flag.
+Prefer the named scientific protocol; a leaf can expose one or several outputs
+and can retain its own explicitly identified model/configuration samples.
 
-`model:` accepts one path **or a list of paths**. The engine builds one leaf instance per
-path (each with a decorrelated seed), so an ensemble is a config change, never a code
-change:
+| Method | Returns | Meaning |
+|---|---|---|
+| `predict_structure_outputs(atoms_list)` | `{name: ScientificOutput}` | Geometry-dependent scientific outputs on source-prepared structures |
+| `predict_outputs(candidate)` | `{name: ScientificOutput}` | Composition/sequence/field scientific outputs |
+| `score_structures(atoms_list)` | one finite float per structure | Legacy single-model raw samples, folded by engine |
+| `score(candidate)` | one finite float | Legacy single-model point sample, folded by engine |
+| `predict_structures(atoms_list)` / `predict(candidate)` | `(mean, std_or_None)` | Legacy physical estimate with native uncertainty; no raw distribution |
 
-```yaml
-model: ckpt/a.pt                    # 1 instance -> std == 0
-model: [ckpt/a.pt, ckpt/b.pt]       # 2 instances -> std = their disagreement
-```
+An optional `output_schema` mapping must exactly match named output names and
+schemas. Named methods take priority, then `score*`, then legacy `predict*`.
+None of these property interfaces should apply reward direction, scale, weight or
+`k`: the engine does that once. A flat historical adapter that returns a reward
+needs a separate scientific method before composition into `properties`.
 
-Expose whichever of these fits; everything is auto-detected, with no YAML flag:
+`model: ckpt/a.pt` creates one registry/FQN instance; a list creates one per
+checkpoint. One sampled model has missing model spread, while two sampled models
+can estimate disagreement. Several self-folding legacy tuple outputs cannot be
+combined by discarding or averaging native uncertainties. Named ensembles must
+provide compatible schemas, aligned raw samples and no unresolved native
+uncertainty. A point-only named output without raw samples is not enough for this
+ensemble path. Use `ScientificOutput`/`ModelSamples`/`aggregate_samples` from
+`rl_matdesign.predictors.outputs`; do not invent zero spread for a singleton.
 
-| method | returns | who folds | use when |
-|---|---|---|---|
-| `score_structures(atoms_list)` | one float **per structure** | engine | one model, geometry-dependent property |
-| `score(composition)` | one float | engine | one model, stoichiometry-only property |
-| `predict_structures(atoms_list)` | `(mean, std)` | leaf | leaf has a genuine *internal* ensemble |
-| `predict(composition)` | `(mean, std)` | leaf | same, composition-based |
+The constructor is `__init__(self, cfg, *, seed=None)`. Inline properties retain
+compatibility constructor options; a named `model_ref` resolves the model-owned
+options. Add optional `close()` for external resources; each resource is closed
+once. Shared model inference applies only to the same candidate, source and
+operating conditions. Do not silently ignore declared `fparam`/`aparam`.
 
-- **structure vs composition** — a leaf exposing either `*_structures` method receives the
-  built (and optionally relaxed) cells; otherwise it receives the candidate composition.
-- **engine-folded vs self-folding** — the `score*` form wins when both are present. The
-  self-folding form is correct only when the leaf really does hold its own ensemble (e.g.
-  `rf_magpie`'s random-forest tree variance); its `(mean, std)` is passed through untouched.
-
-Prefer `score*` for anything wrapping a single checkpoint: fold your own structures and you
-will report *configurational* scatter as if it were model uncertainty, which
-`mean_minus_kstd` will then silently penalise.
-
-Constructor is `__init__(self, cfg, *, seed=None)`, where `cfg` is the whole `properties[]`
-entry. Add an optional `close()` to release external resources (subprocesses, file handles);
-the engine calls it on every instance at the end of a run.
+See [scientific output migration](scientific_output_migration.md) for schema
+versioning, units, raw sample alignment, nonlinear transforms and cache records.
 
 ## `mgtransformer` keys
 
@@ -655,7 +753,7 @@ A builder turns the agent's pick (a flat `{element: fraction}` or a structured
 | `site_pick` | One element per site across N sublattices via `site_map` — the *categorical* counterpart of `substitute`'s multi-sublattice mode (no fractions). |
 | `defect_site` | A/B-site doping plus a signed vacancy/interstitial defect axis. |
 | `sse` | Doped-supercell recipe (P->metal, S->O/Cl/Br, charge-neutral Li vacancies). Keys below. |
-| `"pkg.mod:Class"` | Your own builder (FQN) with `build(candidate, *, n_configs, rng)`. |
+| `"pkg.mod:Class"` | Native serial `build(candidate, *, n_configs, rng)`; seeded serial/parallel parity requires explicit `build_sample(candidate, *, sample) -> Atoms` (see above). |
 
 For `defect_site`, the `formula` column in `generated.csv` contains the full
 elemental composition, including the surviving host atoms and untouched template
@@ -699,6 +797,7 @@ charge-neutral Li vacancy are derived. (No `cl_map` / `o_off`.)
 
 | Key | What it does | Choices / default |
 |---|---|---|
+| `train_budget` | Shared total paid training budget; derives the active algorithm's episode limits | Positive integer or `null` (legacy per-algorithm limits) |
 | `train_count_duplicates` | Whether a completed episode revisiting a seen final candidate consumes budget | YAML boolean; `true` |
 | `train_max_duplicate_attempts` | Stop with an error after this many consecutive completed duplicate episodes when `train_count_duplicates: false` | Positive integer; `1000` |
 
@@ -706,6 +805,16 @@ These keys are top-level and apply to all environments and material systems.
 `--train-count-duplicates` / `--no-train-count-duplicates` override the YAML
 boolean; `--train-max-duplicate-attempts N` overrides the limit. Use an unquoted
 YAML `true` or `false`; strings such as `"false"` are rejected.
+
+When `train_budget: B` is set, DQN's additional online budget is
+`B - dqn_warmup_eps`, and PG derives `ceil(B / pg_batch_eps)` nominal iterations
+while stopping at exactly `B` counted candidates. For example, budget 1000 with
+batch size 16 derives 63 iterations and an eight-candidate final batch when no
+duplicates occur; the budget is 1000, not 1008. Conflicting manually supplied
+`dqn_num_train_eps` or `pg_num_iters` values are rejected. Omit those derived
+limits when using the shared budget. HPO recomputes them after sampling the batch
+size. DQN's rewarded warmup is included; PG's feature-only scaler warmup is not.
+`--train-budget B` overrides the shared YAML budget.
 
 With the default `true`, training budgets retain their existing meaning: one
 completed episode consumes one slot, including repeated candidates. With
@@ -729,7 +838,8 @@ With `train_count_duplicates: false`, the phase budgets mean:
   the online budget again. For example, `400 + 1600` requests 2,000 distinct
   evaluated candidates. Epsilon annealing, target-network updates, and periodic
   checkpoints follow actual sampled online episodes, including duplicates.
-- **REINFORCE/A2C:** the unique target is `pg_num_iters * pg_batch_eps`.
+- **REINFORCE/A2C:** the unique target is `train_budget` when set, otherwise
+  `pg_num_iters * pg_batch_eps`.
   Each update uses up to `pg_batch_eps` sampled episodes, including duplicates;
   additional batches are collected until the target is reached. The final batch
   may be shorter to stop at the exact target. The scaler-only `pg_warmup_eps`
@@ -756,13 +866,13 @@ DQN cumulative columns include warmup, while its `episode` column is the actual
 attempt number within the current phase. PG episode counts exclude scaler-only
 warmup. New checkpoints preserve counters, candidate keys, and accounting mode.
 Changing `train_count_duplicates` while resuming a nonempty checkpoint is
-rejected. Legacy checkpoints and weights-only resumes without candidate history
-can use `true`; `false` requires a new run.
-
-For a legacy resume, `training_budget_history_complete: false` indicates that
-budget diagnostics start from the resumed portion. Appending to an existing CSV
-preserves its header; logs created before these fields were added will therefore
-not gain the new columns on resume.
+rejected. Exact continuation also requires compatible state/action schemas,
+model/source assets, fitted scaler, learning settings and numerical runtime.
+Setting duplicate counting to `true` does not make an incompatible historical
+checkpoint resumable. Use its archived generating version for historical work.
+Weight-only fallback, when otherwise compatible, is a warm start with incomplete
+history, not exact continuation; it cannot establish a unique-budget comparison.
+See [reproducibility contracts](development_contracts.md#reproducible-experiments).
 
 ## Policy gradient (`a2c` / `reinforce`)
 

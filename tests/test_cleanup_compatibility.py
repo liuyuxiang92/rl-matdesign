@@ -7,28 +7,27 @@ from rl_matdesign.utils.composition import composition_key
 from rl_matdesign.utils.timing import candidate_key
 
 
-@pytest.mark.parametrize("candidate,expected", [
-    ({"Ni": 0.75, "Fe": "0.25"}, (("Fe", 0.25), ("Ni", 0.75))),
-    ({"B": {"element": "Ti"}, "A": {"kind": "oxide", "amount": "0.5"}},
-     (("A", (("amount", 0.5), ("kind", "oxide"))),
-      ("B", (("element", "Ti"),)))),
-    ({}, ()),
+@pytest.mark.parametrize("candidate", [
+    {"Ni": 0.75, "Fe": "0.25"},
+    {"B": {"element": "Ti"}, "A": {"kind": "oxide", "amount": "0.5"}},
+    {},
 ])
-def test_cache_key_contracts(candidate, expected):
-    assert composition_key(candidate) == expected
+def test_cache_key_contracts(candidate):
+    expected = composition_key(candidate)
     assert candidate_key(candidate) == expected
     assert StructureScorePredictor._key(candidate) == expected
     assert composition_key(dict(reversed(list(candidate.items())))) == expected
 
 
-def test_structure_precision_and_cost_rounding_remain_distinct():
+def test_structure_and_cost_identity_retain_fine_grid_values():
     a, b = {"Fe": 0.12345671}, {"Fe": 0.12345672}
     assert StructureScorePredictor._key(a) != StructureScorePredictor._key(b)
-    assert candidate_key(a) == candidate_key(b) == (("Fe", 0.123457),)
+    assert candidate_key(a) != candidate_key(b)
+    assert candidate_key(a) == composition_key(a)
 
 
-def test_timer_non_mapping_fallback_is_preserved():
-    assert candidate_key(["custom", 1]) == ("__repr__", "['custom', 1]")
+def test_timer_non_mapping_inputs_use_typed_identity():
+    assert candidate_key(["custom", 1]) == composition_key(["custom", 1])
 
 
 def test_legacy_encoding_imports_and_validation():

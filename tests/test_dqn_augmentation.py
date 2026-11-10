@@ -256,27 +256,26 @@ def test_last_position_pin_detected_inside_chain_filter():
 
 
 # ============================================================================
-# Validity rule: fixed_order_amount short-circuits
+# Legacy all-species alias now permits valid assignment permutations
 # ============================================================================
 
-def test_fixed_order_amount_short_circuits_to_original_only(capsys):
-    """episode_style='fixed_order_amount' disables augmentation entirely."""
+def test_all_species_alias_allows_augmentation_and_preserves_terminal_candidate(capsys):
+    """The deprecated spelling no longer pins the species assignment order."""
     from rl_matdesign.training import _augment_episode_in_buffer
 
     env = _build_env_fixed_order()
-    # Fixed-order picks the species_set order forcibly; we just pick amounts.
     seq = [("Fe", "0.30"), ("Co", "0.30"), ("Ni", "0.20"),
            ("Mn", "0.10"), ("Cr", "0.10")]
     _walk(env, seq)
-
+    terminal_key = env.terminal_comp_key()
     buf: collections.deque = collections.deque()
     _augment_episode_in_buffer(
         env, env.path, buf, _make_elem_feats(env), env.fraction_set, K=5,
     )
-    # Only the original N rows: K augmentations were skipped.
-    assert len(buf) == 5
-    captured = capsys.readouterr()
-    assert "fixed_order_amount" in captured.out.lower()
+    assert len(buf) > len(seq)
+    assert env.terminal_comp_key() == terminal_key
+    assert all(row["reward"] == 11.0 for row in buf if row["done"])
+    assert "no-op" not in capsys.readouterr().out.lower()
 
 
 # ============================================================================

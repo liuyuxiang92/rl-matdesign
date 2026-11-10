@@ -209,7 +209,7 @@ def main() -> None:
         "--seed",
         type=int,
         default=None,
-        help="Seed for the recompute predictor (default: run_config 'dp_seed' or 0).",
+        help="Seed for the recompute predictor (default: run_config 'eval_seed' (legacy 'dp_seed') or 0).",
     )
 
     args = parser.parse_args()
@@ -243,7 +243,7 @@ def main() -> None:
 
     predictor = None
     if args.recompute:
-        seed = args.seed if args.seed is not None else int(run_cfg.get("dp_seed", 0))
+        seed = args.seed if args.seed is not None else int(run_cfg.get("eval_seed", run_cfg.get("dp_seed", 0)))
         predictor = _maybe_build_predictor(run_cfg, seed)
 
     out_csv = args.out_csv or os.path.join(args.run_dir, "replay_buffer_summary.csv")

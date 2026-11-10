@@ -28,23 +28,25 @@ class PropertyPredictor(Protocol):
     (mean, std):
         Scalar mean reward and ensemble standard deviation.
         ``std`` is used for uncertainty-driven exploration and Pareto tracking.
+        An unavailable uncertainty is None, including composite rewards whose
+        physical outputs have different units; never replace it with zero.
 
-    Optional training-sample diagnostics
-    ------------------------------------
-    Predictors with transformed rewards may expose
-    ``prediction_record(candidate, prediction, *, k=1.0) -> dict``. This hook
-    must only read the completed evaluation, without inference, random draws,
-    or timing mutation. Return generated.csv property fields such as dp_mean
-    or obj_<name>_mean/std. A batch predictor must retain every result in its
-    current wave until these records have been captured. Plain predict-only
-    plug-ins need no hook: the returned tuple is recorded directly.
+    Optional training-export hook:
+        ``prediction_record(candidate, prediction, *, k=1.0) -> dict`` returns
+        generated.csv-compatible fields from the completed evaluation only.
+        It must not invoke inference, rebuild a structure, consume randomness,
+        or change timing state. Preserve absent scientific uncertainties as
+        None and retain metadata from the same evaluation. Native scientific
+        adapters can use their cached outputs; composite adapters must also
+        retain the selected uncertainty, reward gates, and paired metadata.
+        The hook is optional and is not part of structural protocol checks.
     """
 
-    def predict(self, composition: Dict[str, float]) -> Tuple[float, float]:
+    def predict(self, composition: Dict[str, float]) -> Tuple[float, float | None]:
         ...
 
     def batch_predict(
         self, compositions: List[Dict[str, float]]
-    ) -> List[Tuple[float, float]]:
+    ) -> List[Tuple[float, float | None]]:
         """Batch variant.  Default loops over ``predict``; override for speed."""
         return [self.predict(c) for c in compositions]

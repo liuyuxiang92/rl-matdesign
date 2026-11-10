@@ -1,4 +1,4 @@
-"""ChainConstraintFilter — registry dispatch, composition order, safety fallback."""
+"""ChainConstraintFilter — registry dispatch, composition order, strict filtering."""
 from __future__ import annotations
 
 import pytest
@@ -83,9 +83,8 @@ def test_chain_runs_children_in_order():
     assert seen_by_second == [["b", "c"]]
 
 
-def test_chain_safety_fallback_when_child_empties():
-    """When any child empties the action list, the chain returns the pre-chain
-    input rather than propagating an empty list (which would strand the agent)."""
+def test_chain_propagates_empty_child_result():
+    """An unsatisfiable constraint must not restore forbidden actions."""
     from rl_matdesign.constraints.chain import ChainConstraintFilter
 
     class _AlwaysEmpty:
@@ -97,11 +96,11 @@ def test_chain_safety_fallback_when_child_empties():
 
     original = [("a", "b"), ("c", "d")]
     out = chain.filter_actions(actions=original)
-    assert out == original
+    assert out == []
 
 
-def test_chain_safety_fallback_when_intermediate_step_empties():
-    """Even if the *intermediate* (not final) child empties, fall back to original."""
+def test_chain_stops_when_intermediate_step_empties():
+    """Later filters cannot restore actions removed by an earlier child."""
     from rl_matdesign.constraints.chain import ChainConstraintFilter
 
     class _DropAll:
@@ -110,14 +109,14 @@ def test_chain_safety_fallback_when_intermediate_step_empties():
 
     class _Identity:
         def filter_actions(self, *, actions, **_):
-            return actions
+            pytest.fail("A child after an empty result must not run")
 
     chain = ChainConstraintFilter.__new__(ChainConstraintFilter)
     chain.children = [_DropAll(), _Identity()]
 
     original = [("x", "y")]
     out = chain.filter_actions(actions=original)
-    assert out == original
+    assert out == []
 
 
 def test_chain_empty_filters_raises():
@@ -167,26 +166,27 @@ def test_chain_child_missing_type_key_raises():
 
 
 def test_oxide_yaml_round_trip_auto_chains():
-    """The shipped oxide configs' `oxide` group carries a three-entry `filters:`
-    list and should auto-resolve to a ChainConstraintFilter
-    (LastStepElementFilter + SMACTChargeFilter + ElectronegativityFilter)
+    """Legacy oxide YAMLs normalize O-last into the hard domain, leaving two
+    chemistry filters that auto-resolve to a ChainConstraintFilter
+    (SMACTChargeFilter + ElectronegativityFilter)
     WITHOUT an explicit `type: chain`."""
     pytest.importorskip("smact")  # SMACT-dependent test
 
-    import yaml
     from pathlib import Path
+    from rl_matdesign.configuration import load_config
     from rl_matdesign.registry import build_constraints
 
     repo = Path(__file__).resolve().parent.parent
     for name in ("oxides_sinter.yaml", "oxides_calcine.yaml"):
-        cfg = yaml.safe_load((repo / "configs" / name).read_text())
+        cfg = load_config(repo / "configs" / name)
         assert "constraint_filter" not in cfg, name      # removed public key
         group = cfg["groups"][0]
-        assert isinstance(group["filters"], list) and len(group["filters"]) == 3, name
+        assert group["token_requirements"] == {"O": {"count": 1, "positive": True}}
+        assert isinstance(group["filters"], list) and len(group["filters"]) == 2, name
         chain = build_constraints(group, env=None)
         child_types = [type(c).__name__ for c in chain.children]
         assert child_types == [
-            "LastStepElementFilter", "SMACTChargeFilter", "ElectronegativityFilter"
+            "SMACTChargeFilter", "ElectronegativityFilter"
         ], f"{name}: unexpected child types {child_types}"
 
 

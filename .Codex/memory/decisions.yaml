@@ -189,19 +189,29 @@
     explicitly unavailable. Flush each counted row before model updates. Save and
     restore training_sample_session_id in both trainer checkpoints so returning
     to an older checkpoint after a weights-only run selects the correct CSV lineage.
+    Adapt against codex/general-refactor's scientific contracts: retain
+    EpisodeSnapshot.prediction as the existing tuple and use prediction_record
+    for the export dictionary. Preserve selected ScientificOutput spreads as
+    None when unavailable, plus metadata from the same cached evaluation. If
+    PredictorTimer implements a batch by scalar calls, capture diagnostics after
+    each scalar call before a single-entry plugin cache can be overwritten.
   alternatives_considered:
   - Exporting replay rows duplicates permutation augmentation and omits PG history.
   - Re-evaluating terminal candidates adds physical cost and can change stochastic properties.
   - Selecting the latest CSV session misattributes checkpoints after weights-only restarts.
+  - Resolving text conflicts alone leaves incompatible tuple/dict snapshots and old scientific cache assumptions.
   trade_off: >-
     Every row incurs a flush/fsync; schema expansion atomically rewrites the CSV.
     Rolling back a checkpoint archives the previous CSV before aligning its active
     session. Legacy or missing histories are marked incomplete instead of reconstructed.
     Generation attempts and uncharged failures remain outside this training export.
+    Existing exact-resume source and protocol checks still apply; this feature
+    does not allow a checkpoint created by different source code to bypass them.
   files:
   - src/rl_matdesign/utils/training_samples.py
   - src/rl_matdesign/utils/prediction_records.py
   - src/rl_matdesign/utils/episode_batch.py
   - src/rl_matdesign/training.py
   - src/rl_matdesign/experiment.py
+  - src/rl_matdesign/utils/timing.py
   tags: [episode-budgeting, prediction-provenance, checkpoint-compatibility]

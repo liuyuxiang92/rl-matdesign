@@ -13,10 +13,11 @@ job. So a sintering-temperature model returns the raw temperature ``T`` (not
 ``-T``); pair it with ``direction: min`` to drive ``T`` down.
 
 ``std`` is the spread across the forest's trees when available (``estimators_``),
-else ``0.0``.
+else ``None``. Tree spread is descriptive, not calibrated predictive uncertainty.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -34,7 +35,7 @@ class RFMagpiePredictor:
     def __init__(self, model_path: str) -> None:
         self.model_path = model_path
         self._model = None
-        self._cache: Dict[Tuple[Tuple[str, float], ...], Tuple[float, float]] = {}
+        self._cache = OrderedDict()
 
     # ------------------------------------------------------------------
     # Lazy model + featurizer loaders
@@ -62,7 +63,7 @@ class RFMagpiePredictor:
     # PropertyPredictor protocol
     # ------------------------------------------------------------------
 
-    def predict(self, composition: Dict[str, float]) -> Tuple[float, float]:
+    def predict(self, composition: Dict[str, float]) -> Tuple[float, float | None]:
         """Return ``(value, std)`` for *composition*.
 
         *composition* is a dict of ``{element: fraction}`` (fractions need not
@@ -70,7 +71,11 @@ class RFMagpiePredictor:
         is the **raw** model output; the reward engine applies the sign.
         """
         key = tuple(sorted((str(el), float(f)) for el, f in composition.items()))
+        if (not key or any(not np.isfinite(f) or f < 0 for _, f in key)
+                or not any(f > 0 for _, f in key)):
+            raise ValueError("RF composition needs finite nonnegative amounts and a positive total")
         if key in self._cache:
+            self._cache.move_to_end(key)
             return self._cache[key]
 
         from pymatgen.core.composition import Composition
@@ -78,31 +83,32 @@ class RFMagpiePredictor:
         model = self._load_model()
         feat_calc = self._get_featurizer()
 
-        try:
-            comp_obj = Composition(dict(composition))
-            features = np.asarray(feat_calc.featurize(comp_obj), dtype=float).reshape(1, -1)
-        except Exception:
-            # Invalid composition — return a large penalty value. The sign is
-            # applied by the engine's direction; for a temperature model with
-            # direction: min, a large value is correctly penalised.
-            result = (float(2000.0), 0.0)
-            self._cache[key] = result
-            return result
+        comp_obj = Composition(dict(key))
+        features = np.asarray(feat_calc.featurize(comp_obj), dtype=float).reshape(1, -1)
+        if not np.all(np.isfinite(features)):
+            raise ValueError("RF featurizer returned nonfinite features")
 
         value = float(model.predict(features)[0])
+        if not np.isfinite(value):
+            raise ValueError("RF model returned a nonfinite prediction")
 
-        # Ensemble std from the forest's trees (free uncertainty estimate).
-        try:
-            per_tree = np.asarray([est.predict(features)[0] for est in model.estimators_])
+        # Preserve the historical population tree spread when available. A
+        # missing/singleton ensemble cannot establish a spread estimate.
+        estimators = getattr(model, "estimators_", ())
+        std = None
+        if len(estimators) >= 2:
+            per_tree = np.asarray([est.predict(features)[0] for est in estimators])
+            if not np.all(np.isfinite(per_tree)):
+                raise ValueError("RF tree returned a nonfinite prediction")
             std = float(per_tree.std())
-        except Exception:
-            std = 0.0
 
         result = (value, std)
         self._cache[key] = result
+        while len(self._cache) > 4096:
+            self._cache.popitem(last=False)
         return result
 
     def batch_predict(
         self, compositions: List[Dict[str, float]]
-    ) -> List[Tuple[float, float]]:
+    ) -> List[Tuple[float, float | None]]:
         return [self.predict(c) for c in compositions]

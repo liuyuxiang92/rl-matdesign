@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from .structure_samples import SamplingProtocolError, sample_plan_failure_record
+
 if TYPE_CHECKING:
     from ase import Atoms
 
@@ -171,7 +173,9 @@ class _Worker:
 class ParallelStructureBuilder:
     """Run independent configurations with one structure worker per GPU.
 
-    A plugin must honor the supplied RNG and return one ASE Atoms for n_configs=1.
+    Seeded execution requires a plugin's explicit build_sample capability;
+    custom sample plans are resolved by the worker-owned builder. Legacy direct
+    calls require one ASE Atoms for n_configs=1 and honor the supplied RNG.
     Configurations from multiple formulas share the same queue. Each GPU starts
     the next queued configuration when its current build and optimization finish.
     """
@@ -243,6 +247,7 @@ class ParallelStructureBuilder:
         self.last_build_timings: list[dict] = []
         self.last_build_job_timings: list[dict] = []
         self.last_build_wall_s = 0.0
+        self.last_sample_records: list[list[dict]] = []
         go = cfg.get("geo_opt") or {}
         self.handles_geo_opt = bool(go) and bool(go.get("enabled", True))
 
@@ -274,33 +279,38 @@ class ParallelStructureBuilder:
                 reply = worker.receive()
                 if not reply.get("ok"):
                     raise RuntimeError(f"Structure worker startup on GPU {worker.token}: {reply.get('error')}")
+                worker.sample_protocol = reply.get("sample_protocol") is True
         except BaseException:
             self._stop_workers()
             raise
 
-    def _run_jobs(self, candidates: list[Any], jobs: list[tuple[int, int, int]],
+    def _run_jobs(self, candidates: list[Any], jobs: list[tuple],
                   targets: list[tuple[int, int]],
                   *, label: str) -> list[dict]:
-        """Queue (candidate index, config index, seed) jobs across shared workers.
+        """Queue (candidate index, config index, seed, sample) across workers.
 
         Replies retain job order, independently of worker completion order.
         """
+        if not jobs:
+            return []
         self._ensure_targets(targets)
+        if any(job[3] is not None for job in jobs):
+            self._require_sample_capabilities(targets)
         replies: dict[int, dict] = {}
         active = {}
         next_index = 0
 
         def context(index: int) -> str:
-            candidate_index, config_index, _ = jobs[index]
+            candidate_index, config_index, _, _sample = jobs[index]
             return (f"{label} candidate {candidate_index + 1}/{len(candidates)} "
                     f"config {config_index + 1} (job {index + 1}/{len(jobs)})")
 
         def dispatch(worker: _Worker, index: int) -> None:
-            candidate_index, config_index, seed = jobs[index]
+            candidate_index, config_index, seed, sample = jobs[index]
             worker.connection.send({"op": "build", "candidate": candidates[candidate_index],
                                     "seed": seed, "index": index,
                                     "candidate_index": candidate_index,
-                                    "config_index": config_index})
+                                    "config_index": config_index, "sample": sample})
             self.last_build_job_timings[index]["dispatched"] = True
             active[worker.connection] = (worker, index, time.monotonic())
             print(f"[structure_parallel] {context(index)} started on GPU {worker.token}", flush=True)
@@ -320,11 +330,14 @@ class ParallelStructureBuilder:
                 for connection in wait(list(active), timeout=min(remaining, 1.0)):
                     worker, index, t = active.pop(connection)
                     reply = worker.receive()
+                    if reply.get("sampling_protocol_error"):
+                        raise SamplingProtocolError(reply.get("error", "Invalid builder sample protocol"))
                     reply["elapsed"] = time.monotonic() - t
                     replies[index] = reply
                     self.last_build_job_timings[index].update(
                         completed=True, succeeded=bool(reply.get("ok")),
                         timing=reply.get("timing"), elapsed_s=reply["elapsed"],
+                        error=reply.get("error"),
                     )
                     status = "done" if reply.get("ok") else "FAILED"
                     print(f"[structure_parallel] {context(index)} {status} on GPU {worker.token} ({reply['elapsed']:.1f}s)", flush=True)
@@ -363,18 +376,80 @@ class ParallelStructureBuilder:
 
     def build_many(self, candidates: Any, *, n_configs: int = 1,
                    rng: np.random.Generator | None = None) -> list[list[Atoms] | Exception]:
-        """Build formulas together, returning ordered ensembles or per-formula errors.
+        """Legacy caller-owned RNG path, preserving its sequential seed stream."""
+        n_configs = self._validate_n_configs(n_configs)
+        candidates = list(candidates)
+        rng = self._rng if rng is None else rng
+        seeds = rng.integers(0, 2**32, size=len(candidates) * n_configs, dtype=np.uint64)
+        jobs = [(index // n_configs, index % n_configs, int(seed), None)
+                for index, seed in enumerate(seeds)]
+        return self._build_jobs(candidates, jobs)
 
-        Any nonempty successful ensemble is returned. Ordinary worker-reported
-        errors only reduce that formula's ensemble;
-        timeout, crash, and startup failures stop the pool and propagate. Seeds
-        are assigned in candidate/config order before any dispatch.
+    def build_seeded(self, candidate: Any, *, n_configs: int, source_spec, eval_seed: int):
+        result = self.build_many_seeded([candidate], n_configs=n_configs,
+                                        source_spec=source_spec, eval_seed=eval_seed)[0]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def _require_sample_capabilities(self, targets: list[tuple[int, int]]) -> None:
+        if any(not self._workers[target].sample_protocol for target in targets):
+            self._stop_workers()
+            raise SamplingProtocolError(
+                "Seeded parallel execution requires explicit "
+                "build_sample(candidate, *, sample) capability; native build ensembles "
+                "cannot be split reproducibly."
+            )
+
+    def build_many_seeded(self, candidates: Any, *, n_configs: int, source_spec, eval_seed: int):
+        """Resolve worker-owned plans, then execute their explicit sample protocol.
+
+        No builder is imported or initialized in the parent. A missing sample
+        capability fails before any scientific build task. Candidate-specific
+        plan errors remain aligned with successful neighboring candidates.
         """
         n_configs = self._validate_n_configs(n_configs)
         candidates = list(candidates)
         self.last_build_timings = []
         self.last_build_job_timings = []
+        self.last_sample_records = []
         self.last_build_wall_s = 0.0
+        if not candidates:
+            return []
+        jobs, plan_failures = [], {}
+        self._ensure_targets([(0, 0)])
+        self._require_sample_capabilities([(0, 0)])
+        worker = self._workers[0, 0]
+        try:
+            for candidate_index, candidate in enumerate(candidates):
+                worker.connection.send({"op": "plan", "candidate": candidate,
+                                        "n_configs": n_configs, "source_spec": source_spec,
+                                        "eval_seed": eval_seed})
+                if not worker.connection.poll(self.timeout):
+                    raise TimeoutError("Structure worker sample_plan timed out")
+                reply = worker.receive()
+                if reply.get("sampling_protocol_error"):
+                    raise SamplingProtocolError(reply.get("error", "Invalid builder sample protocol"))
+                if not reply.get("ok"):
+                    error = RuntimeError(reply.get("error", "Structure sample plan failed"))
+                    plan_failures[candidate_index] = (error, sample_plan_failure_record(source_spec, error))
+                    continue
+                jobs.extend((candidate_index, index, sample.seed, sample)
+                            for index, sample in enumerate(reply["samples"]))
+        except BaseException:
+            self._stop_workers()
+            raise
+        return self._build_jobs(candidates, jobs, plan_failures=plan_failures)
+
+    def _build_jobs(self, candidates: list[Any], jobs: list[tuple], *,
+                    plan_failures: dict[int, tuple[Exception, dict]] | None = None
+                    ) -> list[list[Atoms] | Exception]:
+        """Return ordered successful ensembles, retaining every sample's status."""
+        self.last_build_timings = []
+        self.last_build_job_timings = []
+        self.last_sample_records = []
+        self.last_build_wall_s = 0.0
+        plan_failures = plan_failures or {}
         if not candidates:
             return []
         started = time.monotonic()
@@ -382,29 +457,22 @@ class ParallelStructureBuilder:
             {"candidate_index": candidate_index, "config_index": config_index,
              "dispatched": False, "completed": False, "succeeded": False,
              "timing": None}
-            for candidate_index in range(len(candidates))
-            for config_index in range(n_configs)
+            for candidate_index, config_index, _seed, _sample in jobs
         ]
-        rng = self._rng if rng is None else rng
-        total_configs = len(candidates) * n_configs
-        seeds = [int(s) for s in rng.integers(0, 2**32, size=total_configs, dtype=np.uint64)]
-        targets = [(device, 0) for device in range(min(len(self.devices), total_configs))]
-        # Do not leave optimizer models resident on GPUs unused by this batch.
+        groups = [[] for _ in candidates]
+        for index, (candidate_index, _config_index, _seed, _sample) in enumerate(jobs):
+            groups[candidate_index].append(index)
+        targets = [(device, 0) for device in range(min(len(self.devices), len(jobs)))]
         for device, slot in set(self._workers) - set(targets):
             self._retire(device, slot)
-        print(f"[structure_parallel] scheduling {len(candidates)} candidates x "
-              f"{n_configs} configurations on "
-              f"{len(targets)} GPUs (one structure per GPU)", flush=True)
-        jobs = [(index // n_configs, index % n_configs, seed)
-                for index, seed in enumerate(seeds)]
+        print(f"[structure_parallel] scheduling {len(candidates)} candidates / "
+              f"{len(jobs)} configurations on {len(targets)} GPUs (one structure per GPU)", flush=True)
         try:
             replies = self._run_jobs(candidates, jobs, targets, label="config")
         finally:
-            # Keep completed work visible even if a worker exits or times out.
-            # Unknown in-flight stage costs must never look like measured zeros.
             self.last_build_wall_s = time.monotonic() - started
-            for index in range(len(candidates)):
-                records = self.last_build_job_timings[index * n_configs:(index + 1) * n_configs]
+            for candidate_index, indices in enumerate(groups):
+                records = [self.last_build_job_timings[index] for index in indices]
                 incomplete = any(not record["completed"] for record in records)
                 timing = {
                     "config_attempted": sum(int(record["dispatched"]) for record in records),
@@ -413,21 +481,35 @@ class ParallelStructureBuilder:
                 }
                 for stage in ("md_task_s", "opt_task_s", "structure_other_task_s"):
                     values = [(record["timing"] or {}).get(stage) for record in records]
-                    timing[stage] = (
-                        None if incomplete or any(value is None for value in values)
-                        else sum(values)
-                    )
+                    timing[stage] = (None if incomplete or any(value is None for value in values)
+                                     else sum(values))
                 self.last_build_timings.append(timing)
+                sample_records = ([plan_failures[candidate_index][1]]
+                                  if candidate_index in plan_failures else [])
+                for index, record in zip(indices, records):
+                    _candidate_index, config_index, seed, sample = jobs[index]
+                    identity = sample.record() if sample else {"config_index": config_index, "seed": seed}
+                    status = ("succeeded" if record["succeeded"] else "failed"
+                              if record["completed"] else "interrupted"
+                              if record["dispatched"] else "not_attempted")
+                    identity["status"] = status
+                    if record.get("error"):
+                        identity["error"] = record["error"]
+                    sample_records.append(identity)
+                self.last_sample_records.append(sample_records)
         results: list[list[Atoms] | Exception] = []
-        for index in range(len(candidates)):
-            candidate_replies = replies[index * n_configs:(index + 1) * n_configs]
+        for index, indices in enumerate(groups):
+            if index in plan_failures:
+                results.append(plan_failures[index][0])
+                continue
+            candidate_replies = [replies[job_index] for job_index in indices]
             atoms = [reply["atoms"] for reply in candidate_replies if reply.get("ok")]
             print(f"[structure_parallel] candidate {index + 1}/{len(candidates)}: "
-                  f"{len(atoms)}/{n_configs} configurations succeeded", flush=True)
+                  f"{len(atoms)}/{len(indices)} configurations succeeded", flush=True)
             if not atoms:
                 failure = next((r.get("error") for r in candidate_replies if not r.get("ok")), "no structures")
                 results.append(RuntimeError(
-                    f"Only {len(atoms)}/{n_configs} configurations succeeded for "
+                    f"Only {len(atoms)}/{len(indices)} configurations succeeded for "
                     f"candidate {index + 1}/{len(candidates)}; "
                     f"at least one successful configuration is required. First failure: {failure}"
                 ))

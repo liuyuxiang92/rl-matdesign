@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import csv
+import json
+import os
 import subprocess
 import sys
 
@@ -11,6 +13,7 @@ import torch
 
 from rl_matdesign import training
 from rl_matdesign.configuration import _TerminalReward
+from rl_matdesign.predictors.outputs import OutputSchema, ScientificOutput
 from rl_matdesign.utils.episode_batch import CandidateEvaluationFailed, EpisodeBatchEvaluator
 from rl_matdesign.utils.training_samples import TrainingSampleWriter
 from tests.test_cross_formula_training import Predictor, ScriptedEnv, pg_setup, run_dqn, saved
@@ -57,14 +60,22 @@ def test_cli_exports_exactly_the_budgeted_training_episodes(tmp_path, method, co
         assert len({row["formula"] for row in samples}) < len(samples)
 
 
-@pytest.mark.parametrize("multiple_groups", [False, True])
-def test_cli_material_export_supports_categorical_and_multigroup_spaces(tmp_path, multiple_groups):
+@pytest.mark.parametrize("domain", ["categorical", "multigroup", "sequence", "typed_fields"])
+def test_cli_material_export_preserves_structured_candidates(tmp_path, domain):
     cfg = _config(count_duplicates=True, categorical=True)
-    if multiple_groups:
+    if domain == "multigroup":
         cfg["groups"].insert(0, {
             "name": "metal", "kind": "composition", "species_set": ["Fe", "Ni"],
             "fraction_set": ["1.0"], "n_components": 1,
         })
+    elif domain == "sequence":
+        cfg["groups"] = [{"name": "chain", "kind": "sequence", "tokens": ["01", "1", "C"],
+                          "length": 2}]
+    elif domain == "typed_fields":
+        cfg["groups"] = [{"name": "settings", "kind": "categorical", "choices": [
+            {"name": "level", "values": [1, 2]},
+            {"name": "switch", "values": [False, "off"]},
+        ]}]
     proc, out = _run(tmp_path, cfg)
     _successful_rows(proc, out)
     samples = _samples(out)
@@ -72,6 +83,18 @@ def test_cli_material_export_supports_categorical_and_multigroup_spaces(tmp_path
     assert [int(row["training_budget_used"]) for row in samples] == [1, 2, 3]
     assert all(row["formula"] for row in samples)
     assert all(float(row["dp_mean"]) == float(row["reward"]) for row in samples)
+    for row in samples:
+        candidate = json.loads(row["candidate_json"])
+        assert json.loads(row["metadata_json"]) == {}
+        if domain == "sequence":
+            assert len(candidate["chain"]) == 2
+            assert set(candidate["chain"]) <= {"01", "1", "C"}
+        elif domain == "typed_fields":
+            assert type(candidate["settings"]["level"]) is int
+            switch = candidate["settings"]["switch"]
+            assert (type(switch), switch) in [(bool, False), (str, "off")]
+        elif domain == "multigroup":
+            assert set(candidate) == {"metal", "oxygen"}
 
 
 @pytest.mark.parametrize("method", ["dqn", "reinforce", "a2c"])
@@ -144,10 +167,11 @@ def test_scalar_snapshots_reuse_each_actual_stochastic_prediction():
 
     assert predictor.calls == [{"A": 1.0}, {"A": 1.0}, {"B": 1.0}]
     assert [episode.path[-1].reward for episode in episodes] == [1.25, 2.25, 3.25]
-    assert [episode.prediction["dp_mean"] for episode in episodes] == [1.25, 2.25, 3.25]
-    assert [episode.prediction["dp_std"] for episode in episodes] == [0.125] * 3
+    assert [episode.prediction for episode in episodes] == [(1.25, .125), (2.25, .125), (3.25, .125)]
+    assert [episode.prediction_record["dp_mean"] for episode in episodes] == [1.25, 2.25, 3.25]
+    assert [episode.prediction_record["dp_std"] for episode in episodes] == [0.125] * 3
     env.reward_fn.last_prediction_records[0]["dp_mean"] = -999
-    assert episodes[-1].prediction["dp_mean"] == 3.25
+    assert episodes[-1].prediction_record["dp_mean"] == 3.25
 
 
 def test_raw_predictor_without_a_record_hook_is_not_evaluated_again():
@@ -205,11 +229,13 @@ def test_partial_batch_keeps_gate_properties_aligned_with_successful_episodes():
     assert predictor.record_calls == [({"A": 1.0}, (-10.0, 0.0)), ({"B": 1.0}, (0.12, 0.0))]
     assert first.formula == "A1" and last.formula == "B1"
     assert first.path[-1].reward == -10.0
-    assert first.prediction["obj_delta_mean"] == 0.07
-    assert first.prediction["gate_passed"] is False
+    assert first.prediction == (-10.0, 0.0)
+    assert first.prediction_record["obj_delta_mean"] == 0.07
+    assert first.prediction_record["gate_passed"] is False
     assert last.path[-1].reward == 0.12
-    assert last.prediction["obj_delta_mean"] == 0.12
-    assert last.prediction["gate_passed"] is True
+    assert last.prediction == (0.12, 0.0)
+    assert last.prediction_record["obj_delta_mean"] == 0.12
+    assert last.prediction_record["gate_passed"] is True
     assert len(env.reward_fn.last_prediction_records) == 3
     assert not env.reward_fn.last_prediction_records[1]
     assert first.timing["evaluation_wave_id"] == last.timing["evaluation_wave_id"]
@@ -308,3 +334,71 @@ def test_dqn_permutation_replay_does_not_export_synthetic_samples(tmp_path):
     assert [float(row["reward"]) for row in samples] == [1.25, 2.25, 3.25]
     assert [int(row["training_budget_used"]) for row in samples] == [1, 2, 3]
     assert len(saved(tmp_path)["buffer"]) > 3 * env.n_components
+
+
+class ScientificMetadataPredictor:
+    """Importable CLI fixture: two point estimates without uncertainty data."""
+
+    output_schema = {
+        "delta": OutputSchema("delta", "1"),
+        "probability": OutputSchema("probability", "1"),
+    }
+
+    def __init__(self, cfg, *, seed=None):
+        pass
+
+    def predict_outputs(self, candidate):
+        return {"delta": ScientificOutput(self.output_schema["delta"], .07),
+                "probability": ScientificOutput(self.output_schema["probability"], .4)}
+
+    def candidate_metadata(self, candidate):
+        return {"temperature": 400, "description": "point-only test", "missing": None}
+
+
+def test_scientific_training_and_generation_export_matching_gated_properties(tmp_path, monkeypatch):
+    # Make the software-only oracle importable in the CLI subprocess. No model,
+    # structure builder or scientific library inference is needed.
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [str(_REPO), os.environ.get("PYTHONPATH")])) )
+    cfg = _config(count_duplicates=True)
+    cfg.pop("predictor")
+    cfg.update(
+        models={"test": {"predictor": "tests.test_training_samples_integration:ScientificMetadataPredictor"}},
+        properties=[
+            {"name": "delta", "model_ref": "test", "output": "delta", "direction": "max", "objective": "mean"},
+            {"name": "synthesis_probability", "model_ref": "test", "output": "probability", "direction": "max", "objective": "mean"},
+        ],
+        reward={"type": "gated", "gates": [{"name": "synthesis", "score": {
+            "type": "weighted_sum", "terms": {"synthesis_probability": 1.0}}, "min": .8}],
+            "objective": {"type": "weighted_sum", "terms": {"delta": 1.0}}, "failure": {"reward": -10.0}},
+        num_gen_eps=1, gen_temperature=0.0,
+    )
+    proc, out = _run(tmp_path, cfg)
+    _successful_rows(proc, out)
+    before_generation = (out / "training_samples.csv").read_bytes()
+    generated = subprocess.run(
+        [sys.executable, str(_RUNNER), "--config", str(tmp_path / "config.yaml"),
+         "--out", str(out), "--device", "cpu", "--only-generate", "--gen-seed", "0"],
+        capture_output=True, text=True, cwd=_REPO, timeout=120,
+    )
+    assert generated.returncode == 0, generated.stdout[-3000:] + generated.stderr[-5000:]
+    assert (out / "training_samples.csv").read_bytes() == before_generation
+    with (out / "generated.csv").open() as stream:
+        generated_rows = list(csv.DictReader(stream))
+    assert len(generated_rows) == 1
+    samples = _samples(out)
+    assert len(samples) == 3
+    expected = generated_rows[0]
+    for row in [*samples, expected]:
+        assert float(row["reward"]) < -10
+        assert float(row["obj_delta_mean"]) == .07
+        assert row["obj_delta_std"] == row["obj_synthesis_probability_std"] == ""
+        assert row.get("dp_std", "") == ""
+        assert row["gate_passed"] == "False"
+        assert float(row["reward_objective"]) == .07
+        assert float(row["gate_synthesis_value"]) == .4
+        assert json.loads(row["metadata_json"])
+    for row in samples:
+        for column in ("reward", "dp_mean", "obj_delta_mean", "obj_delta_std", "obj_synthesis_probability_mean",
+                       "obj_synthesis_probability_std", "reward_objective", "gate_passed", "gate_synthesis_value",
+                       "gate_synthesis_passed", "gate_synthesis_violation", "metadata_json"):
+            assert row[column] == expected[column]

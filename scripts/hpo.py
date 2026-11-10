@@ -16,8 +16,8 @@ stopped. Stage progression is tracked via a state.json sentinel.
 Usage
 -----
     python scripts/hpo.py \\
-        --hpo-config configs/hpo/ooh_dqn.yaml \\
-        --out runs/hpo/ooh_dqn_v1
+        --hpo-config /path/to/local/hpo.yaml \\
+        --out runs/hpo/experiment
 
 See `configs/hpo/*.yaml` for the search-space schema.
 """
@@ -28,6 +28,7 @@ import argparse
 import csv
 import json
 import logging
+import math
 import os
 import queue
 import shutil
@@ -42,6 +43,8 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 import numpy as np
 import optuna
 import yaml
+
+from rl_matdesign.config_schema import load_yaml_config, normalize_aliases, resolve_config, validate_config
 
 from rl_matdesign.hpo import (
     TrialRunError,
@@ -63,8 +66,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 def _load_yaml(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f) or {}
+    return load_yaml_config(path)
 
 
 def _resolve_base_config(hpo_config_path: str, base_config_ref: str) -> str:
@@ -145,25 +147,46 @@ def _build_trial_yaml(
     Budget scaling: multiplicative on integer-typed budget knobs. Applied
     AFTER sampled values are merged (so a sampled budget knob is also scaled).
     """
-    cfg = dict(base_cfg)
-    cfg.update(fixed_overrides)
-    cfg.update(sampled)
+    cfg = normalize_aliases(base_cfg)
+    cfg.update(normalize_aliases(fixed_overrides))
+    cfg.update(normalize_aliases(sampled))
     cfg["method"] = method
+    # Validate the same values the experiment consumes, but retain authored keys
+    # so later trial overrides do not freeze derived gamma/warmup defaults.
+    effective = resolve_config(cfg).config
+    cfg = {key: effective[key] for key in cfg}
 
     # Apply budget scaling. Scale relative to the resolved value (which may
     # have come from base_cfg, fixed_overrides, or the sampled dict).
+    budget_keys = {
+        "train_budget",
+        "dqn_num_train_eps", "dqn_warmup_eps", "dqn_eps_anneal_eps",
+        "pg_num_iters", "pg_warmup_eps", "num_gen_eps",
+        "exploration_gen_eps", "max_gen_attempts",
+    }
     for key, mult in (budget_scaling or {}).items():
-        if key in cfg and isinstance(cfg[key], (int, float)):
-            cfg[key] = max(1, int(round(cfg[key] * float(mult))))
+        if key not in budget_keys:
+            raise ValueError(f"budget_scaling key {key!r} is not an episode/iteration budget")
+        if isinstance(mult, bool) or not isinstance(mult, (int, float)) or not math.isfinite(mult) or mult <= 0:
+            raise ValueError(f"budget_scaling[{key!r}] must be a positive finite number")
+        if effective["train_budget"] is not None and key in {"dqn_num_train_eps", "pg_num_iters"}:
+            raise ValueError(f"budget_scaling[{key!r}] conflicts with train_budget; scale train_budget instead")
+        base_value = effective[key]
+        if base_value is None:
+            raise ValueError(f"budget_scaling[{key!r}] requires an explicitly configured budget")
+        cfg[key] = max(1, int(round(base_value * mult))) if base_value else 0
 
     # Defensive clamp: anneal eps cannot exceed train eps.
-    if "dqn_eps_anneal_eps" in cfg and "dqn_num_train_eps" in cfg:
-        cfg["dqn_eps_anneal_eps"] = min(int(cfg["dqn_eps_anneal_eps"]), int(cfg["dqn_num_train_eps"]))
+    effective = resolve_config(cfg).config
+    if "dqn_eps_anneal_eps" in cfg and ("dqn_num_train_eps" in cfg or effective["train_budget"] is not None):
+        cfg["dqn_eps_anneal_eps"] = max(1, min(cfg["dqn_eps_anneal_eps"], effective["dqn_num_train_eps"]))
 
-    return cfg
+    effective = resolve_config(cfg).config
+    return {key: effective[key] for key in cfg}
 
 
 def _dump_trial_yaml(path: str, cfg: dict) -> None:
+    validate_config(normalize_aliases(cfg))
     with open(path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
 
@@ -208,7 +231,7 @@ def _run_one_seed(
             out_dir=seed_out,
             method=method,
             train_seed=seed_idx,
-            dp_seed=seed_idx + 10_000,
+            eval_seed=seed_idx + 10_000,
             gen_seed=seed_idx + 20_000,
             timeout_s=timeout_s,
             env_extra=env_extra,
@@ -554,29 +577,20 @@ def _run_stage2(
         if not s1_yaml or not os.path.exists(s1_yaml):
             log.warning("stage2: cannot find stage-1 config for trial #%d, skipping", t.number)
             continue
-        # Build stage-2 cfg = base + fixed_overrides + sampled (no scaling).
+        # Replay the same search-space transformation as stage 1. Optuna stores
+        # the fraction for frac_of, not the integer episode count it produces.
+        # Resolve that fraction BEFORE the common experiment schema validates it.
+        sampled = sample_from_search_space(
+            optuna.trial.FixedTrial(t.params), hpo_cfg["search_space"],
+            resolved_values={**base_cfg, **hpo_cfg["fixed_overrides"]},
+        )
         cfg = _build_trial_yaml(
             base_cfg=base_cfg,
             fixed_overrides=hpo_cfg["fixed_overrides"],
-            sampled=t.params,  # includes frac_of *fractions*; need to re-resolve them
+            sampled=sampled,
             budget_scaling=None,
             method=hpo_cfg["method"],
         )
-        # If any params were `frac_of`, t.params stored the raw fraction.
-        # Re-multiply by the (now-unscaled) base value.
-        for name, entry in hpo_cfg["search_space"].items():
-            if entry.get("dist") == "frac_of" and name in t.params:
-                base_key = entry["base"]
-                base_val = cfg.get(base_key)
-                if base_val is None:
-                    continue
-                frac = float(t.params[name])
-                resolved_val = frac * float(base_val)
-                from rl_matdesign.hpo.search_space import _INT_TYPED_KEYS
-                cfg[name] = int(round(resolved_val)) if base_key in _INT_TYPED_KEYS else resolved_val
-        # Re-clamp.
-        if "dqn_eps_anneal_eps" in cfg and "dqn_num_train_eps" in cfg:
-            cfg["dqn_eps_anneal_eps"] = min(int(cfg["dqn_eps_anneal_eps"]), int(cfg["dqn_num_train_eps"]))
 
         trial_dir = os.path.join(out_root, "stage2", f"top{rank}_from_s1_{t.number:04d}")
         os.makedirs(trial_dir, exist_ok=True)

@@ -224,7 +224,8 @@ def pg_setup(monkeypatch, sequence, size=4, method="reinforce"):
     species = ["Na", "K", "Ca", "Sr"]
     def candidate(payload):
         for i, name in enumerate(species):
-            if payload.startswith(name + "1"):
+            if ((isinstance(payload, dict) and payload.get(name) == 1)
+                    or (isinstance(payload, str) and payload.startswith(name + "1"))):
                 return {chr(ord("A") + i): 1.0}
         raise AssertionError(payload)
     adapter = _TerminalReward(predictor, "fraction")
@@ -246,7 +247,7 @@ def pg_setup(monkeypatch, sequence, size=4, method="reinforce"):
     monkeypatch.setattr(training, "_rollout_pg_episode", rollout)
     return predictor, sampled_params, dict(
         policy=policy, value_net=Value() if method == "a2c" else None, env=env,
-        scaler=StandardScaler().fit([[0.0], [1.0]]), elem_feats_scaled=np.eye(4),
+        scaler=StandardScaler().fit([env.current_state_features()]), elem_feats_scaled=np.eye(4),
         fraction_set=["1.00"], device=torch.device("cpu"), num_iters=1, batch_eps=4,
         pg_repeat_penalty_coef=.2, rl_method=method,
     )

@@ -14,7 +14,8 @@ def _episode(formula="BaCoO3", **prediction):
     return SimpleNamespace(
         formula=formula, terminal_key=(("Ba", 1), ("Co", 1)), metadata={},
         path=[SimpleNamespace(reward=-99.0)],
-        prediction={"formula": formula, "reward": 0.2, "dp_mean": 0.1, **prediction},
+        prediction=(0.2, None),
+        prediction_record={"formula": formula, "reward": 0.2, "dp_mean": 0.1, **prediction},
     )
 
 
@@ -77,12 +78,24 @@ def test_prediction_snapshot_is_not_replaced_by_training_metrics(tmp_path):
     assert row["terminal_comp_key"] == "(('Ba', 1), ('Co', 1))"
 
 
+def test_unavailable_scientific_uncertainty_is_blank_instead_of_zero(tmp_path):
+    path = tmp_path / "training_samples.csv"
+    writer = TrainingSampleWriter(path)
+    writer.start(0)
+    episode = _episode(dp_std=None, dp_mean_minus_std=None, obj_delta_mean=.07, obj_delta_std=None)
+    writer.record(episode, _metrics(1))
+    row = _read(path)[1][0]
+    assert row["dp_std"] == row["dp_mean_minus_std"] == row["obj_delta_std"] == ""
+    assert row["obj_delta_mean"] == "0.07"
+    assert episode.prediction == (0.2, None), "the generation tuple has a separate role"
+
+
 def test_fallback_reward_and_identity_come_from_episode_snapshot(tmp_path):
     path = tmp_path / "training_samples.csv"
     writer = TrainingSampleWriter(path)
     writer.start(0)
     episode = _episode()
-    episode.prediction = {}
+    episode.prediction_record = {}
     episode.metadata = {"iteration": 17, "phase": "warmup"}
     writer.record(episode, {"budget_counted": True, "training_budget_used": 1})
     row = _read(path)[1][0]

@@ -3,70 +3,69 @@
 ## Entry points
 
 - `rl-matdesign --config CONFIG --method METHOD --out DIR`: installed command.
-- `python scripts/run_experiment.py ...`: source-checkout command, with the same flags.
-- `rl_matdesign.configuration`: YAML aliases, predictor/filter construction, and
-  `build_env`, shared by RL, BO, GA, and the invariance checker.
-- `rl_matdesign.experiment`: argument parsing and experiment orchestration.
-- `scripts/baselines/run_bo.py` and `run_ga.py`: baseline commands.
+- `python scripts/run_experiment.py ...`: source-checkout command with the same flags.
+- `--validate-config`: resolve and export configuration before loading a model.
+- `scripts/benchmark.py`: plan or execute matched-budget DQN-MC, DQN-bootstrap,
+  A2C and exact-uniform random-search arms.
+- `scripts/archive_experiment.py`: archive declared historical evidence without
+  assigning today's code revision to an old experiment.
 
-The source script re-exports its existing config helpers for scripts importing
-`run_experiment`. The installed command uses package modules directly; it no
-longer assumes a sibling `scripts/` directory exists in a wheel installation.
+The source runner re-exports configuration helpers for existing imports. The
+installed command uses package modules and does not require a sibling `scripts`
+directory. BO/GA commands remain available; the new GlassNet benchmark's uniform
+terminal-composition baseline is `scripts/baselines/run_random.py`.
 
 ## Responsibilities
 
 | Location | Responsibility |
 |---|---|
-| `src/rl_matdesign/env*.py` | Flat composition, integer-ratio, and multi-group environments |
-| `src/rl_matdesign/training.py` | DQN, REINFORCE, A2C, checkpoint handling, candidate generation |
-| `src/rl_matdesign/model.py` | Existing model architectures and state-dict names |
-| `src/rl_matdesign/registry.py` | Predictor, builder, and constraint plugin resolution |
-| `src/rl_matdesign/predictors/` | Reward evaluation and structure builders |
-| `src/rl_matdesign/utils/composition.py` | Canonical numeric/categorical composition keys |
-| `src/abcde_ooh/` | OOH predictor/environment support and compatibility imports |
-| `scripts/` | CLI tools and analysis workflows |
-| `tests/` | Regression tests and subprocess smoke runs |
+| `config_schema.py`, `configuration.py` | Core parameter ownership, YAML/CLI/HPO resolution and environment construction |
+| `env.py`, `env_integer.py`, `env_multigroup.py`, `sequence.py` | Composition, accumulated tokens, labelled groups, explicit peptide positions and typed fields |
+| `action_features.py`, `action_encoding.py` | Shared typed action encoding |
+| `structure_sources.py`, `utils/structure_samples.py` | Source ownership, sample plans and candidate-local structure randomness |
+| `predictors/outputs.py`, `predictors/structure_score.py` | Named scientific outputs, aligned sample statistics, shared model inference and reward integration |
+| `predictors/glassnet.py` | Pinned composition-only GlassNet oracle and bounded cache |
+| `training.py`, `model.py`, `experiment.py` | Algorithm updates, checkpoints and run orchestration |
+| `registry.py` | Existing name/FQN plugin resolution |
+| `utils/composition.py`, `utils/design_count.py` | Canonical candidate identity, exact counting and uniform sampling |
+| `utils/model_contract.py`, `utils/execution_contract.py`, `utils/seeding.py` | Artifact/scaler compatibility, oracle/runtime identity and RNG continuation |
+| `utils/timing.py`, `utils/provenance.py` | Evaluation ledger, timing and append-only invocation evidence |
+| `src/abcde_ooh/` | OOH implementation and compatibility imports using the common contracts |
+| `tests/` | Domain, scientific contract, runner and subprocess repeatability checks |
 
-`abcde_ooh` remains in place: the generic OOH predictor still depends on its
-DeepMD implementation and constraints. Its encoding functions delegate to the
-identical shared implementation in `rl_matdesign.encoding`.
+Candidates preserve labels and exact numeric distinctions; generic keys do not
+round all fields to six decimals. Environment adapters own chemical zero removal
+and integer GCD normalization. Evaluation identity additionally includes the
+scientific model, source, preprocessing and conditions.
 
-Structure-score cache keys preserve full float precision. Baseline caches and
-predictor cost accounting keep their existing six-decimal rounding. Categorical
-labels and group names remain part of the key.
+## Version 0.2 compatibility boundary
 
-## Compatibility boundary
+This refactor intentionally changes state/action features, some construction
+MDPs, the sample seed protocol and scientific output statistics. Old weights,
+scalers and replay cannot be accepted solely because shapes match. Incompatible
+artifacts fail with an explicit contract error; historical experiments require
+their actual archived implementation and assets. There is no OOH-only legacy path.
 
-The cleanup preserves the existing feature branch's algorithms, reward formulas,
-RNG order, YAML aliases, CLI flags, model tensor names/shapes, scaler files, and
-output schemas. It does not change scientific settings to improve test results.
+The mathematical updates of DQN-MC, bootstrap DQN and the existing Monte Carlo
+A2C implementation remain distinct. Equivalent labelled assignments share a
+state and final evaluation; a different partial amount or peptide position
+remains distinguishable. Both algorithm parameter families remain in one YAML.
 
-Before this cleanup, `feat/multi-sublattice-lips` had already adopted `groups:`
-and removed several older predictor adapters. Configs or commands from much
-older branches (including `run_ABCDEOOH_experiment.py`) are not automatically
-restored by this cleanup. Audit those separately before merging to `main`.
-
-Private scenario configs, checkpoints, datasets, results, and untracked analysis
-scripts in the original checkout are retained. The cleanup is developed in an
-isolated worktree, based on feature-branch commit `08bb24a`.
+Source migration and output/uncertainty semantics are described in
+[development contracts](development_contracts.md). Actual experiment YAMLs,
+migration inventories, private model paths and detailed run evidence stay local.
+This code release does not update remote GPU environments or historical runs.
 
 ## Validation
 
 ```bash
-python -m pytest
-python scripts/run_experiment.py --config configs/test_dummy.yaml --method a2c --out /tmp/rl-smoke
-python scripts/run_experiment.py --config configs/test_multigroup_dummy.yaml --method dqn --out /tmp/rl-multi-smoke
+python -m pip install -r requirements.txt ase -e '.[dev]'
+python -m ruff check --no-cache src scripts tests
+PYTHONPATH=src python -m pytest
+python -m compileall -q src scripts
 python -m pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/rl-wheels .
 ```
 
-The full suite needs the scientific dependencies used by the tested features,
-including ASE and SMACT. Dummy-predictor smoke runs do not require real DeepMD
-models. Optional tests using a local `perovskite.vasp` skip when it is absent;
-synthetic unit-cell and supercell tests always cover the same substitution rules.
-
-For numerical compatibility, compare fixed-seed CPU runs before and after edits:
-generated CSV bytes, every saved model tensor, scaler arrays, non-timing training
-log fields, generation from old checkpoints, and resumed training. Cover flat
-and multi-group configs with DQN bootstrap, DQN MC, REINFORCE, and A2C. Real
-DeepMD/MGTransformer model runs require separate validation with their original
-external files and runtime.
+CPU dummy runner tests, real pinned GlassNet CPU tests and remote DeepMD/GPU
+validation establish different claims. The validation report records each
+separately. A passing interface mock does not validate an external physical model.

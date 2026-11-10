@@ -32,13 +32,12 @@ the top level, so any combination of built-in short names and user FQN
 plug-ins (``pkg.module:ClassName``) works inside a chain — including nesting
 another ``chain`` if you really want to.
 
-Safety
-------
-Every built-in filter already honours the project-wide convention "if
-filtering empties the list, return the original input." The chain adds a
-top-level fallback: if any intermediate step or the final result is empty,
-the *pre-chain* action list is returned. Combined, the agent is never
-stranded with zero legal actions.
+Filter contract
+---------------
+Each child may only remove actions from its immediate input. An empty output
+means no action satisfies the constraints; it is propagated unchanged to the
+environment. The rollout layer handles infeasible episodes. A child that adds
+or duplicates actions violates this contract and raises ``ValueError``.
 
 Performance note: put cheap, identity-based filters (e.g.
 ``last_step_element``) before expensive ones (e.g. ``smact_charge`` whose
@@ -106,9 +105,25 @@ class ChainConstraintFilter(ConstraintFilter):
             self.children.append(child)
 
     def filter_actions(self, *, actions, **kw):
-        original = actions
-        for child in self.children:
-            actions = child.filter_actions(actions=actions, **kw)
-            if not actions:
-                return original
-        return actions if actions else original
+        current = list(actions)
+        for index, child in enumerate(self.children):
+            if not current:
+                return []
+            # A plug-in may prune its list in place. Retain an independent
+            # snapshot so mutation cannot hide an added action or affect the
+            # caller's action list.
+            available = set(current)
+            result = child.filter_actions(actions=list(current), **kw)
+            prefix = f"Constraint filter {index} ({type(child).__name__})"
+            if not isinstance(result, (list, tuple)):
+                raise ValueError(f"{prefix} must return a list or tuple of actions.")
+            try:
+                selected = set(result)
+            except TypeError as exc:
+                raise ValueError(f"{prefix} returned an invalid action encoding.") from exc
+            if not selected.issubset(available):
+                raise ValueError(f"{prefix} must return a subset of its input actions.")
+            if len(selected) != len(result):
+                raise ValueError(f"{prefix} must not duplicate actions.")
+            current = list(result)
+        return current

@@ -63,6 +63,9 @@
     adds classification to get_sezm_model and provides DeepClassification.predict_proba.
     Also inspect rl_matdesign.__file__ with the CLI interpreter. Changing cwd to a
     newer checkout does not change an editable installation pointing elsewhere.
+    For worktree regression runs, explicitly set PYTHONPATH to that worktree's
+    src directory. Pytest's conftest sys.path edits do not propagate into Python
+    subprocesses, which may otherwise import a different installed checkout.
     Verify the selected checkpoint and head load before launching MD-backed RL. A version
     string alone may not distinguish custom source revisions.
   impact: The old factory raises 'DPA4/SeZM model supports `dpa4_ener`, `sezm_ener`, or `property`

@@ -283,9 +283,12 @@ def main() -> None:
     # user FQN plug-ins, the groups: schema, and single-group flat-env collapse
     # all resolve identically to a real training/generation run.
     from rl_matdesign.configuration import load_config, build_env, build_predictor
+    from rl_matdesign.config_schema import resolve_config
+    from rl_matdesign.utils.model_contract import load_artifact, validate_scaler
+    from rl_matdesign.action_features import value_alphabet
     from rl_matdesign.training import _precompute_elem_features, _detect_last_position_pin
 
-    cfg = load_config(args.config)
+    cfg = resolve_config(load_config(args.config)).config
     rng = random.Random(args.seed)
 
     predictor = build_predictor(cfg, seed=args.seed)
@@ -322,18 +325,19 @@ def main() -> None:
             print(f"[WARN] cannot find scaler at {scaler_path}; skipping Q-net probe.")
         else:
             scaler = joblib.load(scaler_path)
+            validate_scaler(scaler, probe_env, scaler_path)
             elem_feats_scaled, _ = _precompute_elem_features(
-                probe_env.species_set, probe_env.state_featurizer
+                probe_env.species_set, probe_env.state_featurizer, env=probe_env
             )
             state_dim = int(getattr(scaler, "n_features_in_", scaler.mean_.shape[0]))
             qnet = QRegressor(
                 state_dim=state_dim,
                 step_dim=probe_env.n_components,
                 elem_dim=int(elem_feats_scaled.shape[1]),
-                frac_dim=1,
-                hidden_dim=int(cfg.get("dqn_hidden_dim", cfg.get("hidden_dim", 128))),
+                frac_dim=value_alphabet(probe_env).feature_dim,
+                hidden_dim=int(cfg["dqn_hidden_dim"]),
             ).to(device)
-            qnet.load_state_dict(torch.load(args.qnet, map_location=device))
+            qnet.load_state_dict(load_artifact(args.qnet, probe_env, device=device)["qnet_state"])
             qnet.eval()
 
     # Aggregate deltas across all multisets
