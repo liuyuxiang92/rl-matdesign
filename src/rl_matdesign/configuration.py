@@ -92,16 +92,31 @@ _FAILED_CANDIDATE_REWARD = -2000.0
 class _TerminalReward:
     """One conversion/error policy for immediate and deferred terminal rewards."""
 
-    def __init__(self, predictor, env_type: str, anion_formula: str = ""):
+    def __init__(self, predictor, env_type: str, anion_formula: str = "", *, k: float = 1.0):
         self.predictor = predictor
         self.env_type = env_type
         self.anion_formula = anion_formula
         self.last_evaluation_timings = []
         self.last_evaluation_wall_s = 0.0
+        self.k = float(k)
+        self.capture_prediction_records = False
+        self.last_prediction_records = []
 
     def reset_evaluation_timing(self):
         self.last_evaluation_timings = []
         self.last_evaluation_wall_s = 0.0
+        self.last_prediction_records = []
+
+    def _prediction_record(self, candidate, result):
+        if not self.capture_prediction_records:
+            return {}
+        from .utils.prediction_records import prediction_record
+        try:
+            return prediction_record(self.predictor, candidate, result, k=self.k)
+        except Exception as exc:
+            # A diagnostics failure must not resample a scored candidate. The
+            # regular reward validation still rejects malformed/nonfinite means.
+            return {"prediction_record_error": f"{type(exc).__name__}: {exc}"}
 
     def _prediction_timings(self, count):
         rows = getattr(self.predictor, "last_evaluation_timings", None)
@@ -152,19 +167,31 @@ class _TerminalReward:
         if candidate is None:
             self.last_evaluation_timings = [{}]
             self.last_evaluation_wall_s = time.perf_counter() - started
+            self.last_prediction_records = [{
+                "reward": _FAILED_CANDIDATE_REWARD,
+                "prediction_record_error": "Invalid terminal formula; no property prediction",
+            }]
             return _FAILED_CANDIDATE_REWARD
         try:
-            return self._mean(self.predictor.predict(candidate))
+            result = self.predictor.predict(candidate)
+            mean = self._mean(result)
         except Exception as exc:
             raise self._failure(payload, exc) from exc
         finally:
             self.last_evaluation_wall_s = time.perf_counter() - started
             self.last_evaluation_timings = self._prediction_timings(1)
+        # Capture only after timing has been copied. This hook must not infer.
+        self.last_prediction_records = [self._prediction_record(candidate, result)]
+        return mean
 
     def evaluate_many(self, payloads) -> list:
         self.reset_evaluation_timing()
         started = time.perf_counter()
         self.last_evaluation_timings = [{} for _ in payloads]
+        self.last_prediction_records = [{
+            "reward": _FAILED_CANDIDATE_REWARD,
+            "prediction_record_error": "Invalid terminal formula; no property prediction",
+        } for _ in payloads]
         results = [_FAILED_CANDIDATE_REWARD] * len(payloads)
         candidates, indices = [], []
         for index, payload in enumerate(payloads):
@@ -172,6 +199,7 @@ class _TerminalReward:
             if candidate is not None:
                 indices.append(index)
                 candidates.append(candidate)
+                self.last_prediction_records[index] = {}
         if not candidates:
             self.last_evaluation_wall_s = time.perf_counter() - started
             return results
@@ -184,24 +212,35 @@ class _TerminalReward:
             if len(predicted) != len(candidates):
                 raise RuntimeError("predictor.batch_predict returned the wrong number of results")
             timings = self._prediction_timings(len(candidates))
+            records = [
+                {} if isinstance(result, Exception) else self._prediction_record(candidate, result)
+                for candidate, result in zip(candidates, predicted)
+            ]
         else:
             # A legacy plug-in need only implement predict; do not assume it
             # inherits the Protocol's default batch implementation.
             predicted = []
             timings = []
+            records = []
             for candidate in candidates:
                 try:
                     predicted.append(self.predictor.predict(candidate))
                 except Exception as exc:
                     predicted.append(exc)
                 timings.extend(self._prediction_timings(1))
+                result = predicted[-1]
+                # Snapshot each scalar result before a later prediction can
+                # replace a plug-in's one-entry cache.
+                records.append({} if isinstance(result, Exception)
+                               else self._prediction_record(candidate, result))
         for index, timing in zip(indices, timings):
             self.last_evaluation_timings[index] = timing
-        for index, result in zip(indices, predicted):
+        for index, result, record in zip(indices, predicted, records):
             try:
                 if isinstance(result, Exception):
                     raise result
                 results[index] = self._mean(result)
+                self.last_prediction_records[index] = record
             except Exception as exc:
                 results[index] = self._failure(payloads[index], exc)
         self.last_evaluation_wall_s = time.perf_counter() - started
@@ -256,7 +295,8 @@ def build_env(cfg: dict, predictor):
               f"{groups[0].get('name', '?')!r} -> collapsed to flat "
               f"{'IntegerRatioEnv' if collapse_kind == 'integer' else 'CompositionEnv'}")
 
-    reward_fn = _TerminalReward(predictor, env_type, cfg.get("anion_formula", ""))
+    reward_fn = _TerminalReward(predictor, env_type, cfg.get("anion_formula", ""),
+                               k=float(cfg.get("k", 1.0)))
 
     # Build env first (without filter), then build the filter using env's
     # feasibility tables (_allowed_units, _possible_sums_by_k), then attach.

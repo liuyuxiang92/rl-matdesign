@@ -28,6 +28,16 @@ class PropertyPredictor(Protocol):
     (mean, std):
         Scalar mean reward and ensemble standard deviation.
         ``std`` is used for uncertainty-driven exploration and Pareto tracking.
+
+    Optional training-sample diagnostics
+    ------------------------------------
+    Predictors with transformed rewards may expose
+    ``prediction_record(candidate, prediction, *, k=1.0) -> dict``. This hook
+    must only read the completed evaluation, without inference, random draws,
+    or timing mutation. Return generated.csv property fields such as dp_mean
+    or obj_<name>_mean/std. A batch predictor must retain every result in its
+    current wave until these records have been captured. Plain predict-only
+    plug-ins need no hook: the returned tuple is recorded directly.
     """
 
     def predict(self, composition: Dict[str, float]) -> Tuple[float, float]:

@@ -610,12 +610,20 @@ To silence the warnings, rename the keys in your YAML — the values are unchang
 | `value_net.pt` | — | A2C | Critic (ValueNet) weights |
 | `checkpoint.pt` | ✓ | ✓ | Latest mid-training checkpoint (symlink to numbered file) |
 | `training_log.csv` | ✓ | ✓ | Per-episode: return, actor_loss, entropy, critic_loss, … |
+| `training_samples.csv` | ✓ | ✓ | Budget-consuming training materials in sampling order, with the same property fields as generated candidates |
 | `episode_timing.csv` | ✓ | ✓ | Incremental per-attempt wall time, MD/optimization task time, and RL update time |
 | `timing.json` | ✓ | ✓ | Run/phase totals and the current invocation's episode timing totals |
 | `generated.csv` | ✓ | ✓ | Candidates: formula, reward, dp_mean, dp_std |
 | `run_config.json` | ✓ | ✓ | Full config + argparse namespace for reproducibility |
 
 ### Per-episode timing
+
+Training samples are saved automatically, one row per episode with
+`budget_counted=True`. The file includes DQN random warmup and online training,
+or REINFORCE/A2C policy episodes. It preserves raw property means/stds and gate
+diagnostics without additional inference. Generation-only runs leave it intact.
+See [training sample export](docs/training_samples.md) for budget semantics,
+resume handling, and comparison with `generated.csv`.
 
 Timing is enabled automatically; no YAML option is required. `episode_timing.csv`
 is written during training and generation, including failed evaluations and

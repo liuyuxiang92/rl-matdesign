@@ -572,6 +572,7 @@ def train_dqn_online(
     dqn_target_mode: str = "bootstrap",
     train_count_duplicates: bool = True,
     train_max_duplicate_attempts: int = 1000,
+    training_samples=None,
 ) -> Tuple[torch.nn.Module, StandardScaler, List[dict]]:
     """Classical online DQN with FIFO replay buffer and TD targets.
 
@@ -658,7 +659,15 @@ def train_dqn_online(
             )
     # --- END mc-target experiment ---
 
-    evaluator = EpisodeBatchEvaluator(env, max_retries=_MAX_CANDIDATE_RETRIES, timer=timer)
+    if training_samples is not None:
+        training_samples.start(
+            budget.counted, history_complete=budget_history_complete,
+            session_id=resume_state.get("training_sample_session_id") if resume_state else None,
+        )
+    evaluator = EpisodeBatchEvaluator(
+        env, max_retries=_MAX_CANDIDATE_RETRIES, timer=timer,
+        capture_predictions=training_samples is not None,
+    )
 
     # Warmup pays one real predictor call per episode (see below), so those
     # episodes are part of the training cost and belong in the log. Collected
@@ -721,6 +730,8 @@ def train_dqn_online(
                     **_episode_timing_row(episode),
                 })
                 _record_episode_timing(timer, warmup_rows[-1])
+                if training_samples is not None:
+                    training_samples.record(episode, warmup_rows[-1])
             if augment_permutations > 0:
                 _augment_episode_in_buffer(
                     env, episode.path, buffer, elem_feats_scaled, fraction_set,
@@ -820,6 +831,16 @@ def train_dqn_online(
         completed += int(counted)
         train_attempts += 1
 
+        # Save the evaluated candidate before augmentation or optimizer updates
+        # can mutate the environment or fail. Budget semantics are owned above.
+        if training_samples is not None:
+            training_samples.record(episode, {
+                "phase": "dqn_train", "episode": train_attempts,
+                "iteration": train_attempts, "budget_counted": counted,
+                "training_budget_history_complete": budget_history_complete,
+                "terminal_comp_key": str(episode.terminal_key), **budget.snapshot(),
+            })
+
         _sync_training_device(device)
         update_started = time.perf_counter()
         episode_reward = float(episode.path[-1].reward)
@@ -897,6 +918,7 @@ def train_dqn_online(
                 "type": "dqn",
                 "episodes_completed": completed,
                 "training_episodes_completed": train_attempts,
+                "training_sample_session_id": training_samples.session_id if training_samples else None,
                 "training_budget_state": budget.state_dict(),
                 "training_budget_history_complete": budget_history_complete,
                 "qnet_state": qnet.state_dict(),
@@ -1240,6 +1262,7 @@ def train_pg(
     train_max_duplicate_attempts: int = 1000,
     checkpoint_cfg: Optional[dict] = None,
     timer: Optional[object] = None,
+    training_samples=None,
 ) -> List[dict]:
     """Batched REINFORCE / A2C training loop (matches feat/classical-dqn).
 
@@ -1308,7 +1331,15 @@ def train_pg(
         print("[WARN] Legacy checkpoint has no training budget history: new diagnostic "
               "counters start at this resume; the existing episode schedule is preserved.", flush=True)
 
-    evaluator = EpisodeBatchEvaluator(env, max_retries=_MAX_CANDIDATE_RETRIES, timer=timer)
+    if training_samples is not None:
+        training_samples.start(
+            budget.counted, history_complete=budget_history_complete,
+            session_id=checkpoint_cfg.get("training_sample_session_id") if checkpoint_cfg else None,
+        )
+    evaluator = EpisodeBatchEvaluator(
+        env, max_retries=_MAX_CANDIDATE_RETRIES, timer=timer,
+        capture_predictions=training_samples is not None,
+    )
     policy.train()
     opt_actor = torch.optim.Adam(policy.parameters(), lr=lr_actor)
     if value_net is not None:
@@ -1478,6 +1509,8 @@ def train_pg(
                 "training_budget_history_complete": budget_history_complete,
                 **_episode_timing_row(episode),
             })
+            if training_samples is not None:
+                training_samples.record(episode, batch_ep_rows[-1])
 
         if train_count_duplicates:
             outer_pbar.update(1)
@@ -1634,6 +1667,7 @@ def train_pg(
                 "opt_critic_state": opt_critic.state_dict() if opt_critic is not None else None,
                 "visit_counts": dict(visit_counts),
                 "entropy_coef_eff": coef_eff,
+                "training_sample_session_id": training_samples.session_id if training_samples else None,
                 "training_budget_state": budget.state_dict(),
                 **budget.snapshot(),
                 "training_budget_history_complete": budget_history_complete,

@@ -42,6 +42,7 @@ class EpisodeSnapshot:
     formula: str
     metadata: dict = field(default_factory=dict)
     timing: dict = field(default_factory=dict)
+    prediction: dict = field(default_factory=dict)
 
 
 def snapshot_episode(env, metadata: dict | None = None) -> EpisodeSnapshot:
@@ -64,7 +65,7 @@ class EpisodeBatchEvaluator:
     counting. Batch size one calls the original rollout directly.
     """
 
-    def __init__(self, env, *, max_retries: int = 10, timer=None):
+    def __init__(self, env, *, max_retries: int = 10, timer=None, capture_predictions=False):
         self.env = env
         self.reward_fn = getattr(env, "reward_fn", None)
         self.size = 1
@@ -74,6 +75,9 @@ class EpisodeBatchEvaluator:
         self.pending = deque()
         self.timer = timer
         self.wave_id = 0
+        self.capture_predictions = bool(capture_predictions)
+        if hasattr(self.reward_fn, "capture_prediction_records"):
+            self.reward_fn.capture_prediction_records = self.capture_predictions
 
     def _record_failure(self, failure, phase):
         record = getattr(self.timer, "record_episode", None)
@@ -171,14 +175,19 @@ class EpisodeBatchEvaluator:
             started = time.perf_counter()
             rewards = list(self.reward_fn.evaluate_many(payloads))
             elapsed = time.perf_counter() - started
+            predictions = getattr(self.reward_fn, "last_prediction_records", [])
+            if len(predictions) != len(payloads):
+                predictions = [{} for _ in payloads]
             details = getattr(self.reward_fn, "last_evaluation_timings", [])
             if len(details) != len(payloads):
                 details = [{} for _ in payloads]
             if len(rewards) != len(payloads):
                 raise RuntimeError("batched rewards returned the wrong number of results")
-            for index, reward, timing in zip(indices, rewards, details):
+            for index, reward, timing, prediction in zip(indices, rewards, details, predictions):
                 episode = outcomes[index]
                 episode.timing.update(timing)
+                if self.capture_predictions:
+                    episode.prediction = copy.deepcopy(prediction)
                 if isinstance(reward, Exception):
                     reward.episode_timing = episode.timing
                     reward.episode_formula = episode.formula
@@ -213,6 +222,9 @@ class EpisodeBatchEvaluator:
                         retry_scalar(lambda: self._scalar_rollout(rollout, phase))
                     episode = snapshot_episode(self.env, metadata)
                     episode.timing = dict(self._scalar_timing)
+                    predictions = getattr(self.reward_fn, "last_prediction_records", [])
+                    if self.capture_predictions and len(predictions) == 1:
+                        episode.prediction = copy.deepcopy(predictions[0])
                     return episode
                 count = min(self.size, limit, self.max_retries + 1 - self.failures)
                 self.pending.extend(self._collect(rollout, count, metadata))

@@ -148,5 +148,15 @@ class OOHCatalystPredictor:
         ok, label = check_primary_phase(composition)
         return bool(ok), label or ""
 
+    def prediction_record(self, composition, prediction, *, k: float = 1.0) -> dict:
+        """Expose the exact cached raw overpotential used for this reward."""
+        raw_mean, std = self._cache[self._comp_key(composition)]
+        phase_ok, phase_label = self.check_phase(composition)
+        return {
+            "dp_mean": float(raw_mean), "dp_std": float(std),
+            "dp_mean_minus_std": float(raw_mean - k * std),
+            "primary_ok": bool(phase_ok), "primary_label": phase_label or "",
+        }
+
     def batch_predict(self, compositions: List[Dict[str, float]]) -> List[Tuple[float, float]]:
         return [self.predict(c) for c in compositions]

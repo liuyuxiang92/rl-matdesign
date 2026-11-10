@@ -533,6 +533,26 @@ class StructureScorePredictor:
         """Return ``{name: (mean, std)}`` per objective, for CSV logging."""
         return dict(self._raw_stats(candidate))
 
+    def prediction_record(self, candidate: Any, prediction, *, k: float = 1.0) -> dict:
+        """Snapshot an already evaluated candidate without inference or timing changes."""
+        from ..utils.prediction_records import objective_record
+
+        key = self._key(candidate)
+        stats = self._stats_cache.get(key)
+        if stats is None:
+            stats = self._batch_stats.get(key)
+        if stats is None:
+            raise KeyError("Completed prediction missing from the current evaluation cache")
+        row = objective_record(self.raw_combine(stats), stats, self._reward_details(stats))
+        # The builder hook describes composition only; it must not rebuild a structure.
+        try:
+            formula = self.composition_formula(candidate)
+        except Exception:
+            formula = None  # Match generated.csv's environment-formula fallback.
+        if formula:
+            row["formula"] = formula
+        return row
+
     def evaluation_batch_size(self) -> int:
         """Suggested number of episodes to collect before a GPU evaluation wave."""
         if self.share_structure:
