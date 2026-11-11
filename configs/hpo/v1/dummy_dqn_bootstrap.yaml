@@ -1,0 +1,56 @@
+# Software smoke test only; not a scientific parameter or budget recommendation.
+# dqn_grad_steps_per_ep remains the scenario's fixed action-length setting.
+protocol: hpo_v1
+base_config: ../../test_dummy.yaml
+method: dqn-bootstrap
+parameter_profile: builtin:dqn-bootstrap
+
+objective:
+  field: dp_mean
+  direction: maximize
+  threshold: 0.5
+  normalization: {kind: sigmoid, scale: 0.1}
+
+efficiency:
+  max_attempts_per_unique: 1.5
+
+budget:
+  mode: absolute_unique
+  train: {min_unique: 48, initial_unique: 64, max_unique: 96, factor: 2}
+  generation: {min_unique: 8, initial_unique: 16, max_unique: 32, factor: 2}
+  tolerances:
+    score: 0.05
+    qualified_fraction: 0.10
+    best_fraction_mean: {kind: absolute, value: 0.05}
+    best_value: {kind: absolute, value: 0.05}
+    attempts_per_unique: 0.25
+  upper_confirmation_levels: 2
+
+range_search:
+  seeds: [11, 29]
+  confirmation_seed: 47
+  max_extra_values_per_direction: 0
+
+search_space:
+  dqn_lr: {type: categorical, choices: [0.0003, 0.001]}
+  dqn_batch_size: {type: categorical, choices: [4]}
+  warmup_budget_fraction: {type: categorical, choices: [0.25]}
+  dqn_eps_min: {type: categorical, choices: [0.2]}
+  epsilon_anneal_budget_ratio: {type: categorical, choices: [2.0]}
+  dqn_target_update_freq: {type: categorical, choices: [2]}
+
+training_search:
+  trials: 2
+  startup_random_trials: 1
+  seeds: [11, 29]
+  finalists: 1
+  validation_seeds: [101, 211]
+  max_budget_revisions: 1
+  additional_trials_per_revision: 2
+  additional_random_trials: 1
+
+generation_search:
+  initial_values: [0, 1, 100]
+  max_extra_values_per_direction: 0
+  fixed: {gen_epsilon: 0, gen_top_frac: 0, exploration_gen_eps: 0}
+  paired_seeds: [401, 503]

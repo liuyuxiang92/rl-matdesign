@@ -1,0 +1,80 @@
+checkpoint_version: '3.0.0'
+created_at: '2026-11-11'
+branch: codex/hpo-v1
+baseline_commit: 771d68d7
+worktree: /Users/liuyuxiang/.codex/worktrees/hpo-v1/rl-matdesign
+phase:
+  current: implementation_complete
+  completed: [implementation, generic_yaml_templates, unit_regression, installed_wheel_validation, reflection, three_algorithm_campaigns, completed_reuse_verification, validation_report]
+  next: [user_review_and_fill_scientific_settings]
+state:
+  source_frozen: true
+  source_sha256: 456066fc215847ebd81f7ffa5cbdfc592ad0a728782d2dfd50957eb65e7eaef5
+  parameters:
+  - name: efficiency.max_attempts_per_unique
+    value: 1.5
+    comparison: strict_less_than
+    source: Explicit user requirement; YAML editable with phase overrides
+  - name: objective.threshold
+    value: null
+    source: User deferred T3 threshold; may later choose verified GlassNet training-label median
+  - name: generation_search.parameter
+    value: gen_temperature
+    source: User requested gen_temp; existing canonical runtime spelling is gen_temperature
+  experiments:
+  - name: related_regression
+    status: completed
+    result: 468 passed, 1 skipped in 179.39s; skip requires real GlassPy assets
+  - name: final_hpo_unit_integration
+    status: completed
+    result: 164 passed in 26.22s on frozen source
+  - name: installed_wheel
+    status: completed
+    results_path: /private/tmp/hpo-wheel-check-ithf03el/verification.json
+    result: Wheel build/install and both console/module CLI validated outside repository
+  - name: initial_concurrent_smokes
+    status: failed
+    reason: Development edits changed source_sha256 between training and generation; runtime correctly refused mismatched model contracts. Preserved costs, no contract bypass.
+  - name: final_a2c
+    status: completed
+    result: Four stages completed; train A2312/U1792, generation A286/U230; completed resume and ranges/search reuse added no sampling.
+    results_path: /private/tmp/rl_matdesign_hpo_v1_a2c_final_20261111
+    tool_session: 11788
+  - name: final_dqn_bootstrap
+    status: completed
+    result: Four stages completed; train A1669/U1664, generation A286/U230; all budget/archive/artifact checks passed.
+    results_path: /private/tmp/rl_matdesign_hpo_v1_final_dqn_bootstrap_1794389591537
+    owner: /root/hpo_runtime
+    tool_session: 17098
+  - name: final_dqn_mc
+    status: completed
+    result: Four stages completed; train A1666/U1664, generation A286/U230; all budget/archive/artifact checks passed.
+    results_path: /private/tmp/rl_matdesign_hpo_v1_final_dqn_mc_1794389591537
+    owner: /root/hpo_runtime
+    tool_session: 85789
+  decisions:
+  - decision: Keep all implementation in isolated worktree; original dirty checkout is untouched.
+    rationale: Required runtime exists at 771d68d7; original checkout has unrelated changes.
+  - decision: User runs real GlassNet; provide standalone editable HPO YAML templates referencing existing benchmark scenes.
+    rationale: User explicitly requested configuration files rather than prepared run folders and deferred scientific settings.
+  - decision: Do not mutate source during final campaigns or bypass provenance checks.
+    rationale: Frozen scientific and model execution contracts include source hashes.
+blockers: []
+artifacts:
+- path: configs/hpo/v1/glassnet_a2c.example.yaml
+  role: Standalone editable A2C HPO template with T3 threshold null
+- path: configs/hpo/v1/glassnet_dqn_bootstrap.example.yaml
+  role: Bootstrap template; benchmark dqn_boostrap.yaml spelling follows user, verify on host
+- path: configs/hpo/v1/glassnet_dqn_mc.example.yaml
+  role: MC template
+- path: docs/hpo_v1.md
+  role: CLI, stages, metrics, bidirectional budgets, cost and resume documentation
+- path: docs/hpo_v1_validation.md
+  role: Final test results, costs, provenance and scientific validation limits
+resume_instructions: |
+  1. Work only in /Users/liuyuxiang/.codex/worktrees/hpo-v1/rl-matdesign (codex/hpo-v1).
+  2. Read docs/hpo_v1.md and docs/hpo_v1_validation.md; all final experiment processes are finished.
+  3. User authorized committing and pushing codex/hpo-v1. Check git status and its origin upstream for publication state; preserve original checkout's unrelated modifications. No merge was requested.
+  4. Do not claim real GlassNet scientific validation. User scene root is /aisi/yxliu/rl-matdesign/glasspy/glassnet_benchmark_nodes_20261106/configs/coarse[medium/large]/.
+  5. User fills objective.threshold and reviews engineering initial settings in an independent hpo.yaml before validate/plan/run on the asset host.
+  6. New source or configuration requires a new campaign directory. Do not bypass model or accounting contracts to reuse the final smoke runs.

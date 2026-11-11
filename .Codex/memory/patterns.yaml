@@ -1,0 +1,12 @@
+- id: pattern-hpo-contract-validation-001
+  date: '2026-11-11'
+  expires: '2027-05-11'
+  title: Freeze source before complete HPO train-to-generation validation
+  steps:
+  - Finish Python edits and fast fake-runner protocol tests before launching final end-to-end campaigns.
+  - Use PYTHONPATH=src with the intended interpreter to avoid an older editable checkout in subprocesses.
+  - Run each algorithm from a new empty campaign directory, without historical RL weights or HPO evidence.
+  - If source changes during a campaign, retain the resulting source_sha256 contract rejection and start fresh after code stabilizes; do not bypass validation.
+  - Separately verify a non-editable wheel from an unrelated working directory with only its installed target on PYTHONPATH.
+  - Distinguish software dummy validation, externally skipped real assets and actual scientific verification in reports.
+  tags: [hpo, worktree-isolation, installed-cli, provenance]

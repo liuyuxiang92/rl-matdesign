@@ -155,6 +155,11 @@ parameter definitions. A test checks it for drift.
 | `eval_seed` | int | 0 | >= 0; <= 4294967295 | Random seed for property evaluation and structure sampling. |
 | `train_seed` | int | eval_seed | >= 0; <= 4294967295 | Training random seed. |
 | `gen_seed` | int | eval_seed | >= 0; <= 4294967295 | Candidate-generation random seed. |
+| `hpo_recording` | bool | False | — | Enable strict candidate accounting for an isolated HPO job. |
+| `hpo_resume_generation` | bool | False | — | Restore an exactly synchronized HPO generation checkpoint. |
+| `hpo_phase` | str | 'train' | train, generation | HPO job phase. |
+| `hpo_target_unique` | int | None | >= 1 | HPO target successfully evaluated distinct candidates. |
+| `hpo_ratio_limit` | float | 1.5 | > 1 | Strict HPO attempts/unique upper bound. |
 | `constrain_training` | bool | True | — | Apply configured constraints during training. |
 | `train_count_duplicates` | bool | True | — | Count repeated terminal candidates toward training budgets. |
 | `train_budget` | int | None | >= 1 | Total paid training candidates; derives algorithm episode limits when set. |

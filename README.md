@@ -24,6 +24,19 @@ prediction runs on CPU; the RL device is selected separately.
 See [code layout and compatibility](docs/code_layout.md) for maintained entry
 points, module responsibilities, and regression checks.
 
+The [YAML-driven HPO guide](docs/hpo_v1.md) documents training-range diagnosis,
+joint parameter search, bidirectional budget calibration and frozen-model
+generation-temperature selection. Copy a GlassNet example to your own `hpo.yaml`,
+reference your scene config, and fill its objective threshold before running:
+
+```bash
+rl-matdesign hpo validate --hpo-config hpo.yaml
+rl-matdesign hpo run --hpo-config hpo.yaml --out runs/my_hpo
+```
+
+Use `--stage ranges` and then `--stage search` to run the two parts separately.
+This new protocol leaves the legacy `scripts/hpo.py` entry point available.
+
 
 ---
 

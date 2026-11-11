@@ -1,0 +1,12 @@
+# dqn_grad_steps_per_ep remains fixed in the scenario configuration.
+method: dqn-bootstrap
+search_space:
+  dqn_lr: {type: float, low: 0.00001, high: 0.01, log: true}
+  dqn_batch_size: {type: categorical, choices: [64, 128, 256, 512]}
+  warmup_budget_fraction: {type: float, low: 0.02, high: 0.20}
+  dqn_eps_min: {type: float, low: 0.02, high: 0.40}
+  epsilon_anneal_budget_ratio: {type: float, low: 0.25, high: 2.0, log: true}
+  dqn_target_update_freq: {type: categorical, choices: [10, 25, 50, 100, 200]}
+extension_choices:
+  dqn_batch_size: [16, 32, 64, 128, 256, 512, 1024, 2048]
+  dqn_target_update_freq: [1, 2, 5, 10, 25, 50, 100, 200, 500, 1000]

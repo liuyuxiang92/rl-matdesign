@@ -1,0 +1,10 @@
+# MC targets have no active target-network update interval to optimize.
+method: dqn-mc
+search_space:
+  dqn_lr: {type: float, low: 0.00001, high: 0.01, log: true}
+  dqn_batch_size: {type: categorical, choices: [64, 128, 256, 512]}
+  warmup_budget_fraction: {type: float, low: 0.02, high: 0.20}
+  dqn_eps_min: {type: float, low: 0.02, high: 0.40}
+  epsilon_anneal_budget_ratio: {type: float, low: 0.25, high: 2.0, log: true}
+extension_choices:
+  dqn_batch_size: [16, 32, 64, 128, 256, 512, 1024, 2048]
