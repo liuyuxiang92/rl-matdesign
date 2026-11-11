@@ -1,0 +1,10 @@
+# Optional editable equivalent of parameter_profile: builtin:a2c.
+method: a2c
+search_space:
+  pg_lr_actor: {type: float, low: 0.00001, high: 0.01, log: true}
+  pg_lr_critic: {type: float, low: 0.00001, high: 0.01, log: true}
+  pg_batch_eps: {type: categorical, choices: [8, 16, 32, 64]}
+  pg_entropy_coef: {type: float, low: 0.0001, high: 0.1, log: true}
+  pg_entropy_min: {type: float, low: 0.0, high: 0.8}
+extension_choices:
+  pg_batch_eps: [1, 2, 4, 8, 16, 32, 64, 128, 256]

@@ -80,7 +80,8 @@ class EpisodeBatchEvaluator:
         self.pending = deque()
         self.timer = timer
         self.wave_id = 0
-        self.capture_predictions = bool(capture_predictions)
+        self.hpo_recorder = getattr(env, "hpo_recorder", None)
+        self.capture_predictions = bool(capture_predictions or self.hpo_recorder is not None)
         if hasattr(self.reward_fn, "capture_prediction_records"):
             self.reward_fn.capture_prediction_records = self.capture_predictions
 
@@ -114,6 +115,8 @@ class EpisodeBatchEvaluator:
         }
 
     def _scalar_rollout(self, rollout, phase):
+        if self.hpo_recorder is not None:
+            self.hpo_recorder.start()
         self.wave_id += 1
         reset = getattr(self.reward_fn, "reset_evaluation_timing", None)
         if callable(reset):
@@ -122,8 +125,12 @@ class EpisodeBatchEvaluator:
         failure = None
         try:
             rollout()
+            if self.hpo_recorder is not None and not getattr(self.reward_fn, "last_predictions", []):
+                raise CandidateEvaluationFailed("Terminal candidate was not evaluated")
         except (CandidateEvaluationFailed, InfeasibleEpisode) as exc:
             failure = exc
+            if self.hpo_recorder is not None:
+                self.hpo_recorder.failure()
             raise
         finally:
             elapsed = time.perf_counter() - started
@@ -152,6 +159,8 @@ class EpisodeBatchEvaluator:
         payloads = []
         indices = []
         for _ in range(count):
+            if self.hpo_recorder is not None:
+                self.hpo_recorder.start()
             started = time.perf_counter()
             captured = []
 
@@ -214,6 +223,16 @@ class EpisodeBatchEvaluator:
                           else outcome.timing)
                 timing["eval_wall_share_s"] = share
                 timing["episode_wall_share_s"] = timing["rollout_s"] + share
+        if self.hpo_recorder is not None:
+            for index, outcome in enumerate(outcomes):
+                if isinstance(outcome, Exception):
+                    self.hpo_recorder.failure()
+                elif outcome.prediction is None:
+                    # Invalid formula rewards are sentinels, not evaluations.
+                    self.hpo_recorder.failure()
+                    outcomes[index] = CandidateEvaluationFailed("Terminal candidate was not evaluated")
+                else:
+                    self.hpo_recorder.success(outcome)
         return outcomes
 
     def next(self, rollout: Callable[[], None], *, limit: int,
@@ -226,9 +245,20 @@ class EpisodeBatchEvaluator:
                 # A predictor can change its recommendation between waves.
                 # Never change collection behavior while prefetched paths remain.
                 self._refresh_size()
+                if self.hpo_recorder is not None:
+                    limit = self.hpo_recorder.wave_limit(limit)
                 if self.size == 1 and self.failures == 0:
                     if retry_scalar is None:
                         self._scalar_rollout(rollout, phase)
+                    elif self.hpo_recorder is not None:
+                        # The strict whole-job cap bounds retries. Legacy's
+                        # consecutive-failure counter is not an HPO budget.
+                        while True:
+                            try:
+                                self._scalar_rollout(rollout, phase)
+                                break
+                            except (CandidateEvaluationFailed, InfeasibleEpisode):
+                                continue
                     else:
                         retry_scalar(lambda: self._scalar_rollout(rollout, phase))
                     episode = snapshot_episode(self.env, metadata)
@@ -236,8 +266,15 @@ class EpisodeBatchEvaluator:
                     records = getattr(self.reward_fn, "last_prediction_records", [])
                     if self.capture_predictions and len(records) == 1:
                         episode.prediction_record = copy.deepcopy(records[0])
+                    if self.hpo_recorder is not None:
+                        if episode.prediction is None:
+                            self.hpo_recorder.failure()
+                            raise CandidateEvaluationFailed("Terminal candidate was not evaluated")
+                        self.hpo_recorder.success(episode)
                     return episode
-                count = min(self.size, limit, self.max_retries + 1 - self.failures)
+                count = min(self.size, limit)
+                if self.hpo_recorder is None:
+                    count = min(count, self.max_retries + 1 - self.failures)
                 self.pending.extend(self._collect(rollout, count, metadata))
             outcome = self.pending.popleft()
             if not isinstance(outcome, Exception):
@@ -251,7 +288,7 @@ class EpisodeBatchEvaluator:
                 self.failures = 0
                 raise outcome
             self.failures += 1
-            if self.failures > self.max_retries:
+            if self.failures > self.max_retries and self.hpo_recorder is None:
                 raise RuntimeError(
                     f"{self.max_retries + 1} consecutive candidates all failed evaluation -- "
                     "giving up rather than spending the rest of the run on unscored "

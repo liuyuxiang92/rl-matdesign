@@ -215,3 +215,38 @@
   - src/rl_matdesign/experiment.py
   - src/rl_matdesign/utils/timing.py
   tags: [episode-budgeting, prediction-provenance, checkpoint-compatibility]
+- id: decision-hpo-v1-001
+  date: '2026-11-11'
+  expires: '2027-05-11'
+  title: Separate HPO sampling cost, scientific scores and convergence evidence
+  choice: >-
+    Use the opt-in hpo_v1 YAML protocol with independent training and generation
+    candidate ledgers. Count every started candidate attempt, including duplicate,
+    failed and preparation-only sampling; credit only evaluated canonical unique
+    candidates. Enforce A < ratio_limit * B with an exact integer maximum and
+    stop only when the settled ledger cannot finish even with perfect remaining
+    attempts. Score named raw properties from immutable snapshots, with direction
+    and fixed threshold supplied by HPO YAML and scientific constraints inherited
+    from the scene. Keep selected_budget separate from convergence_status: all
+    configured budget levels and other configurations must be checked before
+    claiming a plateau. Freeze selected training networks before temperature-only
+    generation search. Safe resume requires matching costs, archive, RNG, predictor
+    state and model/code contracts; never erase spent attempts to restart a job.
+  alternatives_considered:
+  - Global novelty across phases would give training-seen generation candidates free credit.
+  - Prefix ratio rejection would discard runs that can still satisfy the final strict cap.
+  - Reward-only or filtered-CSV scoring would change the scientific objective or denominator.
+  - Calling a finite-grid winner converged would overstate evidence beyond measured budgets.
+  trade_off: >-
+    Full cost persistence and synchronized checkpoints add I/O. Hard interruptions
+    between checkpoints can make exact continuation impossible, so diagnostics
+    preserve costs and refuse rollback. Other already-integrated scenarios reuse
+    the protocol through YAML; domains without exact canonical cardinality must
+    explicitly use absolute_unique budgets.
+  files:
+  - src/rl_matdesign/hpo/controller.py
+  - src/rl_matdesign/hpo/budget_search.py
+  - src/rl_matdesign/hpo/scoring.py
+  - src/rl_matdesign/utils/candidate_records.py
+  - src/rl_matdesign/utils/generation_resume.py
+  tags: [hpo, sampling-accounting, scientific-evidence]

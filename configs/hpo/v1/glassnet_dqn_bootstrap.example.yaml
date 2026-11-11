@@ -1,0 +1,72 @@
+# Independent editable HPO template; copy to hpo.yaml and set the T3 threshold.
+# Model assets, oxide choices, CTE/Tg and fixed gradient steps stay in the scene.
+# For medium/large, change only base_config. The user supplied the filename
+# dqn_boostrap.yaml (not dqn_bootstrap.yaml); verify that spelling on the host.
+# Search settings below are engineering defaults, not scientific recommendations.
+protocol: hpo_v1
+base_config: /aisi/yxliu/rl-matdesign/glasspy/glassnet_benchmark_nodes_20261106/configs/coarse/dqn_boostrap.yaml
+method: dqn-bootstrap
+parameter_profile: builtin:dqn-bootstrap
+objective:
+  field: T3
+  direction: minimize
+  threshold: null
+  threshold_inclusive: false
+  unit: K
+  normalization: {kind: positive_threshold_ratio}
+metrics:
+  best_fraction: 0.10
+  # Editable engineering weights; not a validated optimum for GlassNet.
+  training_weights:
+    qualified_fraction: 0.45
+    best_fraction_quality: 0.30
+    best_value_quality: 0.10
+    sampling_efficiency: 0.15
+  generation_weights:
+    qualified_fraction: 0.50
+    best_fraction_quality: 0.40
+    best_value_quality: 0.10
+efficiency:
+  max_attempts_per_unique: 1.5
+  comparison: lt
+  train: {}
+  generation: {}
+budget:
+  mode: fraction_of_space
+  strategy: bidirectional_grid
+  train: {min_fraction: 0.000001, initial_fraction: 0.0001, max_fraction: 0.01, factor: 2, min_unique: 100}
+  generation: {min_fraction: 0.000001, initial_fraction: 0.0001, max_fraction: 0.01, factor: 2, min_unique: 100}
+  tolerances:
+    score: 0.01
+    qualified_fraction: 0.02
+    best_fraction_mean: {kind: threshold_fraction, value: 0.005}
+    best_value: {kind: threshold_fraction, value: 0.005}
+    attempts_per_unique: 0.10
+  upper_confirmation_levels: 2
+# Explicit copies of the built-in initial ranges, editable in this file.
+# These engineering starting ranges are not experimentally established optima.
+# dqn_grad_steps_per_ep remains fixed in the scenario config, never searched.
+search_space:
+  dqn_lr: {type: float, low: 0.00001, high: 0.01, log: true}
+  dqn_batch_size: {type: categorical, choices: [64, 128, 256, 512]}
+  warmup_budget_fraction: {type: float, low: 0.02, high: 0.20}
+  dqn_eps_min: {type: float, low: 0.02, high: 0.40}
+  epsilon_anneal_budget_ratio: {type: float, low: 0.25, high: 2.0, log: true}
+  dqn_target_update_freq: {type: categorical, choices: [10, 25, 50, 100, 200]}
+
+range_search: {seeds: [11, 29], confirmation_seed: 47, max_extra_values_per_direction: 2, score_improvement: 0.02}
+training_search:
+  trials: 30
+  startup_random_trials: 10
+  seeds: [11, 29]
+  finalists: 3
+  validation_seeds: [101, 211, 307]
+  max_budget_revisions: 2
+  additional_trials_per_revision: 10
+  additional_random_trials: 5
+generation_search:
+  parameter: gen_temperature
+  initial_values: [0, 0.001, 0.01, 0.1, 1, 10, 100, 1000]
+  max_extra_values_per_direction: 2
+  fixed: {gen_epsilon: 0, gen_top_frac: 0, exploration_gen_eps: 0}
+  paired_seeds: [401, 503, 607]

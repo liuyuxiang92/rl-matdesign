@@ -87,6 +87,17 @@ def _episode_timing_row(episode, update_s: float = 0.0) -> dict:
     return timing
 
 
+def _check_hpo_numerical(env, *losses, models=()):
+    if getattr(env, "hpo_recorder", None) is None:
+        return
+    from .utils.candidate_budget import NumericalTrainingError
+    if any(not math.isfinite(float(loss)) for loss in losses):
+        raise NumericalTrainingError("Nonfinite loss in HPO training")
+    if any(not torch.isfinite(parameter).all().item()
+           for model in models if model is not None for parameter in model.parameters()):
+        raise NumericalTrainingError("Nonfinite network parameters in HPO training")
+
+
 def _record_episode_timing(timer, row) -> None:
     record = getattr(timer, "record_episode", None)
     if callable(record):
@@ -823,6 +834,15 @@ def train_dqn_online(
         )
         return qnet, scaler, metrics
 
+    recorder = getattr(env, "hpo_recorder", None)
+    if recorder is not None:
+        recorder.partial_checkpoint_factory = lambda: {
+            "type": "dqn", "qnet_state": qnet.state_dict(),
+            "target_net_state": target_net.state_dict(), "opt_state": optimizer.state_dict(),
+            "buffer": list(buffer), "scaler": scaler,
+            "training_budget_state": budget.state_dict(),
+        }
+
     pbar = tqdm(total=dqn_num_train_eps, initial=start_ep, desc="DQN train")
 
     def _rollout_eps_greedy_episode() -> None:
@@ -898,6 +918,7 @@ def train_dqn_online(
                     elem_feats_scaled, fraction_set, optimizer, loss_fn, device, gamma,
                     target_mode=dqn_target_mode,
                 ))
+            _check_hpo_numerical(env, *losses, models=(qnet,))
             mean_loss = float(np.mean(losses))
             optimizer_steps = len(losses)
 
@@ -960,6 +981,7 @@ def train_dqn_online(
                 "training_episodes_completed": train_attempts,
                 "training_sample_session_id": training_samples.session_id if training_samples else None,
                 "training_budget_state": budget.state_dict(),
+                "hpo_state": env.hpo_recorder.checkpoint_state() if getattr(env, "hpo_recorder", None) is not None else None,
                 "training_budget_history_complete": budget_history_complete,
                 "qnet_state": qnet.state_dict(),
                 "target_net_state": target_net.state_dict(),
@@ -1132,7 +1154,20 @@ def _fit_scaler_from_warmup(env: CompositionEnv, n_warmup_eps: int) -> StandardS
     pbar = tqdm(total=n_warmup_eps, desc="Warmup (scaler fit)")
     try:
         for _ in range(n_warmup_eps):
-            _rollout_with_retry(lambda: _rollout_random_episode(env))
+            recorder = getattr(env, "hpo_recorder", None)
+            def preparation_rollout():
+                if recorder is not None:
+                    recorder.start()
+                try:
+                    _rollout_random_episode(env)
+                except Exception:
+                    if recorder is not None:
+                        recorder.failure()
+                    raise
+                else:
+                    if recorder is not None:
+                        recorder.failure(preparation=True)
+            _rollout_with_retry(preparation_rollout)
             for step in env.path:
                 all_s_mat.append(np.asarray(step.state_material_features, dtype=float))
             pbar.update(1)
@@ -1424,6 +1459,16 @@ def train_pg(
         if opt_critic is not None and checkpoint_cfg.get("opt_critic_state") is not None:
             opt_critic.load_state_dict(checkpoint_cfg["opt_critic_state"])
 
+    recorder = getattr(env, "hpo_recorder", None)
+    if recorder is not None:
+        recorder.partial_checkpoint_factory = lambda: {
+            "type": "pg", "policy_state": policy.state_dict(),
+            "value_net_state": value_net.state_dict() if value_net is not None else None,
+            "opt_actor_state": opt_actor.state_dict(),
+            "opt_critic_state": opt_critic.state_dict() if opt_critic is not None else None,
+            "scaler": scaler, "training_budget_state": budget.state_dict(),
+        }
+
     visit_counts: Counter = Counter()
     if checkpoint_cfg and checkpoint_cfg.get("visit_counts"):
         visit_counts = Counter(checkpoint_cfg["visit_counts"])
@@ -1643,6 +1688,7 @@ def train_pg(
                                        pg_entropy_coef, pg_entropy_min)
         total_actor_loss = actor_loss - coef_eff * entropy_bonus
 
+        _check_hpo_numerical(env, total_actor_loss.item())
         opt_actor.zero_grad(set_to_none=True)
         total_actor_loss.backward()
         opt_actor.step()
@@ -1650,11 +1696,13 @@ def train_pg(
         critic_loss_val: float | str = ""
         if opt_critic is not None and all_critic:
             critic_loss = torch.stack(all_critic).mean()
+            _check_hpo_numerical(env, critic_loss.item())
             opt_critic.zero_grad(set_to_none=True)
             critic_loss.backward()
             opt_critic.step()
             critic_loss_val = float(critic_loss.item())
 
+        _check_hpo_numerical(env, models=(policy, value_net))
         _sync_training_device(device)
         update_s = time.perf_counter() - update_started
         for row in batch_ep_rows:
@@ -1744,6 +1792,7 @@ def train_pg(
                 "entropy_coef_eff": coef_eff,
                 "training_sample_session_id": training_samples.session_id if training_samples else None,
                 "training_budget_state": budget.state_dict(),
+                "hpo_state": env.hpo_recorder.checkpoint_state() if getattr(env, "hpo_recorder", None) is not None else None,
                 **budget.snapshot(),
                 "training_budget_history_complete": budget_history_complete,
             }, numbered_path=_numbered)
@@ -1894,6 +1943,53 @@ def generate_candidates(
                 gen_epsilon=gen_epsilon, gen_top_frac=gen_top_frac,
                 gen_temperature=gen_temperature,
             )
+
+    recorder = getattr(env, "hpo_recorder", None)
+    if recorder is not None:
+        # HPO consumes the immutable evaluation snapshot before scientific
+        # postfilters; never query a stochastic/expensive predictor again.
+        if n_explore or n_exploit != recorder.budget.target_unique:
+            raise ValueError("HPO generation requires n_exploit=target_unique and n_explore=0")
+        from .utils.generation_resume import predictor_snapshot, restore_generation
+        contract = getattr(env, "hpo_generation_contract", None)
+        resumed = getattr(env, "hpo_generation_resume", None)
+        if resumed is not None:
+            restore_generation(predictor, resumed, contract)
+        checkpoint_path = str(recorder.path / "generation_checkpoint.pt")
+
+        def checkpoint_generation():
+            if evaluator.pending or recorder.budget.pending:
+                return
+            state = predictor_snapshot(predictor)
+            if state is None or contract is None:
+                return  # Direct library callers may not expose a resumable predictor.
+            _save_checkpoint(checkpoint_path, {
+                "type": "hpo_generation", "hpo_state": recorder.checkpoint_state(),
+                "generation_contract": contract, "predictor_ledger": state["ledger"],
+                "predictor_caches": state["caches"], "predictor_extra": state["extra"],
+            })
+
+        checkpoint_generation()
+        while (recorder.budget.unique_evaluated < recorder.budget.target_unique
+               or evaluator.pending):
+            try:
+                episode = evaluator.next(
+                    rollout_generation,
+                    limit=max(1, recorder.budget.target_unique - recorder.budget.unique_evaluated),
+                    phase="generate",
+                )
+            except (CandidateEvaluationFailed, InfeasibleEpisode):
+                checkpoint_generation()
+                continue
+            _record_episode_timing(predictor, {
+                **_episode_timing_row(episode), "phase": "generate",
+                "episode": recorder.budget.attempts_started,
+            })
+            checkpoint_generation()
+        # Reconstruct the export from authoritative unique snapshots. This
+        # includes prior invocation rows without resampling or charging twice.
+        return [{"formula": row["formula"], **row["prediction_record"]}
+                for row in (json.loads(line) for line in recorder.records_path.read_text().splitlines())]
 
     use_predict_raw = hasattr(predictor, "predict_raw")
     use_check_phase = hasattr(predictor, "check_phase")

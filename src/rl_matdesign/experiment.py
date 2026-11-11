@@ -177,7 +177,11 @@ def main() -> None:
                 and signal.getsignal(signal.SIGTERM) == signal.SIG_DFL):
             resources.callback(signal.signal, signal.SIGTERM, signal.SIG_DFL)
             signal.signal(signal.SIGTERM, _terminate_experiment)
-        _run_experiment(resources)
+        from .utils.candidate_budget import EfficiencyLimitReached
+        try:
+            _run_experiment(resources)
+        except EfficiencyLimitReached as exc:
+            print(f"[HPO] INFEASIBLE_EFFICIENCY: {exc}", flush=True)
 
 
 def _terminate_experiment(signum, _frame) -> None:
@@ -217,6 +221,40 @@ def _run_experiment(resources: ExitStack) -> None:
     TrainingBudget(count_duplicates=train_count_duplicates,
                    max_duplicate_attempts=train_max_duplicate_attempts)
     method = cfg["method"]
+    hpo_recorder = None
+    hpo_generation_resume = None
+    if cfg["hpo_resume_generation"] and (not cfg["hpo_recording"] or cfg["hpo_phase"] != "generation" or not args.only_generate):
+        raise ValueError("hpo_resume_generation requires an HPO --only-generate job")
+    if cfg["hpo_recording"]:
+        if cfg["hpo_target_unique"] is None:
+            raise ValueError("hpo_recording requires hpo_target_unique")
+        if cfg["hpo_phase"] == "train":
+            if args.only_generate or not args.skip_generation or train_count_duplicates:
+                raise ValueError("HPO train jobs require --skip-generation and train_count_duplicates=false")
+            if cfg.get("train_budget") != cfg["hpo_target_unique"]:
+                raise ValueError("HPO train_budget must equal hpo_target_unique")
+        elif not args.only_generate or args.skip_generation:
+            raise ValueError("HPO generation jobs require --only-generate")
+        from .utils.candidate_records import CandidateRecorder
+        hpo_resume = None
+        if args.resume_training:
+            source = (args.load_qnet if method == "dqn" else args.load_policy) or os.path.join(args.out, "checkpoint.pt")
+            if not os.path.exists(source):
+                raise ValueError("HPO resume requires the original synchronized checkpoint")
+            saved_hpo = torch.load(source, map_location="cpu", weights_only=False)
+            if not isinstance(saved_hpo, dict) or any(saved_hpo.get(key) is None for key in ("hpo_state", "rng_state", "predictor_ledger")):
+                raise ValueError("HPO resume requires checkpoint accounting, RNG and predictor ledger; weights-only restart is refused")
+            hpo_resume = saved_hpo["hpo_state"]
+        if cfg["hpo_resume_generation"]:
+            source = os.path.join(args.out, "generation_checkpoint.pt")
+            if not os.path.exists(source):
+                raise ValueError("Generation resume requires generation_checkpoint.pt")
+            hpo_generation_resume = torch.load(source, map_location="cpu", weights_only=False)
+            if not isinstance(hpo_generation_resume, dict) or hpo_generation_resume.get("type") != "hpo_generation" or any(hpo_generation_resume.get(key) is None for key in ("hpo_state", "rng_state", "predictor_ledger", "generation_contract")):
+                raise ValueError("Generation checkpoint lacks synchronized accounting, RNG, predictor or sampling identity")
+            hpo_resume = hpo_generation_resume["hpo_state"]
+        hpo_recorder = CandidateRecorder(args.out, cfg["hpo_target_unique"], cfg["hpo_ratio_limit"], cfg["hpo_phase"], resume_state=hpo_resume)
+        resources.callback(hpo_recorder.close)
     eval_seed, train_seed, gen_seed = (cfg[key] for key in ("eval_seed", "train_seed", "gen_seed"))
     # Determinism must not depend on whether the same seed came from YAML or CLI.
     set_global_seed(train_seed, deterministic=True)
@@ -263,7 +301,7 @@ def _run_experiment(resources: ExitStack) -> None:
             episode_log_path=os.path.join(
                 args.out, "generation_episode_timing.csv" if args.only_generate else "episode_timing.csv"
             ),
-            append=args.resume_training,
+            append=args.resume_training or bool(cfg["hpo_resume_generation"]),
         )
         resources.callback(_close_predictor, predictor)
         source_identity = getattr(predictor, "source_identity", None)
@@ -288,6 +326,27 @@ def _run_experiment(resources: ExitStack) -> None:
     if not constrain_training:
         print("[INFO] constrain_training=False: in-episode constraint filtering is "
               "DISABLED during training (generation still constrained).", flush=True)
+
+    if hpo_recorder is not None:
+        env.hpo_recorder = hpo_recorder
+        if cfg["hpo_phase"] == "generation":
+            from .utils.provenance import sha256_file
+            weight_name = "qnet.pt" if method == "dqn" else "policy.pt"
+            weight_path = (args.load_qnet if method == "dqn" else args.load_policy) or os.path.join(args.out, weight_name)
+            scaler_path_hpo = args.load_scaler or os.path.join(args.out, "std_scaler.bin")
+            env.hpo_generation_contract = {
+                "execution": run_contract,
+                "sampling": {key: cfg[key] for key in ("gen_seed", "gen_temperature", "gen_top_frac", "gen_epsilon", "num_gen_eps", "exploration_gen_eps")},
+                "frozen_artifacts": {weight_name: sha256_file(weight_path), "std_scaler.bin": sha256_file(scaler_path_hpo)},
+            }
+            env.hpo_generation_resume = hpo_generation_resume
+        from .registry import charge_check_enabled, charge_use_pauling
+        if charge_check_enabled(cfg):
+            from .constraints.charge import charge_neutral
+            hpo_recorder.constraint_check = lambda episode: charge_neutral(
+                episode.prediction_record.get("formula") or episode.formula,
+                use_pauling=charge_use_pauling(cfg),
+            )
 
     step_dim     = env.n_components
     fraction_set = value_alphabet(env)
