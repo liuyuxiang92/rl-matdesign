@@ -9,6 +9,7 @@
 base_config: /aisi/yxliu/rl-matdesign/glasspy/glassnet_benchmark_nodes_20261106/configs/coarse/dqn_mc.yaml
 method: dqn-mc
 random_seed: 42
+parallel_jobs: 1  # 1 = serial; >1 caps concurrent worker jobs across all phases.
 evaluation: {threshold: null, best_fraction: 0.1, score_tolerance: 0.01, max_attempts_per_unique: 1.5}
 training:
   repeats: 3

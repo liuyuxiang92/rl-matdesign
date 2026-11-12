@@ -24,6 +24,8 @@ def write_plan(tmp_path, extra=None, scene=None):
 def test_simplified_defaults_inherit_named_property_and_fixed_rules(tmp_path, method):
     plan = load_plan(write_plan(tmp_path, {'method': method}))
     assert plan['protocol'] == 'hpo_v2'
+    assert plan['parallel_jobs'] == 1
+    assert plan['sources']['parallel_jobs'] == 'default'
     assert plan['objective'] == {
         'field': 'working_temperature', 'direction': 'minimize', 'threshold': 0,
         'threshold_inclusive': True, 'unit': 'K',
@@ -41,6 +43,25 @@ def test_simplified_defaults_inherit_named_property_and_fixed_rules(tmp_path, me
     assert plan['efficiency']['max_attempts_per_unique'] == 1.5
     assert plan['generation_search']['parameter'] == 'gen_temperature'
     assert plan['generation_search']['repeats_per_model'] == 3
+
+
+@pytest.mark.parametrize('parallel_jobs', [1, 3])
+def test_parallel_jobs_changes_execution_capacity_only(tmp_path, parallel_jobs):
+    serial = load_plan(write_plan(tmp_path))
+    plan = load_plan(write_plan(tmp_path, {'parallel_jobs': parallel_jobs}))
+    assert plan['parallel_jobs'] == parallel_jobs
+    assert plan['sources']['parallel_jobs'] == 'yaml'
+    assert plan['authored_config']['parallel_jobs'] == parallel_jobs
+    # Protocol, budgets, scoring, parameter ranges and every seed stay identical.
+    execution_fields = {'parallel_jobs', 'sources', 'authored_config'}
+    assert {key: value for key, value in plan.items() if key not in execution_fields} == {
+        key: value for key, value in serial.items() if key not in execution_fields}
+
+
+@pytest.mark.parametrize('parallel_jobs', [0, -1, True, False, 1.0, '3', None])
+def test_parallel_jobs_requires_positive_integer(tmp_path, parallel_jobs):
+    with pytest.raises(ConfigError, match=r'parallel_jobs must be an integer >= 1'):
+        load_plan(write_plan(tmp_path, {'parallel_jobs': parallel_jobs}))
 
 
 @pytest.mark.parametrize('direction,result', [('min', 'minimize'), ('minimize', 'minimize'),
@@ -246,6 +267,8 @@ def test_templates_resolve_shared_rules_using_dummy_scene(tmp_path, name):
     source.write_text(yaml.safe_dump(data, sort_keys=False))
     plan = load_plan(source)
     assert plan['protocol'] == 'hpo_v2'
+    assert plan['parallel_jobs'] == data['parallel_jobs'] == 1
+    assert plan['sources']['parallel_jobs'] == 'yaml'
     assert plan['method'] == data['method']
     assert plan['objective']['field'] == 'quality'
     assert plan['generation_search']['parameter'] == 'gen_temperature'

@@ -17,6 +17,7 @@ from .budget_search import budget_grid, budget_schedule, select_budget
 from .domain import design_space_info, minimum_training_budget, training_budget_preflight
 from .job_runner import JobError, JobRunner
 from .range_search import initial_reference, run_range_search
+from .scheduling import run_jobs
 
 STAGES = ("ranges", "train-budget", "train-search", "generation")
 SCOPES = {"all": STAGES, "search": STAGES[1:], **{s: (s,) for s in STAGES}}
@@ -96,6 +97,7 @@ class Campaign:
         self.runner = runner or JobRunner(self.plan, self.out)
         self.completed_jobs = 0
         self.known_seconds = []
+        self.parallel_jobs = self.plan.get("parallel_jobs", 1)
         ranges = self.stage_path("ranges")
         if ranges.exists() and read_json(ranges).get("status") == "COMPLETED":
             self.plan["search_space"] = read_json(ranges)["ranges"]
@@ -111,59 +113,99 @@ class Campaign:
 
     def evaluate(self, parameters: dict, budget: int, seeds: list[int], phase="train", models=None,
                  pairings=None):
-        if models is not None and len(models) != len(seeds):
-            raise CampaignError("Each generation seed requires exactly one paired frozen model")
-        if pairings is not None and (models is None or len(pairings) != len(seeds)):
-            raise CampaignError("Generation pairing metadata must match the models and seeds")
-        rows = []
-        preflight = training_budget_preflight(self.plan, parameters, budget, self.domain) if phase == "train" else None
-        if preflight is not None and not preflight["eligible"]:
-            self.progress("preflight_rejected", phase=phase, budget=budget,
-                          parameter_id=parameter_id(parameters), **preflight)
-            for seed in seeds:
-                rows.append({"status": "INFEASIBLE_LEARNING_BUDGET", "eligible_for_selection": False,
-                             "score": -1.0, "seed": seed, "budget": budget, "executed": False,
-                             "reason": preflight["reason"], "required_budget": preflight["required_budget"],
-                             "failure_kind": preflight["failure_kind"], "wall_seconds": 0.0,
-                             "checkpoint_paths": {}, "raw_metrics": {},
-                             "ledger": {"attempts_started": 0, "unique_evaluated": 0,
-                                        "target_unique": budget, "status": "INFEASIBLE_LEARNING_BUDGET"}})
-        else:
-            for i, seed in enumerate(seeds):
-                self.progress("job", phase=phase, budget=budget, seed=seed,
-                              parameter_id=parameter_id(parameters), completed_jobs=self.completed_jobs)
-                row = self.runner(parameters, budget, seed, phase, None if models is None else models[i])
-                if pairings is not None:
-                    # Copy cached results: pairing annotations belong to this
-                    # aggregate, not to the runner's reusable job dictionary.
-                    row = {**row, **pairings[i]}
-                rows.append(row)
-                self.completed_jobs += 1
-                if row.get("wall_seconds") is not None:
-                    self.known_seconds.append(row["wall_seconds"])
-                if row.get("status") in ("SYSTEM_ERROR", "INVALID_RECORDS", "QUALITY_CALIBRATION_REQUIRED"):
-                    raise CampaignError(f"Job {row.get('job_id', '')} has {row['status']}: "
-                                        f"{row.get('reason') or row.get('error') or 'inspect its preserved records'}; "
-                                        f"inspect {row.get('directory', '')}")
-        result = aggregate_results(rows, parameters, budget)
-        if pairings is not None:
-            grouped = {}
-            for row in rows:
-                grouped.setdefault(row["model_index"], []).append(row)
-            result["model_results"] = [
-                {**aggregate_results(group, parameters, budget),
-                 "model_index": model_index, "model_id": group[0]["model_id"],
-                 "training_seed": group[0]["training_seed"]}
-                for model_index, group in sorted(grouped.items())]
-            result["generation_pairings"] = pairings
-        if preflight is not None and not preflight["eligible"]:
-            result.update(preflight=preflight, reason=preflight["reason"], required_budget=preflight["required_budget"])
-        measurement_key = {"parameters": parameters, "budget": budget, "seeds": seeds, "phase": phase}
-        if pairings is not None:
-            measurement_key["generation_pairings"] = pairings
-        location = self.out / "measurements" / (digest(measurement_key)[:24] + ".json")
-        atomic_json(location, result)
-        return result
+        return self.evaluate_many([dict(parameters=parameters, budget=budget, seeds=seeds,
+                                        phase=phase, models=models, pairings=pairings)])[0]
+
+    def evaluate_many(self, requests):
+        """Flatten configurations × seeds under one global worker limit."""
+        groups, jobs, identities = [], [], {}
+        for request in requests:
+            parameters, budget, seeds = request["parameters"], request["budget"], request["seeds"]
+            phase = request.get("phase", "train")
+            models, pairings = request.get("models"), request.get("pairings")
+            if models is not None and len(models) != len(seeds):
+                raise CampaignError("Each generation seed requires exactly one paired frozen model")
+            if pairings is not None and (models is None or len(pairings) != len(seeds)):
+                raise CampaignError("Generation pairing metadata must match the models and seeds")
+            preflight = training_budget_preflight(self.plan, parameters, budget, self.domain) if phase == "train" else None
+            group = dict(parameters=parameters, budget=budget, seeds=seeds, phase=phase,
+                         pairings=pairings, preflight=preflight, indices=[], rejected=[])
+            if preflight is not None and not preflight["eligible"]:
+                self.progress("preflight_rejected", phase=phase, budget=budget,
+                              parameter_id=parameter_id(parameters), **preflight)
+                for seed in seeds:
+                    group["rejected"].append({
+                        "status": "INFEASIBLE_LEARNING_BUDGET", "eligible_for_selection": False,
+                        "score": -1.0, "seed": seed, "budget": budget, "executed": False,
+                        "reason": preflight["reason"], "required_budget": preflight["required_budget"],
+                        "failure_kind": preflight["failure_kind"], "wall_seconds": 0.0,
+                        "checkpoint_paths": {}, "raw_metrics": {},
+                        "ledger": {"attempts_started": 0, "unique_evaluated": 0,
+                                   "target_unique": budget, "status": "INFEASIBLE_LEARNING_BUDGET"}})
+            else:
+                for index, seed in enumerate(seeds):
+                    job = dict(parameters=parameters, budget=budget, seed=seed, phase=phase,
+                               model=None if models is None else models[index])
+                    identity = digest(job)
+                    if identity not in identities:
+                        identities[identity] = len(jobs)
+                        jobs.append(job)
+                    group["indices"].append(identities[identity])
+            groups.append(group)
+
+        def started(index, job):
+            self.progress("job", phase=job["phase"], budget=job["budget"], seed=job["seed"],
+                          parameter_id=parameter_id(job["parameters"]), completed_jobs=self.completed_jobs,
+                          parallel_jobs=self.parallel_jobs, batch_job_index=index,
+                          scheduled_jobs=len(jobs))
+
+        def recorded(index, row):
+            self.completed_jobs += 1
+            if row.get("wall_seconds") is not None:
+                self.known_seconds.append(row["wall_seconds"])
+            if row.get("status") in ("SYSTEM_ERROR", "INVALID_RECORDS", "QUALITY_CALIBRATION_REQUIRED"):
+                raise CampaignError(f"Job {row.get('job_id', '')} has {row['status']}: "
+                                    f"{row.get('reason') or row.get('error') or 'inspect its preserved records'}; "
+                                    f"inspect {row.get('directory', '')}")
+
+        def progressed(active, completed, queued):
+            self.progress("parallel_batch", parallel_jobs=self.parallel_jobs,
+                          scheduled_jobs=len(jobs), completed_batch_jobs=completed,
+                          remaining_scheduled_jobs=len(jobs) - completed, queued_jobs=queued,
+                          completed_jobs=self.completed_jobs,
+                          active_jobs=[{key: jobs[index][key] for key in ("phase", "budget", "seed")}
+                                       | {"parameter_id": parameter_id(jobs[index]["parameters"])}
+                                       for index in active])
+
+        rows = run_jobs(jobs, self.runner, self.parallel_jobs, on_start=started,
+                        on_result=recorded, on_progress=progressed)
+        results = []
+        for group in groups:
+            parameters, budget, seeds, phase = (group[key] for key in ("parameters", "budget", "seeds", "phase"))
+            pairings, preflight = group["pairings"], group["preflight"]
+            selected = group["rejected"] or [rows[index] for index in group["indices"]]
+            if pairings is not None:
+                selected = [{**row, **pairing} for row, pairing in zip(selected, pairings)]
+            result = aggregate_results(selected, parameters, budget)
+            if pairings is not None:
+                grouped = {}
+                for row in selected:
+                    grouped.setdefault(row["model_index"], []).append(row)
+                result["model_results"] = [
+                    {**aggregate_results(group_rows, parameters, budget),
+                     "model_index": model_index, "model_id": group_rows[0]["model_id"],
+                     "training_seed": group_rows[0]["training_seed"]}
+                    for model_index, group_rows in sorted(grouped.items())]
+                result["generation_pairings"] = pairings
+            if preflight is not None and not preflight["eligible"]:
+                result.update(preflight=preflight, reason=preflight["reason"], required_budget=preflight["required_budget"])
+            measurement_key = {"parameters": parameters, "budget": budget, "seeds": seeds, "phase": phase}
+            if pairings is not None:
+                measurement_key["generation_pairings"] = pairings
+            location = self.out / "measurements" / (digest(measurement_key)[:24] + ".json")
+            atomic_json(location, result)
+            results.append(result)
+        return results
 
     def grids(self, phase):
         minimum = minimum_training_budget(self.plan, self.domain) if phase == "train" else 1
@@ -175,8 +217,16 @@ class Campaign:
     def run_ranges(self):
         grid, schedule = self.grids("train")
         initial = schedule[0]
-        result = run_range_search(self.plan, lambda params, seeds=None: self.evaluate(
-            params, initial, seeds or self.plan["range_search"]["seeds"]))
+        def evaluate(params, seeds=None):
+            return self.evaluate(params, initial, seeds or self.plan["range_search"]["seeds"])
+
+        def evaluate_many(parameters, seeds=None):
+            return self.evaluate_many([dict(parameters=params, budget=initial,
+                                           seeds=seeds or self.plan["range_search"]["seeds"])
+                                       for params in parameters])
+
+        result = run_range_search(self.plan, evaluate,
+                                  **({"evaluate_many": evaluate_many} if self.parallel_jobs > 1 else {}))
         result.update(diagnostic_budget=initial, budget_grid=grid)
         if result["status"] == "COMPLETED":
             self.plan["search_space"] = result["ranges"]
@@ -208,6 +258,13 @@ class Campaign:
         _, schedule = self.grids(phase)
         results = []
         total = len(schedule) * len(panel) * len(seeds)
+        if self.parallel_jobs > 1:
+            self.progress("budget_scan", phase=phase, scheduled_jobs=total,
+                          remaining_scheduled_jobs=total, estimated_remaining_seconds=None,
+                          parallel_jobs=self.parallel_jobs)
+            return self.evaluate_many([dict(parameters=parameters, budget=budget, seeds=seeds,
+                                            phase=phase, models=models, pairings=pairings)
+                                       for budget in schedule for parameters in panel])
         for budget in schedule:
             for parameters in panel:
                 self.progress("budget_scan", phase=phase, budget=budget, scheduled_jobs=total,
@@ -233,26 +290,32 @@ class Campaign:
                                    direction="maximize", load_if_exists=True)
         results_dir = self.out / "studies" / name
         results_dir.mkdir(parents=True, exist_ok=True)
-        # Restarted proposals use deterministic per-number RNGs; persisted
-        # RUNNING proposals are finished, not discarded and replaced for free.
+        # Random startup proposals are independent. Adaptive TPE proposals wait
+        # for all preceding scores; only their seed repeats execute concurrently.
         while True:
             frozen = study.get_trials(deepcopy=False)
-            running = next((t for t in frozen if t.state == TrialState.RUNNING), None)
-            finished_count = sum(t.state == TrialState.COMPLETE for t in frozen)
-            if running is None and finished_count >= trials:
-                break
-            if running is not None:
-                number, parameters = running.number, dict(running.params)
-                if set(parameters) != set(self.plan["search_space"]):
-                    study.tell(number, state=TrialState.FAIL)
+            running = []
+            for trial in frozen:
+                if trial.state != TrialState.RUNNING:
                     continue
-            else:
-                number = len(frozen)
+                if set(trial.params) != set(self.plan["search_space"]):
+                    study.tell(trial.number, state=TrialState.FAIL)
+                else:
+                    running.append((trial.number, dict(trial.params)))
+            finished_count = sum(t.state == TrialState.COMPLETE for t in frozen)
+            if not running and finished_count >= trials:
+                break
+            target = min(trials, startup) if finished_count < startup else min(trials, finished_count + 1)
+            count = max(0, target - finished_count - len(running))
+            if self.parallel_jobs == 1:
+                count = min(count, 1)
+                running = running[:1]
+            for _ in range(count):
+                number = len(study.get_trials(deepcopy=False))
                 study.sampler = optuna.samplers.TPESampler(
                     seed=(self.plan["training_search"]["seeds"][0] + number) % (2**32),
                     n_startup_trials=startup)
                 trial = study.ask()
-                number = trial.number
                 parameters = {}
                 for key, spec in self.plan["search_space"].items():
                     if spec["type"] == "categorical":
@@ -262,11 +325,23 @@ class Campaign:
                             step=spec.get("step", 1), log=spec.get("log", False))
                     else:
                         parameters[key] = trial.suggest_float(key, spec["low"], spec["high"], log=spec.get("log", False))
-            result_path = results_dir / f"trial_{number:05d}.json"
-            result = (read_json(result_path) if result_path.exists() else
-                      self.evaluate(parameters, budget, self.plan["training_search"]["seeds"]))
-            atomic_json(result_path, result)
-            study.tell(number, result["score"] if result["eligible_for_selection"] else -1.)
+                running.append((trial.number, parameters))
+            pending, observed = [], {}
+            for number, parameters in running:
+                result_path = results_dir / f"trial_{number:05d}.json"
+                if result_path.exists():
+                    observed[number] = read_json(result_path)
+                else:
+                    pending.append((number, parameters))
+            if pending:
+                evaluated = self.evaluate_many([dict(parameters=parameters, budget=budget,
+                                                       seeds=self.plan["training_search"]["seeds"])
+                                                for _, parameters in pending])
+                observed.update({number: result for (number, _), result in zip(pending, evaluated)})
+            for number, _ in running:
+                result = observed[number]
+                atomic_json(results_dir / f"trial_{number:05d}.json", result)
+                study.tell(number, result["score"] if result["eligible_for_selection"] else -1.)
         return [read_json(path) for path in sorted(results_dir.glob("trial_*.json"))]
 
     def run_train_search(self):

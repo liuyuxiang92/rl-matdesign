@@ -12,6 +12,7 @@ def test_plan_reports_training_tiers_excluded_by_actual_learning_requirements(tm
     config = yaml.safe_load((root / "configs/hpo/v1/dummy_a2c.yaml").read_text())
     config["base_config"] = str(root / "configs/hpo/scenarios/dummy.yaml")
     config["training"]["budget"]["min_unique"] = 8
+    config["parallel_jobs"] = 3
     source = tmp_path / "hpo.yaml"
     source.write_text(yaml.safe_dump(config))
     for command in ("validate", "plan"):
@@ -23,3 +24,6 @@ def test_plan_reports_training_tiers_excluded_by_actual_learning_requirements(tm
         assert output["budget_grids"]["train"] == [64, 96]
         assert output["budget_grids"]["generation"] == [8, 16, 32]
         assert not output["predictor_evaluated"]
+        if command == "plan":
+            assert output["resolved_plan"]["parallel_jobs"] == 3
+            assert output["resolved_plan"]["sources"]["parallel_jobs"] == "yaml"

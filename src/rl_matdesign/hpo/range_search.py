@@ -190,12 +190,20 @@ def _endpoints(spec: Mapping[str, Any]) -> tuple[Any, Any]:
     return spec["low"], spec["high"]
 
 
-def run_range_search(plan: Mapping[str, Any], evaluate: Callable[..., Mapping[str, Any]]) -> dict[str, Any]:
+def run_range_search(
+    plan: Mapping[str, Any], evaluate: Callable[..., Mapping[str, Any]], *,
+    evaluate_many: Callable[..., list[Mapping[str, Any]]] | None = None,
+) -> dict[str, Any]:
     """Diagnose ranges using ``evaluate(parameters, seeds=[...])`` aggregates.
 
     The callback may accept only parameters; then uncertain paired comparisons
     remain unresolved rather than manufacturing independent replication.  Results
     should expose ``seed_results`` with seed, score, status and eligibility.
+
+    An optional ``evaluate_many(parameters_list, seeds=[...])`` callback may
+    batch independent initial/reference-replacement endpoints. It must return
+    aggregates in input order. Adaptive probes still use ``evaluate``; cached
+    measurements and recorded history retain their logical proposal order.
     """
     original = deepcopy(plan["search_space"])
     ranges = deepcopy(original)
@@ -231,6 +239,31 @@ def run_range_search(plan: Mapping[str, Any], evaluate: Callable[..., Mapping[st
             evaluations.append(result)
         return measurements[key]
 
+    def measure_many(parameters_list: list[Mapping[str, Any]],
+                     selected_seeds: list[Any] | None = None) -> list[dict[str, Any]]:
+        selected_seeds = list(selected_seeds or seeds)
+        if evaluate_many is None:
+            return [measure(parameters, selected_seeds) for parameters in parameters_list]
+        missing = {}
+        for parameters in parameters_list:
+            key = (parameter_id(parameters), tuple(selected_seeds))
+            if key not in measurements:
+                missing.setdefault(key, dict(parameters))
+        if missing:
+            proposed = list(missing.values())
+            results = list(evaluate_many(deepcopy(proposed), seeds=list(selected_seeds)))
+            if len(results) != len(proposed):
+                raise ValueError("evaluate_many must return one aggregate per requested parameter combination")
+            if any(not isinstance(result, Mapping) for result in results):
+                raise TypeError("evaluate_many must return mapping aggregates in input order")
+            for (key, parameters), raw in zip(missing.items(), results):
+                result = dict(raw)
+                result.update(parameters=dict(parameters), parameter_id=key[0],
+                              requested_seeds=list(selected_seeds))
+                measurements[key] = result
+                evaluations.append(result)
+        return [measure(parameters, selected_seeds) for parameters in parameters_list]
+
     def fresh_evidence() -> list[dict[str, Any]]:
         """Never let an old successful subset replace a larger failed cohort."""
         latest = {}
@@ -257,6 +290,9 @@ def run_range_search(plan: Mapping[str, Any], evaluate: Callable[..., Mapping[st
                 "legal_combination_conditions": ["Runtime validates every complete configuration at the common diagnostic budget.",
                                                    "Single-parameter diagnoses are conditional on the recorded reference configuration."]}
 
+    if evaluate_many is not None:
+        measure_many([reference, *({**reference, name: value}
+                     for name, spec in original.items() for value in _endpoints(spec))])
     reference_result = measure(reference)
     if _system_error(reference_result):
         return outcome("SYSTEM_ERROR", reference_result)
@@ -293,6 +329,9 @@ def run_range_search(plan: Mapping[str, Any], evaluate: Callable[..., Mapping[st
         reference = dict(reference_result["parameters"])
         decisions.append({"action": "replace_reference", "old_reference": initial, "reference": reference,
                           "reason": "initial reference ineligible; redo comparisons with a runnable reference"})
+        if evaluate_many is not None:
+            measure_many([{**reference, name: value}
+                          for name, spec in original.items() for value in _endpoints(spec)])
         for name, spec in original.items():
             for direction, value in zip(("low", "high"), _endpoints(spec)):
                 endpoints[(name, direction)] = measure({**reference, name: value})

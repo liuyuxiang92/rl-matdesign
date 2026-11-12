@@ -279,6 +279,13 @@
     rather than silently ignoring a value that no longer controls execution.
     Legacy v1 input
     remains explicitly warned and retains its original scoring semantics.
+    Expose a single top-level parallel_jobs integer, default 1, as the global
+    independent-worker cap. Flatten configurations, budgets and seeds into one
+    bounded queue; batch independent Optuna startup proposals while adaptive
+    TPE and range/budget decisions await preceding scores. Worker processes run
+    independently, but quality calibration and score finalization retain the
+    original request order. Interrupted batches preserve accounting without
+    choosing a replacement scientific reference; ordered resume handles scoring.
   alternatives_considered:
   - Duplicated HPO objectives and raw predictor-output names can drift from the scene reward.
   - Per-trial normalization makes scores incomparable across parameters and budgets.

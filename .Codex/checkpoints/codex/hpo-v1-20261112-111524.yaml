@@ -1,0 +1,82 @@
+checkpoint_version: 3.0.0
+created_at: '2026-11-12T11:15:24.605778+00:00'
+branch: codex/hpo-v1
+worktree: /Users/liuyuxiang/.codex/worktrees/hpo-v1/rl-matdesign
+baseline_commit: 50c25e9a4b6193ad817b63f58c50c7fd7eebb3ca
+phase:
+  current: parallel_hpo_implementation_complete
+  completed:
+  - global_job_cap
+  - ordered_calibration
+  - range_and_grid_batches
+  - startup_batching
+  - interruption_recovery
+  - regression
+  - three_algorithm_worker_checks
+  - reflection
+  next:
+  - user_gpu_validation
+state:
+  package_digest: de0877ab451bccee168e8c8dee02c92eca9a64ba246bc0589a3d766d762286d8
+  parameters:
+  - name: parallel_jobs
+    value: 1
+    source: New shared HPO YAML default; >1 enables a global independent-worker cap.
+  - name: training.repeats / generation.repeats
+    value: 3
+    source: Existing user-confirmed GlassNet defaults; generation repeats remain per
+      frozen model.
+  experiments:
+  - name: hpo_regression
+    status: completed
+    result: 454 passed,77 warnings,30.92 seconds
+    results_path: /private/tmp/rlmat-hpo-parallel-regression.log
+  - name: three_algorithm_serial_parallel_workers
+    status: completed
+    result: 72 real dummy worker jobs, serial/3-worker scientific outputs identical,
+      frozen hashes and reused candidate archives unchanged
+    results_path: /private/tmp/rlmat-parallel-runtime-sg8ncnnw/verification.json
+  - name: initial_tiny_a2c_smoke
+    status: failed
+    reason: Temporary smoke fixture set pg_warmup_eps=0; scaler has no samples. Corrected
+      fixture to2 and completed validation in fresh directory.
+    results_path: /private/tmp/rlmat-parallel-runtime-slyl3qut
+  decisions:
+  - decision: One parallel_jobs integer with default1; flatten jobs into one bounded
+      pool.
+    rationale: Avoid nested configuration×seed multipliers and redundant public on/off
+      switches.
+  - decision: Execute processes independently; finalize scientific results in request
+      order. Cleanup only preserves pending evidence.
+    rationale: Completion order or interruption must not choose a different normalization
+      reference.
+  - decision: Batch startup random proposals; adaptive TPE still waits for previous
+      aggregate.
+    rationale: Exploit independence without changing serial optimization proposals.
+blockers: []
+artifacts:
+- path: src/rl_matdesign/hpo/scheduling.py
+  role: Bounded independent process-wait queue
+- path: docs/hpo_v1.md
+  role: User interface and parallel execution guide
+- path: docs/hpo_v2_validation.md
+  role: Validation provenance
+resume_instructions: '1. Work only in /Users/liuyuxiang/.codex/worktrees/hpo-v1/rl-matdesign;
+  preserve original checkout unrelated changes.
+
+  2. Inspect git status/log before any commit/push. The two standalone artifact HPO
+  YAMLs also gained parallel_jobs:1 outside the tracked worktree.
+
+  3. All three methods support top-level parallel_jobs; scientific budgets, ranges
+  and seed/repeat settings were not changed.
+
+  4. Verify current package_digest against checkpoint before reusing validation claims.
+  New source/config requires a new HPO --out; do not resume a pre-change campaign
+  with this source.
+
+  5. No real GlassNet GPU experiment was run. User must choose parallel_jobs based
+  on their GPU capacity; this implementation inherits the existing device configuration,
+  not automatic multi-GPU allocation.
+
+  6. Existing parent-ordered calibration and known-failure recovery regressions must
+  remain passing.'

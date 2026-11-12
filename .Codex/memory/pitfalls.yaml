@@ -191,3 +191,30 @@
   - src/rl_matdesign/experiment.py
   - tests/test_numerical_runtime_contract.py
   tags: [configuration-contracts, generation, checkpoint-compatibility]
+
+- id: pitfall-hpo-parallel-cleanup-001
+  date: '2026-11-12'
+  expires: '2027-02-12'
+  title: Parallel batch cleanup must not choose a scientific reference
+  wrong: Finalizing later completed workers while unwinding an earlier failed or
+    interrupted reference can freeze the normalization scale from completion order.
+  right: Keep subprocess execution separate from request-ordered finalization.
+    In exception cleanup call JobRunner.preserve, which records ledgers, hashes
+    and timing without calibration or scoring. Resume pending results in the
+    original request order; do not replace a degenerate reference with a later job.
+  impact: Scores and parameter rankings can otherwise change with worker timing.
+  files: [src/rl_matdesign/hpo/scheduling.py, src/rl_matdesign/hpo/job_runner.py]
+  tags: [hpo, concurrency, scientific-evidence]
+- id: pitfall-hpo-terminal-recovery-001
+  date: '2026-11-12'
+  expires: '2027-02-12'
+  title: A terminal candidate ledger does not prove successful worker execution
+  wrong: Recovering a COMPLETED ledger with returncode reset to null can promote
+    a known nonzero-exit or execution-failure job into an eligible result.
+  right: Retain parent-recorded exit status and serialized execution failures.
+    Reject a successful-looking terminal ledger with known fatal execution evidence.
+    Preserve expected numerical or efficiency stops as ineligible, and retain
+    measured time when scoring a previously preserved successful execution.
+  impact: Resume could otherwise erase system errors and bless invalid experiments.
+  files: [src/rl_matdesign/hpo/job_runner.py, tests/test_hpo_parallel_job_runner.py]
+  tags: [hpo, recovery, provenance]

@@ -16,7 +16,7 @@ from .algorithm_profiles import METHODS, get_profile, validate_search_space
 from .spec import (_GEN_WEIGHTS, _TRAIN_WEIGHTS, _efficiency, _integer, _mapping,
                    _number, _resolve_asset_paths, _weights)
 
-_PUBLIC_KEYS = {"base_config", "method", "random_seed", "evaluation", "training", "generation"}
+_PUBLIC_KEYS = {"base_config", "method", "random_seed", "parallel_jobs", "evaluation", "training", "generation"}
 # Fixed protocol rules, intentionally absent from the user-facing YAML schema.
 _BUDGET_FACTOR = 2.0
 _RANGE_MAX_EXTRA_VALUES_PER_DIRECTION = 2
@@ -166,6 +166,7 @@ def load_simplified_plan(path: Path, value, method=None) -> dict:
         "base_config": str(base_path), "base_config_dir": str(base_path.parent),
         "base_config_raw": base_raw, "base_config_data": base, "source_path": str(path),
         "random_seed": master, "seed_schedule": schedule,
+        "parallel_jobs": _integer(raw.get("parallel_jobs", 1), "parallel_jobs", 1),
         "objective": objective, "scoring_scope": "score_only",
         "metrics": {"best_fraction": _number(evaluation.get("best_fraction", .1), "evaluation.best_fraction", 0, 1, exclusive=True),
                     "training_weights": _weights(training.get("score_weights", {}), "training.score_weights", _TRAIN_WEIGHTS),
