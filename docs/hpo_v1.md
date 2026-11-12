@@ -1,240 +1,193 @@
 # YAML 驱动的两部分 HPO
 
-新入口使用 `hpo_v1` 协议，训练参数按训练收集结果选择，生成参数按冻结网络的生成结果选择。它保留旧 HPO 脚本的行为，不把旧的生成 top-k 评分悄悄替换为新评分。
+当前接口将用户配置分为公共评价、训练、生成三部分：第一部分诊断训练参数范围；第二部分校准训练预算、联合搜索及复核训练参数，再使用冻结网络联合选择生成参数与生成数量。训练参数按训练收集结果评分，生成参数按生成结果评分。HPO 评分不会替换场景的训练 reward。
 
-已接入 rl-matdesign 的场景通过两份 YAML 使用相同流程：场景文件负责设计空间、预测模型、命名性质和科学约束；HPO 文件负责引用场景、目标方向及阈值、参数范围、预算与采样效率限制。切换已接入场景不需要修改 HPO 代码。尚未接入工程的预测器或环境仍需要先完成普通场景接入。
+场景 YAML 负责设计空间、模型资产、命名性质、优化方向及材料约束；HPO YAML 引用场景，负责达标阈值、评分权重、超参数范围和实验规模。已接入本项目的场景无需修改 HPO 代码；新预测器或新环境仍需先完成普通场景接入。
 
-## 先验证，再执行
+## 从独立 HPO 文件运行
 
-安装项目后使用已有的 `rl-matdesign` 命令。源码 checkout 也可以在前面设置 `PYTHONPATH=src`，把 `rl-matdesign hpo` 替换为 `python -m rl_matdesign.hpo`。HPO 运行需要项目的训练依赖以及 Optuna；`validate` 和 `plan` 不调用性质预测器、不训练网络。
-
-```bash
-rl-matdesign hpo validate --hpo-config configs/hpo/v1/dummy_a2c.yaml
-rl-matdesign hpo plan --hpo-config configs/hpo/v1/dummy_a2c.yaml
-rl-matdesign hpo run --hpo-config configs/hpo/v1/dummy_a2c.yaml \
-  --out runs/hpo_a2c_smoke
-```
-
-`validate` 检查配置、目标字段、预算档位与准备采样的最低预算。`plan` 另外展示生效配置、双向预算顺序与阶段，不创建试验结果。`run` 默认运行完整流程，输出目录应为本次新建的空目录。已完成的同一 campaign 作业只有在配置、代码、资产及结果校验一致时才会复用。
-
-方法可以放在 YAML 中，也可以显式传入：
+GlassNet 模板位于 `configs/hpo/v1/glassnet_a2c.example.yaml`、`glassnet_dqn_bootstrap.example.yaml`、`glassnet_dqn_mc.example.yaml`。目录名为历史路径；当前模板采用精简接口，运行时记录为 `hpo_v2`，用户不需要填写 `protocol`。
 
 ```bash
-rl-matdesign hpo run --method a2c --hpo-config hpo_a2c.yaml --out runs/my_hpo
+cp configs/hpo/v1/glassnet_a2c.example.yaml hpo.yaml
+# 编辑 base_config，填写 evaluation.threshold，检查场景中的生成方式。
+rl-matdesign hpo validate --hpo-config hpo.yaml
+rl-matdesign hpo plan --hpo-config hpo.yaml
+rl-matdesign hpo run --hpo-config hpo.yaml --out runs/my_hpo
 ```
 
-支持 `a2c`、`dqn-bootstrap`、`dqn-mc`。命令行和 YAML 同时指定的方法必须一致；命令行不会静默改写另一份方法的搜索空间。
+安装项目后使用 `rl-matdesign hpo`；源码 checkout 可用 `PYTHONPATH=src python -m rl_matdesign.hpo` 替代。执行实验需要项目训练依赖及 Optuna。`validate`、`plan` 不调用性质预测器、不训练网络；自动质量尺度要等实际参考实验后才能确定。
 
-## 分开运行第一部分和第二部分
+支持 `a2c`、`dqn-bootstrap`、`dqn-mc`。方法可以写入 YAML，或添加 `--method a2c`；两处同时指定时必须一致。相对 `base_config` 路径按 HPO 文件所在目录解析，场景资产仍按场景文件目录解析。
 
-第一部分只做训练参数范围诊断，不执行生成：
-
-```bash
-rl-matdesign hpo run --hpo-config hpo_a2c.yaml --out runs/my_hpo --stage ranges
-```
-
-检查该目录中的 `ranges.json` 和 `range_decisions.jsonl` 后，继续第二部分：
-
-```bash
-rl-matdesign hpo run --hpo-config hpo_a2c.yaml --out runs/my_hpo --stage search
-```
-
-| `--stage` | 执行内容 | 前置结果 |
-|---|---|---|
-| `all` | 第一部分及完整第二部分，默认值 | 无 |
-| `ranges` | 参考配置、上下界、失稳内收和有证据的外扩 | 无 |
-| `search` | 训练预算、训练组合搜索与复核、生成温度和数量 | `ranges` |
-| `train-budget` | 代表配置在完整双向预算网格上的校准 | `ranges` |
-| `train-search` | 固定预算的 TPE 搜索、全网格复核及有限次预算修订 | `train-budget` |
-| `generation` | 冻结验证网络的温度和生成数量联合选择 | `train-search` |
-
-缺少前置结果时命令会报错，不自动偷偷执行前一阶段。第一部分保存的范围附带条件证据；少数点的正常运行不证明整个连续区间都稳定。正常但低分的边界会保留，效率失败只说明当次完整配置不合格。
-
-追加 seed 复核后，后续决策使用更新后的证据；旧成功记录保留在 `measurement_history` 中，不会覆盖后来的失败。范围外扩或联合组合若与共同预算不兼容，或 DQN 批大小超过固定回放容量，会预检为 `INFEASIBLE_LEARNING_BUDGET`，记录原因且不启动采样，不把没有学习更新的运行当作正常训练，也不单独提高该参数组合的预算。
-
-如果查看范围后希望手动改变范围、目标或预算设置，请保存新的 HPO YAML 并使用新的输出目录。不要直接改已有 campaign 的 manifest 或结果文件以绕过一致性检查。
-
-## 场景与评分配置
-
-`base_config` 可以使用绝对路径；相对路径以 HPO YAML 所在目录解析。场景内部资产路径保持相对场景 YAML 的含义，不会因作业输出到不同目录而改变。HPO 文件无需再复制模型路径或材料约束。
+下面是结构示例。数值仅展示格式，不能视为经过 GlassNet 验证的推荐值；完整算法范围见对应模板。
 
 ```yaml
-protocol: hpo_v1
-base_config: ../../my_scenario/config.yaml
+base_config: config.yaml
 method: a2c
-parameter_profile: builtin:a2c
-
-objective:
-  field: my_property
-  direction: maximize
-  threshold: 0.8
-  threshold_inclusive: false
-  normalization: {kind: sigmoid, scale: 0.1}
-
-metrics:
+random_seed: 42
+evaluation:
+  threshold: null
   best_fraction: 0.10
-```
-
-这里的性质、阈值及尺度仅演示字段格式。HPO 的目标阈值在整个 campaign 固定，不能对每个 RL 试验重新求中位数。
-
-| 指标 | `minimize` | `maximize` |
-|---|---|---|
-| `qualified_fraction` | 性质低于阈值且通过场景约束的比例 | 性质高于阈值且通过场景约束的比例 |
-| `best_fraction_mean` | 通过场景约束的最小一部分值的均值 | 通过场景约束的最大一部分值的均值 |
-| `best_value` | 通过场景约束的最小值 | 通过场景约束的最大值 |
-| `attempts_per_unique` | 尝试次数除以成功评价的不同候选数 | 相同 |
-
-`threshold_inclusive: true` 分别改为 `<=` 或 `>=`。达标比例分母包括所有成功评价的不同候选，不能先删除约束不合格材料再计算。最优子集槽位数为 `ceil(best_fraction * budget)`；约束可行材料不足时，归一化子集质量按槽位填充率折减。没有可行材料时原始均值、极值为 `null`，不伪造数值或宣称质量平台。
-
-默认训练分权重依次为达标比例 0.45、子集质量 0.30、最优质量 0.10、采样效率 `unique / attempts` 0.15；生成分为前三项 0.50、0.40、0.10。可通过 `metrics.training_weights` 和 `metrics.generation_weights` 修改，所有权重和归一化规则会被固定记录。HPO 评分不会自动替换场景的 RL reward。
-
-正阈值和正目标可以使用 `positive_threshold_ratio`；零、负数或其他尺度的目标使用带固定正 `scale` 的 `sigmoid`。方向同步控制达标比较、子集排序、极值和归一化，不需要修改代码。
-
-## 预算向小、向大都测试
-
-```yaml
-budget:
-  mode: fraction_of_space
-  strategy: bidirectional_grid
-  train:
-    min_fraction: 0.000001
-    initial_fraction: 0.0001
-    max_fraction: 0.01
-    factor: 2
-    min_unique: 100
-  generation:
-    min_fraction: 0.000001
-    initial_fraction: 0.0001
-    max_fraction: 0.01
-    factor: 2
-    min_unique: 100
-  tolerances:
-    score: 0.01
-    qualified_fraction: 0.02
-    best_fraction_mean: {kind: absolute, value: 1.0}
-    best_value: {kind: absolute, value: 1.0}
-    attempts_per_unique: 0.10
-  upper_confirmation_levels: 2
-```
-
-`0.0001` 表示 0.01%，只是起点。程序从起点按 `factor` 向下和向上生成档位，显式包含上下边界，再按精确不同候选数取整、合并重复整数预算。训练和生成各有一份独立网格。物理指标的绝对容差必须使用目标的原始单位；也可指定 `threshold_fraction`，但零阈值必须使用绝对容差。
-
-完整网格在少量代表配置上校准。联合搜索后，入围配置再次在所有预算档位上复核，允许预算向任意方向改变；预算改变后建立独立 study 补充搜索，不把不同预算的测量混为同一 TPE 保真度。
-
-百分比要求有限且能精确计数的规范候选空间，不能把动作路径数或训练数据行数当作分母。不能精确计数的场景可明确选择绝对预算：
-
-```yaml
-budget:
-  mode: absolute_unique
-  train: {min_unique: 100, initial_unique: 400, max_unique: 1600, factor: 2}
-  generation: {min_unique: 50, initial_unique: 200, max_unique: 800, factor: 2}
-```
-
-预算选择返回两个不同结论：`selected_budget` 是本轮已测范围内质量足够接近参照结果的最小预算；`convergence_status` 是关于平台的证据。`OBSERVED_PLATEAU` 要求所选配置在至少指定数量的更大档位上也合格，指标变化都在容差内，且整个计划网格已经测完。更大预算明显变差、效率失败、缺失测量或达到预算上限分别报告，不冒充平台。
-
-所有实际准备采样也计入尝试。A2C 的 scaler-only warmup 不产生性质评价，因此会消耗尝试而不增加有效 unique。例：20 次准备采样、严格 1.5 上限，至少需要 41 个 unique；程序会从共同网格选合法档位，不自动降低 warmup 或放宽上限。计时只更新 ETA，不按期望时长倒推或降低预算。
-
-## 尝试上限及生成温度
-
-```yaml
-efficiency:
+  score_tolerance: 0.01
   max_attempts_per_unique: 1.5
-  comparison: lt
-  train: {}
-  generation: {}  # 可覆盖，例如 {max_attempts_per_unique: 1.8}
-
-generation_search:
-  parameter: gen_temperature
-  initial_values: [0, 0.001, 0.01, 0.1, 1, 10, 100, 1000]
-  max_extra_values_per_direction: 2
-  fixed: {gen_epsilon: 0, gen_top_frac: 0, exploration_gen_eps: 0}
-  paired_seeds: [401, 503, 607]
+training:
+  repeats: 3
+  score_weights:
+    qualified_fraction: 0.45
+    best_fraction_quality: 0.30
+    best_value_quality: 0.10
+    sampling_efficiency: 0.15
+  parameter_ranges:
+    pg_lr_actor: {type: float, low: 0.00001, high: 0.01, log: true}
+  budget:
+    mode: fraction_of_space
+    min_fraction: 0.000001
+    initial_fraction: 0.0001
+    max_fraction: 0.01
+  search: {max_rounds: 3, trials_per_round: 30, startup_random_trials: 10}
+generation:
+  repeats: 3
+  score_weights:
+    qualified_fraction: 0.50
+    best_fraction_quality: 0.40
+    best_value_quality: 0.10
+  # initial_values 可省略，按场景选中的采样方式提供初始值。
+  budget: {mode: absolute_unique, min_unique: 100, initial_unique: 400, max_unique: 1600}
 ```
 
-用户所说的 `gen_temp` 对应规范字段 `gen_temperature`。温度 0 是贪心诊断点，正温度对网络分数使用 softmax 温度采样。DQN 的 Q 值与 A2C 的 logits 尺度不同，温度必须按各自训练网络测量。每个预算比较同一温度集合，不能在初始数量就淘汰温度后声称所有数量都已检验。生成 seed 数量必须与验证网络数量一一对应。
+`parameter_ranges` 覆盖内置算法范围中的同名项。省略某个参数会保留内置范围，不表示固定该参数；要固定支持的参数，可设置 `type: categorical, choices: [固定值]`。`low`、`high` 是范围诊断的初始边界，`choices` 是初始离散选项；有实验证据时可按限制外扩，数值失稳时可内收。正常但低分的区域不会仅凭低分被删除。`dqn_grad_steps_per_ep` 继续使用场景值，不参与搜索。
 
-训练和生成分别去重。训练中出现过的候选在生成阶段首次出现，仍计入生成预算；同一阶段内部再次重复只增加尝试和时间。失败、无效候选及重新采样的重试同样计入尝试。
+训练范围诊断和生成参数范围搜索均内部固定为：每个参数的每一侧最多补测两个新值。用户 YAML 不再包含 `training.range_search` 或 `generation.max_extra_values_per_direction`。训练与生成的预算档位也统一使用内部固定倍数 2，不再填写 `budget.factor`。每轮 Optuna 搜索后，内部固定最多选择三个不同且符合条件的候选参数组合参加复核；用户 YAML 不包含 `training.validation`。这些规则在解析后的执行计划中仍会显示，其中训练和生成每侧补测上限均为 2，复核入选组合数上限为 3，便于核实实际实验安排；后续需要可调时再扩展用户接口。
 
-上限默认是严格小于 1.5：目标 1000 个 unique 最多允许 1499 次尝试。不会仅因运行前缀暂时超过 1.5 就停止；只有 `已开始尝试 + 尚缺 unique` 已超过允许总尝试次数时，才确认即使余下每次都成功也无法达标，提前停止。批量结果结算后再做此判断，不能把 pending 当永久失败。
+## 目标继承与评分
 
-效率不合格保存候选、账本和可用检查点，状态为 `INFEASIBLE_EFFICIENCY`。该配置不进入完整预算的优胜排序，任一必需 seed 失败都不能靠其他 seed 的平均分掩盖。控制器不会在原试验内提高温度、降低预算、放宽上限或重置已经消耗的尝试。
+程序解析场景 reward，要求它有且只有一个非零优化目标，并通过该目标的 `properties[].name` 获取性质、`direction: min/max` 和单位。约束项不自动成为优化目标。性质名称可以不同于模型的 `output`：例如 `name: working_temperature`、`output: T3` 时，HPO 使用 `working_temperature`。多目标、目标方向不明确或 reward 系数与方向矛盾时直接报告配置问题，不猜测第一个性质。
 
-## 输出、错误与恢复
+HPO 只填写 `evaluation.threshold`。最小化使用 `性质值 <= 阈值`，最大化使用 `性质值 >= 阈值`，等于阈值也达标。阈值在整个实验固定，不按每组材料重新求中位数，也不自动加入训练 reward。GlassNet 模板保留 `threshold: null`，执行前必须填写；如采用训练数据中位数，应先核实数据版本、对应列和单位。Tg、CTE 条件只来自场景配置，HPO 不自动添加或复制它们。
 
-主要输出：
-
-| 路径 | 内容 |
+| 评分项 | 含义 |
 |---|---|
-| `manifest.json` | 生效配置、代码和资产契约 |
-| `state.json`、`progress.json` | campaign 阶段、状态与进度 |
-| `ranges.json`、`range_decisions.jsonl` | 参数范围和每项边界修改依据 |
-| `stages/*.json` | 各阶段完整汇总与预算证据 |
-| `best_training.yaml`、`frozen_models.json` | 训练参数选择摘要与冻结验证网络 |
-| `best_generation.yaml` | 生成温度与数量选择 |
-| `selection.json` | 选择结果与实际成本汇总 |
-| `jobs/*/candidate_records.jsonl` | 本作业独立的完整原始候选档案 |
-| `jobs/*/candidate_budget.json` | 真实尝试、成功 unique、准备采样及终止状态 |
-| `jobs/*/stdout.log`、`stderr.log` | 运行日志及错误详情 |
+| `qualified_fraction` | 同时满足场景约束及目标阈值的不同材料数，除以全部成功评价的不同材料数 |
+| `best_fraction_quality` | 约束可行材料中最好一部分的均值，经固定质量映射转换后的分数 |
+| `best_value_quality` | 最好一个约束可行材料的性质，经同一质量映射转换后的分数 |
+| `sampling_efficiency` | 成功评价的不同材料数除以尝试次数，只纳入训练加权评分 |
 
-`trials.csv`、`generation_trials.csv` 按实际作业汇总费用，复用同一个作业不会再次累加；未完成作业的已花尝试也在 `selection.json` 中保留。不能恢复的历史耗时标记为未知，不写成零。已知精确空间大小时，CSV 同时给出整数预算及其实际空间占比。`best_training.yaml` 是包含 HPO 参数与收敛状态的选择摘要，不能直接替代原始场景配置；场景与生效作业配置仍保存在 manifest 和 `jobs/*/config.yaml`。
+`best_fraction: 0.10` 表示最好 10%，方向随场景变化。名额数为 `ceil(best_fraction × 目标预算)`；约束可行材料不足时，均值使用已有可行材料，质量分数再乘以名额填充比例。没有可行材料时，两项质量分数为零，原始均值和极值保留为 `null`。不满足约束但成功评价的材料仍在达标比例分母中。每阶段的权重非负且和为 1；全部规定重复必须完成并满足效率上限，不能只平均其中成功的实验。
+
+新版固定采用 sigmoid 质量映射，支持正数、零和负数，不开放 `normalization.kind`。最小化时，输入为“阈值减性质值，再除以尺度”；最大化时相反。性质等于阈值时分数为 0.5，性质越好分数越高。
+
+尺度来自第一份完成且符合条件的训练参考作业，候选采样成本照常计入。程序依次尝试目标性质的四分位距、最大最小值之差、与阈值距离的绝对值中位数，取第一个正的有限尺度，保存到 `quality_calibration.json`。尺度随后冻结，所有参数组合、预算和生成实验共用，不会每次分别归一化。若数据全部等于阈值等情况导致无法得到正尺度，保留成本并报告 `QUALITY_CALIBRATION_REQUIRED`，不能悄悄使用任意物理单位尺度；应检查参考预算及场景，在新目录开始调整后的实验。
+
+`evaluation.score_tolerance` 是统一的**绝对总分差**：0.01 表示总分差 0.01，不是相对改善 1%。范围边界改善、候选比较和预算平台判断共用它。当前只根据总评分判断改善与平台；原始分项仍记录，但不再各设容差或阻止总分平台判断。材料约束及效率上限继续独立执行。
+
+## 两个重复次数与自动种子
+
+`random_seed` 控制可复现的种子派生；用户只设置两个重复次数，不填写阶段种子列表。
+
+| 实验 | 次数控制 | 配对规则 |
+|---|---|---|
+| 参数范围诊断 | `training.repeats` | 对照与各参数取值使用相同探索种子 |
+| 训练预算校准 | `training.repeats` | 不同预算与代表配置使用相同探索种子 |
+| 联合参数搜索 | `training.repeats` | 每套参数使用相同探索种子 |
+| 候选参数与预算复核 | `training.repeats` | 自动派生另一组验证种子，与前三步分开 |
+| 生成参数及数量搜索 | `generation.repeats` | 每个冻结网络重复采样，各设置使用相同模型及种子配对 |
+
+前三步共享探索种子，第四步重复次数相同但使用新种子。新版所有训练比较都使用固定重复组；范围结果存在不一致时保留为未解决证据，不隐式追加种子或增加重复次数。预算修订沿用搜索及复核规则，不新增一套用户种子。
+
+当前实现中，`random_seed: 42` 与 `training.repeats: 3` 派生的探索种子为 `[2746317213, 1181241943, 958682846]`，独立验证种子为 `[3163119785, 1812140441, 127978094]`。因此三次重复不是都使用 42；42 决定整组可复现种子。实际组别会写入解析计划的 `seed_schedule`，修改主种子或重复次数后应重新查看计划。
+
+`generation.repeats` 表示“每个冻结模型的生成重复次数”，默认值为 3，与训练阶段统一使用 `repeats` 这个字段名。生成阶段已有多个训练种子产生的冻结模型，该字段再控制每个模型使用多少个生成随机种子。区分这两个来源，才能同时观察训练随机性和采样随机性，不会把它误解为整个生成阶段的总实验次数。
+
+例如 `training.repeats: 3`、`generation.repeats: 3`：最终选定一套训练参数，保留它的三个验证网络；每个“生成参数值 × 生成预算”设置对每个网络采样三次，即 **3 个网络 × 3 次 = 9 次生成实验**，不重新训练网络。每轮搜索后内部最多选入三套不同候选参数参加复核，符合条件的组合不足三套时按实际数量选入；这与 `training.repeats` 独立，每套参数分别按该重复次数训练。所有实际种子及模型配对都写入结果。
+
+## 训练和生成预算分别设置
+
+每个阶段的 `budget.mode` 可独立选择，允许训练按比例、生成按绝对数量，反之亦可。
+
+| 模式 | 字段 | 预算含义 |
+|---|---|---|
+| `fraction_of_space` | `min_fraction`、`initial_fraction`、`max_fraction` | 设计空间不同候选总数乘比例，向上取整 |
+| `absolute_unique` | `min_unique`、`initial_unique`、`max_unique` | 直接指定成功评价的不同候选数量 |
+
+比例 `0.0001` 是 0.01%，不是 0.0001%。两个阶段都从初始值按内部固定倍数 2 向下除、向上乘，纳入边界并合并相同整数预算。例如起点 400、下界 100、上界 1600 对应档位 100、200、400、800、1600。比例模式不接受额外 `min_unique`；程序只因学习更新和准备采样的实际可执行条件剔除过小档位，不再使用隐藏的 100 候选下限。设计空间必须可精确计数，不能使用动作路径数或 GlassNet 训练集行数；不能精确计数时使用绝对模式。
+
+`validate` 和 `plan` 输出中的 `minimum_training_unique` 是当前算法范围与场景准备成本要求的最低训练预算；`omitted_training_budgets` 列出因此剔除的用户预算档位，`budget_grids` 列出实际可执行档位。它们只说明能否执行，不意味着最低预算已足够学习或结果已收敛。
+
+预算指**单个参数组合、单个重复、单个阶段**的有效候选数，不是整个 HPO 的总开销。不同训练预算分别从头训练，不能自动把小预算模型继续训练当作独立大预算比较。准备采样也有成本：A2C 仅拟合 scaler 的采样增加尝试、不增加成功评价数，可能使小预算无法满足效率限制。计时只更新 ETA，不根据期望时长降低预算。
+
+`search.trials_per_round` 是每轮提出的参数组合数；其中前 `startup_random_trials` 组随机探索，已包含在该总数内。后续使用 TPE 按训练评分提案。每轮搜索结束后，程序按评分选出最多三个不同且符合条件的候选参数组合；符合条件的组合不足三个时按实际数量选入。这个上限内部固定，不受 `training.repeats` 影响。程序继续保留原有对照组合，并记录实际复核数量，因此整组复核实验可以包含超过三套参数。验证在完整训练预算网格上复核；推荐预算改变时，在新预算建立下一轮独立搜索。`max_rounds` 包含初始轮，因此 3 轮、每轮 30 组最多是 90 个联合搜索提案，范围、预算、复核和生成实验另计。
+
+`training.search.max_rounds: 3` 不表示固定执行三轮。比如训练预算校准先推荐 1000，第一轮就在 1000 下优化参数；若独立验证仍推荐 1000，则第一轮后结束。如果验证改为推荐 2000，第二轮才在 2000 下重新搜索，因为参数在更大预算下的表现可能不同。第二轮验证仍选 2000 时结束；若改为 4000，则进入第三轮。若第三轮后验证仍推荐另一档预算，就达到轮数上限并报告 `BUDGET_UNRESOLVED`，不会把未稳定的预算写成最终结论。这个上限用于控制“预算改变后重新优化参数”的次数。
+
+预算可向更小或更大改变。结果中的 `selected_budget` 与 `convergence_status` 分开：前者是已测范围内推荐的较小预算，后者说明是否有总分平台证据。平台仍要求足够的更大预算观测，当前内部固定至少两个更大档位。到达上界仍改善、较大预算明显恶化、效率失败或证据缺失均如实报告；不能把推荐某一预算写成已证明全局收敛。预算修订轮数耗尽仍未稳定时报告 `BUDGET_UNRESOLVED`。
+
+## 生成方式从场景继承
+
+场景中 `gen_temperature`、`gen_top_frac`、`gen_epsilon` **最后显式出现的字段**选择一种生成方式；0 也属于显式选择，程序补充的默认值不能覆盖它。例如：
+
+```yaml
+gen_temperature: 1.0
+gen_epsilon: 0.1  # 最后出现：使用 epsilon，温度在内部关闭
+```
+
+HPO 只优化被选中的参数。`generation.initial_values` 是该参数的初始候选值，可省略以使用对应方式的内置值；epsilon 与 top fraction 限于 `[0,1]`，temperature 非负。数量来自 `generation.budget`，不会将 `initial_values` 当作生成个数。
+
+生成参数范围搜索在初始候选值之外，向较小、较大的方向各最多增加两个生成参数取值；这个上限内部固定为 2，与训练范围诊断一致，不向用户开放。它控制测试哪些参数值，生成预算与每个模型的重复次数仍分别由 `generation.budget` 和 `generation.repeats` 控制。程序先测试初始候选值；某个预算下的最佳结果落在当前取值范围的边界时，才尝试向对应方向扩大范围。温度向下测试最小正温度的十分之一，向上测试最大正温度的十倍。例如初始正温度为 `[0.1, 1, 10]`，若下边界持续最优，可依次补测 `0.01`、`0.001`；若上边界持续最优，可依次补测 `100`、`1000`。每个新取值都按相同预算网格和模型重复规则评价。如果当前所有结果都不符合条件，程序也可在上限内向更大值补测。epsilon 和 top fraction 的范围有限，向外补测直接到合法边界 0 或 1，不会越界。解析后的执行计划仍会显示每侧补测上限 2。
+
+温度 0 是贪心，较小正温度集中于高网络分数动作，较大温度使采样更分散；它不是探索百分比，A2C 与 DQN 的分数尺度也可能不同。epsilon 调节随机动作概率，top fraction 调节保留的高分动作比例。HPO 内部关闭未选中的方式及额外随机生成批次，用户不需要填写三个 `fixed: 0`。
+
+普通场景解析器也执行最后显式字段优先。生效配置中的内部 `generation_selection` 快照保存选中的方法和有效值，防止导出时排序、补全默认字段或重新加载改变选择。显式覆盖优先于场景；编辑已解析配置的策略值时会识别变化。普通用户编辑原始场景即可，无需手工维护快照。
+
+训练与生成分别记账：生成第一次遇到训练中出现过的材料，仍计入生成预算；同一阶段再次重复只增加尝试。成功评价但不满足材料约束仍消耗有效预算；失败、无效候选和重新采样也消耗尝试。
+
+效率统一要求 `尝试次数 / 有效不同候选数 < evaluation.max_attempts_per_unique`，默认严格小于 1.5。目标 1000 个不同候选最多允许 1499 次尝试。不会仅因早期比例偏高就停止；待已启动结果结算后，若即使余下每次都成功也无法在上限内完成，标记 `INFEASIBLE_EFFICIENCY` 并停止。已消耗成本保留，不自动放宽上限、提高温度或重置预算。
+
+## 分阶段执行、输出与恢复
+
+```bash
+rl-matdesign hpo run --hpo-config hpo.yaml --out runs/my_hpo --stage ranges
+rl-matdesign hpo run --hpo-config hpo.yaml --out runs/my_hpo --stage search
+```
+
+| `--stage` | 内容 | 前置结果 |
+|---|---|---|
+| `all` | 完整两部分流程，默认值 | 无 |
+| `ranges` | 训练参数范围诊断 | 无 |
+| `search` | 训练预算、参数搜索及复核、生成参数与数量 | `ranges` |
+| `train-budget` | 训练预算校准 | `ranges` |
+| `train-search` | 训练参数联合搜索、复核及预算修订 | `train-budget` |
+| `generation` | 冻结网络的生成参数与数量搜索 | `train-search` |
+
+缺少前置结果时明确报错。主要输出包括 `manifest.json`（生效配置与来源）、`quality_calibration.json`、`ranges.json`、`range_decisions.jsonl`、`stages/*.json`、`frozen_models.json`、`best_training.yaml`、`best_generation.yaml`、`selection.json` 及每个 `jobs/*/` 的配置、候选档案、预算账本和日志。选择 YAML 是摘要，不能直接替代完整场景配置。汇总包括失败和未完成实验已经花费的成本，复用同一作业不重复累计。
 
 ```bash
 rl-matdesign hpo status --out runs/my_hpo
 rl-matdesign hpo resume --out runs/my_hpo
 ```
 
-`resume` 恢复上次请求的阶段范围，并复用契约一致、校验通过的已完成作业。中断作业只有在训练/生成状态、随机状态、候选账本和档案与同步检查点一致时才能继续。硬退出后若账本已经前进但检查点没有同步，命令会拒绝抹掉已花费额度；保留目录用于诊断，不能把重新开始伪装成同一次低成本试验。
+新运行使用空输出目录。恢复仅复用配置、代码、资产与结果校验一致的作业；中断继续还要求检查点、随机状态和候选账本同步，不能抹掉已花费额度。修改配置、模型资产或源码后使用新输出目录。ETA 随真实完整作业耗时更新，包含模型初始化、训练和账本持久化。
 
-本版逐次持久化尝试账本，并保存同步检查点。快速预测器场景中，写盘可能占明显时间；`--out` 适合放在低延迟本地存储。ETA 使用实际作业墙钟时间，包含模型初始化、训练和持久化开销，不能把候选预测时间直接当作完整 HPO 运行时间。后台存储负载变化时估计会随新测量更新。
+历史 `protocol: hpo_v1` YAML 仍由兼容读取器识别并发出提示，保留旧显式目标、归一化和阶段种子语义；它们不是当前推荐接口。六份模板已全部更新，路径保持不变。升级为精简配置会改变协议及评分契约，不能继续使用旧 campaign 目录。[第一版实现计划](hpo_v1_implementation_plan.md) 和历史验证报告描述此前版本，不代替本页。
 
-修改目标、场景、代码、模型资产或 HPO 配置后，应使用新的输出目录。恢复不允许换预算或效率上限，不从其他 campaign 导入旧 RL 优胜权重。生成失败不会解除冻结网络的约束。
+## GlassNet 初次验证与软件 smoke
 
-`INFEASIBLE_NUMERICAL` 表示配置导致的数值失稳；`SYSTEM_ERROR` 表示运行或资产问题，不能当作参数低质量证据。全部配置不合格时返回 `NO_FEASIBLE_CONFIGURATION`；有评价但没有约束可行材料时报告 `NO_FEASIBLE_MATERIAL_EVIDENCE`；预算修订次数耗尽仍变化时报告 `BUDGET_UNRESOLVED`。这些情况保留证据，不强制导出成功结论。
-
-## 三个软件 smoke 与 GlassNet 首次验证
-
-仓库提供三份可以引用现有 dummy 场景的 HPO 配置：
-
-```bash
-rl-matdesign hpo run --hpo-config configs/hpo/v1/dummy_a2c.yaml --out runs/hpo_smoke_a2c
-rl-matdesign hpo run --hpo-config configs/hpo/v1/dummy_dqn_bootstrap.yaml --out runs/hpo_smoke_dqn_bootstrap
-rl-matdesign hpo run --hpo-config configs/hpo/v1/dummy_dqn_mc.yaml --out runs/hpo_smoke_dqn_mc
-```
-
-这三份配置只用于验证软件流程：训练预算为 48、64、96；生成预算为 8、16、32；两个训练 seed、两个全新的验证网络；生成温度为 0、1、100。训练搜索仅两个组合，大多数参数固定为单个候选，范围补点关闭。它们不是参数科学推荐，dummy 的合成预测也不能替代 GlassNet 验证。贪心温度可能因重复而正常被效率门槛拒绝，这不是程序崩溃。
-
-GlassNet 提供 `glassnet_a2c.example.yaml`、`glassnet_dqn_bootstrap.example.yaml`、`glassnet_dqn_mc.example.yaml` 三份独立可编辑的 HPO 模板。它们引用用户给出的 benchmark 场景根目录：
+GlassNet 模板引用用户提供的 benchmark 场景根目录：
 
 ```text
 /aisi/yxliu/rl-matdesign/glasspy/glassnet_benchmark_nodes_20261106/configs/
 ```
 
-| HPO 模板 | 当前 `base_config` 对应的场景 |
-|---|---|
-| `glassnet_a2c.example.yaml` | `coarse/a2c.yaml` |
-| `glassnet_dqn_bootstrap.example.yaml` | `coarse/dqn_boostrap.yaml` |
-| `glassnet_dqn_mc.example.yaml` | `coarse/dqn_mc.yaml` |
+三个模板分别引用 `coarse/a2c.yaml`、`coarse/dqn_bootstrap.yaml`、`coarse/dqn_mc.yaml`。切换 medium/fine 时修改 `base_config`；模型路径、Tg/CTE 条件和设计空间继续由场景负责。场景 reward 必须明确只有一个非零目标，不能仅凭属性名 `T3` 假定它是主目标。
 
-`dqn_boostrap.yaml` 沿用用户提供的拼写，需在实际运行主机核实文件名；HPO 方法名仍是 `dqn-bootstrap`。模板使用完整绝对路径，便于复制到任意位置并另存为自己的 `hpo.yaml`：
+填写 `evaluation.threshold` 后先运行 `validate`、`plan`，再在具有场景和模型资产的主机启动真实实验。模板中的范围、比例、权重、试验数和容差都是可修改的工程初值，尚未证明适合该真实 GlassNet benchmark。
+
+本地软件流程可使用 `configs/hpo/v1/dummy_a2c.yaml`、`dummy_dqn_bootstrap.yaml`、`dummy_dqn_mc.yaml`，例如：
 
 ```bash
-cp configs/hpo/v1/glassnet_a2c.example.yaml hpo.yaml
-# 编辑 hpo.yaml，填写用户确定的 objective.threshold。
-rl-matdesign hpo validate --hpo-config hpo.yaml
-rl-matdesign hpo plan --hpo-config hpo.yaml
-rl-matdesign hpo run --hpo-config hpo.yaml --out runs/glassnet_coarse_a2c_hpo
+rl-matdesign hpo run --hpo-config configs/hpo/v1/dummy_a2c.yaml --out runs/hpo_smoke_a2c
 ```
 
-同一算法从 coarse 切换到 medium 或 large 时，只修改 `base_config` 中的目录，例如：
+dummy 配置使用小范围、小预算验证软件契约；贪心等配置可能因重复而被效率门槛正常拒绝。软件测试通过不代表真实材料目标已达成，也不能代替 GlassNet 验证。
 
-```yaml
-base_config: /aisi/yxliu/rl-matdesign/glasspy/glassnet_benchmark_nodes_20261106/configs/medium/a2c.yaml
-```
-
-模型位置、实际氧化物设计空间及 CTE/Tg 条件全部沿用被引用的 benchmark 场景配置，不搬进 HPO 文件，也不在 HPO 中重新定义。运行目录则使用新的 `--out`，避免跨设计空间复用 campaign 结果。
-
-三份模板有意保留 `objective.threshold: null`。T3 达标线仍由用户确定，程序不会从运行结果临时生成阈值或猜测工业要求。场景文件存在且其他配置有效时，未填写阈值的 `validate` 会返回退出码 2，并显示 `HPO error: objective.threshold must be a finite number`；这是预期的配置提示，不会启动训练或抛出 traceback。若当前主机没有上述场景文件，先明确报告路径不存在。
-
-模板中的搜索范围、预算比例、试验次数和容差是可改的工程初值，尚未通过这套真实 GlassNet benchmark 验证，不应解读为已确定的科学推荐。尚未确定的性质阈值保持待定，不妨碍程序和软件测试先完成。真实 GlassNet HPO 由用户在场景及模型资产所在主机运行。
-
-GlassNet 的命名 T3 输出、T3/Tg 的 K 单位及 CTE 变换由现有场景适配器确认。若 T3 阈值选用 GlassNet 训练标签中位数，应先核实训练数据版本、对应性质列及单位，并把得到的固定值写入 HPO YAML。软件 smoke 通过不代表材料目标已经实现。
+新版完整回归、三个算法的实际流程及恢复验证见 [精简接口验证记录](hpo_v2_validation.md)。

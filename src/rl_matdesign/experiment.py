@@ -65,7 +65,9 @@ from rl_matdesign.training import (
 )
 from rl_matdesign.utils.metrics import RunMetrics
 from rl_matdesign.utils.seeding import set_global_seed, isolated_rng
-from rl_matdesign.utils.execution_contract import execution_contract, require_execution_contract
+from rl_matdesign.utils.execution_contract import (
+    execution_contract, generation_sampling_contract, require_execution_contract,
+)
 from rl_matdesign.utils.timing import PhaseTimer, PredictorTimer
 from rl_matdesign.utils.training_budget import TrainingBudget
 from rl_matdesign.utils.training_samples import TrainingSampleWriter
@@ -336,7 +338,7 @@ def _run_experiment(resources: ExitStack) -> None:
             scaler_path_hpo = args.load_scaler or os.path.join(args.out, "std_scaler.bin")
             env.hpo_generation_contract = {
                 "execution": run_contract,
-                "sampling": {key: cfg[key] for key in ("gen_seed", "gen_temperature", "gen_top_frac", "gen_epsilon", "num_gen_eps", "exploration_gen_eps")},
+                "sampling": generation_sampling_contract(cfg),
                 "frozen_artifacts": {weight_name: sha256_file(weight_path), "std_scaler.bin": sha256_file(scaler_path_hpo)},
             }
             env.hpo_generation_resume = hpo_generation_resume

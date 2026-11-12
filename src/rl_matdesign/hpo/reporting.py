@@ -76,6 +76,10 @@ def export_reports(out: str | Path) -> dict:
             "jobs_with_unknown_total_time": unknown_time_jobs,
         }
     summary = {"selections": selections, "physical_cost": cost,
+               "quality_calibration": read_json(out / "quality_calibration.json")
+                   if (out / "quality_calibration.json").is_file() else None,
+               "generation_pairings": read_json(out / "generation_pairings.json")
+                   if (out / "generation_pairings.json").is_file() else None,
                "design_space_size": space_size,
                "unfinished_jobs_with_cost": unfinished,
                "cost_scope": "Distinct job records; candidate credits are phase-local, not campaign-global novelty"}

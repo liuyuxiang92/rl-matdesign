@@ -22,7 +22,14 @@ def quality(value: float, objective: Mapping) -> float:
         return (t if minimize else v) / (t + v)
     if norm["kind"] != "sigmoid":
         raise ValueError(f"Unknown normalization kind {norm['kind']!r}")
-    z = ((threshold - value) if minimize else (value - threshold)) / norm["scale"]
+    scale = norm["scale"]
+    if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not math.isfinite(scale) or scale <= 0:
+        raise ValueError("Sigmoid quality scale must be calibrated and positive")
+    difference = (threshold - value) if minimize else (value - threshold)
+    # Opposite finite extremes can overflow on subtraction while their scaled
+    # difference is finite. Divide first only in that case.
+    z = difference / scale if math.isfinite(difference) else (
+        (threshold / scale - value / scale) if minimize else (value / scale - threshold / scale))
     if z >= 0:
         return 1.0 / (1.0 + math.exp(-z))
     exp_z = math.exp(z)
@@ -123,6 +130,17 @@ def score_records(records, ledger: Mapping, plan: Mapping, phase: str) -> dict:
                "best_fraction_slots": slots, "best_fraction_filled": len(best_values),
                "unique_evaluated": unique, "attempts_started": attempts, "target_unique": target}
         result["raw_metrics"] = raw
+        if (objective["normalization"].get("calibration") == "reference"
+                and objective["normalization"].get("scale") is None):
+            if result["status"] == "COMPLETED":
+                if unique != target:
+                    result["status"] = "INCOMPLETE"
+                elif Decimal(attempts) >= Decimal(str(efficiency["max_attempts_per_unique"])) * unique:
+                    result["status"] = "INFEASIBLE_EFFICIENCY"
+                else:
+                    result.update(status="QUALITY_CALIBRATION_REQUIRED",
+                                  error="No fixed quality scale is available for this campaign")
+            return result
         normalized = {"qualified_fraction": raw["qualified_fraction"],
                       "best_fraction_quality": quality(mean, objective) * len(best_values) / slots if mean is not None else 0.0,
                       "best_value_quality": quality(best, objective) if best is not None else 0.0,

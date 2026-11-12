@@ -92,7 +92,7 @@ def _system_error(result: Mapping[str, Any]) -> bool:
 
 def _paired_differences(candidate: Mapping[str, Any], reference: Mapping[str, Any]) -> list[float] | None:
     current, baseline = _seeds(candidate), _seeds(reference)
-    if len(current) < 2 or current.keys() != baseline.keys():
+    if not current or current.keys() != baseline.keys():
         return None
     differences = []
     for seed in sorted(current):
@@ -201,11 +201,13 @@ def run_range_search(plan: Mapping[str, Any], evaluate: Callable[..., Mapping[st
     ranges = deepcopy(original)
     options = plan.get("range_search", {})
     seeds = list(options.get("seeds", [11, 29]))
-    confirmation = options.get("confirmation_seed", 47)
+    fixed_repeats = plan.get("protocol") == "hpo_v2"
+    confirmation = None if fixed_repeats else options.get("confirmation_seed", 47)
     maximum_extra = int(options.get("max_extra_values_per_direction", 2))
     improvement = float(options.get("score_improvement", 0.02))
-    if maximum_extra < 0 or improvement < 0 or len(set(seeds)) < 2:
-        raise ValueError("range search requires >=2 unique seeds, nonnegative extra values and improvement")
+    required_repeats = 1 if plan.get("protocol") == "hpo_v2" else 2
+    if maximum_extra < 0 or improvement < 0 or len(set(seeds)) < required_repeats:
+        raise ValueError(f"range search requires >={required_repeats} unique seeds, nonnegative extra values and improvement")
     initial = initial_reference(original)
     reference = dict(initial)
     measurements: dict[tuple[str, tuple[Any, ...]], dict[str, Any]] = {}
@@ -305,13 +307,15 @@ def run_range_search(plan: Mapping[str, Any], evaluate: Callable[..., Mapping[st
             compared = measure(compared["parameters"], shared_seeds)
             decisions.append({"action": "paired_alignment", "parameter_id": result["parameter_id"], "seeds": shared_seeds})
         if _ambiguous(result, compared):
-            if accepts_seeds and confirmation not in seeds:
+            if accepts_seeds and confirmation is not None and confirmation not in seeds:
                 expanded = [*seeds, confirmation]
                 result = measure(result["parameters"], expanded)
                 compared = measure(compared["parameters"], expanded)
                 decisions.append({"action": "paired_confirmation", "parameter_id": result["parameter_id"], "seeds": expanded})
             else:
-                decisions.append({"action": "unresolved", "parameter_id": result["parameter_id"], "reason": "independent confirmation seed unavailable"})
+                reason = ("paired evidence disagrees; retain the configured training.repeats cohort"
+                          if fixed_repeats else "independent confirmation seed unavailable")
+                decisions.append({"action": "unresolved", "parameter_id": result["parameter_id"], "reason": reason})
         return result, compared
 
     for name, initial_spec in original.items():

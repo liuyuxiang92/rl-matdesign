@@ -1,9 +1,10 @@
-"""Strict, YAML-only configuration for the reusable HPO v1 protocol."""
+"""Strict HPO YAML loading, including compatibility for authored v1 files."""
 from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
 import math
+import warnings
 from pathlib import Path
 
 from ..config_schema import ConfigError, load_yaml_config, resolve_config
@@ -231,7 +232,7 @@ def _resolve_asset_paths(value, base_dir, key=None):
     return path(value) if key in _PATH_KEYS else value
 
 
-def load_plan(path: str | Path, method: str | None = None) -> dict:
+def _load_legacy_plan(path: str | Path, method: str | None = None) -> dict:
     """Load, validate and materialize a complete campaign configuration.
 
     No scientific model is loaded and no experiment is run. Authored YAML and
@@ -312,3 +313,22 @@ def load_plan(path: str | Path, method: str | None = None) -> dict:
             "training_search": training_search, "generation_search": generation_search,
             "authored_config": raw,
             "sources": {key: "yaml" if key in raw else "default" for key in allowed}}
+
+
+def load_plan(path: str | Path, method: str | None = None) -> dict:
+    """Read the simplified public schema, while retaining authored v1 files."""
+    path = Path(path).expanduser().resolve()
+    raw = load_yaml_config(path)
+    if isinstance(raw, Mapping) and (raw.get("protocol") == "hpo_v1" or
+            not {"evaluation", "training", "generation", "random_seed"}.intersection(raw)
+            and {"objective", "metrics", "efficiency", "budget", "range_search",
+                 "search_space", "training_search", "generation_search", "parameter_profile"}.intersection(raw)):
+        warnings.warn(
+            "Legacy HPO v1 YAML retains its original scoring and seed settings. "
+            "Migrate to evaluation/training/generation to use inferred scene objectives, "
+            "inclusive thresholds, fixed quality mapping and shared repeat counts.",
+            FutureWarning, stacklevel=2,
+        )
+        return _load_legacy_plan(path, method)
+    from .spec_v2 import load_simplified_plan
+    return load_simplified_plan(path, raw, method)

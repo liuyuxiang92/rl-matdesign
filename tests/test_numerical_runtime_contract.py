@@ -89,6 +89,41 @@ def test_manifest_runtime_propagates_to_execution_contract(tmp_path):
         require_execution_contract(changed, first)
 
 
+@pytest.mark.parametrize('first,second,sampling_matches', [
+    ({}, {'gen_temperature': 1}, True),
+    ({'gen_temperature': 1}, {'gen_epsilon': .2}, False),
+    ({'gen_temperature': 0}, {'gen_epsilon': 0}, False),
+    ({'gen_top_frac': .2}, {'gen_top_frac': .8}, False),
+])
+def test_generation_selection_is_not_part_of_the_oracle_or_learning_contract(
+        tmp_path, first, second, sampling_matches):
+    from rl_matdesign.config_schema import resolve_config
+    from rl_matdesign.utils.execution_contract import generation_sampling_contract
+    from rl_matdesign.utils.generation_resume import restore_generation
+    path = tmp_path / 'manifest.json'
+    path.write_text(json.dumps({'input_files': [], 'runtime': runtime()}))
+    before = resolve_config(first).config
+    after = resolve_config(second).config
+    assert execution_contract(before, SimpleNamespace(), path, 'cpu') == execution_contract(
+        after, SimpleNamespace(), path, 'cpu')
+    sampling_before = generation_sampling_contract(before)
+    sampling_after = generation_sampling_contract(after)
+    assert (sampling_before == sampling_after) == sampling_matches
+    if not sampling_matches:
+        with pytest.raises(ValueError, match='sampling settings'):
+            restore_generation(None, {'generation_contract': {'sampling': sampling_before}},
+                               {'sampling': sampling_after})
+
+
+def test_generation_sampling_contract_ignores_source_provenance():
+    from rl_matdesign.config_schema import resolve_config
+    from rl_matdesign.utils.execution_contract import generation_sampling_contract
+    authored = resolve_config({'gen_epsilon': .2}).config
+    overridden = resolve_config({}, {'gen_epsilon': .2}).config
+    assert authored['generation_selection']['source'] != overridden['generation_selection']['source']
+    assert generation_sampling_contract(authored) == generation_sampling_contract(overridden)
+
+
 @pytest.mark.parametrize('name', ['MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
     'NUMEXPR_NUM_THREADS', 'MKL_CBWR', 'OMP_SCHEDULE', 'OMP_PROC_BIND',
     'OMP_DYNAMIC', 'MKL_DYNAMIC', 'KMP_AFFINITY', 'NVIDIA_TF32_OVERRIDE'])

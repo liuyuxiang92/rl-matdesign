@@ -250,3 +250,49 @@
   - src/rl_matdesign/utils/candidate_records.py
   - src/rl_matdesign/utils/generation_resume.py
   tags: [hpo, sampling-accounting, scientific-evidence]
+- id: decision-hpo-v2-001
+  date: '2026-11-12'
+  expires: '2027-05-12'
+  title: Infer scientific objectives and expose only experiment choices in HPO YAML
+  choice: >-
+    The simplified interface supersedes v1 templates with evaluation, training
+    and generation sections. Infer a single nonzero reward objective through
+    properties[].name and inherit its min/max direction and unit; keep physical
+    constraints in the scene. Require evaluation.threshold and include equality.
+    Fit one sigmoid scale from the first complete, archive-validated reference
+    training job, freeze it for the campaign and verify its provenance on resume.
+    Use one score_tolerance for total-score improvement and plateau decisions.
+    training.repeats controls a fixed exploration cohort and an equally sized
+    disjoint validation cohort; disagreements do not buy hidden confirmation
+    seeds. generation.repeats means sampling repeats per frozen model and controls
+    the full model-by-repeat product; both public phases use the name repeats.
+    Default generation.repeats to 3 per the user's explicit preference; three
+    trained models then produce nine runs for each generation setting/budget.
+    Select the last explicitly authored generation strategy, including zero,
+    and preserve it across config resolution and sorted exports. Phase budgets
+    independently support fractions or absolute unique counts. Keep the budget
+    multiplier/divisor fixed at 2 and both training and generation range extra
+    probes fixed at 2 per direction internally. Each search round admits up to 3 distinct
+    eligible finalists for validation while retaining the comparison panel;
+    keep this limit internal and omit training.validation from public YAML.
+    Reject these fields in simplified user YAML
+    rather than silently ignoring a value that no longer controls execution.
+    Legacy v1 input
+    remains explicitly warned and retains its original scoring semantics.
+  alternatives_considered:
+  - Duplicated HPO objectives and raw predictor-output names can drift from the scene reward.
+  - Per-trial normalization makes scores incomparable across parameters and budgets.
+  - Hidden extra seeds violate the requested single repeat-count control.
+  - Three simultaneous generation controls make the active method ambiguous.
+  trade_off: >-
+    A single threshold cannot represent multiple competing scientific objectives;
+    reject those scenes until their scoring contract is defined. A constant
+    reference exactly at the threshold has no meaningful physical scale and
+    stops with preserved costs instead of inventing one. Reference-derived scale
+    is campaign-specific, not a claim of cross-campaign score comparability.
+  files:
+  - src/rl_matdesign/hpo/spec_v2.py
+  - src/rl_matdesign/hpo/calibration.py
+  - src/rl_matdesign/hpo/controller.py
+  - src/rl_matdesign/config_schema.py
+  tags: [hpo, configuration-contracts, scientific-evidence]

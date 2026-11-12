@@ -170,3 +170,24 @@
   - hpo-budgeting
   - gpu-allocation
   - configuration-merging
+- id: pitfall-config-metadata-contract-001
+  date: '2026-11-12'
+  expires: '2027-02-12'
+  title: Classify resolved configuration metadata by the contract it affects
+  wrong: >-
+    Add generation_selection as a non-PARAMETERS metadata field without auditing
+    execution_contract's scientific configuration allow/exclude rules. Merely
+    changing generation temperature then changes the oracle contract.
+  right: >-
+    Exclude generation selection provenance from scientific evaluation and
+    learning contracts. Include the canonical effective strategy and values in
+    the generation sampling resume contract. Test model reuse across generation
+    methods, zero-valued method selection, sorted YAML reload, and identical
+    effective values supplied through YAML versus CLI overrides.
+  impact: Frozen model loading rejected legitimate generation with evaluation contract differs.
+  files:
+  - src/rl_matdesign/utils/execution_contract.py
+  - src/rl_matdesign/config_schema.py
+  - src/rl_matdesign/experiment.py
+  - tests/test_numerical_runtime_contract.py
+  tags: [configuration-contracts, generation, checkpoint-compatibility]

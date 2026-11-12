@@ -57,11 +57,17 @@ def main(argv=None) -> int:
         minimum = minimum_training_budget(plan, domain)
         grids = {phase: budget_grid(plan, phase, domain.get("size"), minimum if phase == "train" else 1)
                  for phase in ("train", "generation")}
+        budget_preflight = {
+            "minimum_training_unique": minimum,
+            "omitted_training_budgets": sorted(set(budget_grid(plan, "train", domain.get("size"), 1))
+                                               - set(grids["train"])),
+        }
         if args.command == "validate":
             _print({"valid": True, "method": plan["method"], "domain": domain,
-                    "budget_grids": grids, "predictor_evaluated": False})
+                    "budget_grids": grids, "budget_preflight": budget_preflight, "predictor_evaluated": False})
         elif args.command == "plan":
             _print({"resolved_plan": plan, "domain": domain, "budget_grids": grids,
+                    "budget_preflight": budget_preflight,
                     "schedule": {phase: budget_schedule(plan, phase, domain.get("size"), minimum if phase == "train" else 1)
                                  for phase in ("train", "generation")},
                     "stages": ["ranges", "train-budget", "train-search", "generation"],
