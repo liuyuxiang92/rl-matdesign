@@ -69,6 +69,11 @@ def execution_contract(config, predictor, manifest_path, device) -> dict:
                   if key not in PARAMETERS or key in {"eval_seed", "k"}}
     scientific.pop("generated_columns", None)
     scientific.pop("predict_cache_size", None)
+    # This is resolved sampling provenance, not a predictor input. In
+    # particular, choosing another generation policy must not invalidate a
+    # frozen model's oracle contract. Exact generation resume locks the actual
+    # selected policy and values separately in generation_sampling_contract.
+    scientific.pop("generation_selection", None)
     evaluation = {"schema_version": 1, "source_sha256": digest.hexdigest(),
                   "configuration": scientific, "assets": assets,
                   "adapter_identity": describe() if callable(describe) else None,
@@ -88,6 +93,22 @@ def execution_contract(config, predictor, manifest_path, device) -> dict:
     # changes when the policy is updated relative to subsequent sampling.
     learning["checkpoint_frequency"] = manifest.get("runtime_args", {}).get("save_checkpoint_freq", 0)
     return json.loads(json.dumps({"evaluation": evaluation, "learning": learning}, sort_keys=True))
+
+
+def generation_sampling_contract(config) -> dict:
+    """Freeze effective sampling semantics without binding their source spelling.
+
+    The strategy identity remains explicit even when every numeric policy value
+    is zero. The snapshot's YAML/override provenance is deliberately omitted:
+    saving and reloading the same effective policy must remain compatible.
+    """
+    from ..config_schema import selected_generation_parameter
+    return {
+        "parameter": selected_generation_parameter(config),
+        **{key: config[key] for key in (
+            "gen_seed", "gen_temperature", "gen_top_frac", "gen_epsilon",
+            "num_gen_eps", "exploration_gen_eps")},
+    }
 
 
 def _contract_difference_paths(actual, expected, *, limit: int = 8) -> list[str]:

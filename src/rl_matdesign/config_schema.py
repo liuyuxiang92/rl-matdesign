@@ -26,6 +26,12 @@ class ConfigDeprecationWarning(DeprecationWarning):
     """A supported configuration spelling should be migrated."""
 
 
+# Authored order selects one generation policy. These keys are intentionally not
+# sorted: iteration over the source mapping, rather than this tuple, decides.
+GENERATION_PARAMETERS = ("gen_temperature", "gen_top_frac", "gen_epsilon")
+_GENERATION_METADATA = "generation_selection"
+
+
 ALIASES = {
     "buffer_size": "dqn_buffer_size",
     "num_train_eps": "dqn_num_train_eps",
@@ -58,7 +64,16 @@ class _UniqueKeyLoader(yaml.SafeLoader):
                 seen[key] = key_node.start_mark
             except TypeError as exc:
                 raise ConfigError(f"Unhashable YAML key at {key_node.start_mark}") from exc
-        return super().construct_mapping(node, deep=deep)
+        result = super().construct_mapping(node, deep=deep)
+        # SafeLoader flattens merged defaults before explicit entries, but dict
+        # reassignment otherwise retains an inherited key's earlier position.
+        # Move strategy keys on each occurrence so authored overrides remain
+        # later than inherited generation fields.
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in GENERATION_PARAMETERS:
+                result[key] = result.pop(key)
+        return result
 
 
 def _mapping(value: Any, context: str) -> dict:
@@ -222,6 +237,71 @@ _DELEGATED_NAMES = frozenset().union(*DELEGATED_KEYS.values())
 _RESERVED_PREFIXES = ("dqn_", "pg_", "train_", "gen_", "eval_")
 
 
+def _generation_selection(raw: Mapping, source: str = "yaml") -> tuple[str, str]:
+    """Select before defaults, respecting a saved effective-value snapshot.
+
+    Resolved configs contain all three policy fields and may be exported with
+    alphabetically sorted keys. The snapshot preserves their original selection;
+    an explicitly edited field supersedes it, including a newly supplied zero.
+    """
+    authored = [key for key in raw if key in GENERATION_PARAMETERS]
+    for key in authored:
+        PARAMETERS[key].normalize(key, raw[key])
+    if _GENERATION_METADATA not in raw:
+        return (authored[-1], source) if authored else ("gen_temperature", "default")
+
+    metadata = _mapping(raw[_GENERATION_METADATA], _GENERATION_METADATA)
+    if set(metadata) != {"parameter", "values", "source"}:
+        raise ConfigError("generation_selection requires exactly parameter, values and source")
+    selected = metadata["parameter"]
+    if selected not in GENERATION_PARAMETERS:
+        raise ConfigError(f"generation_selection.parameter must be one of {GENERATION_PARAMETERS}")
+    if metadata["source"] not in ("yaml", "override", "default"):
+        raise ConfigError("generation_selection.source must be yaml, override or default")
+    values = _mapping(metadata["values"], "generation_selection.values")
+    if set(values) != set(GENERATION_PARAMETERS):
+        raise ConfigError("generation_selection.values must contain all three generation parameters")
+    values = {key: PARAMETERS[key].normalize(key, values[key]) for key in GENERATION_PARAMETERS}
+    if any(values[key] != 0 for key in GENERATION_PARAMETERS if key != selected):
+        raise ConfigError("generation_selection.values must disable both unselected generation parameters")
+    if not set(GENERATION_PARAMETERS).issubset(raw):
+        raise ConfigError("generation_selection metadata requires all three effective generation fields")
+    changed = [key for key in authored if PARAMETERS[key].normalize(key, raw[key]) != values[key]]
+    return (changed[-1], source) if changed else (selected, metadata["source"])
+
+
+def selected_generation_parameter(raw: Mapping) -> str:
+    """Return the selected canonical generation field without adding defaults.
+
+    In an authored YAML mapping the last explicit generation field wins. A
+    resolved config's selection survives serialization and key sorting. Later
+    value edits are treated as new explicit choices. When no field is authored,
+    the existing temperature default is selected.
+    """
+    return _generation_selection(_mapping(raw, "Configuration"))[0]
+
+
+def with_generation_selection(raw: Mapping, parameter: str) -> dict:
+    """Return an exclusive, persistable selection for a synthesized run config.
+
+    Unlike authored-order discovery, a job builder already knows which policy
+    it intends to run. Its value is taken from ``raw`` (or its normal default),
+    while both inactive values are set to zero before capturing the snapshot.
+    """
+    if parameter not in GENERATION_PARAMETERS:
+        raise ConfigError(f"Generation parameter must be one of {GENERATION_PARAMETERS}")
+    cfg = _mapping(raw, "Configuration")
+    for key in GENERATION_PARAMETERS:
+        cfg[key] = (PARAMETERS[key].normalize(key, cfg.get(key, PARAMETERS[key].default))
+                    if key == parameter else 0.0)
+    cfg[_GENERATION_METADATA] = {
+        "parameter": parameter,
+        "values": {key: cfg[key] for key in GENERATION_PARAMETERS},
+        "source": "override",
+    }
+    return cfg
+
+
 def _has_flat_extension(cfg: Mapping) -> bool:
     # A property-level FQN receives that property's mapping, not the entire run;
     # it therefore does not excuse unknown keys at the experiment top level.
@@ -242,6 +322,7 @@ def validate_config(raw: Mapping) -> None:
     Extension schemas retain authority over their own values and nested keys.
     """
     cfg = _mapping(raw, "Configuration")
+    _generation_selection(cfg)
     for key, value in cfg.items():
         if key in PARAMETERS:
             PARAMETERS[key].normalize(key, value)
@@ -296,7 +377,7 @@ def validate_config(raw: Mapping) -> None:
     if "constraint_filter" in cfg and cfg["constraint_filter"] is not None:
         raise ConfigError("constraint_filter no longer selects a filter; use filters: [{type: ...}].")
     flat_extension = _has_flat_extension(cfg)
-    known = set(PARAMETERS) | set(_DELEGATED_NAMES)
+    known = set(PARAMETERS) | set(_DELEGATED_NAMES) | {_GENERATION_METADATA}
     for key in cfg:
         if key in known:
             continue
@@ -327,9 +408,12 @@ def resolve_config(raw: Mapping, overrides: Mapping | None = None) -> ResolvedCo
     Both DQN and policy-gradient settings remain present regardless of method.
     """
     cfg, sources = _normalize_aliases(raw, "yaml")
+    selected, selection_source = _generation_selection(cfg)
     if overrides is not None:
         explicit = {key: value for key, value in _mapping(overrides, "Overrides").items() if value is not None}
         cli, cli_sources = _normalize_aliases(explicit, "override")
+        if any(key in cli for key in GENERATION_PARAMETERS) or _GENERATION_METADATA in cli:
+            selected, selection_source = _generation_selection(cli, "override")
         cfg.update(cli)
         sources.update(cli_sources)
     validate_config(cfg)
@@ -369,6 +453,18 @@ def resolve_config(raw: Mapping, overrides: Mapping | None = None) -> ResolvedCo
         sources["max_gen_attempts"] = "derived:10*num_gen_eps"
     for key, spec in PARAMETERS.items():
         cfg[key] = spec.normalize(key, cfg[key])
+    # A generation policy is exclusive. Inactive fields cannot reactivate merely
+    # because a default or an earlier authored field has a nonzero value.
+    for key in GENERATION_PARAMETERS:
+        if key != selected:
+            cfg[key] = 0.0
+            sources[key] = f"disabled:selection:{selected}"
+    cfg[_GENERATION_METADATA] = {
+        "parameter": selected,
+        "values": {key: cfg[key] for key in GENERATION_PARAMETERS},
+        "source": selection_source,
+    }
+    sources[_GENERATION_METADATA] = "derived:generation-selection"
     return ResolvedConfig(cfg, sources)
 
 

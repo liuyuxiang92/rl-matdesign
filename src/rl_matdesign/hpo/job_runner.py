@@ -16,6 +16,8 @@ from .artifacts import atomic_json, checkpoint_files, digest, file_digest, read_
 from .scoring import score_records
 from .spec import phase_efficiency
 from .algorithm_profiles import resolve_parameters
+from .calibration import calibrate_quality_scale, restore_quality_scale, QualityCalibrationError
+from ..config_schema import with_generation_selection
 
 
 class JobError(RuntimeError):
@@ -25,6 +27,7 @@ class JobError(RuntimeError):
 class JobRunner:
     def __init__(self, plan: dict, out: str | Path):
         self.plan, self.out = plan, Path(out)
+        restore_quality_scale(self.plan, self.out)
 
     def __call__(self, parameters: dict, budget: int, seed: int, phase: str,
                  model: dict | None = None) -> dict:
@@ -76,7 +79,9 @@ class JobRunner:
 
         train_budget = budget if model is None else model["budget"]
         cfg = copy.deepcopy(self.plan["base_config_data"])
-        training_parameters = {name: value for name, value in parameters.items() if name != "gen_temperature"}
+        generation_parameter = self.plan["generation_search"]["parameter"]
+        training_parameters = {name: value for name, value in parameters.items()
+                               if name not in ("gen_temperature", "gen_epsilon", "gen_top_frac")}
         cfg.update(resolve_parameters(self.plan, training_parameters, train_budget))
         efficiency = phase_efficiency(self.plan, phase)
         cfg.update(hpo_recording=True, hpo_phase=phase, hpo_target_unique=budget,
@@ -85,11 +90,14 @@ class JobRunner:
                    train_max_duplicate_attempts=max(1000, 10 * budget),
                    exploration_gen_eps=0)
         if phase == "generation":
-            cfg.update(num_gen_eps=budget, gen_epsilon=0.0, gen_top_frac=0.0,
-                       gen_temperature=parameters["gen_temperature"],
+            cfg.update(num_gen_eps=budget, gen_epsilon=0.0, gen_top_frac=0.0, gen_temperature=0.0,
                        max_gen_attempts=max(1000, 10 * budget))
+            cfg[generation_parameter] = parameters[generation_parameter]
             if resume:
                 cfg["hpo_resume_generation"] = True
+        # Full runtime configs contain defaults for all three strategies. Carry
+        # the actual selection explicitly so YAML key sorting cannot change it.
+        cfg = with_generation_selection(cfg, generation_parameter)
         config_path = directory / "config.yaml"
         config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
         atomic_json(directory / "job.json", key)
@@ -147,7 +155,16 @@ class JobRunner:
                 records = [json.loads(line) for line in record_path.read_text().splitlines() if line.strip()]
             except json.JSONDecodeError as exc:
                 raise JobError(f"Incomplete record archive preserved at {record_path}: {exc}") from exc
+        calibration_error = None
+        try:
+            if not interrupted and not returncode:
+                calibrate_quality_scale(self.plan, self.out, records, ledger, record_path, job_id, phase)
+        except QualityCalibrationError as exc:
+            calibration_error = str(exc)
         scored = score_records(records, ledger, self.plan, phase)
+        if calibration_error:
+            scored.update(status="QUALITY_CALIBRATION_REQUIRED", eligible_for_selection=False,
+                          score=-1.0, error=calibration_error)
         if interrupted:
             scored.update(status="INTERRUPTED", eligible_for_selection=False, score=-1.0)
         elif returncode and scored.get("status") not in ("INFEASIBLE_EFFICIENCY", "INFEASIBLE_NUMERICAL"):
@@ -164,7 +181,10 @@ class JobRunner:
             if after != input_models:
                 raise JobError("Frozen generation modified its input model or scaler")
         prior_time_unknown = resume and (previous is None or previous.get("wall_seconds") is None)
+        calibration_path = self.out / "quality_calibration.json"
+        calibration_artifacts = [str(calibration_path)] if calibration_path.is_file() else []
         result = {**scored, "job_id": job_id, **key, "parameters": parameters,
+                  "quality_normalization": copy.deepcopy(self.plan["objective"]["normalization"]),
                   "checkpoint_paths": paths, "ledger": ledger, "directory": str(directory),
                   "records_path": str(record_path), "returncode": returncode,
                   "wall_seconds": None if elapsed is None or prior_time_unknown else elapsed + ((previous or {}).get("wall_seconds") or 0),
@@ -173,7 +193,7 @@ class JobRunner:
                   "timing_status": ("unknown_after_parent_interruption" if recover_terminal else
                                     "partial_after_resume" if prior_time_unknown else "measured"),
                   "artifact_hashes": {p: file_digest(p) for p in
-                      [*paths.values(), str(record_path), str(ledger_path)] if Path(p).is_file()}}
+                      [*paths.values(), str(record_path), str(ledger_path), *calibration_artifacts] if Path(p).is_file()}}
         atomic_json(result_path, result)
         atomic_json(directory / "execution.json", {"status": result["status"], "argv": args,
                                                    "returncode": returncode, "wall_seconds": result["wall_seconds"]})

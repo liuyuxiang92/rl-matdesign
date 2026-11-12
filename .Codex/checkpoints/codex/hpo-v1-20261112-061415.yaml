@@ -1,0 +1,87 @@
+checkpoint_version: '3.0.0'
+created_at: '2026-11-12T06:14:15Z'
+updated_at: '2026-11-12T07:36:02Z'
+branch: codex/hpo-v1
+baseline_commit: cf571b2dffb67890ee0b6cf5feb7737ce4316884
+worktree: /Users/liuyuxiang/.codex/worktrees/hpo-v1/rl-matdesign
+phase:
+  current: implementation_complete
+  completed: [simplified_schema, template_migration, generation_selection, fixed_quality_calibration, repeat_controls, full_regression, three_algorithm_campaigns, resume_verification, documentation, reflection]
+  next: [user_glassnet_run]
+state:
+  changes_committed: true
+  source_frozen: true
+  package_digest: 81dd419e6177da9b87d716f3138d110677da21bec8d36effa85c2010bd69b27b
+  parameters:
+  - name: evaluation.threshold
+    value: null
+    source: User defines the scientific threshold; GlassNet examples intentionally leave it unset.
+  - name: evaluation.max_attempts_per_unique
+    value: 1.5
+    source: User-requested configurable strict upper bound, shared across phases.
+  - name: training.repeats
+    value: 3
+    source: Engineering template default; user requested one count controlling all four training steps.
+  - name: generation.repeats
+    value: 1
+    source: Engineering template default; independently configurable sampling count per frozen model.
+  experiments:
+  - name: final_dqn_parity_and_prepush_regression
+    status: completed
+    package_digest: 81dd419e6177da9b87d716f3138d110677da21bec8d36effa85c2010bd69b27b
+    result: 396 passed, 68 warnings in 35.68 seconds; all HPO tests, generation selection, numerical runtime contracts and six-template three-method parity checked.
+    results_path: /private/tmp/rlmat-hpo-prepush-regression.log
+  - name: fixed_top_three_validation
+    status: completed
+    package_digest: 81dd419e6177da9b87d716f3138d110677da21bec8d36effa85c2010bd69b27b
+    result: 110 simplified HPO tests passed, 8 warnings in 7.83 seconds; public validation controls removed, top three distinct eligible finalists selected internally.
+    results_path: /private/tmp/rlmat-hpo-fixed-top-three-regression.log
+  - name: public_generation_repeat_rename
+    status: completed
+    package_digest: d24ed70166475065f63279ef2663434e79629f1d5657a6a8315b8b6682f429a1
+    result: 108 simplified HPO tests passed, 9 warnings in 9.69 seconds; all six templates parsed. Public generation.repeats still means repeats per frozen model.
+    results_path: /private/tmp/rlmat-hpo-generation-repeats-regression.log
+  - name: internal_control_schema_followup
+    status: completed
+    package_digest: d8b3f5748e3a0c36413bd85a92e5ddae6c0b7cf71f11d1973971813639a7a8e6
+    result: 310 HPO tests passed, 69 warnings in 43.73 seconds; all six templates and three dummy plans parsed.
+    results_path: /private/tmp/rlmat-hpo-internal-controls-regression.log
+  - name: final_full_regression
+    status: completed
+    package_digest: 10ea60bf2fbf014e9ba551c0bd13537cd5f0b36b1dd1595eddee9499ad4fe392
+    result: 2208 passed, 5 skipped, 93 warnings in 686.41 seconds
+    results_path: /private/tmp/rlmat-hpo-v2-regression-final.log
+  - name: three_algorithm_complete_campaigns_and_resume
+    status: completed
+    package_digest: 10ea60bf2fbf014e9ba551c0bd13537cd5f0b36b1dd1595eddee9499ad4fe392
+    result: A2C temperature, bootstrap epsilon and MC top fraction completed; cost/artifact hashes and reuse verified.
+    results_path: /private/tmp/rlmat-hpo-v2-smoke-qzamugy6/verification.json
+  - name: initial_development_regression
+    status: failed
+    reason: Generation metadata was incorrectly included in scientific contracts; concurrent source/test edits also invalidated in-flight compatibility checks. Fixed contract classification, froze source, and reran the complete suite successfully.
+    results_path: /private/tmp/rlmat-hpo-v2-regression.log
+  decisions:
+  - decision: Infer one named scientific objective and active generation strategy from the scene; retain only threshold and experiment controls in HPO YAML.
+    rationale: Avoid conflicting duplicate settings and predictor-output-name assumptions.
+  - decision: Freeze a validated reference-derived sigmoid scale and use only total-score tolerance.
+    rationale: Support positive, zero and negative properties without per-trial normalization or extra user tuning fields.
+  - decision: Keep fixed exploration and fresh validation seed cohorts of the same requested size; generate the full model-by-repeat product.
+    rationale: Predictable repeat counts with independent final checks; no hidden confirmation experiment.
+blockers: []
+artifacts:
+- path: docs/hpo_v1.md
+  role: Current interface and field documentation
+- path: docs/hpo_v2_validation.md
+  role: Final software validation and scientific limits
+- path: configs/hpo/v1/glassnet_a2c.example.yaml
+  role: Standalone editable GlassNet A2C HPO template
+- path: configs/hpo/v1/glassnet_dqn_bootstrap.example.yaml
+  role: Standalone editable GlassNet bootstrap template
+- path: configs/hpo/v1/glassnet_dqn_mc.example.yaml
+  role: Standalone editable GlassNet MC template
+resume_instructions: |
+  1. Work only in the isolated codex/hpo-v1 worktree; preserve the original checkout's unrelated changes.
+  2. Read docs/hpo_v1.md and docs/hpo_v2_validation.md; this checkpoint is included in the user-requested simplified HPO commit.
+  3. A2C and both DQN methods share the simplified rules: training range probes and both budget factors fixed internally at 2, public generation.repeats, and validation finalists fixed internally at 3 without training.validation. The final relevant regression passed 396 tests for the current fingerprint; earlier test/campaign records each name their own fingerprint. New source/config changes require new experiment output directories.
+  4. Real GlassNet assets are on the user's host. The user fills evaluation.threshold and runs validate/plan/run from a standalone HPO YAML there.
+  5. User explicitly requested commit then push to origin/codex/hpo-v1. Verify HEAD and the remote branch to determine publication status; no merge was requested.

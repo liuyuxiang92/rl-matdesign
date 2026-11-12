@@ -26,8 +26,10 @@ points, module responsibilities, and regression checks.
 
 The [YAML-driven HPO guide](docs/hpo_v1.md) documents training-range diagnosis,
 joint parameter search, bidirectional budget calibration and frozen-model
-generation-temperature selection. Copy a GlassNet example to your own `hpo.yaml`,
-reference your scene config, and fill its objective threshold before running:
+generation parameter and quantity selection. The scene supplies the target,
+constraints and active generation method; HPO uses one training repeat count and
+one sampling repeat count per frozen model. Copy a GlassNet example to your own
+`hpo.yaml`, reference your scene config, and fill `evaluation.threshold` before running:
 
 ```bash
 rl-matdesign hpo validate --hpo-config hpo.yaml

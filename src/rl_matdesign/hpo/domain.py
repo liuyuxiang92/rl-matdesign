@@ -32,7 +32,9 @@ def design_space_info(plan: dict) -> dict:
                 info.update(status="exact", size=sampler.size, reason=None)
             except ValueError as exc:
                 info["reason"] = str(exc)
-    if plan["budget"]["mode"] == "fraction_of_space" and info["status"] != "exact":
+    fraction_required = any(plan["budget"][phase].get("mode", plan["budget"].get("mode")) == "fraction_of_space"
+                            for phase in ("train", "generation"))
+    if fraction_required and info["status"] != "exact":
         raise ValueError(f"fraction_of_space requires an exact canonical candidate count: {info['reason']}. "
                          "Select budget.mode=absolute_unique for this scenario.")
     return info

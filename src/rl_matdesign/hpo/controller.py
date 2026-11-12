@@ -51,10 +51,15 @@ def rank_results(rows: list[dict], plan: dict) -> list[dict]:
     while pending:
         anchor = max(r["score"] for r in pending)
         band = [r for r in pending if anchor - r["score"] <= plan["budget"]["tolerances"]["score"]]
-        band.sort(key=lambda r: (r["raw_metrics"].get("attempts_per_unique", math.inf),
-                  direction * r["raw_metrics"]["best_fraction_mean"]
-                  if r["raw_metrics"].get("best_fraction_mean") is not None else math.inf,
-                  r["parameter_id"]))
+        if plan.get("protocol") == "hpo_v2" or plan.get("scoring_scope") == "score_only":
+            # Near ties are equivalent under the one public score tolerance.
+            # Never reintroduce component-specific preferences as tie breakers.
+            band.sort(key=lambda r: r["parameter_id"])
+        else:
+            band.sort(key=lambda r: (r["raw_metrics"].get("attempts_per_unique", math.inf),
+                      direction * r["raw_metrics"]["best_fraction_mean"]
+                      if r["raw_metrics"].get("best_fraction_mean") is not None else math.inf,
+                      r["parameter_id"]))
         result.extend(band)
         ids = {id(r) for r in band}
         pending = [r for r in pending if id(r) not in ids]
@@ -87,7 +92,7 @@ class Campaign:
                 raise CampaignError(f"Output directory is nonempty and is not this HPO campaign: {self.out}")
             self.out.mkdir(parents=True, exist_ok=True)
             atomic_json(self.manifest_path, {**contract, "contract_digest": self.contract_digest,
-                        "created_at": datetime.now(timezone.utc).isoformat(), "protocol": "hpo_v1"})
+                        "created_at": datetime.now(timezone.utc).isoformat(), "protocol": plan.get("protocol", "hpo_v1")})
         self.runner = runner or JobRunner(self.plan, self.out)
         self.completed_jobs = 0
         self.known_seconds = []
@@ -104,9 +109,12 @@ class Campaign:
         print(json.dumps(row, ensure_ascii=False, allow_nan=False), flush=True)
         atomic_json(self.out / "progress.json", row)
 
-    def evaluate(self, parameters: dict, budget: int, seeds: list[int], phase="train", models=None):
+    def evaluate(self, parameters: dict, budget: int, seeds: list[int], phase="train", models=None,
+                 pairings=None):
         if models is not None and len(models) != len(seeds):
             raise CampaignError("Each generation seed requires exactly one paired frozen model")
+        if pairings is not None and (models is None or len(pairings) != len(seeds)):
+            raise CampaignError("Generation pairing metadata must match the models and seeds")
         rows = []
         preflight = training_budget_preflight(self.plan, parameters, budget, self.domain) if phase == "train" else None
         if preflight is not None and not preflight["eligible"]:
@@ -125,17 +133,35 @@ class Campaign:
                 self.progress("job", phase=phase, budget=budget, seed=seed,
                               parameter_id=parameter_id(parameters), completed_jobs=self.completed_jobs)
                 row = self.runner(parameters, budget, seed, phase, None if models is None else models[i])
+                if pairings is not None:
+                    # Copy cached results: pairing annotations belong to this
+                    # aggregate, not to the runner's reusable job dictionary.
+                    row = {**row, **pairings[i]}
                 rows.append(row)
                 self.completed_jobs += 1
                 if row.get("wall_seconds") is not None:
                     self.known_seconds.append(row["wall_seconds"])
-                if row.get("status") in ("SYSTEM_ERROR", "INVALID_RECORDS"):
-                    raise CampaignError(f"Job {row.get('job_id', '')} has {row['status']}; inspect {row.get('directory', '')}")
+                if row.get("status") in ("SYSTEM_ERROR", "INVALID_RECORDS", "QUALITY_CALIBRATION_REQUIRED"):
+                    raise CampaignError(f"Job {row.get('job_id', '')} has {row['status']}: "
+                                        f"{row.get('reason') or row.get('error') or 'inspect its preserved records'}; "
+                                        f"inspect {row.get('directory', '')}")
         result = aggregate_results(rows, parameters, budget)
+        if pairings is not None:
+            grouped = {}
+            for row in rows:
+                grouped.setdefault(row["model_index"], []).append(row)
+            result["model_results"] = [
+                {**aggregate_results(group, parameters, budget),
+                 "model_index": model_index, "model_id": group[0]["model_id"],
+                 "training_seed": group[0]["training_seed"]}
+                for model_index, group in sorted(grouped.items())]
+            result["generation_pairings"] = pairings
         if preflight is not None and not preflight["eligible"]:
             result.update(preflight=preflight, reason=preflight["reason"], required_budget=preflight["required_budget"])
-        location = self.out / "measurements" / (digest({"parameters": parameters, "budget": budget,
-                     "seeds": seeds, "phase": phase})[:24] + ".json")
+        measurement_key = {"parameters": parameters, "budget": budget, "seeds": seeds, "phase": phase}
+        if pairings is not None:
+            measurement_key["generation_pairings"] = pairings
+        location = self.out / "measurements" / (digest(measurement_key)[:24] + ".json")
         atomic_json(location, result)
         return result
 
@@ -178,7 +204,7 @@ class Campaign:
                 slow[name] = max(spec["choices"]) if spec["type"] == "categorical" else spec["high"]
         return unique_parameters([reference, *(r["parameters"] for r in ranked[:1]), slow])
 
-    def scan(self, panel, phase, seeds, models=None):
+    def scan(self, panel, phase, seeds, models=None, pairings=None):
         _, schedule = self.grids(phase)
         results = []
         total = len(schedule) * len(panel) * len(seeds)
@@ -188,7 +214,7 @@ class Campaign:
                               remaining_scheduled_jobs=total - len(results) * len(seeds),
                               estimated_remaining_seconds=(statistics.mean(self.known_seconds) *
                                   (total - len(results) * len(seeds))) if self.known_seconds else None)
-                results.append(self.evaluate(parameters, budget, seeds, phase, models))
+                results.append(self.evaluate(parameters, budget, seeds, phase, models, pairings))
         return results
 
     def run_train_budget(self):
@@ -255,7 +281,13 @@ class Campaign:
             startup = settings["startup_random_trials"] if revision == 0 else settings["additional_random_trials"]
             measured = self.train_study(budget, f"revision-{revision}", trials, startup)
             studies.append({"budget": budget, "results": measured})
-            finalists = rank_results(measured, self.plan)[:settings["finalists"]]
+            # TPE may propose an identical configuration more than once,
+            # especially in a small categorical space. A duplicate trial must
+            # not consume another validation slot and exclude a distinct runner-up.
+            distinct_ranked = {}
+            for row in rank_results(measured, self.plan):
+                distinct_ranked.setdefault(row["parameter_id"], row)
+            finalists = list(distinct_ranked.values())[:settings["finalists"]]
             if not finalists:
                 return {"status": "NO_FEASIBLE_CONFIGURATION", "studies": studies}
             panel = unique_parameters([*panel, *(r["parameters"] for r in finalists)])
@@ -266,7 +298,7 @@ class Campaign:
             selected = selection["selected"]
             if selected["budget"] == budget:
                 models = selected["seed_results"]
-                if len(models) != len(self.plan["generation_search"]["paired_seeds"]):
+                if self.plan.get("protocol") != "hpo_v2" and len(models) != len(self.plan["generation_search"]["paired_seeds"]):
                     raise CampaignError("generation paired_seeds must match training validation_seeds count")
                 result = {"status": "COMPLETED", "selection": selection, "studies": studies,
                           "results": validated, "models": models, "budget_revisions": revision}
@@ -280,50 +312,111 @@ class Campaign:
         return {"status": "BUDGET_UNRESOLVED", "selection": selection, "studies": studies,
                 "results": validated, "budget_revisions": settings["max_budget_revisions"]}
 
+    def generation_pairs(self, models):
+        """Build a reproducible model × sampling-repeat experiment, once.
+
+        Pair identities are independent of temperature/epsilon/top-fraction
+        and budget so all settings use the same frozen networks and RNG pairs.
+        """
+        settings = self.plan["generation_search"]
+        if self.plan.get("protocol") != "hpo_v2":
+            return settings["paired_seeds"], models, None
+        repeats = settings["repeats_per_model"]
+        master_seed = settings["master_seed"]
+        seeds, expanded_models, pairings = [], [], []
+        used = set(self.plan["training_search"]["seeds"])
+        used.update(self.plan["training_search"]["validation_seeds"])
+        confirmation = self.plan["range_search"].get("confirmation_seed")
+        if confirmation is not None:
+            used.add(confirmation)
+        for model_index, model in enumerate(models):
+            model_id = model.get("job_id") or digest({
+                "training_seed": model["seed"], "budget": model["budget"],
+                "checkpoint_paths": model.get("checkpoint_paths", {}),
+                "artifact_hashes": model.get("artifact_hashes", {})})[:24]
+            for repeat_index in range(repeats):
+                seed = int(digest({"master_seed": master_seed, "phase": "generation",
+                                  "model_index": model_index, "repeat_index": repeat_index})[:8], 16)
+                while seed in used:
+                    seed = (seed + 1) % (2**32)
+                used.add(seed)
+                seeds.append(seed)
+                expanded_models.append(model)
+                pairings.append({"seed": seed, "model_index": model_index,
+                                 "model_id": model_id, "training_seed": model["seed"],
+                                 "generation_repeat_index": repeat_index})
+        atomic_json(self.out / "generation_pairings.json", pairings)
+        return seeds, expanded_models, pairings
+
+    @staticmethod
+    def generation_extensions(parameter, values):
+        """Return legal next endpoint probes for a selected sampling method."""
+        if parameter == "gen_temperature":
+            positives = [value for value in values if value > 0]
+            if not positives:
+                return []
+            return [("low", positives[0], positives[0] / 10),
+                    ("high", positives[-1], positives[-1] * 10)]
+        if parameter not in {"gen_epsilon", "gen_top_frac"}:
+            raise CampaignError(f"Unsupported generation parameter: {parameter}")
+        # These parameters have exact finite domains; reach the legal boundary
+        # directly rather than inventing an unbounded multiplicative scale.
+        return [("low", values[0], 0.0), ("high", values[-1], 1.0)]
+
     def run_generation(self):
         trained = read_json(self.stage_path("train-search"))
         params = trained["selection"]["selected"]["parameters"]
         models = trained["models"]
         settings = self.plan["generation_search"]
-        temperatures = sorted(set(settings["initial_values"]))
+        parameter = settings.get("parameter", "gen_temperature")
+        values = sorted(set(settings["initial_values"]))
+        seeds, paired_models, pairings = self.generation_pairs(models)
         extensions = {"low": 0, "high": 0}
         results = []
         measured = set()
         while True:
-            added = [t for t in temperatures if t not in measured]
+            added = [value for value in values if value not in measured]
             if added:
-                results += self.scan([{**params, "gen_temperature": t} for t in added],
-                                     "generation", settings["paired_seeds"], models)
+                results += self.scan([{**params, parameter: value} for value in added],
+                                     "generation", seeds, paired_models, pairings)
                 measured.update(added)
-            positives = [t for t in temperatures if t > 0]
             proposed = []
-            if positives:
-                by_budget = {}
-                for row in results:
-                    by_budget.setdefault(row["budget"], []).append(row)
-                winners = [rank_results(rows, self.plan)[0] for rows in by_budget.values()
-                           if rank_results(rows, self.plan)]
-                for direction, endpoint, next_value in (
-                    ("low", positives[0], positives[0] / 10),
-                    ("high", positives[-1], positives[-1] * 10)):
-                    boundary_wins = any(r["parameters"]["gen_temperature"] == endpoint for r in winners)
-                    all_failed = not winners and direction == "high"
-                    if (boundary_wins or all_failed) and extensions[direction] < settings["max_extra_values_per_direction"]:
-                        if math.isfinite(next_value) and next_value > 0:
-                            extensions[direction] += 1
-                            proposed.append(next_value)
+            by_budget = {}
+            for row in results:
+                by_budget.setdefault(row["budget"], []).append(row)
+            winners = [rank_results(rows, self.plan)[0] for rows in by_budget.values()
+                       if rank_results(rows, self.plan)]
+            for direction, endpoint, next_value in self.generation_extensions(parameter, values):
+                boundary_wins = any(row["parameters"][parameter] == endpoint for row in winners)
+                all_failed = not winners and direction == "high"
+                if (boundary_wins or all_failed) and extensions[direction] < settings["max_extra_values_per_direction"]:
+                    if math.isfinite(next_value) and next_value >= 0 and next_value not in measured:
+                        extensions[direction] += 1
+                        proposed.append(next_value)
             if not proposed:
                 break
-            temperatures = sorted(set([*temperatures, *proposed]))
+            values = sorted(set([*values, *proposed]))
         selection = select_budget(results, self.plan, "generation")
         status = "COMPLETED" if selection.get("selected") else selection["convergence_status"]
         if status == "COMPLETED":
             best = selection["selected"]
-            (self.out / "best_generation.yaml").write_text(yaml.safe_dump({
-                "num_gen_eps": best["budget"], "gen_temperature": best["parameters"]["gen_temperature"],
-                "gen_epsilon": 0., "gen_top_frac": 0., "exploration_gen_eps": 0,
-                "convergence_status": selection["convergence_status"]}, sort_keys=False))
-        return {"status": status, "selection": selection, "results": results, "temperatures": temperatures}
+            if self.plan.get("protocol") == "hpo_v2":
+                # A standalone export should express the one selected method,
+                # without exposing implementation-only disabled alternatives.
+                output = {"num_gen_eps": best["budget"], parameter: best["parameters"][parameter],
+                          "convergence_status": selection["convergence_status"]}
+            else:
+                output = {"num_gen_eps": best["budget"], "gen_temperature": best["parameters"]["gen_temperature"],
+                          "gen_epsilon": 0., "gen_top_frac": 0., "exploration_gen_eps": 0,
+                          "convergence_status": selection["convergence_status"]}
+            (self.out / "best_generation.yaml").write_text(yaml.safe_dump(output, sort_keys=False))
+        result = {"status": status, "selection": selection, "results": results,
+                  "parameter": parameter, "parameter_values": values}
+        if parameter == "gen_temperature":
+            result["temperatures"] = values  # Preserve readers of v1 reports.
+        if pairings is not None:
+            result["generation_pairings"] = pairings
+        return result
 
     def run(self, scope="all"):
         if scope not in SCOPES:

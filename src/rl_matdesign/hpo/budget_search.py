@@ -78,7 +78,7 @@ def budget_grid(
     budget, config = _phase_config(plan, phase)
     minimum = max(_integer(minimum_unique, "minimum_unique"), _integer(config.get("min_unique", 1), "min_unique"))
     factor = _decimal(config.get("factor", 2), "factor")
-    mode = budget.get("mode", "fraction_of_space")
+    mode = config.get("mode", budget.get("mode", "fraction_of_space"))
     if space_size is not None:
         space_size = _integer(space_size, "exact space_size")
     if mode == "fraction_of_space":
@@ -120,7 +120,7 @@ def budget_schedule(
     """Initial-nearest budget first, then alternate lower and higher grid points."""
     budgets = budget_grid(plan, phase, space_size, minimum_unique)
     budget, config = _phase_config(plan, phase)
-    if budget.get("mode", "fraction_of_space") == "fraction_of_space":
+    if config.get("mode", budget.get("mode", "fraction_of_space")) == "fraction_of_space":
         initial = int((_decimal(config["initial_fraction"], "initial_fraction") * Decimal(space_size)).to_integral_value(rounding=ROUND_CEILING))
     else:
         initial = int(config["initial_unique"])
@@ -147,6 +147,11 @@ def _parameter_id(result: Mapping[str, Any]) -> str:
 def _tolerances(plan: Mapping[str, Any], phase: str) -> dict[str, float]:
     budget, phase_config = _phase_config(plan, phase)
     configured = {**budget.get("tolerances", {}), **phase_config.get("tolerances", {})}
+    if plan.get("scoring_scope") == "score_only":
+        tolerance = _decimal(configured.get("score", 0.01), "score")
+        if tolerance < 0:
+            raise ValueError("score tolerance must be nonnegative")
+        return {"score": float(tolerance)}
     defaults: dict[str, Any] = {
         "score": 0.01, "qualified_fraction": 0.02, "attempts_per_unique": 0.10,
         "best_fraction_mean": {"kind": "threshold_fraction", "value": 0.005},
@@ -181,8 +186,9 @@ def select_budget(results: Sequence[Mapping[str, Any]], plan: Mapping[str, Any],
     if direction not in {"minimize", "maximize"}:
         raise ValueError("objective.direction must be minimize or maximize")
     objective_sign = 1 if direction == "minimize" else -1
-    metrics = ["qualified_fraction", "best_fraction_mean", "best_value"]
-    if phase == "train":
+    score_only = plan.get("scoring_scope") == "score_only"
+    metrics = [] if score_only else ["qualified_fraction", "best_fraction_mean", "best_value"]
+    if phase == "train" and not score_only:
         metrics.append("attempts_per_unique")
     all_results = [dict(result) for result in results]
     measured_budgets = sorted({int(result["budget"]) for result in all_results if result.get("budget") is not None})
@@ -211,12 +217,14 @@ def select_budget(results: Sequence[Mapping[str, Any]], plan: Mapping[str, Any],
         valid.append(result)
     if not valid:
         return output
-    scientific = [result for result in valid if all(_finite(result.get("raw_metrics", {}).get(key)) for key in ("best_fraction_mean", "best_value"))]
+    scientific = valid if score_only else [result for result in valid if all(_finite(result.get("raw_metrics", {}).get(key)) for key in ("best_fraction_mean", "best_value"))]
     if not scientific:
         output["convergence_status"] = "NO_FEASIBLE_MATERIAL_EVIDENCE"
         return output
 
     def tie_key(result: Mapping[str, Any]) -> tuple[Any, ...]:
+        if score_only:
+            return (int(result["budget"]), _parameter_id(result))
         raw = result["raw_metrics"]
         return (int(result["budget"]), float(raw["attempts_per_unique"]), objective_sign * float(raw["best_fraction_mean"]), _parameter_id(result))
 
