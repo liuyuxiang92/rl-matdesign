@@ -64,3 +64,19 @@ A2C 每个生成设置实际使用 2 个冻结模型 × 2 次采样，共 4 次�
 按用户确认，将六份模板及解析器的 `generation.repeats` 默认值统一为 3。源码摘要为 `6b4f35097748c2f71d560faf874ed8fb7f3146fcfc60c37a3fb3ea351ac1e45b`。全部简化接口测试通过：**121 passed、8 warnings，7.73 秒**，确认三个模型在省略该字段或显式设为 3 时均得到九次生成，显式设为 2 时仍为六次。日志为 `/private/tmp/rlmat-hpo-three-generation-repeats-regression.log`。两份交付的 DQN HPO YAML 与用户最新 coarse 场景进行了临时阈值解析检查，确认继承新 CTE/Tg 约束及温度生成方式；交付文件的科学阈值仍保留 `null`，没有运行真实预测模型。
 
 随后将生成范围每侧额外补测上限也内部固定为 2，从六份模板和两份已交付的 DQN HPO YAML 移除对应字段。源码摘要为 `d36cb3421288539990253b5954d0c6a2dda8cbb231008ab408fc647f17a29981`。全部简化接口测试通过：**123 passed、8 warnings，9.04 秒**，包括三算法固定规则、拒绝旧公开字段及生成模型重复流程。交付文件再次完成临时阈值解析检查，仍保留 `generation.repeats: 3`。日志为 `/private/tmp/rlmat-hpo-internal-generation-probes-regression.log`。
+
+## 可选并行 HPO（2026-11-12）
+
+新增顶层 `parallel_jobs`，默认1；独立参数、预算、种子与生成模型配对共用一个 worker 上限。随机 startup 提案可以批量执行，自适应 TPE 等待前一提案反馈。质量校准及评分按原始请求顺序处理；异常清理只保留待评分结果，恢复时不允许后完成的实验替换参考，也不允许已知失败退出被完成账本覆盖。
+
+冻结包源码摘要：`de0877ab451bccee168e8c8dee02c92eca9a64ba246bc0589a3d766d762286d8`。全部 HPO 测试及生成策略、数值运行契约回归：**454 passed、77 warnings，30.92 秒**。日志：`/private/tmp/rlmat-hpo-parallel-regression.log`。覆盖全局并发上限、组合去重、固定 seed/repeat、Optuna 随机与自适应提案顺序、逐阶段串并行结果一致、失败 seed 淘汰、进程组终止、待评分结果恢复与计时保留。
+
+额外运行三算法真实 worker 子进程，使用小型 dummy 场景：每个算法分别以 parallel_jobs1和3执行3个训练种子、每个冻结模型3次生成，共72个作业。单次训练预算8、生成预算4、A2C准备采样2，仅用于软件验证。三算法的训练与生成分数、原始指标、参数及种子逐项一致；冻结模型哈希未变化；重新读取全部训练及生成任务未新增采样或改变候选档案。
+
+| 算法 | 串行耗时（秒） | 3路并行耗时（秒） | 科学输出对比 |
+|---|---:|---:|---|
+| a2c | 37.98 | 12.94 | 一致 |
+| dqn_mc | 34.22 | 13.05 | 一致 |
+| dqn_bootstrap | 33.91 | 13.25 | 一致 |
+
+以上耗时来自本地 dummy 运行，不代表 GlassNet 或 GPU 加速效果。结果与逐作业日志：`/private/tmp/rlmat-parallel-runtime-sg8ncnnw/verification.json`。第一次临时 smoke 将 A2C warmup设为0，scaler拟合没有样本而失败；修正临时场景为2次准备采样后在全新目录完成验证，未修改生产训练逻辑。

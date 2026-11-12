@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import copy
+from concurrent.futures import CancelledError
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import threading
 import time
 
 import yaml
@@ -28,9 +31,76 @@ class JobRunner:
     def __init__(self, plan: dict, out: str | Path):
         self.plan, self.out = plan, Path(out)
         restore_quality_scale(self.plan, self.out)
+        self._process_lock = threading.Lock()
+        self._cancel_lock = threading.Lock()
+        self._cancelled = threading.Event()
+        self._processes = {}
+        self._job_locks = {}
 
     def __call__(self, parameters: dict, budget: int, seed: int, phase: str,
                  model: dict | None = None) -> dict:
+        return self.finalize(self.execute(parameters, budget, seed, phase, model))
+
+    @staticmethod
+    def _completed_result(path: Path) -> dict | None:
+        previous = read_json(path) if path.exists() else None
+        if previous and previous["status"] not in ("INTERRUPTED", "INCOMPLETE", "SYSTEM_ERROR"):
+            JobRunner._validate_artifacts(previous, "Completed job")
+            return previous
+        return None
+
+    @staticmethod
+    def _validate_artifacts(result, description):
+        for artifact, expected in result.get("artifact_hashes", {}).items():
+            if not Path(artifact).is_file() or file_digest(artifact) != expected:
+                raise JobError(f"{description} artifact changed: {artifact}")
+
+    @staticmethod
+    def _signal_process(process, sig):
+        try:
+            if os.name == "posix":
+                # start_new_session makes this group independent of terminal
+                # SIGINT, including children created by the experiment.
+                os.killpg(process.pid, sig)
+            elif sig == signal.SIGTERM:
+                process.terminate()
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+
+    def cancel_all(self) -> None:
+        """Stop/reap active workers and prevent queued jobs from starting.
+
+        Cancellation is sticky. Resume uses a fresh runner, which validates the
+        preserved ledgers/checkpoints before spending further attempts.
+        """
+        self._cancelled.set()
+        with self._cancel_lock:
+            with self._process_lock:
+                active = list(self._processes.items())
+                for _, cancelled in active:
+                    cancelled.set()
+            # Signal every worker promptly before waiting for any one of them.
+            for process, _ in active:
+                self._signal_process(process, signal.SIGTERM)
+            deadline = time.monotonic() + 10
+            for process, _ in active:
+                try:
+                    process.wait(timeout=max(0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    self._signal_process(process, signal.SIGKILL)
+                    process.wait()
+
+    def execute(self, parameters: dict, budget: int, seed: int, phase: str,
+                model: dict | None = None) -> dict:
+        """Run isolated work, returning a small payload without global scoring.
+
+        The coordinator must call finalize on these payloads in request order.
+        Archives stay on disk rather than accumulating in completed futures.
+        """
+        if self._cancelled.is_set():
+            raise CancelledError("Job runner has been cancelled")
         if phase not in ("train", "generation"):
             raise ValueError(f"Unknown phase {phase}")
         if phase == "generation" and model is None:
@@ -47,17 +117,30 @@ class JobRunner:
                 source = model["checkpoint_paths"][name]
                 if expected_hashes.get(source) != observed:
                     raise JobError(f"Frozen model artifact changed or has no recorded fingerprint: {source}")
-        key = {"parameters": parameters, "budget": budget, "seed": seed,
+        key = {"parameters": copy.deepcopy(parameters), "budget": budget, "seed": seed,
                "phase": phase, "input_models": input_models}
         job_id = digest(key)[:24]
+        with self._process_lock:
+            lock = self._job_locks.setdefault(job_id, threading.Lock())
+        # Duplicate requests must never race on the same ledger/archive.
+        with lock:
+            if self._cancelled.is_set():
+                raise CancelledError("Job runner has been cancelled")
+            return self._execute_job(key, job_id, model)
+
+    def _execute_job(self, key, job_id, model):
+        parameters, budget, seed, phase = (key[name] for name in ("parameters", "budget", "seed", "phase"))
+        # Range search may replace the search space between batches. Snapshot
+        # the current plan for this job without mutating shared campaign state.
+        plan = copy.deepcopy(self.plan)
         directory = self.out / "jobs" / job_id
         result_path = directory / "result.json"
+        completed = self._completed_result(result_path)
+        if completed is not None:
+            return {"cached_result_path": str(result_path)}
         previous = read_json(result_path) if result_path.exists() else None
-        if previous and previous["status"] not in ("INTERRUPTED", "INCOMPLETE", "SYSTEM_ERROR"):
-            for path, expected in previous.get("artifact_hashes", {}).items():
-                if not Path(path).is_file() or file_digest(path) != expected:
-                    raise JobError(f"Completed job artifact changed: {path}")
-            return previous
+        if previous and previous.get("finalization_pending"):
+            self._validate_artifacts(previous, "Preserved job")
         directory.mkdir(parents=True, exist_ok=True)
         ledger_path = directory / "candidate_budget.json"
         resume = False
@@ -66,6 +149,14 @@ class JobRunner:
             old_ledger = read_json(ledger_path)
             recover_terminal = old_ledger.get("status") in {
                 "COMPLETED", "INFEASIBLE_EFFICIENCY", "INFEASIBLE_NUMERICAL"}
+            if recover_terminal and previous and (
+                    previous.get("execution_failure")
+                    or (old_ledger.get("status") == "COMPLETED" and (
+                        previous.get("status") == "SYSTEM_ERROR"
+                        or previous.get("returncode") not in (None, 0)))):
+                raise JobError(f"Job {job_id} has a terminal ledger but its execution failed; "
+                               "the recorded failure and consumed cost cannot be cleared by recovery. "
+                               "Inspect result.json and the preserved worker logs.")
             if not recover_terminal and not old_ledger.get("attempts_started", 0):
                 raise JobError(f"Job {job_id} has initialized accounting artifacts but no consumed attempts; "
                                "inspect the preserved initialization failure before starting a new campaign. "
@@ -78,12 +169,12 @@ class JobRunner:
                 resume = True
 
         train_budget = budget if model is None else model["budget"]
-        cfg = copy.deepcopy(self.plan["base_config_data"])
-        generation_parameter = self.plan["generation_search"]["parameter"]
+        cfg = copy.deepcopy(plan["base_config_data"])
+        generation_parameter = plan["generation_search"]["parameter"]
         training_parameters = {name: value for name, value in parameters.items()
                                if name not in ("gen_temperature", "gen_epsilon", "gen_top_frac")}
-        cfg.update(resolve_parameters(self.plan, training_parameters, train_budget))
-        efficiency = phase_efficiency(self.plan, phase)
+        cfg.update(resolve_parameters(plan, training_parameters, train_budget))
+        efficiency = phase_efficiency(plan, phase)
         cfg.update(hpo_recording=True, hpo_phase=phase, hpo_target_unique=budget,
                    hpo_ratio_limit=efficiency["max_attempts_per_unique"],
                    train_count_duplicates=False,
@@ -121,30 +212,100 @@ class JobRunner:
             environment.setdefault(name, "1")
         started = time.monotonic()
         interrupted = False
+        execution_error = None
         if recover_terminal:
             # A process may finish and persist its ledger before the parent
             # persists result.json. Reconstruct evidence, never buy it twice.
-            returncode = None
-            elapsed = None
+            returncode = (previous or {}).get("returncode")
+            # Cleanup can preserve a measured worker duration before scoring.
+            # Reusing terminal artifacts spends no additional worker time.
+            elapsed = 0.0 if previous is not None and previous.get("wall_seconds") is not None else None
         else:
             atomic_json(directory / "execution.json", {"status": "RUNNING", "argv": args,
                         "started_at": datetime.now(timezone.utc).isoformat(),
                         "resume": resume, "previous": previous})
             with (directory / "stdout.log").open("a") as stdout, (directory / "stderr.log").open("a") as stderr:
-                process = subprocess.Popen(args, cwd=self.plan["base_config_dir"], env=environment,
-                                           stdout=stdout, stderr=stderr)
+                cancelled = threading.Event()
+                # Lock launch+registration against cancel_all's snapshot. Once
+                # cancellation is requested, no late worker can escape it.
+                with self._process_lock:
+                    if self._cancelled.is_set():
+                        raise CancelledError("Job runner has been cancelled")
+                    process = subprocess.Popen(args, cwd=plan["base_config_dir"], env=environment,
+                                               stdout=stdout, stderr=stderr,
+                                               start_new_session=True)
+                    self._processes[process] = cancelled
                 try:
                     returncode = process.wait()
-                except (KeyboardInterrupt, SystemExit):
-                    interrupted = True
-                    process.terminate()
-                    try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
+                except BaseException as exc:
+                    execution_error = exc
+                    self.cancel_all()
                     returncode = process.returncode
+                finally:
+                    with self._process_lock:
+                        interrupted = cancelled.is_set()
+                        self._processes.pop(process, None)
             elapsed = time.monotonic() - started
+        if model:
+            after = {name: file_digest(path) for name, path in model["checkpoint_paths"].items()
+                     if name in key["input_models"]}
+            if after != key["input_models"]:
+                raise JobError("Frozen generation modified its input model or scaler")
+        return {"key": key, "job_id": job_id, "directory": str(directory),
+                "argv": args, "previous": previous, "resume": resume,
+                "recover_terminal": recover_terminal, "elapsed": elapsed,
+                "interrupted": interrupted, "returncode": returncode,
+                "execution_error": execution_error}
+
+    def preserve(self, payload: dict) -> dict:
+        """Persist cleanup evidence without making any scientific decision.
+
+        A later completed worker cannot become the quality reference while an
+        earlier requested job is unresolved. Resume finalizes terminal ledgers
+        in the original request order without rerunning their workers.
+        """
+        if "cached_result_path" in payload:
+            completed = self._completed_result(Path(payload["cached_result_path"]))
+            if completed is None:
+                raise JobError("Completed job result disappeared before preservation")
+            return completed
+        directory = Path(payload["directory"])
+        completed = self._completed_result(directory / "result.json")
+        if completed is not None:
+            return completed
+        ledger_path = directory / "candidate_budget.json"
+        interrupted = payload["interrupted"]
+        ledger = read_json(ledger_path) if ledger_path.exists() else {
+            "status": "INTERRUPTED" if interrupted else "SYSTEM_ERROR",
+            "attempts_started": 0, "unique_evaluated": 0,
+            "target_unique": payload["key"]["budget"]}
+        pending = {"status": "INTERRUPTED" if interrupted else "INCOMPLETE",
+                   "eligible_for_selection": False, "score": -1.0,
+                   "raw_metrics": {}, "normalized_metrics": {},
+                   "finalization_pending": True,
+                   "reason": "Awaiting ordered finalization after batch interruption or failure"}
+        paths = checkpoint_files(directory) if payload["key"]["phase"] == "train" else {}
+        return self._save_result(payload, pending, ledger, paths, include_quality=False)
+
+    def finalize(self, payload: dict) -> dict:
+        """Calibrate, score and persist one payload on the coordinator thread."""
+        if "cached_result_path" in payload:
+            completed = self._completed_result(Path(payload["cached_result_path"]))
+            if completed is None:
+                raise JobError("Completed job result disappeared before finalization")
+            return completed
+        key, job_id = payload["key"], payload["job_id"]
+        budget, phase = key["budget"], key["phase"]
+        directory = Path(payload["directory"])
+        result_path = directory / "result.json"
+        # An identical request may have completed while this payload waited for
+        # its turn; reuse its measured result rather than replacing its timing.
+        completed = self._completed_result(result_path)
+        if completed is not None:
+            return completed
+        ledger_path = directory / "candidate_budget.json"
+        interrupted, returncode = payload["interrupted"], payload["returncode"]
+        execution_error = payload["execution_error"]
         ledger = read_json(ledger_path) if ledger_path.exists() else {
             "status": "INTERRUPTED" if interrupted else "SYSTEM_ERROR",
             "attempts_started": 0, "unique_evaluated": 0, "target_unique": budget}
@@ -157,7 +318,7 @@ class JobRunner:
                 raise JobError(f"Incomplete record archive preserved at {record_path}: {exc}") from exc
         calibration_error = None
         try:
-            if not interrupted and not returncode:
+            if not interrupted and not returncode and execution_error is None:
                 calibrate_quality_scale(self.plan, self.out, records, ledger, record_path, job_id, phase)
         except QualityCalibrationError as exc:
             calibration_error = str(exc)
@@ -165,7 +326,10 @@ class JobRunner:
         if calibration_error:
             scored.update(status="QUALITY_CALIBRATION_REQUIRED", eligible_for_selection=False,
                           score=-1.0, error=calibration_error)
-        if interrupted:
+        if execution_error is not None and not isinstance(execution_error, (KeyboardInterrupt, SystemExit)):
+            scored.update(status="SYSTEM_ERROR", eligible_for_selection=False, score=-1.0,
+                          error=str(execution_error))
+        elif interrupted:
             scored.update(status="INTERRUPTED", eligible_for_selection=False, score=-1.0)
         elif returncode and scored.get("status") not in ("INFEASIBLE_EFFICIENCY", "INFEASIBLE_NUMERICAL"):
             scored.update(status="SYSTEM_ERROR", eligible_for_selection=False, score=-1.0)
@@ -175,28 +339,39 @@ class JobRunner:
             if not required.issubset(paths):
                 scored.update(status="SYSTEM_ERROR", eligible_for_selection=False, score=-1.0,
                               reason="Completed training did not save all required model artifacts")
-        if model:
-            after = {name: file_digest(path) for name, path in model["checkpoint_paths"].items()
-                     if name in input_models}
-            if after != input_models:
-                raise JobError("Frozen generation modified its input model or scaler")
+        result = self._save_result(payload, scored, ledger, paths, include_quality=True)
+        if execution_error is not None:
+            raise execution_error
+        return result
+
+    def _save_result(self, payload, evaluation, ledger, paths, *, include_quality):
+        key, job_id = payload["key"], payload["job_id"]
+        directory = Path(payload["directory"])
+        result_path = directory / "result.json"
+        record_path, ledger_path = directory / "candidate_records.jsonl", directory / "candidate_budget.json"
+        resume, previous = payload["resume"], payload["previous"]
+        elapsed, recover_terminal = payload["elapsed"], payload["recover_terminal"]
+        returncode = payload["returncode"]
         prior_time_unknown = resume and (previous is None or previous.get("wall_seconds") is None)
         calibration_path = self.out / "quality_calibration.json"
-        calibration_artifacts = [str(calibration_path)] if calibration_path.is_file() else []
-        result = {**scored, "job_id": job_id, **key, "parameters": parameters,
-                  "quality_normalization": copy.deepcopy(self.plan["objective"]["normalization"]),
+        calibration_artifacts = [str(calibration_path)] if include_quality and calibration_path.is_file() else []
+        result = {**evaluation, "job_id": job_id, **key,
                   "checkpoint_paths": paths, "ledger": ledger, "directory": str(directory),
                   "records_path": str(record_path), "returncode": returncode,
                   "wall_seconds": None if elapsed is None or prior_time_unknown else elapsed + ((previous or {}).get("wall_seconds") or 0),
                   "current_execution_seconds": elapsed,
                   "recovered_from_terminal_artifacts": recover_terminal,
-                  "timing_status": ("unknown_after_parent_interruption" if recover_terminal else
+                  "timing_status": ("recovered_from_preserved_execution" if recover_terminal and elapsed is not None else
+                                    "unknown_after_parent_interruption" if recover_terminal else
                                     "partial_after_resume" if prior_time_unknown else "measured"),
                   "artifact_hashes": {p: file_digest(p) for p in
                       [*paths.values(), str(record_path), str(ledger_path), *calibration_artifacts] if Path(p).is_file()}}
+        if include_quality:
+            result["quality_normalization"] = copy.deepcopy(self.plan["objective"]["normalization"])
+        if payload.get("execution_error") is not None:
+            error = payload["execution_error"]
+            result["execution_failure"] = {"type": type(error).__name__, "message": str(error)}
         atomic_json(result_path, result)
-        atomic_json(directory / "execution.json", {"status": result["status"], "argv": args,
+        atomic_json(directory / "execution.json", {"status": result["status"], "argv": payload["argv"],
                                                    "returncode": returncode, "wall_seconds": result["wall_seconds"]})
-        if interrupted:
-            raise KeyboardInterrupt
         return result

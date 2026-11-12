@@ -6,6 +6,7 @@
 base_config: ../scenarios/dummy.yaml
 method: dqn-mc
 random_seed: 42
+parallel_jobs: 1  # 1 = serial; >1 caps concurrent worker jobs across all phases.
 evaluation: {threshold: 0.5, best_fraction: 0.1, score_tolerance: 0.05, max_attempts_per_unique: 1.5}
 training:
   repeats: 2
