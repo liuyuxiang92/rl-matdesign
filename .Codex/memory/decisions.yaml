@@ -266,11 +266,13 @@
     disjoint validation cohort; disagreements do not buy hidden confirmation
     seeds. generation.repeats means sampling repeats per frozen model and controls
     the full model-by-repeat product; both public phases use the name repeats.
+    Default generation.repeats to 3 per the user's explicit preference; three
+    trained models then produce nine runs for each generation setting/budget.
     Select the last explicitly authored generation strategy, including zero,
     and preserve it across config resolution and sorted exports. Phase budgets
     independently support fractions or absolute unique counts. Keep the budget
-    multiplier/divisor fixed at 2 and the training range's extra probes fixed
-    at 2 per direction internally. Each search round admits up to 3 distinct
+    multiplier/divisor fixed at 2 and both training and generation range extra
+    probes fixed at 2 per direction internally. Each search round admits up to 3 distinct
     eligible finalists for validation while retaining the comparison panel;
     keep this limit internal and omit training.validation from public YAML.
     Reject these fields in simplified user YAML

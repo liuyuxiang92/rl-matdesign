@@ -58,3 +58,9 @@ A2C 每个生成设置实际使用 2 个冻结模型 × 2 次采样，共 4 次�
 确认 A2C、DQN MC 与 DQN bootstrap 共用简化配置和内部规则，并将默认规则、搜索轮次与六份模板的测试扩展到三种算法。GlassNet 模板解析测试临时引用本地 dummy 场景并填写测试阈值，只验证 HPO 配置，不加载真实 GlassNet 模型。bootstrap 保留独有的目标网络更新间隔搜索；MC 不引入该参数；两者均不优化 `dqn_grad_steps_per_ep`。
 
 冻结源码摘要仍为 `81dd419e6177da9b87d716f3138d110677da21bec8d36effa85c2010bd69b27b`。提交前运行 `tests/test_hpo*.py`、`tests/test_generation_selection.py` 和 `tests/test_numerical_runtime_contract.py`：**396 passed、68 warnings，35.68 秒**。日志为 `/private/tmp/rlmat-hpo-prepush-regression.log`。独立一致性审查未发现两种 DQN 与 A2C 的规则差异；`git diff --check` 通过。
+
+## 每模型三次生成的默认值
+
+按用户确认，将六份模板及解析器的 `generation.repeats` 默认值统一为 3。源码摘要为 `6b4f35097748c2f71d560faf874ed8fb7f3146fcfc60c37a3fb3ea351ac1e45b`。全部简化接口测试通过：**121 passed、8 warnings，7.73 秒**，确认三个模型在省略该字段或显式设为 3 时均得到九次生成，显式设为 2 时仍为六次。日志为 `/private/tmp/rlmat-hpo-three-generation-repeats-regression.log`。两份交付的 DQN HPO YAML 与用户最新 coarse 场景进行了临时阈值解析检查，确认继承新 CTE/Tg 约束及温度生成方式；交付文件的科学阈值仍保留 `null`，没有运行真实预测模型。
+
+随后将生成范围每侧额外补测上限也内部固定为 2，从六份模板和两份已交付的 DQN HPO YAML 移除对应字段。源码摘要为 `d36cb3421288539990253b5954d0c6a2dda8cbb231008ab408fc647f17a29981`。全部简化接口测试通过：**123 passed、8 warnings，9.04 秒**，包括三算法固定规则、拒绝旧公开字段及生成模型重复流程。交付文件再次完成临时阈值解析检查，仍保留 `generation.repeats: 3`。日志为 `/private/tmp/rlmat-hpo-internal-generation-probes-regression.log`。

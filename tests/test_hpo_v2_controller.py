@@ -219,7 +219,7 @@ def test_one_failed_generation_repeat_invalidates_aggregate(tmp_path, campaign_e
     assert result["score"] == -1
 
 
-def public_plan(tmp_path):
+def public_plan(tmp_path, generation_repeats=2):
     (tmp_path / "scenario.yaml").write_text(yaml.safe_dump({
         "pg_warmup_eps": 0, "gen_temperature": 1,
         "properties": [{"name": "working_temperature", "output": "T3",
@@ -227,6 +227,9 @@ def public_plan(tmp_path):
         "reward": {"objective": {"terms": {"working_temperature": 1}}},
     }, sort_keys=False))
     budget = {"mode": "absolute_unique", "min_unique": 4, "initial_unique": 16, "max_unique": 32}
+    generation = {"initial_values": [0, .1, 1], "budget": budget}
+    if generation_repeats is not None:
+        generation["repeats"] = generation_repeats
     source = tmp_path / "hpo.yaml"
     source.write_text(yaml.safe_dump({
         "base_config": "scenario.yaml", "method": "a2c", "random_seed": 42,
@@ -235,14 +238,15 @@ def public_plan(tmp_path):
                      "parameter_ranges": {"pg_batch_eps": {"type": "categorical", "choices": [2, 4]}},
                      "budget": budget,
                      "search": {"max_rounds": 2, "trials_per_round": 2, "startup_random_trials": 1}},
-        "generation": {"repeats": 2, "initial_values": [0, .1, 1],
-                       "max_extra_values_per_direction": 0, "budget": budget},
+        "generation": generation,
     }, sort_keys=False))
     return load_plan(source)
 
 
-def test_public_v2_yaml_runs_all_stages_with_two_repeat_controls(tmp_path, campaign_environment):
-    plan = public_plan(tmp_path)
+@pytest.mark.parametrize("generation_repeats,expected_jobs", [(None, 9), (2, 6), (3, 9)])
+def test_public_v2_yaml_runs_all_stages_with_two_repeat_controls(
+        tmp_path, campaign_environment, generation_repeats, expected_jobs):
+    plan = public_plan(tmp_path, generation_repeats)
     assert plan["protocol"] == "hpo_v2"
     assert plan["objective"]["field"] == "working_temperature"
     assert plan["objective"]["threshold_inclusive"] is True
@@ -257,8 +261,8 @@ def test_public_v2_yaml_runs_all_stages_with_two_repeat_controls(tmp_path, campa
     assert {model["seed"] for model in trained["models"]} == set(validation)
     assert len(trained["models"]) == 3
     generation = read_json(run.stage_path("generation"))
-    assert len(generation["generation_pairings"]) == 6
-    assert all(len(row["seed_results"]) == 6 for row in generation["results"])
+    assert len(generation["generation_pairings"]) == expected_jobs
+    assert all(len(row["seed_results"]) == expected_jobs for row in generation["results"])
     assert set(plan["authored_config"]) == {"base_config", "method", "random_seed", "evaluation", "training", "generation"}
 
 

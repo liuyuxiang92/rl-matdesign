@@ -47,19 +47,18 @@ training:
     max_fraction: 0.01
   search: {max_rounds: 3, trials_per_round: 30, startup_random_trials: 10}
 generation:
-  repeats: 2
+  repeats: 3
   score_weights:
     qualified_fraction: 0.50
     best_fraction_quality: 0.40
     best_value_quality: 0.10
   # initial_values 可省略，按场景选中的采样方式提供初始值。
-  max_extra_values_per_direction: 2
   budget: {mode: absolute_unique, min_unique: 100, initial_unique: 400, max_unique: 1600}
 ```
 
 `parameter_ranges` 覆盖内置算法范围中的同名项。省略某个参数会保留内置范围，不表示固定该参数；要固定支持的参数，可设置 `type: categorical, choices: [固定值]`。`low`、`high` 是范围诊断的初始边界，`choices` 是初始离散选项；有实验证据时可按限制外扩，数值失稳时可内收。正常但低分的区域不会仅凭低分被删除。`dqn_grad_steps_per_ep` 继续使用场景值，不参与搜索。
 
-训练范围诊断内部固定为：每个参数的每一侧最多补测两个新值。用户 YAML 不再包含 `training.range_search`。训练与生成的预算档位也统一使用内部固定倍数 2，不再填写 `budget.factor`。每轮 Optuna 搜索后，内部固定最多选择三个不同且符合条件的候选参数组合参加复核；用户 YAML 不包含 `training.validation`。这些规则在解析后的执行计划中仍会显示，其中入选组合数上限为 3，便于核实实际实验安排；后续需要可调时再扩展用户接口。
+训练范围诊断和生成参数范围搜索均内部固定为：每个参数的每一侧最多补测两个新值。用户 YAML 不再包含 `training.range_search` 或 `generation.max_extra_values_per_direction`。训练与生成的预算档位也统一使用内部固定倍数 2，不再填写 `budget.factor`。每轮 Optuna 搜索后，内部固定最多选择三个不同且符合条件的候选参数组合参加复核；用户 YAML 不包含 `training.validation`。这些规则在解析后的执行计划中仍会显示，其中训练和生成每侧补测上限均为 2，复核入选组合数上限为 3，便于核实实际实验安排；后续需要可调时再扩展用户接口。
 
 ## 目标继承与评分
 
@@ -98,9 +97,9 @@ HPO 只填写 `evaluation.threshold`。最小化使用 `性质值 <= 阈值`，�
 
 当前实现中，`random_seed: 42` 与 `training.repeats: 3` 派生的探索种子为 `[2746317213, 1181241943, 958682846]`，独立验证种子为 `[3163119785, 1812140441, 127978094]`。因此三次重复不是都使用 42；42 决定整组可复现种子。实际组别会写入解析计划的 `seed_schedule`，修改主种子或重复次数后应重新查看计划。
 
-`generation.repeats` 表示“每个冻结模型的生成重复次数”，与训练阶段统一使用 `repeats` 这个字段名。生成阶段已有多个训练种子产生的冻结模型，该字段再控制每个模型使用多少个生成随机种子。区分这两个来源，才能同时观察训练随机性和采样随机性，不会把它误解为整个生成阶段的总实验次数。
+`generation.repeats` 表示“每个冻结模型的生成重复次数”，默认值为 3，与训练阶段统一使用 `repeats` 这个字段名。生成阶段已有多个训练种子产生的冻结模型，该字段再控制每个模型使用多少个生成随机种子。区分这两个来源，才能同时观察训练随机性和采样随机性，不会把它误解为整个生成阶段的总实验次数。
 
-例如 `training.repeats: 3`、`generation.repeats: 2`：最终选定一套训练参数，保留它的三个验证网络；每个“生成参数值 × 生成预算”设置对每个网络采样两次，即 **3 个网络 × 2 次 = 6 次生成实验**，不重新训练网络。每轮搜索后内部最多选入三套不同候选参数参加复核，符合条件的组合不足三套时按实际数量选入；这与 `training.repeats` 独立，每套参数分别按该重复次数训练。所有实际种子及模型配对都写入结果。
+例如 `training.repeats: 3`、`generation.repeats: 3`：最终选定一套训练参数，保留它的三个验证网络；每个“生成参数值 × 生成预算”设置对每个网络采样三次，即 **3 个网络 × 3 次 = 9 次生成实验**，不重新训练网络。每轮搜索后内部最多选入三套不同候选参数参加复核，符合条件的组合不足三套时按实际数量选入；这与 `training.repeats` 独立，每套参数分别按该重复次数训练。所有实际种子及模型配对都写入结果。
 
 ## 训练和生成预算分别设置
 
@@ -132,7 +131,9 @@ gen_temperature: 1.0
 gen_epsilon: 0.1  # 最后出现：使用 epsilon，温度在内部关闭
 ```
 
-HPO 只优化被选中的参数。`generation.initial_values` 是该参数的初始候选值，可省略以使用对应方式的内置值；epsilon 与 top fraction 限于 `[0,1]`，temperature 非负。`generation.max_extra_values_per_direction` 限制边界额外探测。数量来自 `generation.budget`，不会将 `initial_values` 当作生成个数。
+HPO 只优化被选中的参数。`generation.initial_values` 是该参数的初始候选值，可省略以使用对应方式的内置值；epsilon 与 top fraction 限于 `[0,1]`，temperature 非负。数量来自 `generation.budget`，不会将 `initial_values` 当作生成个数。
+
+生成参数范围搜索在初始候选值之外，向较小、较大的方向各最多增加两个生成参数取值；这个上限内部固定为 2，与训练范围诊断一致，不向用户开放。它控制测试哪些参数值，生成预算与每个模型的重复次数仍分别由 `generation.budget` 和 `generation.repeats` 控制。程序先测试初始候选值；某个预算下的最佳结果落在当前取值范围的边界时，才尝试向对应方向扩大范围。温度向下测试最小正温度的十分之一，向上测试最大正温度的十倍。例如初始正温度为 `[0.1, 1, 10]`，若下边界持续最优，可依次补测 `0.01`、`0.001`；若上边界持续最优，可依次补测 `100`、`1000`。每个新取值都按相同预算网格和模型重复规则评价。如果当前所有结果都不符合条件，程序也可在上限内向更大值补测。epsilon 和 top fraction 的范围有限，向外补测直接到合法边界 0 或 1，不会越界。解析后的执行计划仍会显示每侧补测上限 2。
 
 温度 0 是贪心，较小正温度集中于高网络分数动作，较大温度使采样更分散；它不是探索百分比，A2C 与 DQN 的分数尺度也可能不同。epsilon 调节随机动作概率，top fraction 调节保留的高分动作比例。HPO 内部关闭未选中的方式及额外随机生成批次，用户不需要填写三个 `fixed: 0`。
 
@@ -177,7 +178,7 @@ GlassNet 模板引用用户提供的 benchmark 场景根目录：
 /aisi/yxliu/rl-matdesign/glasspy/glassnet_benchmark_nodes_20261106/configs/
 ```
 
-三个模板分别引用 `coarse/a2c.yaml`、`coarse/dqn_boostrap.yaml`、`coarse/dqn_mc.yaml`。`dqn_boostrap.yaml` 沿用提供的拼写，运行前核实真实文件名。切换 medium/large 时修改 `base_config`；模型路径、Tg/CTE 条件和设计空间继续由场景负责。场景 reward 必须明确只有一个非零目标，不能仅凭属性名 `T3` 假定它是主目标。
+三个模板分别引用 `coarse/a2c.yaml`、`coarse/dqn_bootstrap.yaml`、`coarse/dqn_mc.yaml`。切换 medium/fine 时修改 `base_config`；模型路径、Tg/CTE 条件和设计空间继续由场景负责。场景 reward 必须明确只有一个非零目标，不能仅凭属性名 `T3` 假定它是主目标。
 
 填写 `evaluation.threshold` 后先运行 `validate`、`plan`，再在具有场景和模型资产的主机启动真实实验。模板中的范围、比例、权重、试验数和容差都是可修改的工程初值，尚未证明适合该真实 GlassNet benchmark。
 

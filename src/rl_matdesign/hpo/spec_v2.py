@@ -20,6 +20,7 @@ _PUBLIC_KEYS = {"base_config", "method", "random_seed", "evaluation", "training"
 # Fixed protocol rules, intentionally absent from the user-facing YAML schema.
 _BUDGET_FACTOR = 2.0
 _RANGE_MAX_EXTRA_VALUES_PER_DIRECTION = 2
+_GENERATION_MAX_EXTRA_VALUES_PER_DIRECTION = 2
 _VALIDATION_TOP_CONFIGS = 3
 _GENERATION_DEFAULTS = {
     "gen_temperature": [0, .001, .01, .1, 1, 10, 100, 1000],
@@ -128,7 +129,7 @@ def load_simplified_plan(path: Path, value, method=None) -> dict:
     training = _mapping(raw.get("training", {}), "training",
                         {"repeats", "parameter_ranges", "score_weights", "budget", "search"})
     generation = _mapping(raw.get("generation", {}), "generation",
-                          {"repeats", "score_weights", "initial_values", "max_extra_values_per_direction", "budget"})
+                          {"repeats", "score_weights", "initial_values", "budget"})
     repeats = _integer(training.get("repeats", 3), "training.repeats", 1)
     schedule = _seed_schedule(master, repeats)
     profile = get_profile(method)
@@ -179,11 +180,10 @@ def load_simplified_plan(path: Path, value, method=None) -> dict:
         "search_space": space, "extension_choices": profile["extension_choices"],
         "training_search": training_search,
         "generation_search": {"parameter": parameter, "initial_values": sorted(initial_values),
-                              "max_extra_values_per_direction": _integer(generation.get("max_extra_values_per_direction", 2),
-                                                                         "generation.max_extra_values_per_direction"),
+                              "max_extra_values_per_direction": _GENERATION_MAX_EXTRA_VALUES_PER_DIRECTION,
                               "fixed": {key: 0 for key in ("gen_epsilon", "gen_top_frac", "gen_temperature", "exploration_gen_eps")
                                         if key != parameter},
-                              "repeats_per_model": _integer(generation.get("repeats", 1), "generation.repeats", 1),
+                              "repeats_per_model": _integer(generation.get("repeats", 3), "generation.repeats", 1),
                               "master_seed": master},
         "authored_config": deepcopy(raw),
         "sources": {key: "yaml" if key in raw else "default" for key in _PUBLIC_KEYS},

@@ -1,7 +1,7 @@
 # Copy this standalone file to hpo.yaml and fill evaluation.threshold.
 # Target property/direction/unit, CTE/Tg constraints, models and design space
 # are inherited from the scenario; it must declare one nonzero reward objective.
-# For medium/large, change base_config only. Defaults are unvalidated starting values.
+# For medium/fine, change base_config only. Defaults are unvalidated starting values.
 # training.repeats controls all four training stages; validation gets fresh seeds.
 # generation.repeats controls sampling repeats for each frozen model.
 # The last authored gen_temperature/gen_top_frac/gen_epsilon in base_config
@@ -24,7 +24,6 @@ training:
   budget: {mode: fraction_of_space, min_fraction: 1.0e-06, initial_fraction: 0.0001, max_fraction: 0.01}
   search: {max_rounds: 3, trials_per_round: 30, startup_random_trials: 10}
 generation:
-  repeats: 1
+  repeats: 3
   score_weights: {qualified_fraction: 0.5, best_fraction_quality: 0.4, best_value_quality: 0.1}
-  max_extra_values_per_direction: 2
   budget: {mode: fraction_of_space, min_fraction: 1.0e-06, initial_fraction: 0.0001, max_fraction: 0.01}

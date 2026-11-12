@@ -33,13 +33,14 @@ def test_simplified_defaults_inherit_named_property_and_fixed_rules(tmp_path, me
     assert plan['budget']['tolerances'] == {'score': .01}
     assert plan['range_search']['score_improvement'] == .01
     assert plan['range_search']['max_extra_values_per_direction'] == 2
+    assert plan['generation_search']['max_extra_values_per_direction'] == 2
     assert plan['training_search']['finalists'] == 3
     assert plan['budget']['train']['factor'] == plan['budget']['generation']['factor'] == 2
     assert plan['budget']['train']['min_unique'] == 1
     assert plan['efficiency']['comparison'] == 'lt'
     assert plan['efficiency']['max_attempts_per_unique'] == 1.5
     assert plan['generation_search']['parameter'] == 'gen_temperature'
-    assert plan['generation_search']['repeats_per_model'] == 1
+    assert plan['generation_search']['repeats_per_model'] == 3
 
 
 @pytest.mark.parametrize('direction,result', [('min', 'minimize'), ('minimize', 'minimize'),
@@ -181,6 +182,8 @@ def test_default_seed_42_and_three_repeats_have_reproducible_distinct_cohorts(tm
     ({'training': {'budget': {'min_fraction': .5}}}, 'min <= initial'),
     ({'generation': {'paired_seeds': [1]}}, 'Unknown fields'),
     ({'generation': {'fixed': {'gen_epsilon': 0}}}, 'Unknown fields'),
+    ({'generation': {'max_extra_values_per_direction': 0}}, 'Unknown fields.*max_extra_values_per_direction'),
+    ({'generation': {'max_extra_values_per_direction': 2}}, 'Unknown fields.*max_extra_values_per_direction'),
     ({'generation': {'repeats': 0}}, r'generation\.repeats must be an integer >= 1'),
     ({'generation': {'repeats_per_model': 2}}, 'Unknown fields.*repeats_per_model'),
     ({'random_seed': 2**32}, '< 2'),
@@ -233,6 +236,7 @@ def test_templates_resolve_shared_rules_using_dummy_scene(tmp_path, name):
     data = yaml.safe_load((root / 'configs/hpo/v1' / name).read_text())
     assert not {'validation', 'range_search'} & data['training'].keys()
     assert 'repeats_per_model' not in data['generation']
+    assert 'max_extra_values_per_direction' not in data['generation']
     assert all('factor' not in data[phase]['budget'] for phase in ('training', 'generation'))
     # GlassNet assets/threshold belong to the user's host; exercise all actual
     # template controls against a local named scene without pretending to run it.
@@ -246,6 +250,7 @@ def test_templates_resolve_shared_rules_using_dummy_scene(tmp_path, name):
     assert plan['objective']['field'] == 'quality'
     assert plan['generation_search']['parameter'] == 'gen_temperature'
     assert plan['generation_search']['repeats_per_model'] == data['generation']['repeats']
+    assert plan['generation_search']['max_extra_values_per_direction'] == 2
     assert plan['training_search']['finalists'] == 3
     assert plan['range_search']['max_extra_values_per_direction'] == 2
     assert plan['budget']['train']['factor'] == plan['budget']['generation']['factor'] == 2

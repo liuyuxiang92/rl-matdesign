@@ -2838,3 +2838,18 @@ update defect_site.py's docstring, then write the new test file.
 ### EARS — Commit Digest (2026-11-12 15:37)
 <!-- concepts: hpo-configuration, algorithm-parity, worktree-isolation -->
 - The global hook again reported an unrelated generated-CSV commit from the original checkout. This isolated worktree's requested commit contains the reviewed shared HPO configuration, fixed protocol controls, seed/repeat semantics and scene-derived objective/generation selection. A2C and both DQN methods share the same policy while preserving algorithm-specific search dimensions. Relevant regression passed 396 tests; real GlassNet inference remains user-run. Existing memory records the interface and provenance decisions. Verify this worktree's HEAD before retrying a commit reported as failed by the hook; preserve the original checkout.
+
+### 2026-11-12 — Confirm three sampling repeats per frozen model
+<!-- concepts: experimental-repeats, hpo-configuration -->
+- User confirmed generation.repeats should be 3 per frozen model. Updated the shared parser default and all six templates, keeping explicit overrides and Cartesian model-by-repeat semantics. Clarified conditional generation parameter boundary probes separately from budget expansion/repeats. Updated GlassNet template paths to the supplied coarse/medium/fine archive and dqn_bootstrap filename.
+- Simplified HPO regression passed121 tests with8 warnings in7.73 seconds, including omitted/explicit3 producing nine jobs across three models and explicit2 producing six. Delivered standalone hpo_dqn_mc.yaml and hpo_dqn_bootstrap.yaml alongside updated scene artifacts; threshold remains user-owned null. Reflection updated the existing interface decision rather than adding a new pattern. This follow-up is uncommitted; earlier publication e0d67bf2 remains intact.
+
+### 2026-11-12 — Internalize generation boundary probes
+<!-- concepts: hpo-configuration, experimental-repeats -->
+- User requested the generation range extension cap follow training's internal fixed policy. Fixed it at 2 per direction, removed the public field from all six templates and both delivered DQN HPO files, and retained generation.repeats3. Legacy v1 remains unchanged; simplified YAML rejects retired fields rather than silently ignoring user edits.
+- All simplified HPO tests passed: 123 passed, 8 warnings in 9.04 seconds. Both delivered files resolve against the latest scene constraints using a transient test threshold; their delivered threshold remains null. Reflection updates the existing interface decision, with no new pitfall. No commit or push performed for this follow-up.
+
+### 2026-11-12 — Publish generation settings correction
+<!-- concepts: experimental-repeats, hpo-configuration, worktree-isolation -->
+- User explicitly requested commit then push. Reviewed all 14 changed files and verified the tested source fingerprint d36cb3421288539990253b5954d0c6a2dda8cbb231008ab408fc647f17a29981 is unchanged since 123 passing tests. Independent parity review found no blockers; remote codex/hpo-v1 still points to the preceding e0d67bf2 publication. Commit the shared three-repeat default, internal two-probe generation limit, six templates, documentation and regression evidence; preserve original-checkout artifacts and unrelated work.
+- Pre-commit reflection: the existing interface decision already captures both changes, so there is no additional pitfall or pattern. The global commit hook may report the original checkout's unrelated commit; verify the isolated worktree HEAD instead of retrying blindly. No merge or real GlassNet run is part of this publication.

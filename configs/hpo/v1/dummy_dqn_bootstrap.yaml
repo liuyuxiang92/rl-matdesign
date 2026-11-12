@@ -32,8 +32,7 @@ training:
   budget: {mode: absolute_unique, min_unique: 48, initial_unique: 64, max_unique: 96}
   search: {max_rounds: 2, trials_per_round: 2, startup_random_trials: 1}
 generation:
-  repeats: 1
+  repeats: 3
   score_weights: {qualified_fraction: 0.5, best_fraction_quality: 0.4, best_value_quality: 0.1}
-  max_extra_values_per_direction: 0
   budget: {mode: absolute_unique, min_unique: 8, initial_unique: 16, max_unique: 32}
   initial_values: [0, 1, 100]

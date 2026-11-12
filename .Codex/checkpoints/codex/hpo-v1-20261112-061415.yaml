@@ -1,6 +1,6 @@
 checkpoint_version: '3.0.0'
 created_at: '2026-11-12T06:14:15Z'
-updated_at: '2026-11-12T07:36:02Z'
+updated_at: '2026-11-12T08:02:58Z'
 branch: codex/hpo-v1
 baseline_commit: cf571b2dffb67890ee0b6cf5feb7737ce4316884
 worktree: /Users/liuyuxiang/.codex/worktrees/hpo-v1/rl-matdesign
@@ -10,8 +10,9 @@ phase:
   next: [user_glassnet_run]
 state:
   changes_committed: true
+  previous_published_commit: e0d67bf22cb1349dc2e32110637ccb208b29618b
   source_frozen: true
-  package_digest: 81dd419e6177da9b87d716f3138d110677da21bec8d36effa85c2010bd69b27b
+  package_digest: d36cb3421288539990253b5954d0c6a2dda8cbb231008ab408fc647f17a29981
   parameters:
   - name: evaluation.threshold
     value: null
@@ -23,9 +24,19 @@ state:
     value: 3
     source: Engineering template default; user requested one count controlling all four training steps.
   - name: generation.repeats
-    value: 1
-    source: Engineering template default; independently configurable sampling count per frozen model.
+    value: 3
+    source: User explicitly requested three sampling repetitions per frozen model; also the parser default.
   experiments:
+  - name: internal_generation_range_probes
+    status: completed
+    package_digest: d36cb3421288539990253b5954d0c6a2dda8cbb231008ab408fc647f17a29981
+    result: 123 simplified HPO tests passed, 8 warnings in 9.04 seconds; six templates and two delivered DQN YAMLs omit the public expansion control and resolve to2 internally with generation.repeats3.
+    results_path: /private/tmp/rlmat-hpo-internal-generation-probes-regression.log
+  - name: three_generation_repeats_default
+    status: completed
+    package_digest: 6b4f35097748c2f71d560faf874ed8fb7f3146fcfc60c37a3fb3ea351ac1e45b
+    result: 121 simplified HPO tests passed, 8 warnings in 7.73 seconds; omitted and explicit generation.repeats3 both yield nine jobs for three models, explicit2 still yields six.
+    results_path: /private/tmp/rlmat-hpo-three-generation-repeats-regression.log
   - name: final_dqn_parity_and_prepush_regression
     status: completed
     package_digest: 81dd419e6177da9b87d716f3138d110677da21bec8d36effa85c2010bd69b27b
@@ -81,7 +92,7 @@ artifacts:
   role: Standalone editable GlassNet MC template
 resume_instructions: |
   1. Work only in the isolated codex/hpo-v1 worktree; preserve the original checkout's unrelated changes.
-  2. Read docs/hpo_v1.md and docs/hpo_v2_validation.md; this checkpoint is included in the user-requested simplified HPO commit.
-  3. A2C and both DQN methods share the simplified rules: training range probes and both budget factors fixed internally at 2, public generation.repeats, and validation finalists fixed internally at 3 without training.validation. The final relevant regression passed 396 tests for the current fingerprint; earlier test/campaign records each name their own fingerprint. New source/config changes require new experiment output directories.
+  2. Read docs/hpo_v1.md and docs/hpo_v2_validation.md. Shared simplification was published in e0d67bf2; this user-requested follow-up commit contains generation.repeats default3, internal generation boundary probes2, and template-path corrections.
+  3. All three methods default generation.repeats to3 per frozen model and fix generation boundary probes internally at2 per direction. The current fingerprint passed123 simplified HPO tests; earlier test/campaign records each name their own fingerprint. New source/config changes require new experiment output directories.
   4. Real GlassNet assets are on the user's host. The user fills evaluation.threshold and runs validate/plan/run from a standalone HPO YAML there.
-  5. User explicitly requested commit then push to origin/codex/hpo-v1. Verify HEAD and the remote branch to determine publication status; no merge was requested.
+  5. User explicitly requested committing and pushing this follow-up to origin/codex/hpo-v1. Verify HEAD and remote for publication status. Two standalone DQN HPO YAMLs were delivered beside the updated scene configs in the original checkout's artifacts/glassnet_constraints_20261112_w36uwt6o directory. No merge requested.
