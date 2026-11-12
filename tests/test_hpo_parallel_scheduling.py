@@ -1,5 +1,5 @@
 """Concurrent execution must preserve ordered scoring and stop owned work."""
-from threading import Event, Lock, get_ident
+from threading import Barrier, Event, Lock, get_ident
 
 import pytest
 
@@ -178,3 +178,30 @@ def test_failed_reference_cannot_be_replaced_by_cleanup_of_later_job(tmp_path, m
     assert not pending["eligible_for_selection"]
     assert pending["ledger"]["unique_evaluated"] == 8
     assert pending.get("quality_normalization", {}).get("scale") is None
+
+
+@pytest.mark.parametrize("job_count", [0, 1, 3])
+def test_parallel_limit_larger_than_ready_jobs_does_not_wait_or_pad(job_count):
+    ready = Barrier(max(job_count, 1), timeout=5)
+    lock = Lock()
+
+    class Runner:
+        active = peak = 0
+
+        def execute(self, index):
+            with lock:
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+            try:
+                ready.wait()
+                return index
+            finally:
+                with lock:
+                    self.active -= 1
+
+    runner = Runner()
+    indices = list(range(job_count))
+    rows = run_jobs([{"index": index} for index in indices], runner, 10, **callbacks())
+    assert rows == indices
+    assert runner.peak == job_count
+    assert runner.active == 0
