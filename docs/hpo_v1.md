@@ -218,7 +218,7 @@ rl-matdesign hpo restart --out ./runs/a2c_coarse
 python /path/to/rl-matdesign/scripts/diagnose_hpo_restart.py --out ./runs/a2c_coarse
 ```
 
-脚本输出实际包路径、旧/新源码指纹、是否登记兼容，以及具体变化字段。它不创建 campaign、不启动 worker、不加载模型张量、不修改实验目录。`campaign_contract_accepted` 仅表示外层契约可以通过，不代表内部断点已同步，之后仍需 `restart --check-only`。输出中的 `configuration_sources` 还会检查原 YAML 的字节指纹；注释变化也会被记录。诊断失败时保留原文件并根据差异定位原因，不改写 manifest 哈希或跳过校验。脚本位于 `scripts/`，新增它不会改变已登记的包源码指纹。
+脚本输出实际包路径、旧/新源码指纹、是否登记兼容，以及具体变化字段。若源码指纹未登记，`source_evidence` 还列出当前 Git 提交、已修改/缺失的 Python 文件和额外 Python 文件（包括被 Git 忽略的备份），并从最多 12 份旧调用记录读取历史提交。`committed_tree_plus_current_extra_files_matches_saved_digest` 只是“旧提交加上当前额外文件是否能重现旧哈希”的验证结果，不表示这些文件无害或可以自动恢复。它不创建 campaign、不启动 worker、不加载模型张量、不修改实验目录。`campaign_contract_accepted` 仅表示外层契约可以通过，不代表内部断点已同步，之后仍需 `restart --check-only`。输出中的 `configuration_sources` 还会检查原 YAML 的字节指纹；注释变化也会被记录。诊断失败时保留原文件并根据差异定位原因，不改写 manifest 哈希或跳过校验。脚本位于 `scripts/`，新增它不会改变已登记的包源码指纹。
 
 `restart` 按 `state.json` 保存的阶段继续，不从头创建 HPO；原 `resume` 命令同样支持这套机制。检查在启动任何 worker 前读取所有已有任务，输出以下分类：
 
