@@ -1,0 +1,76 @@
+checkpoint_version: 3.0.0
+created_at: '2026-11-13T05:44:30.100415+00:00'
+branch: codex/hpo-v1
+phase:
+  current: validated_generation_repair_awaiting_server
+  completed:
+  - read_server_cp6_ledger7_damaged_tmp_evidence
+  - bounded_policy_replay_implementation
+  - atomic_evidence_backup
+  - independent_review
+  - three_real_algorithm_fault_resume_tests
+  - regression_179
+  - reflect
+  next:
+  - commit_push_repair
+  - user_applies_repair_in_original_cuda_environment
+  - normal_check_only_then_parallel_restart
+state:
+  parameters:
+  - name: blocked_generation_job
+    value: dd2b3a16877e54f40cdc52f3
+    source: user single-job diagnostic attachment e862096e-fa7b-455c-8c6a-3f5d726283c5
+    confidence: high
+  - name: checkpoint_unique
+    value: 6
+    source: same diagnostic
+    confidence: high
+  - name: paid_unique
+    value: 7
+    source: same diagnostic
+    confidence: high
+  - name: generation_target
+    value: 115
+    source: same diagnostic
+    confidence: high
+  experiments:
+  - name: new_repair_and_io
+    status: completed
+    result: 41 passed in45.03s; three algorithms actual ENOSPC fault with exact cp7
+      and continued sequence comparisons
+  - name: existing_restart_compatibility_diagnostics
+    status: completed
+    result: 138 passed in36.81s
+    results_path: /private/tmp/rlmat-generation-repair-regression.log
+  - name: fresh_process_readonly_cli
+    status: completed
+    result: from6to7, ready_to_apply true, predictor_evaluations0
+    results_path: /private/tmp/rlmat-generation-repair-cli.json
+  decisions:
+  - decision: Reconstruct exactly one proven scalar generation episode using the recorded
+      terminal reward
+    rationale: Frozen policy and isolated oracle RNG allow replay without new property
+      costs; prefix caches and exact candidate are validated first
+  - decision: Keep standalone scripts outside production src and preserve all paid
+      accounting
+    rationale: Existing reviewed source upgrade identities and original scientific
+      evidence remain valid
+  production_source_digest: f46e85e2ade8649a7daf97bd1e5b589de4ce21f43d0e85359593aa847636af7c
+blockers:
+- question: Does the exact server GlassNet/CUDA run pass local replay checks?
+  impact: Actual server checkpoint has not been modified or directly accessed
+  assumption: User runs script in original rl-glassnet environment after updating
+    repo
+artifacts:
+- path: scripts/repair_hpo_generation.py
+  role: bounded recovery CLI
+- path: scripts/hpo_generation_repair_io.py
+  role: evidence guard and atomic backup transaction
+- path: docs/hpo_v1.md
+  role: recovery commands and limitations
+resume_instructions: Verify branch HEAD and push status before retrying publication.
+  Server source /aisi/yxliu/code/test_rl_material/oxyhydroxide-catalyst-gen; run its
+  scripts/repair_hpo_generation.py --out ./runs/a2c_coarse --job-id dd2b3a16877e54f40cdc52f3
+  --apply with stopped workers and free backup space. Then normal restart --parallel-jobs
+  10 --check-only, followed by restart if ready. Never reset ledger, promote damaged
+  tmp, edit YAML/source hashes, or claim server was already repaired.

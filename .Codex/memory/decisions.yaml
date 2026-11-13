@@ -357,3 +357,29 @@
     src/rl_matdesign/utils/hpo_resume_compatibility.py,
     src/rl_matdesign/utils/hpo_resume_compatibility.json]
   tags: [hpo, recovery, concurrency, provenance]
+
+
+- id: decision-hpo-single-observation-generation-repair-001
+  date: '2026-11-13'
+  expires: '2027-05-13'
+  title: Repair a narrowly proven generation state gap without buying an observation twice
+  choice: >-
+    Keep repair in standalone scripts outside the frozen source compatibility tree.
+    For exactly one scalar unique successful observation beyond a verified nonempty
+    generation prefix, reconstruct saved scientific caches and predictor accounting,
+    restore RNG and replay the fixed policy with the recorded reward instead of an
+    oracle call. Require exact runtime, assets and candidate identity before writing.
+    Preserve original evidence in a fsynced transaction, recheck model/config hashes
+    immediately before atomic replacement, and make interrupted apply detectable.
+  alternatives_considered:
+  - Resetting the ledger or discarding candidate 7 would conceal already paid cost.
+  - Re-evaluating GlassNet would spend new cost and change stochastic scientific evidence.
+  - Promoting the 128-byte damaged temporary file would destroy the last valid checkpoint.
+  - General training recovery would require proof of missing optimizer updates and is out of scope.
+  trade_off: >-
+    Deliberately rejects unknown predictor/filter state, batch evaluation, duplicates,
+    pending requests and larger gaps. Real GlassNet/CUDA recovery must validate in
+    the original numerical environment; CPU dummy tests prove the software path only.
+  files: [scripts/repair_hpo_generation.py, scripts/hpo_generation_repair_io.py,
+    tests/test_hpo_generation_repair.py, tests/test_hpo_generation_repair_io.py]
+  tags: [hpo, recovery, rng-replay, paid-accounting]

@@ -272,3 +272,28 @@ rl-matdesign hpo run --hpo-config configs/hpo/v1/dummy_a2c.yaml --out runs/hpo_s
 dummy 配置使用小范围、小预算验证软件契约；贪心等配置可能因重复而被效率门槛正常拒绝。软件测试通过不代表真实材料目标已达成，也不能代替 GlassNet 验证。
 
 新版完整回归、三个算法的实际流程及恢复验证见 [精简接口验证记录](hpo_v2_validation.md)。
+
+
+对于已确认的特定写盘失败，还提供独立的单步恢复工具：完整生成 checkpoint 恰好落后一个已成功记录的唯一候选，全部采样都是成功且不重复的标量评估，没有失败、准备或待完成请求。当前仅审核了平坦 CompositionEnv、内置 GlassNet/dummy 的纯组成性质、无额外 filters，以及 A2C/DQN 的纯 gen_temperature 采样。该工具不适用于训练更新丢失、批量生成、任意自定义预测器或任意数量的不同步记录。
+
+先停止该 campaign 的所有控制器/worker，并确保磁盘能保存该单个作业的证据备份与新断点。使用原 CLI 的 Python 环境、设备和依赖版本：
+
+```bash
+# 默认只验证，不修改 campaign；重放一次策略选材，但禁止任何性质模型评估。
+python /path/to/rl-matdesign/scripts/repair_hpo_generation.py \
+  --out /path/to/hpo_output --job-id BLOCKED_JOB_ID
+
+# 同样执行全部验证，成功后备份原文件并原子替换生成断点。
+python /path/to/rl-matdesign/scripts/repair_hpo_generation.py \
+  --out /path/to/hpo_output --job-id BLOCKED_JOB_ID --apply
+
+# 修复通过后，仍走标准预检与恢复流程。
+rl-matdesign hpo restart --out /path/to/hpo_output --parallel-jobs 10 --check-only
+rl-matdesign hpo restart --out /path/to/hpo_output --parallel-jobs 10
+```
+
+工具先验证原 campaign、运行环境、冻结模型、输入资产、候选记录的精确前缀和成本记录，用前缀观测重建缓存并与原断点逐项比较。随后恢复原 RNG，仅执行一次策略选材；必须与已保存候选的输入、规范身份和公式完全一致，终点奖励直接取自已有评估记录。这样补齐 RNG、结果缓存和已记录的预测成本，不重新运行 GlassNet、不减少或新增已付费采样数，也不把修复耗时记作原预测耗时。
+
+`--apply` 在 `jobs/<id>/.hpo-generation-repair/<transaction>/original/` 保存该作业原有文件，在 receipt 中记录新旧指纹和验证结果；写入前再次验证全部作业及外部输入。只替换 `generation_checkpoint.pt`，原账本、候选档案、错误日志、损坏临时文件和冻结网络均保留。断点记录已有的完整付费计数，正常 restart 再继续剩余额度。若替换时意外退出，可在继续运行 worker 前重跑同一修复命令识别已完成的事务。任何契约、前缀或重放不一致都会拒绝修复，不自动回退预算或从头训练。
+
+软件测试使用 A2C、DQN MC、DQN bootstrap 的真实 CPU worker 和内置 dummy 性质模型，在第 7 次 checkpoint 写入注入磁盘满错误；验证修复结果与正常应写出的状态及后续候选序列一致。真实 GlassNet/CUDA 是否通过这些条件，由服务器上的验证决定。

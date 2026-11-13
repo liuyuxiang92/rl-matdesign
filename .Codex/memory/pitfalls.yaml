@@ -241,6 +241,13 @@
     failure does not imply lost trained weights. Unique-success archives alone cannot
     reconstruct duplicate, failed or pending attempts. Readable temporary checkpoints
     are evidence for further validation, not permission for automatic replacement.
+    The audited single-observation exception is scripts/repair_hpo_generation.py;
+    require an exact nonempty prefix, one scalar unique success beyond it, frozen
+    temperature policy, matching runtime/assets and reproducible prefix caches.
+    Replay only policy actions after restoring RNG; reuse the durable reward,
+    forbid all property evaluation, and require exact candidate/input/formula.
+    Back up all job evidence and atomically replace only the generation checkpoint;
+    preserve ledger, paid counts, original timing, failure logs and damaged tmp.
   impact: GPU HPO jobs can all fail from shared-disk exhaustion; a surviving previous
     checkpoint is not sufficient for exact resume if paid accounting has advanced.
   files: [src/rl_matdesign/training.py, src/rl_matdesign/hpo/job_runner.py,
