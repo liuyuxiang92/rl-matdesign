@@ -224,3 +224,22 @@ def test_malformed_provenance_stays_a_source_diagnostic_error(source_repo, tmp_p
     report = diagnose.source_evidence(root, out, "unknown")
     assert report["available"]
     assert "Invalid provenance" in report["inspection_error"]
+
+
+def test_diagnostic_reports_reviewed_implicit_serial_migration(campaign, monkeypatch):
+    out, current, manifest, _ = campaign
+    current["plan"].update(parallel_jobs=1, sources={"parallel_jobs": "default"}, authored_config={})
+    saved = artifacts.read_json(manifest)
+    saved["plan"] = copy.deepcopy(current["plan"])
+    saved["plan"].pop("parallel_jobs")
+    saved["plan"]["sources"].pop("parallel_jobs")
+    saved["software_digest"] = "a" * 64
+    saved["contract_digest"] = artifacts.digest({k: saved[k] for k in diagnose.CONTRACT_KEYS})
+    artifacts.atomic_json(manifest, saved)
+    monkeypatch.setattr(compatibility, "approved_upgrade", lambda *a: {"id": "audited-serial"})
+    report = diagnose.inspect_campaign(out)
+    assert report["campaign_contract_accepted"]
+    assert report["normalizable_plan_defaults"] == ["plan.parallel_jobs", "plan.sources.parallel_jobs"]
+    monkeypatch.setattr(compatibility, "approved_upgrade", lambda *a: None)
+    report = diagnose.inspect_campaign(out)
+    assert not report["campaign_contract_accepted"]

@@ -331,3 +331,29 @@
     src/rl_matdesign/hpo/cli.py, src/rl_matdesign/utils/hpo_resume_compatibility.py,
     src/rl_matdesign/utils/hpo_resume_compatibility.json]
   tags: [hpo, checkpoint-compatibility, scientific-evidence]
+
+- id: decision-hpo-restart-runtime-concurrency-001
+  date: '2026-11-13'
+  expires: '2027-05-13'
+  title: Separate recovery concurrency from immutable scientific plans
+  choice: >-
+    restart/resume --parallel-jobs changes only Campaign.parallel_jobs after
+    original contract validation and before execution. Record runtime settings
+    separately after successful job preflight; omit the flag to restore original
+    YAML/default concurrency. Normalize only jointly absent legacy parallel_jobs
+    and its sources entry to exact1/default for reviewed source upgrades.
+    Keep original manifests, plans, job IDs, seeds and per-job budgets unchanged.
+  alternatives_considered:
+  - Editing the original HPO YAML would invalidate its archived fingerprint.
+  - Removing all concurrency fields from contract checks would accept authored configuration changes.
+  - Ignoring extra Python files would hide potentially active custom predictor changes.
+  trade_off: >-
+    Exact compatibility must cover every worker version used in an interrupted
+    campaign. The six audited legacy predictor files form a distinct source
+    variant; only upgrades preserving the exact variant are registered, since
+    custom configs may explicitly import those modules. Parallel failure may
+    leave more paid in-flight work than serial failure; retain every ledger.
+  files: [src/rl_matdesign/hpo/cli.py, src/rl_matdesign/hpo/controller.py,
+    src/rl_matdesign/utils/hpo_resume_compatibility.py,
+    src/rl_matdesign/utils/hpo_resume_compatibility.json]
+  tags: [hpo, recovery, concurrency, provenance]

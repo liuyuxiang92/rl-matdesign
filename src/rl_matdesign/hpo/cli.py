@@ -11,6 +11,16 @@ from .artifacts import read_json
 from .spec import load_plan
 
 
+def _positive_int(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 def parser():
     root = argparse.ArgumentParser(prog="rl-matdesign hpo", description="Two-part, YAML-configured material-design HPO")
     commands = root.add_subparsers(dest="command", required=True)
@@ -24,6 +34,9 @@ def parser():
     for name in ("status", "resume", "restart"):
         command = commands.add_parser(name)
         command.add_argument("--out", required=True)
+        if name in ("resume", "restart"):
+            command.add_argument("--parallel-jobs", type=_positive_int,
+                                 help="Override the independent-job concurrency for this execution only")
         if name == "restart":
             command.add_argument("--check-only", action="store_true",
                                  help="Check saved job accounting/checkpoints without writes or sampling")
@@ -51,16 +64,25 @@ def main(argv=None) -> int:
             state = read_json(Path(args.out) / "state.json")
             plan = load_plan(manifest["plan"]["source_path"], method=manifest["plan"]["method"])
             campaign = Campaign(plan, args.out)
+            # Validate the original plan and manifest before changing execution-only options.
+            if args.parallel_jobs is not None:
+                campaign.parallel_jobs = args.parallel_jobs
             from .restart import inspect_restart
             report = inspect_restart(args.out)
             report["software_migration"] = campaign.software_migration
             report["requested_stage"] = state["requested_stage"]
+            report["execution_options"] = {
+                "original_parallel_jobs": manifest["plan"].get("parallel_jobs", 1),
+                "requested_parallel_jobs": args.parallel_jobs,
+                "effective_parallel_jobs": campaign.parallel_jobs,
+            }
             _print({"restart_check": report})
             if not report["ready"]:
                 print("HPO restart blocked: inspect the listed jobs; no new sampling was started.", file=sys.stderr)
                 return 2
             if getattr(args, "check_only", False):
                 return 0
+            campaign.record_execution_options(args.parallel_jobs)
             result = campaign.run(state["requested_stage"])
             _print(result)
             return 0 if result["status"] == "COMPLETED" else 3

@@ -1,0 +1,60 @@
+checkpoint_version: 3.0.0
+created_at: '2026-11-13T04:54:50.662728+00:00'
+branch: codex/hpo-v1
+phase:
+  current: validated_legacy_parallel_restart
+  completed:
+  - source_reconstruction
+  - serial_defaults
+  - runtime_parallel_override
+  - regression_668
+  - real_old_new_and_mixed_validation
+  next:
+  - commit_push
+  - user_gpu_check_only
+state:
+  parameters:
+  - name: frozen_source_targets
+    value:
+      clean:
+        package: f46e85e2ade8649a7daf97bd1e5b589de4ce21f43d0e85359593aa847636af7c
+        source: 8a78b12a29235756a4e12fe7f5e7c161fefa1f0d9895559528fb525cb3068a09
+      plus_six_legacy_predictors:
+        package: 4535f81ee9c871805e8775219f9e28e4266cd4e579f8d5e90339ffb3c2d7b7bf
+        source: 840cb998f866d27b77c1558b6410e4f541abe34293f111fbe5e36d62d3d2a24a
+    source: current src + audited six-file inventory
+    confidence: high
+  experiments:
+  - name: full_regression
+    status: completed
+    results_path: /private/tmp/rlmat-serial-parallel-restart-regression.log
+    result: 668 passed,77 existing warnings,83.53s
+  - name: real_legacy_restart
+    status: completed
+    results_path: /private/tmp/rlmat-preparallel-restart-0au08yu6/verification.json
+    result: Three algorithms, parallel10, exact records/counts/tensors, no cached
+      reruns or new numbered history, frozen generation, interrupted generation and
+      mixed50c/5d+six all passed
+  decisions:
+  - decision: Only exact same source-file variant upgrades
+    rationale: Keep explicitly referenced legacy modules; do not relax scientific
+      contracts
+  - decision: Runtime concurrency overrides leave YAML/manifest/plan/job IDs intact
+    rationale: Reuse experiments while adjusting scheduling only
+blockers:
+- question: Actual GPU checkpoint synchronization and integrity
+  impact: server recovery
+  assumption: User must run read-only preflight; server not inspected locally
+artifacts:
+- path: src/rl_matdesign/utils/hpo_resume_compatibility.json
+  role: six exact source migration pairs
+- path: src/rl_matdesign/hpo/cli.py
+  role: restart/resume concurrency override
+- path: docs/hpo_v1.md
+  role: instructions
+resume_instructions: Verify git HEAD and remote before publication retry. Do not change
+  frozen production Python without review and target regeneration/revalidation. Actual
+  server code repo is /aisi/yxliu/code/test_rl_material/oxyhydroxide-catalyst-gen.
+  Preserve original YAML and all six extra predictors. Run restart --out ./runs/a2c_coarse
+  --parallel-jobs 10 --check-only then restart. Never bypass mismatched checkpoint
+  accounting.
