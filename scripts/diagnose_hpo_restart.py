@@ -10,6 +10,9 @@ from __future__ import annotations
 import argparse
 from contextlib import redirect_stdout
 import json
+import hashlib
+import re
+import subprocess
 from pathlib import Path
 import shutil
 import sys
@@ -38,6 +41,103 @@ def differences(saved, current, path=""):
         yield {"path": path, "saved": preview(saved), "current": preview(current)}
 
 
+def _git(repo, *args):
+    return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20).stdout
+
+
+def _tree_inventory(repo, revision, relative_package):
+    """Hash committed blobs, including files ignored by archive export rules."""
+    rows = _git(repo, "ls-tree", "-r", "-z", revision, "--", relative_package)
+    result = {}
+    prefix = relative_package.rstrip("/") + "/"
+    for row in rows.split(b"\0"):
+        if not row:
+            continue
+        meta, raw_path = row.split(b"\t", 1)
+        mode, kind, oid = meta.decode().split()
+        name = raw_path.decode()
+        if kind != "blob" or not name.endswith(".py") or not name.startswith(prefix):
+            continue
+        if mode == "120000":
+            raise ValueError("Committed Python symlink needs manual inspection: " + name)
+        result[name[len(prefix):]] = hashlib.sha256(_git(repo, "cat-file", "blob", oid)).hexdigest()
+    return result
+
+
+def _inventory_digest(inventory):
+    return hashlib.sha256(json.dumps(inventory, sort_keys=True, separators=(",", ":"),
+                                     allow_nan=False).encode()).hexdigest()
+
+
+def source_evidence(package, out, saved_digest):
+    """Localize a non-release fingerprint; this never authorizes an upgrade."""
+    result = {"available": False, "historical_sample": [], "historical_sample_limit": 12}
+    try:
+        root = Path(package).resolve()
+        inventory = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+                     for p in sorted(root.rglob("*.py"))}
+        result["actual_package_digest"] = _inventory_digest(inventory)
+        result["python_file_count"] = len(inventory)
+        repo = Path(_git(root, "rev-parse", "--show-toplevel").decode().strip())
+        relative = root.relative_to(repo).as_posix()
+        head = _git(repo, "rev-parse", "HEAD").decode().strip()
+        committed = _tree_inventory(repo, "HEAD", relative)
+        extra = {name: value for name, value in inventory.items() if name not in committed}
+        result.update(available=True, repository=str(repo), head_commit=head,
+                      head_package_digest=_inventory_digest(committed),
+                      modified_python_files=[{"path": name, "head_sha256": committed[name],
+                                              "current_sha256": inventory[name]}
+                                             for name in sorted(set(inventory) & set(committed))
+                                             if inventory[name] != committed[name]],
+                      missing_python_files=sorted(set(committed) - set(inventory)),
+                      extra_python_files=[{"path": name, "sha256": value}
+                                          for name, value in sorted(extra.items())])
+        # Old invocations recorded their commit and dirty patch even if campaign
+        # manifests only kept one aggregate source hash. Inspect a bounded sample.
+        seen, trees = set(), {}
+        manifests = Path(out).glob("jobs/*/provenance/*/manifest.json")
+        for index, path in enumerate(manifests):
+            if index >= result["historical_sample_limit"]:
+                result["historical_sample_truncated"] = True
+                break
+            document = json.loads(path.read_text())
+            if not isinstance(document, dict):
+                raise ValueError(f"Invalid provenance object: {path}")
+            git = document.get("git", {})
+            if not isinstance(git, dict):
+                raise ValueError(f"Invalid provenance git object: {path}")
+            key = (git.get("commit"), git.get("patch_sha256"))
+            if key in seen:
+                continue
+            seen.add(key)
+            row = {"manifest": str(path), "commit": git.get("commit"),
+                   "dirty_tracked": git.get("dirty_tracked"),
+                   "patch_sha256": git.get("patch_sha256"),
+                   "untracked_file_count": git.get("untracked_file_count")}
+            result["historical_sample"].append(row)
+            commit = git.get("commit")
+            # Only pass actual recorded object IDs to Git, not arbitrary refs.
+            if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40,64}", commit):
+                continue
+            try:
+                if commit not in trees:
+                    trees[commit] = _tree_inventory(repo, commit, relative)
+                tree = trees[commit]
+                row["committed_package_digest"] = _inventory_digest(tree)
+                row["committed_tree_matches_saved_digest"] = row["committed_package_digest"] == saved_digest
+                # This is a test of one explicit hypothesis, not proof that
+                # untracked files are harmless or that training can resume.
+                combined = {**tree, **{k: v for k, v in extra.items() if k not in tree}}
+                row["committed_tree_plus_current_extra_files_matches_saved_digest"] = (
+                    _inventory_digest(combined) == saved_digest)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                row["inspection_error"] = str(exc)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        result["inspection_error"] = str(exc)
+    return result
+
+
 def inspect_campaign(out):
     report = {"out": str(Path(out).resolve()), "read_only": True,
               "python": sys.executable, "cli_path": shutil.which("rl-matdesign"),
@@ -59,6 +159,9 @@ def inspect_campaign(out):
         report["software_identical"] = same_software
         report["software_upgrade_registered"] = upgrade is not None
         report["software_upgrade_id"] = upgrade["id"] if upgrade else None
+        if not same_software and upgrade is None:
+            report["source_evidence"] = source_evidence(
+                report["package"]["path"], out, original["software_digest"])
         # Report raw source changes even when the edited YAML no longer parses.
         sources = {}
         report["configuration_sources"] = sources

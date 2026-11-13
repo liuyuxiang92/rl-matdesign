@@ -248,9 +248,14 @@
   wrong: Treating the combined Campaign configuration/software/domain/assets error
     as proof that a checkpoint cannot resume, or changing source to diagnose it
     without accounting for exact registered source hashes.
+    Aggregate package hashing includes all recursive .py files, including ignored
+    notebook/backup files; a Git commit ID or clean tracked status alone is insufficient.
   right: Use scripts/diagnose_hpo_restart.py with the CLI's Python environment.
     Compare actual imported package path and hashes, registration, resolved plan,
-    domain, assets and raw YAML hashes. The campaign gate runs before per-job
+    domain, assets and raw YAML hashes. For unknown digests inspect source_evidence
+    for per-file changes, ignored extras and historical run commits. A match to an
+    old tree plus current extras is evidence for review, never automatic approval.
+    The campaign gate runs before per-job
     checkpoint checks. Keep diagnosis outside src so reviewed recovery hashes stay
     unchanged; never rewrite archived hashes to bypass an unexplained difference.
   impact: A legitimate old run, changed YAML comment, or another installed package

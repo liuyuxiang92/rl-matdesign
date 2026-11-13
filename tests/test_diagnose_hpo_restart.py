@@ -139,3 +139,88 @@ def test_difference_distinguishes_missing_from_null():
     diff = list(diagnose.differences({"items": [None]}, {"items": [], "new": None}))
     assert diff == [{"path": "items[0]", "saved": None, "current": {"missing": True}},
                     {"path": "new", "saved": {"missing": True}, "current": None}]
+
+
+@pytest.fixture
+def source_repo(tmp_path):
+    import subprocess
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    def git(*args):
+        return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.decode().strip()
+    git("init")
+    root = repo / "src" / "rl_matdesign"
+    root.mkdir(parents=True)
+    (root / "model.py").write_text("VERSION = 1\n")
+    (root / "remove.py").write_text("OLD = True\n")
+    (repo / ".gitignore").write_text(".ipynb_checkpoints/\n")
+    # Git archives can omit source via export-ignore; diagnosis must not.
+    (repo / ".gitattributes").write_text("src/rl_matdesign/remove.py export-ignore\n")
+    git("add", ".")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "old")
+    old = git("rev-parse", "HEAD")
+    old_tree = diagnose._tree_inventory(repo, old, "src/rl_matdesign")
+    extra = root / ".ipynb_checkpoints" / "model-checkpoint.py"
+    extra.parent.mkdir()
+    extra.write_text("BACKUP = 1\n")
+    return repo, root, extra, old, old_tree, git
+
+
+def test_source_details_find_ignored_backup_and_old_tree_hypothesis(source_repo, tmp_path):
+    import hashlib
+    repo, root, extra, old, old_tree, git = source_repo
+    saved = diagnose._inventory_digest({**old_tree,
+        str(extra.relative_to(root)): hashlib.sha256(extra.read_bytes()).hexdigest()})
+    (root / "model.py").write_text("VERSION = 2\n")
+    git("add", "src")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "new")
+    out = tmp_path / "campaign"
+    provenance = out / "jobs" / "first" / "provenance" / "first"
+    provenance.mkdir(parents=True)
+    (provenance / "manifest.json").write_text(json.dumps({"git": {
+        "commit": old, "dirty_tracked": False, "patch_sha256": "empty", "untracked_file_count": 1}}))
+    before = snapshot(out)
+    report = diagnose.source_evidence(root, out, saved)
+    assert report["available"]
+    assert report["modified_python_files"] == []
+    assert report["missing_python_files"] == []
+    assert report["extra_python_files"][0]["path"] == ".ipynb_checkpoints/model-checkpoint.py"
+    historical = report["historical_sample"][0]
+    assert not historical["committed_tree_matches_saved_digest"]
+    assert historical["committed_tree_plus_current_extra_files_matches_saved_digest"]
+    assert snapshot(out) == before
+
+
+def test_source_details_distinguish_edits_and_deletions_from_untracked_files(source_repo, tmp_path):
+    repo, root, extra, old, old_tree, git = source_repo
+    (root / "model.py").write_text("LOCAL = 3\n")
+    (root / "remove.py").unlink()
+    report = diagnose.source_evidence(root, tmp_path / "absent", "unknown")
+    assert report["available"]
+    assert [row["path"] for row in report["modified_python_files"]] == ["model.py"]
+    assert report["missing_python_files"] == ["remove.py"]
+    assert report["extra_python_files"][0]["path"] == ".ipynb_checkpoints/model-checkpoint.py"
+
+
+def test_source_details_support_installed_package_without_git(tmp_path):
+    root = tmp_path / "package"
+    root.mkdir()
+    (root / "model.py").write_text("VERSION = 1\n")
+    report = diagnose.source_evidence(root, tmp_path, "unknown")
+    assert not report["available"]
+    assert report["python_file_count"] == 1
+    assert report["actual_package_digest"]
+    assert report["inspection_error"]
+
+
+@pytest.mark.parametrize("document", [[], {"git": None}])
+def test_malformed_provenance_stays_a_source_diagnostic_error(source_repo, tmp_path, document):
+    _, root, _, _, _, _ = source_repo
+    out = tmp_path / "campaign"
+    provenance = out / "jobs" / "first" / "provenance" / "first"
+    provenance.mkdir(parents=True)
+    (provenance / "manifest.json").write_text(json.dumps(document))
+    report = diagnose.source_evidence(root, out, "unknown")
+    assert report["available"]
+    assert "Invalid provenance" in report["inspection_error"]
