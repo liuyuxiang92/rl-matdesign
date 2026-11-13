@@ -81,41 +81,15 @@ A2C 每个生成设置实际使用 2 个冻结模型 × 2 次采样，共 4 次�
 
 以上耗时来自本地 dummy 运行，不代表 GlassNet 或 GPU 加速效果。结果与逐作业日志：`/private/tmp/rlmat-parallel-runtime-sg8ncnnw/verification.json`。第一次临时 smoke 将 A2C warmup设为0，scaler拟合没有样本而失败；修正临时场景为2次准备采样后在全新目录完成验证，未修改生产训练逻辑。
 
+## 原生停止与恢复的回归范围
 
-## 2026-11-13：单份最新断点及旧版本 restart
+当前正常停止与恢复由原生 HPO 控制器、worker 和 `restart` 负责。回归用例使用新建的 CPU dummy campaign，覆盖 A2C、DQN MC 和 DQN bootstrap 的采样中断、完整训练单元保存、同步断点续跑及生成结果收尾：
 
-本次 Python 源码冻结指纹：package `909f265fe8e8c9c305c14d1714bde161941406c08c06240b80b9d35ab3595e84`，worker source `e5716b0ecb31012be6adb81ab4f04d03ee423c838f382a98f59f74e0196b9913`。包内 JSON 登记表只批准上一发布版本 `5d0d0dae` / 同源码 `b8e01748` 到此修复的精确指纹对；配置、资产、种子、数值环境和学习/生成规则仍须一致。旧 manifest 与完成模型不改写。
+- `tests/test_hpo_cooperative_worker_stop.py`：候选请求已开始时收到信号，完成当前训练单元后保存；再次 Ctrl+C 强制停止；目标预算已完成时正常导出。
+- `tests/test_hpo_cooperative_restart.py`：真实 worker 停止后通过原生作业调度恢复，比较网络、优化器、随机状态、候选记录与不中断对照；覆盖生成恢复及最终导出，以及并行控制器 SIGTERM 后的原生 CLI restart。
+- `tests/test_hpo_stop_coordinator.py`：控制器停止启动新作业、等待完整断点、清理 worker，并保留已结算终态作业供结果收尾。
+- `tests/test_hpo_checkpoint_retention.py`：仅覆盖最新完整 checkpoint，不累积编号快照；原子保存失败时保留上一份完整断点。
 
-相关 HPO、清理、恢复、模型契约、训练预算和生成回归：**619 passed，77 个既有 legacy 提示，74.23 秒**。随后增加发布登记表与真实源码匹配的检查，兼容模块 **27 passed，2.01 秒**。清理测试使用临时目录验证原 checkpoint 链接目标与结果哈希不变；写盘失败测试验证旧断点完整且不同步账本不能回滚。wheel 构建检查确认兼容 JSON 会随包分发。
+只读预检、运行时 `--parallel-jobs` 覆盖、已完成作业复用与预算账本校验仍保留。源码、配置、资产或运行契约变化不自动放行；新的实验使用空输出目录。这里描述软件验证范围，不代表真实 GlassNet/GPU 结果已经达标。
 
-额外使用从 Git 精确导出的旧版源码创建三种算法的真实 CPU dummy campaign。每个 campaign 第一任务完成、第二任务在完整同步 checkpoint 后中断、第三任务尚未执行。新版本 `restart --check-only` 不修改文件；实际 restart/resume 复用第一任务，续跑第二任务并执行第三任务。续跑后的候选档案、计数和模型张量与旧版不中断对照完全一致；没有新增编号 checkpoint，原 manifest 与完成任务文件保持不变。三种方法的旧模型在新版本生成结果也与旧版对照相同。
-
-另外验证了实际 A2C 旧版生成断点：从一次已同步采样续到四次，最终记录与预算等于旧版连续生成，冻结模型/scaler 未变。重复恢复和生成不新增采样，迁移记录保持一条。证据在 `/private/tmp/rlmat-oldnew-restart-0ozktp2x/verification.json`，回归日志在 `/private/tmp/rlmat-hpo-restart-regression.log`。
-
-这不是 GlassNet/GPU 实验，也未访问或清理用户服务器。真实磁盘写满可能破坏未成功落盘的更新或让账本超前；此类任务由预检明确阻塞，不承诺重建丢失状态，不清空账本或从零重跑。
-
-
-## 2026-11-13：旧串行计划、历史模块组合与并行恢复
-
-从用户的逐文件报告重建了旧串行、并行和存储修复三个版本，每个版本分别审核干净源码和精确六个历史预测器文件的组合。服务器原始 `d495c572...` 与当前 `5621cee85...` 均精确匹配；同一 campaign 存在改造前后 worker 的情况由分别登记的 worker 指纹覆盖。源码例外仍为精确、单向且保持同一文件集合，未知修改不放行。
-
-旧 manifest 缺失并行字段时仅规范化为串行默认值，另行核验全部非源码字段。新增 `restart/resume --parallel-jobs N` 在原契约与所有作业预检通过后仅更改运行时调度，并独立记录设置历史。`--check-only`、预检失败不写运行设置；不传覆盖恢复原设置。自动化测试覆盖旧默认值迁移、未知源码拒绝、其他参数变更拒绝、精确服务器文件组合、并行覆盖只读检查与任务身份不变。
-
-相关完整回归 **668 passed，77 条既有兼容提示**（83.53 秒）。使用精确 `50c25e9a + 六个历史模块` 的 CPU dummy 旧实验，对 A2C、DQN MC、DQN Bootstrap 均完成“第一 seed 已完成、第二 seed 同步断点中断、第三 seed 未开始”的跨版本续跑；新版 `--parallel-jobs 10` 后候选档案、计数和模型张量与旧版不中断对照一致，已完成文件、原 manifest 不变，编号 checkpoint 不增加。三算法旧模型并行生成及另一次旧版生成断点续跑均通过。
-
-补充混合版本实测：campaign manifest 与第一模型来自 `50c25e9a + 六文件`，中断的第二 worker 来自 `5d0d0dae + 六文件`；新版并行恢复同样通过只读检查、已完成任务复用及与旧版对照的精确候选/模型比较。
-
-冻结源码目标：clean package `f46e85e2ade8649a7daf97bd1e5b589de4ce21f43d0e85359593aa847636af7c`；保留六文件的 package `4535f81ee9c871805e8775219f9e28e4266cd4e579f8d5e90339ffb3c2d7b7bf`。证据：`/private/tmp/rlmat-preparallel-restart-0au08yu6/verification.json`；回归日志：`/private/tmp/rlmat-serial-parallel-restart-regression.log`。这些 CPU 软件验证不代替真实 GPU 输出目录的 checkpoint 同步检查，也不证明 GlassNet 科学结果已达标。
-
-
-## 2026-11-13：单次生成落盘失败的有限恢复
-
-服务器单任务诊断明确：已有 698 个任务可复用；唯一阻塞的生成任务账本与候选档案为 7，完整 checkpoint 为 6，原 `.pt.tmp` 仅 128 字节且不可读取，冻结网络和 scaler 指纹完整。新增独立 `repair_hpo_generation.py` 及文件事务 helper，生产包源码保持 `f46e85e2ade8649a7daf97bd1e5b589de4ce21f43d0e85359593aa847636af7c`，既有精确源码兼容登记无需改变。
-
-针对 A2C、DQN MC、DQN bootstrap，使用真实 CPU worker 和内置 dummy 性质模型，在第 7 次生成 checkpoint 写入注入 ENOSPC：保留完整 cp6、7 条完整候选/性质/计时记录和损坏 tmp，同时捕获本应写出的 cp7 作为对照。验证只重放策略、禁止任何预测模型调用的恢复能逐项复现 cp7 的 RNG、hpo_state、预测成本账本、缓存、额外状态和原契约。应用只改变主 checkpoint，全部原文件备份，原账本与损坏 tmp 保留；重复应用不修改文件。随后常规预检通过，续跑候选档案、最终 RNG 和缓存与不中断运行一致，第 7 次已付费评估没有重新发生。
-
-集成模块还覆盖嵌套 group filters 和不一致科学不确定性的拒绝。相关已有 restart/源码兼容/断点保存/诊断回归 **138 passed，36.81 秒**，日志 `/private/tmp/rlmat-generation-repair-regression.log`。另以新 Python 进程实际执行只读 CLI，在真实 DQN MC 失败夹具上得到 `from_unique: 6`、`to_unique: 7`、`predictor_evaluations: 0`；输出 `/private/tmp/rlmat-generation-repair-cli.json`。
-
-这些结果是本地软件验证，不代表服务器文件已修改。真实 GlassNet/CUDA 必须在原环境通过同样的契约、前缀缓存与候选重放检查；工具不放行其他类型的状态缺口，也不调用性质预测器重新评估已付费候选。
-
-新增修复与事务保护测试最终联合通过 **41 passed，45.03 秒**；合计本次验证 **179 passed**。包含缓存子类属性和顺序的序列化核验，以及备份/序列化期间外部模型变化的拒绝。
+本轮移除旧任务修复与源码迁移代码后，全部 `tests/test_hpo*.py`、严格恢复合约、exact resume、生成策略、数值运行契约和模型合约测试共 **605 passed、77 warnings，244.07 秒**。独立 wheel 构建与安装成功，安装包包含原生 stop/restart，不含旧兼容模块及登记表；在源码目录之外使用安装版 CLI 验证 dummy A2C 配置通过，未调用性质预测器。

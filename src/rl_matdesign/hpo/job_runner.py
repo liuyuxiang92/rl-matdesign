@@ -92,6 +92,40 @@ class JobRunner:
                     self._signal_process(process, signal.SIGKILL)
                     process.wait()
 
+    def stop_all(self) -> None:
+        """Ask native workers to stop at their next complete checkpoint.
+
+        Signal only the Python worker: its predictor children must finish the
+        current evaluation. A second interrupt explicitly forces group cleanup.
+        """
+        self._cancelled.set()
+        with self._cancel_lock:
+            with self._process_lock:
+                active = list(self._processes.items())
+                for _, cancelled in active:
+                    cancelled.set()
+            if active:
+                print("[HPO] Stopping after complete checkpoints; waiting for active "
+                      "evaluations/training batches. Press Ctrl+C again to force exit.",
+                      file=sys.stderr, flush=True)
+            try:
+                for process, _ in active:
+                    try:
+                        process.send_signal(signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                for process, _ in active:
+                    process.wait()
+            except BaseException as forced:
+                # Finish cleanup here instead of re-entering cancel_all while
+                # holding its lock. The caller retains the original interrupt.
+                for process, _ in active:
+                    self._signal_process(process, signal.SIGKILL)
+                for process, _ in active:
+                    process.wait()
+                if not isinstance(forced, KeyboardInterrupt):
+                    raise
+
     def execute(self, parameters: dict, budget: int, seed: int, phase: str,
                 model: dict | None = None) -> dict:
         """Run isolated work, returning a small payload without global scoring.
@@ -239,7 +273,10 @@ class JobRunner:
                     returncode = process.wait()
                 except BaseException as exc:
                     execution_error = exc
-                    self.cancel_all()
+                    if isinstance(exc, KeyboardInterrupt):
+                        self.stop_all()
+                    else:
+                        self.cancel_all()
                     returncode = process.returncode
                 finally:
                     with self._process_lock:
@@ -370,7 +407,11 @@ class JobRunner:
             result["quality_normalization"] = copy.deepcopy(self.plan["objective"]["normalization"])
         if payload.get("execution_error") is not None:
             error = payload["execution_error"]
-            result["execution_failure"] = {"type": type(error).__name__, "message": str(error)}
+            settled = returncode == 0 or ledger.get("status") in {
+                "INFEASIBLE_EFFICIENCY", "INFEASIBLE_NUMERICAL"}
+            field = ("coordinator_interruption" if isinstance(error, KeyboardInterrupt)
+                     and payload["interrupted"] and settled else "execution_failure")
+            result[field] = {"type": type(error).__name__, "message": str(error)}
         atomic_json(result_path, result)
         atomic_json(directory / "execution.json", {"status": result["status"], "argv": payload["argv"],
                                                    "returncode": returncode, "wall_seconds": result["wall_seconds"]})

@@ -187,45 +187,19 @@ rl-matdesign hpo restart --out runs/my_hpo --parallel-jobs 10 --check-only
 rl-matdesign hpo restart --out runs/my_hpo --parallel-jobs 10
 ```
 
-`restart` 和 `resume` 支持运行时 `--parallel-jobs N`（正整数）。不传时使用原 YAML 的值，旧串行计划缺失时为 1；上一次覆盖不会自动继承。覆盖只应用于独立作业调度，不修改原 YAML、manifest、实验参数、种子、每项预算或 job ID。完成任务直接复用，中断任务各自恢复；TPE 和自适应边界探测继续遵守依赖顺序。实际独立任务不足 N 个时按可用任务数量运行。`--check-only` 报告原始、请求和实际并发数但不写文件；实际恢复在全部预检通过后把设置变化另存到 `execution_options.json`。并行故障时可能已有更多任务消耗成本，这些成本仍完整记账。
+`restart` 和 `resume` 支持运行时 `--parallel-jobs N`（正整数）。不传时使用原 YAML 的值（默认 1）；上一次覆盖不会自动继承。覆盖只应用于独立作业调度，不修改原 YAML、manifest、实验参数、种子、每项预算或 job ID。完成任务直接复用，中断任务各自恢复；TPE 和自适应边界探测继续遵守依赖顺序。实际独立任务不足 N 个时按可用任务数量运行。`--check-only` 报告原始、请求和实际并发数但不写文件；实际恢复在全部预检通过后把设置变化另存到 `execution_options.json`。并行故障时可能已有更多任务消耗成本，这些成本仍完整记账。
 
-新运行使用空输出目录。恢复仅复用配置、代码、资产与结果校验一致的作业；中断继续还要求检查点、随机状态和候选账本同步，不能抹掉已花费额度。配置、模型资产或未经审核的源码变更仍要求新输出目录；下述已登记的 checkpoint 存储修复可以继续已有 campaign。ETA 随真实完整作业耗时更新，包含模型初始化、训练和账本持久化。
+按一次 Ctrl+C 或向 HPO 控制器发送 SIGTERM 时，调度器停止启动新任务，已有 worker 等待完整断点写入后退出。DQN 会完成当前训练 episode；A2C 会完成当前训练 batch；生成会消费完当前 evaluation wave。若还在初始化或 DQN warmup，会等到第一个完整训练断点。等待期间可能继续消耗当前训练单元所需的预算，仍按原配置记账。到达目标预算的任务先完成最终模型和结果导出，再退出。随后直接使用上面的原生 `restart` 命令，无需外部恢复启动器或额外 YAML 参数。
+
+等待保存期间再次按 Ctrl+C 会强制结束进程组；这种强制停止、SIGKILL、断电或磁盘写满仍可能留下不同步文件，不能保证直接恢复。正常停止不会向正在计算的性质预测子进程发送终止信号，也不再用固定 10 秒超时截断尚未完成的批次。
+
+正常停止与恢复用于当前版本创建的 HPO。此前中断的旧任务重新计算时，使用新的空 `--out` 目录。
+
+新运行使用空输出目录。恢复仅复用配置、代码、资产与结果校验一致的作业；中断继续还要求检查点、随机状态和候选账本同步，不能抹掉已花费额度。配置、模型资产或源码发生变化时，使用新输出目录重新运行。ETA 随真实完整作业耗时更新，包含模型初始化、训练和账本持久化。
 
 历史 `protocol: hpo_v1` YAML 仍由兼容读取器识别并发出提示，保留旧显式目标、归一化和阶段种子语义；它们不是当前推荐接口。六份模板已全部更新，路径保持不变。升级为精简配置会改变协议及评分契约，不能继续使用旧 campaign 目录。[第一版实现计划](hpo_v1_implementation_plan.md) 和历史验证报告描述此前版本，不代替本页。
 
-## Checkpoint 磁盘占用与旧任务清理
-
-HPO 训练只原子覆盖一份 `jobs/<id>/checkpoint.pt`，不再逐步累积 `checkpoint-epN.pt`（DQN）或 `checkpoint-iterN.pt`（A2C）。保存频率在 HPO 内部固定为 `--save-checkpoint-freq 1`：DQN 两种方法每完成一次候选 episode 及相应训练处理后保存（含重复候选，不是每个 action）；A2C 每完成一个训练 batch 并更新网络后保存，因此一个 batch 含多个候选时不是每个候选保存一次。断点保存优化器、随机状态、已花预算和 DQN replay buffer，用于恢复最新同步状态。评分使用候选档案，不读取历史训练快照；冻结生成使用被选中任务的最终模型。该策略在 HPO 内部固定，不新增 YAML 参数；普通非 HPO 训练仍保留编号快照。
-
-每个任务的最终 `qnet.pt` / `policy.pt` / `value_net.pt`、`std_scaler.bin`、最新完整断点以及候选档案、账本和结果仍保留。生成任务继续覆盖自己的 `generation_checkpoint.pt`；失败任务可能保留诊断用 `partial_checkpoint.pt`。这次修复消除的是同一任务内的历史全量副本，并不让整个 campaign 的磁盘占用与任务数量无关。原子写入期间需要同时容纳旧断点和新临时文件。
-
-旧版本每步保存全量历史，DQN 中重复保存不断增长的 replay buffer 尤其占空间。旧任务可使用独立标准库脚本清理历史版本：**先停止 HPO 控制器和全部 worker**，将脚本复制到运行机器，先预览，确认输出后执行：
-
-```bash
-python scripts/prune_hpo_checkpoints.py --out /path/to/hpo_output
-python scripts/prune_hpo_checkpoints.py --out /path/to/hpo_output --apply
-```
-
-脚本仅处理有 HPO 清单和作业元数据的目录，保留 `checkpoint.pt` 当前指向的文件和元数据明确引用的文件，不删除最终模型、scaler、生成/诊断断点或实验记录。不会加载 `.pt` 内容。缺失或异常的最新断点会使对应目录跳过清理，避免猜测哪个文件可恢复。不要直接删除所有 `checkpoint-*.pt`：旧 `checkpoint.pt` 是符号链接，删除其目标会破坏恢复和结果校验。
-
-**清理历史文件不改变原实验配置或已记录文件的哈希。** 磁盘仍满时可以只复制此脚本，先释放空间，再更新代码。本次修复登记了 `50c25e9a`（并行功能前，对应合并提交 `f9d593db`）、`5d0d0dae` / `b8e01748`（对应 `ab73f2fd`）以及 `1a3e26fd` 的精确源码兼容关系。旧串行计划只允许把同时缺失的 `plan.parallel_jobs` 和 `plan.sources.parallel_jobs` 解释为 `1/default`；这项规范化只在源码升级已登记、其余字段和 YAML 指纹一致时生效，原 manifest 不重写。
-
-另单独审核了保留六个历史预测器文件的服务器源码组合：`predictors/{composite,dp_property,dp_structure,hea,perovskite,sinter_calcine}.py`。文件内容必须与兼容表的 SHA 完全一致，升级后仍须保留同样的文件集合；不放行任意额外文件或本地代码修改，也不把带旧模块的任务迁移到缺少这些模块的安装。该组合覆盖服务器旧 campaign 指纹 `d495c572...`、并行版本 worker 和 checkpoint 修复版 `5621cee85...`。无需删除这六个文件或改写记录中的哈希。旧任务可以在通过检查后继续并改用单份最新断点。其他源码版本或本地源码改动不会自动放行。配置、预测模型、种子、数值环境和学习/生成规则仍严格校验，没有跳过校验的开关。
-
-更新到此修复并保留原 YAML、资产和运行环境后，先只读检查，再启动恢复：
-
-```bash
-rl-matdesign hpo restart --out ./runs/a2c_coarse --check-only
-rl-matdesign hpo restart --out ./runs/a2c_coarse
-```
-
-如果在出现任务检查结果前报 `Campaign configuration, software, domain or assets changed`，这是 campaign 契约检查未通过，尚不能判断 checkpoint 是否损坏。用运行 CLI 的同一个 Python 环境执行仓库内的只读诊断脚本（不强行切换 `PYTHONPATH`，以便发现实际加载了另一份安装包）：
-
-```bash
-python /path/to/rl-matdesign/scripts/diagnose_hpo_restart.py --out ./runs/a2c_coarse
-```
-
-脚本输出实际包路径、旧/新源码指纹、是否登记兼容，以及具体变化字段。若源码指纹未登记，`source_evidence` 还列出当前 Git 提交、已修改/缺失的 Python 文件和额外 Python 文件（包括被 Git 忽略的备份），并从最多 12 份旧调用记录读取历史提交。`committed_tree_plus_current_extra_files_matches_saved_digest` 只是“旧提交加上当前额外文件是否能重现旧哈希”的验证结果，不表示这些文件无害或可以自动恢复。它不创建 campaign、不启动 worker、不加载模型张量、不修改实验目录。`campaign_contract_accepted` 仅表示外层契约可以通过，不代表内部断点已同步，之后仍需 `restart --check-only`。输出中的 `configuration_sources` 还会检查原 YAML 的字节指纹；注释变化也会被记录。诊断失败时保留原文件并根据差异定位原因，不改写 manifest 哈希或跳过校验。脚本位于 `scripts/`，新增它不会改变已登记的包源码指纹。
+## 恢复预检
 
 `restart` 按 `state.json` 保存的阶段继续，不从头创建 HPO；原 `resume` 命令同样支持这套机制。检查在启动任何 worker 前读取所有已有任务，输出以下分类：
 
@@ -236,20 +210,15 @@ python /path/to/rl-matdesign/scripts/diagnose_hpo_restart.py --out ./runs/a2c_co
 | `RECOVERABLE_TERMINAL` | 终态材料档案完整，可完成结果收尾而不新增采样 |
 | `BLOCKED` | 存在损坏、缺失、不同步或需检查的失败证据；输出具体任务路径与原因 |
 
-只读检查不写文件、不加载性质预测模型、不采样。实际恢复还会核对 worker 的运行环境和模型契约。存在任何 `BLOCKED` 时不会启动新采样；先处理报告中的任务。版本升级保留原 `manifest.json`、已完成模型和结果哈希，另写一次 `software_migrations.json` 记录审核过的旧/新源码指纹；后续新断点记录真实的新版本。
+只读检查不写文件、不加载性质预测模型、不采样。实际恢复还会核对 worker 的运行环境和模型契约。存在任何 `BLOCKED` 时不会启动新采样；报告会给出具体任务路径与原因。原 `manifest.json`、已完成模型和结果哈希继续用于严格校验。
 
-磁盘写满可能留下未完成的临时文件、截断的候选记录，或已领先模型断点的已付费账本；有 `checkpoint.pt` 并不保证任意中断点都能精确恢复。遇到 `accounting advanced beyond checkpoint`、`archive differs`、缺失/损坏文件或已记录的失败退出，应保留目录与报错逐项检查，不能删除账本、篡改哈希或把诊断 `partial_checkpoint.pt` 当作完整断点。`restart` 不会声称重建从未成功写入磁盘的网络更新，也不会悄悄从零训练或抹掉已花预算。已完成实验的有效结果不必因此全部重做。
+磁盘写满可能留下未完成的临时文件、截断的候选记录，或已领先模型断点的已付费账本；有 `checkpoint.pt` 并不保证任意中断点都能精确恢复。遇到 `accounting advanced beyond checkpoint`、`archive differs`、缺失/损坏文件或已记录的失败退出，应保留目录与报错逐项检查，不能删除账本、篡改哈希或把诊断 `partial_checkpoint.pt` 当作完整断点。`restart` 不会重建未成功写入磁盘的网络更新，也不会从零训练或抹掉已花预算。需要重算时显式使用新的空输出目录。
 
-如果外层兼容检查已经通过，但某个任务因账本与 checkpoint 不同步而被标为 `BLOCKED`，停止该 campaign 的控制器和 worker 后，针对报告中的 job ID 进一步检查：
+## Checkpoint 保存与磁盘占用
 
-```bash
-python /path/to/rl-matdesign/scripts/diagnose_hpo_job.py \
-  --out ./runs/a2c_coarse --job-id REPORT中的job_id
-```
+HPO 训练只原子覆盖一份 `jobs/<id>/checkpoint.pt`，不再逐步累积 `checkpoint-epN.pt`（DQN）或 `checkpoint-iterN.pt`（A2C）。保存频率在 HPO 内部固定为 `--save-checkpoint-freq 1`：DQN 两种方法每完成一次候选 episode 及相应训练处理后保存（含重复候选，不是每个 action）；A2C 每完成一个训练 batch 并更新网络后保存，因此一个 batch 含多个候选时不是每个候选保存一次。断点保存优化器、随机状态、已花预算和 DQN replay buffer，用于恢复最新同步状态。评分使用候选档案，不读取历史训练快照；冻结生成使用被选中任务的最终模型。该策略在 HPO 内部固定，不新增 YAML 参数；普通非 HPO 训练仍保留编号快照。
 
-使用运行 CLI 的同一 Python 环境。此脚本只读取指定任务的本地可信 checkpoint（含可能遗留的 `.pt.tmp`），在 CPU 上提取计数与指纹；不运行模型或采样，也不修改文件。报告对比磁盘账本与断点中的各项计数，检查候选档案及断点对应前缀，并列出冻结模型文件指纹和失败日志。退出码 0 仅表示诊断资料读取完成，不表示可以恢复；退出码 2 表示有缺失、损坏或无法读取的诊断资料。
-
-生成任务先保存已评估候选及账本，再保存生成 checkpoint，因此账本领先不能直接判定训练网络或候选丢失。生成使用冻结的训练网络，但精确续跑仍需要同步的随机状态、预测器状态与预算。即使 `.pt.tmp` 可以加载且计数相符，也需要进一步核对全部契约，不能直接重命名替换。保留原文件并提供诊断输出；不回退账本、不删除已付费候选，也不把旧 checkpoint 的计数手动改成新值。
+每个任务的最终 `qnet.pt` / `policy.pt` / `value_net.pt`、`std_scaler.bin`、最新完整断点以及候选档案、账本和结果仍保留。生成任务继续覆盖自己的 `generation_checkpoint.pt`；失败任务可能保留诊断用 `partial_checkpoint.pt`。单份断点避免同一任务内累积历史全量副本；整个 campaign 的磁盘占用仍随任务数量增加。原子写入期间需要同时容纳旧断点和新临时文件。
 
 ## GlassNet 初次验证与软件 smoke
 
@@ -272,28 +241,3 @@ rl-matdesign hpo run --hpo-config configs/hpo/v1/dummy_a2c.yaml --out runs/hpo_s
 dummy 配置使用小范围、小预算验证软件契约；贪心等配置可能因重复而被效率门槛正常拒绝。软件测试通过不代表真实材料目标已达成，也不能代替 GlassNet 验证。
 
 新版完整回归、三个算法的实际流程及恢复验证见 [精简接口验证记录](hpo_v2_validation.md)。
-
-
-对于已确认的特定写盘失败，还提供独立的单步恢复工具：完整生成 checkpoint 恰好落后一个已成功记录的唯一候选，全部采样都是成功且不重复的标量评估，没有失败、准备或待完成请求。当前仅审核了平坦 CompositionEnv、内置 GlassNet/dummy 的纯组成性质、无额外 filters，以及 A2C/DQN 的纯 gen_temperature 采样。该工具不适用于训练更新丢失、批量生成、任意自定义预测器或任意数量的不同步记录。
-
-先停止该 campaign 的所有控制器/worker，并确保磁盘能保存该单个作业的证据备份与新断点。使用原 CLI 的 Python 环境、设备和依赖版本：
-
-```bash
-# 默认只验证，不修改 campaign；重放一次策略选材，但禁止任何性质模型评估。
-python /path/to/rl-matdesign/scripts/repair_hpo_generation.py \
-  --out /path/to/hpo_output --job-id BLOCKED_JOB_ID
-
-# 同样执行全部验证，成功后备份原文件并原子替换生成断点。
-python /path/to/rl-matdesign/scripts/repair_hpo_generation.py \
-  --out /path/to/hpo_output --job-id BLOCKED_JOB_ID --apply
-
-# 修复通过后，仍走标准预检与恢复流程。
-rl-matdesign hpo restart --out /path/to/hpo_output --parallel-jobs 10 --check-only
-rl-matdesign hpo restart --out /path/to/hpo_output --parallel-jobs 10
-```
-
-工具先验证原 campaign、运行环境、冻结模型、输入资产、候选记录的精确前缀和成本记录，用前缀观测重建缓存并与原断点逐项比较。随后恢复原 RNG，仅执行一次策略选材；必须与已保存候选的输入、规范身份和公式完全一致，终点奖励直接取自已有评估记录。这样补齐 RNG、结果缓存和已记录的预测成本，不重新运行 GlassNet、不减少或新增已付费采样数，也不把修复耗时记作原预测耗时。
-
-`--apply` 在 `jobs/<id>/.hpo-generation-repair/<transaction>/original/` 保存该作业原有文件，在 receipt 中记录新旧指纹和验证结果；写入前再次验证全部作业及外部输入。只替换 `generation_checkpoint.pt`，原账本、候选档案、错误日志、损坏临时文件和冻结网络均保留。断点记录已有的完整付费计数，正常 restart 再继续剩余额度。若替换时意外退出，可在继续运行 worker 前重跑同一修复命令识别已完成的事务。任何契约、前缀或重放不一致都会拒绝修复，不自动回退预算或从头训练。
-
-软件测试使用 A2C、DQN MC、DQN bootstrap 的真实 CPU worker 和内置 dummy 性质模型，在第 7 次 checkpoint 写入注入磁盘满错误；验证修复结果与正常应写出的状态及后续候选序列一致。真实 GlassNet/CUDA 是否通过这些条件，由服务器上的验证决定。

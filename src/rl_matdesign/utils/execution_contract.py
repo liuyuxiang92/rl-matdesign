@@ -111,12 +111,21 @@ def generation_sampling_contract(config) -> dict:
     }
 
 
+def contracts_equal(actual, expected) -> bool:
+    """Compare serialized contracts exactly, without bool/int coercion or NaN."""
+    try:
+        return json.dumps(actual, sort_keys=True, allow_nan=False) == json.dumps(
+            expected, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError):
+        return False
+
+
 def _contract_difference_paths(actual, expected, *, limit: int = 8) -> list[str]:
     """Identify incompatible fields without exposing recorded values."""
     paths = []
 
     def visit(left, right, path):
-        if len(paths) >= limit or left == right:
+        if len(paths) >= limit or contracts_equal(left, right):
             return
         if isinstance(left, dict) and isinstance(right, dict):
             for key in sorted(set(left) | set(right), key=str):
@@ -143,10 +152,8 @@ def _contract_difference_paths(actual, expected, *, limit: int = 8) -> list[str]
     return paths
 
 
-def require_execution_contract(actual, expected, *, allow_source_upgrade=False) -> None:
-    from .hpo_resume_compatibility import execution_contracts_equal
-
-    if not execution_contracts_equal(actual, expected, allow_source_upgrade=allow_source_upgrade):
+def require_execution_contract(actual, expected) -> None:
+    if not contracts_equal(actual, expected):
         changed = ", ".join(_contract_difference_paths(actual, expected))
         raise ValueError("Checkpoint oracle, runtime or training protocol differs "
                          f"(first differing fields: {changed}). Exact resume requires "

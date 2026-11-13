@@ -163,6 +163,8 @@ def _save_checkpoint(path: str, data: dict, numbered_path: str | None = None) ->
             os.remove(link_tmp)
         os.symlink(os.path.basename(numbered_path), link_tmp)
         os.replace(link_tmp, path)
+    from .utils.hpo_stop import checkpoint_committed
+    checkpoint_committed(data)
 
 
 # ---------------------------------------------------------------------------

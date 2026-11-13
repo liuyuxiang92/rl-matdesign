@@ -23,9 +23,9 @@ def predictor_snapshot(predictor):
 
 
 def restore_generation(predictor, saved, contract):
-    from .hpo_resume_compatibility import generation_contracts_equal
+    from .execution_contract import contracts_equal
 
-    if not generation_contracts_equal(saved.get("generation_contract"), contract, allow_source_upgrade=True):
+    if not contracts_equal(saved.get("generation_contract"), contract):
         raise ValueError("Generation resume changed its frozen weights, scenario, seed or sampling settings")
     load_ledger = getattr(predictor, "load_state_dict", None)
     if not callable(load_ledger):
