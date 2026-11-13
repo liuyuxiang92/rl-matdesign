@@ -235,6 +235,12 @@
     hashes without rewriting their original manifests or models.
     Disk-full resume still requires the candidate ledger/archive and model state to
     match; never reset paid attempts or treat partial_checkpoint.pt as resumable.
+    For a blocked generation job use scripts/diagnose_hpo_job.py to compare all
+    checkpoint/ledger counters, exact archive prefixes, frozen inputs and any .pt.tmp.
+    Generation persists observations before its RNG/cache checkpoint; a ledger-ahead
+    failure does not imply lost trained weights. Unique-success archives alone cannot
+    reconstruct duplicate, failed or pending attempts. Readable temporary checkpoints
+    are evidence for further validation, not permission for automatic replacement.
   impact: GPU HPO jobs can all fail from shared-disk exhaustion; a surviving previous
     checkpoint is not sufficient for exact resume if paid accounting has advanced.
   files: [src/rl_matdesign/training.py, src/rl_matdesign/hpo/job_runner.py,
