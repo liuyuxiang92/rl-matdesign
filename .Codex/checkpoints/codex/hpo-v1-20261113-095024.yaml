@@ -1,0 +1,71 @@
+checkpoint_version: 3.0.0
+created_at: '2026-11-13T09:50:24.875184+00:00'
+branch: codex/hpo-v1
+phase:
+  current: native_restart_cleanup_validated
+  completed:
+  - native_cooperative_worker_stop
+  - serial_parallel_controller_cleanup
+  - terminal_boundary_review
+  - 204_regressions
+  - reflect
+  - remove_retired_repair_diagnostics_and_migrations
+  - strict_contract_rejection_regression
+  - 605_related_tests
+  - installed_wheel_validation
+  - cleanup_reflection
+  next:
+  - user_starts_fresh_HPO_campaigns
+state:
+  parameters:
+  - name: checkpoint_retention
+    value: one latest complete checkpoint per training/generation job
+    source: existing training.py plus current user scope
+    confidence: high
+  experiments:
+  - name: native_restart_retention_scheduling_regression
+    status: completed
+    result: 169 passed, 9 existing warnings in98.74s
+  - name: three_algorithm_integration_and_historical_compatibility
+    status: completed
+    result: 35 passed in107.23s; real CPU dummy workers and CLI; no real GlassNet/GPU
+      claim
+  - name: post_cleanup_full_hpo_and_resume_regression
+    status: completed
+    result: 605 passed,77 existing warnings in244.07s; fresh wheel installed and validates
+      dummy A2C without prediction
+  decisions:
+  - decision: User will recompute old disk-full campaigns; stop standalone old-job/glibc
+      recovery work
+    rationale: Latest explicit user instruction supersedes prior recovery requests
+  - decision: Graceful native stops wait for complete current work and atomically
+      overwritten checkpoint
+    rationale: Immediate or timed termination can leave paid ledger ahead of model
+      state
+  - decision: Remove historical compatibility registry rather than retaining stale
+      targets
+    rationale: User subsequently authorizes removing the retired recovery code entirely
+  - decision: Remove old repair/diagnosis/pruning scripts, source registry/upgrade
+      exceptions and associated tests/docs
+    rationale: User explicitly requests repository cleanup; preserves native restart
+      and latest-only checkpoints
+  base_revision: daa040125d83427c9fe0681893282abab7aa4cfc
+  publication: User requested commit and push of native stop and cleanup on codex/hpo-v1;
+    verify HEAD and remote tracking state before retrying publication.
+blockers: []
+artifacts:
+- path: src/rl_matdesign/utils/hpo_stop.py
+  role: worker signal deferral until committed checkpoint
+- path: docs/hpo_v1.md
+  role: native stop/restart and storage behavior
+- path: tests/test_hpo_cooperative_restart.py
+  role: all algorithm native integration proof
+resume_instructions: Use /Users/liuyuxiang/.codex/worktrees/hpo-v1/rl-matdesign on
+  codex/hpo-v1. Verify git status before any publication. Current work includes previous
+  native cooperative stop plus removal of historical repair/migration machinery. User
+  will recompute old campaigns; do not resurrect retired scripts from historical records.
+  New server runs use empty --out and this source; unchanged-code restart --check-only
+  then restart continues normally. All605 related tests passed in /private/tmp/hpo-native-cleanup;
+  fresh installed wheel also validates. Preserve the unrelated dirty default checkout.
+  No actual GPU/server campaign was modified.
+updated_at: '2026-11-13T10:04:17.909094+00:00'

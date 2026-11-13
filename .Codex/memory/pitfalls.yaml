@@ -215,6 +215,12 @@
     Reject a successful-looking terminal ledger with known fatal execution evidence.
     Preserve expected numerical or efficiency stops as ineligible, and retain
     measured time when scoring a previously preserved successful execution.
+    Distinguish a coordinator KeyboardInterrupt from a worker execution failure;
+    when cooperative stop finishes the worker normally or reaches an expected
+    efficiency/numerical terminal result, preserve the interruption separately
+    and retain the actual exit code. Otherwise native restart can falsely block
+    a valid terminal ledger after the last batch. Exercise all three terminal
+    statuses, not only a successful COMPLETED result.
   impact: Resume could otherwise erase system errors and bless invalid experiments.
   files: [src/rl_matdesign/hpo/job_runner.py, tests/test_hpo_parallel_job_runner.py]
   tags: [hpo, recovery, provenance]
@@ -228,30 +234,22 @@
     snapshots. Larger budgets and parallel workers rapidly exhaust disk.
   right: HPO must atomically overwrite checkpoint.pt at the same synchronization
     frequency, while normal experiment history remains opt-in through its existing
-    checkpoint settings. For old stopped campaigns use the standalone prune script
-    to delete only superseded numbered files, protecting the current symlink target
-    and recorded references. Copy that script alone to free space before upgrading.
-    The registered storage-repair release may restart exact approved old source
-    hashes without rewriting their original manifests or models.
+    checkpoint settings. Normal Ctrl+C/SIGTERM should wait for a complete unit
+    and synchronized checkpoint rather than interrupting a paid sample or batch.
     Disk-full resume still requires the candidate ledger/archive and model state to
     match; never reset paid attempts or treat partial_checkpoint.pt as resumable.
-    For a blocked generation job use scripts/diagnose_hpo_job.py to compare all
-    checkpoint/ledger counters, exact archive prefixes, frozen inputs and any .pt.tmp.
+    Use native restart --check-only to check candidate accounting and artifacts
+    before any new worker starts.
     Generation persists observations before its RNG/cache checkpoint; a ledger-ahead
     failure does not imply lost trained weights. Unique-success archives alone cannot
     reconstruct duplicate, failed or pending attempts. Readable temporary checkpoints
     are evidence for further validation, not permission for automatic replacement.
-    The audited single-observation exception is scripts/repair_hpo_generation.py;
-    require an exact nonempty prefix, one scalar unique success beyond it, frozen
-    temperature policy, matching runtime/assets and reproducible prefix caches.
-    Replay only policy actions after restoring RNG; reuse the durable reward,
-    forbid all property evaluation, and require exact candidate/input/formula.
-    Back up all job evidence and atomically replace only the generation checkpoint;
-    preserve ledger, paid counts, original timing, failure logs and damaged tmp.
+    The user retired old repair scripts and source-migration exceptions and will
+    recompute those campaigns in new directories; do not recreate that machinery.
   impact: GPU HPO jobs can all fail from shared-disk exhaustion; a surviving previous
     checkpoint is not sufficient for exact resume if paid accounting has advanced.
   files: [src/rl_matdesign/training.py, src/rl_matdesign/hpo/job_runner.py,
-    scripts/prune_hpo_checkpoints.py, tests/test_hpo_checkpoint_retention.py]
+    src/rl_matdesign/hpo/restart.py, tests/test_hpo_checkpoint_retention.py]
   tags: [hpo, checkpoint-retention, recovery-accounting]
 
 - id: pitfall-hpo-restart-gate-diagnosis-001
@@ -260,21 +258,15 @@
   title: Diagnose the campaign contract before blaming checkpoint corruption
   wrong: Treating the combined Campaign configuration/software/domain/assets error
     as proof that a checkpoint cannot resume, or changing source to diagnose it
-    without accounting for exact registered source hashes.
+    without accounting for exact source hashes.
     Aggregate package hashing includes all recursive .py files, including ignored
     notebook/backup files; a Git commit ID or clean tracked status alone is insufficient.
-  right: Use scripts/diagnose_hpo_restart.py with the CLI's Python environment.
-    Compare actual imported package path and hashes, registration, resolved plan,
-    domain, assets and raw YAML hashes. For unknown digests inspect source_evidence
-    for per-file changes, ignored extras and historical run commits. A match to an
-    old tree plus current extras is evidence for review, never automatic approval.
-    The server case was exactly reproduced from50c25e9a plus six historical
-    predictor files; recorded workers also used5d0d0dae. Register all reviewed
-    worker versions while preserving that same extra-file variant.
-    The campaign gate runs before per-job
-    checkpoint checks. Keep diagnosis outside src so reviewed recovery hashes stay
-    unchanged; never rewrite archived hashes to bypass an unexplained difference.
+  right: Native restart --check-only first checks campaign integrity and unchanged
+    inputs, then per-job checkpoint/accounting synchronization. Compare actual
+    imported package path and hashes, resolved plan, domain, assets and raw YAML
+    hashes when the campaign gate fails. Do not rewrite archived fingerprints or
+    add source-version exceptions. Use the original environment or start a new run.
   impact: A legitimate old run, changed YAML comment, or another installed package
     can produce the same opaque rejection despite intact checkpoint files.
-  files: [scripts/diagnose_hpo_restart.py, src/rl_matdesign/hpo/controller.py]
+  files: [src/rl_matdesign/hpo/controller.py, src/rl_matdesign/hpo/restart.py]
   tags: [hpo, recovery, provenance, diagnostics]

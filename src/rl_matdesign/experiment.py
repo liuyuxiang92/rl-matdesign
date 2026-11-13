@@ -469,8 +469,7 @@ def _run_experiment(resources: ExitStack) -> None:
                 _predictor_cache = getattr(predictor, "_cache", None)
 
                 if _mid is not None:
-                    require_execution_contract(_mid.get("execution_contract"), run_contract,
-                                               allow_source_upgrade=bool(cfg["hpo_recording"]))
+                    require_execution_contract(_mid.get("execution_contract"), run_contract)
                     if _mid.get("rng_state") is None or _mid.get("predictor_ledger") is None:
                         raise ValueError("Exact resume requires RNG state and predictor ledger")
                     predictor.load_state_dict(_mid["predictor_ledger"])
@@ -675,8 +674,7 @@ def _run_experiment(resources: ExitStack) -> None:
                 _raw = load_artifact(_resume_src, env, device=device, checkpoint=True, scaler=scaler)
                 if isinstance(_raw, dict) and _raw.get("type") == "pg":
                     _mid_ckpt = _raw
-                    require_execution_contract(_raw.get("execution_contract"), run_contract,
-                                               allow_source_upgrade=bool(cfg["hpo_recording"]))
+                    require_execution_contract(_raw.get("execution_contract"), run_contract)
                     if _raw.get("rng_state") is None or _raw.get("predictor_ledger") is None:
                         raise ValueError("Exact resume requires RNG state and predictor ledger")
                     predictor.load_state_dict(_raw["predictor_ledger"])

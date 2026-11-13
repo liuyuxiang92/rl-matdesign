@@ -59,10 +59,12 @@ def run_jobs(jobs, runner, parallel_jobs, *, on_start, on_result, on_progress):
             if done:
                 on_progress([pending[f] for f in pending if not f.done()],
                             len(launched) - len(pending), len(jobs) - next_submit)
-    except BaseException:
+    except BaseException as failure:
         # Stop active workers before joining their waiting threads. Queued jobs
         # that never started spend no candidate budget and must not be counted.
-        cancel = getattr(runner, "cancel_all", None)
+        cancel = (getattr(runner, "stop_all", None) if isinstance(failure, KeyboardInterrupt) else None)
+        if cancel is None:
+            cancel = getattr(runner, "cancel_all", None)
         if cancel is not None:
             try:
                 cancel()

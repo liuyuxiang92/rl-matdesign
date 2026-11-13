@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import sys
+import signal
+import threading
 
 from ..config_schema import ConfigError
 from .artifacts import read_json
@@ -47,8 +50,31 @@ def _print(value):
     print(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))
 
 
+@contextmanager
+def _coordinator_termination(enabled):
+    """Route scheduler SIGTERM through the same cleanup as terminal Ctrl+C."""
+    previous = signal.getsignal(signal.SIGTERM)
+    installed = (enabled and threading.current_thread() is threading.main_thread()
+                 and previous == signal.SIG_DFL)
+    if installed:
+        def interrupt(_signum, _frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, interrupt)
+    try:
+        yield
+    finally:
+        if installed:
+            signal.signal(signal.SIGTERM, previous)
+
+
 def main(argv=None) -> int:
     args = parser().parse_args(argv)
+    with _coordinator_termination(args.command in ("run", "resume", "restart")
+                                  and not getattr(args, "check_only", False)):
+        return _main(args)
+
+
+def _main(args) -> int:
     from .controller import Campaign, CampaignError
     from .job_runner import JobError
     try:
@@ -69,7 +95,6 @@ def main(argv=None) -> int:
                 campaign.parallel_jobs = args.parallel_jobs
             from .restart import inspect_restart
             report = inspect_restart(args.out)
-            report["software_migration"] = campaign.software_migration
             report["requested_stage"] = state["requested_stage"]
             report["execution_options"] = {
                 "original_parallel_jobs": manifest["plan"].get("parallel_jobs", 1),

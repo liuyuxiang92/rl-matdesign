@@ -139,8 +139,7 @@ def load_artifact(path, env, *, device="cpu", checkpoint: bool = False, scaler=N
     expected = getattr(env, "evaluation_contract", None)
     if expected is not None:
         actual = (raw.get("execution_contract") or {}).get("evaluation") if checkpoint else raw.get("evaluation_contract")
-        from .hpo_resume_compatibility import evaluation_contracts_equal
-        if not evaluation_contracts_equal(
-                actual, expected, allow_source_upgrade=getattr(env, "hpo_recorder", None) is not None):
+        from .execution_contract import contracts_equal
+        if not contracts_equal(actual, expected):
             raise ValueError(f"{path}: evaluation contract differs or is missing; model assets, code, seeds or runtime changed")
     return raw

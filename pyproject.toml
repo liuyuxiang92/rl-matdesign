@@ -20,9 +20,6 @@ dev = ["pytest>=7", "ruff==0.14.3"]
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-data]
-"rl_matdesign.utils" = ["hpo_resume_compatibility.json"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q"

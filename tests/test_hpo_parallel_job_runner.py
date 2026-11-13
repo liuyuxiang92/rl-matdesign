@@ -235,6 +235,9 @@ def test_direct_call_persists_interrupt_and_reraises_original_failure(tmp_path, 
             super().__init__(*args, **kwargs)
             self.first_wait = True
 
+        def send_signal(self, sig):
+            assert sig == signal.SIGTERM
+
         def wait(self, timeout=None):
             if self.first_wait:
                 self.first_wait = False
