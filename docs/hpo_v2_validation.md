@@ -106,3 +106,16 @@ A2C 每个生成设置实际使用 2 个冻结模型 × 2 次采样，共 4 次�
 补充混合版本实测：campaign manifest 与第一模型来自 `50c25e9a + 六文件`，中断的第二 worker 来自 `5d0d0dae + 六文件`；新版并行恢复同样通过只读检查、已完成任务复用及与旧版对照的精确候选/模型比较。
 
 冻结源码目标：clean package `f46e85e2ade8649a7daf97bd1e5b589de4ce21f43d0e85359593aa847636af7c`；保留六文件的 package `4535f81ee9c871805e8775219f9e28e4266cd4e579f8d5e90339ffb3c2d7b7bf`。证据：`/private/tmp/rlmat-preparallel-restart-0au08yu6/verification.json`；回归日志：`/private/tmp/rlmat-serial-parallel-restart-regression.log`。这些 CPU 软件验证不代替真实 GPU 输出目录的 checkpoint 同步检查，也不证明 GlassNet 科学结果已达标。
+
+
+## 2026-11-13：单次生成落盘失败的有限恢复
+
+服务器单任务诊断明确：已有 698 个任务可复用；唯一阻塞的生成任务账本与候选档案为 7，完整 checkpoint 为 6，原 `.pt.tmp` 仅 128 字节且不可读取，冻结网络和 scaler 指纹完整。新增独立 `repair_hpo_generation.py` 及文件事务 helper，生产包源码保持 `f46e85e2ade8649a7daf97bd1e5b589de4ce21f43d0e85359593aa847636af7c`，既有精确源码兼容登记无需改变。
+
+针对 A2C、DQN MC、DQN bootstrap，使用真实 CPU worker 和内置 dummy 性质模型，在第 7 次生成 checkpoint 写入注入 ENOSPC：保留完整 cp6、7 条完整候选/性质/计时记录和损坏 tmp，同时捕获本应写出的 cp7 作为对照。验证只重放策略、禁止任何预测模型调用的恢复能逐项复现 cp7 的 RNG、hpo_state、预测成本账本、缓存、额外状态和原契约。应用只改变主 checkpoint，全部原文件备份，原账本与损坏 tmp 保留；重复应用不修改文件。随后常规预检通过，续跑候选档案、最终 RNG 和缓存与不中断运行一致，第 7 次已付费评估没有重新发生。
+
+集成模块还覆盖嵌套 group filters 和不一致科学不确定性的拒绝。相关已有 restart/源码兼容/断点保存/诊断回归 **138 passed，36.81 秒**，日志 `/private/tmp/rlmat-generation-repair-regression.log`。另以新 Python 进程实际执行只读 CLI，在真实 DQN MC 失败夹具上得到 `from_unique: 6`、`to_unique: 7`、`predictor_evaluations: 0`；输出 `/private/tmp/rlmat-generation-repair-cli.json`。
+
+这些结果是本地软件验证，不代表服务器文件已修改。真实 GlassNet/CUDA 必须在原环境通过同样的契约、前缀缓存与候选重放检查；工具不放行其他类型的状态缺口，也不调用性质预测器重新评估已付费候选。
+
+新增修复与事务保护测试最终联合通过 **41 passed，45.03 秒**；合计本次验证 **179 passed**。包含缓存子类属性和顺序的序列化核验，以及备份/序列化期间外部模型变化的拒绝。
