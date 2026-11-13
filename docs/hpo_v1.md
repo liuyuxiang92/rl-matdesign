@@ -190,7 +190,7 @@ rl-matdesign hpo resume --out runs/my_hpo
 
 ## Checkpoint 磁盘占用与旧任务清理
 
-HPO 训练只原子覆盖一份 `jobs/<id>/checkpoint.pt`，不再逐步累积 `checkpoint-epN.pt`（DQN）或 `checkpoint-iterN.pt`（A2C）。保存频率不变：断点保存优化器、随机状态、已花预算和 DQN replay buffer，用于恢复最新同步状态。评分使用候选档案，不读取历史训练快照；冻结生成使用被选中任务的最终模型。该策略在 HPO 内部固定，不新增 YAML 参数；普通非 HPO 训练仍保留编号快照。
+HPO 训练只原子覆盖一份 `jobs/<id>/checkpoint.pt`，不再逐步累积 `checkpoint-epN.pt`（DQN）或 `checkpoint-iterN.pt`（A2C）。保存频率在 HPO 内部固定为 `--save-checkpoint-freq 1`：DQN 两种方法每完成一次候选 episode 及相应训练处理后保存（含重复候选，不是每个 action）；A2C 每完成一个训练 batch 并更新网络后保存，因此一个 batch 含多个候选时不是每个候选保存一次。断点保存优化器、随机状态、已花预算和 DQN replay buffer，用于恢复最新同步状态。评分使用候选档案，不读取历史训练快照；冻结生成使用被选中任务的最终模型。该策略在 HPO 内部固定，不新增 YAML 参数；普通非 HPO 训练仍保留编号快照。
 
 每个任务的最终 `qnet.pt` / `policy.pt` / `value_net.pt`、`std_scaler.bin`、最新完整断点以及候选档案、账本和结果仍保留。生成任务继续覆盖自己的 `generation_checkpoint.pt`；失败任务可能保留诊断用 `partial_checkpoint.pt`。这次修复消除的是同一任务内的历史全量副本，并不让整个 campaign 的磁盘占用与任务数量无关。原子写入期间需要同时容纳旧断点和新临时文件。
 
@@ -211,6 +211,14 @@ python scripts/prune_hpo_checkpoints.py --out /path/to/hpo_output --apply
 rl-matdesign hpo restart --out ./runs/a2c_coarse --check-only
 rl-matdesign hpo restart --out ./runs/a2c_coarse
 ```
+
+如果在出现任务检查结果前报 `Campaign configuration, software, domain or assets changed`，这是 campaign 契约检查未通过，尚不能判断 checkpoint 是否损坏。用运行 CLI 的同一个 Python 环境执行仓库内的只读诊断脚本（不强行切换 `PYTHONPATH`，以便发现实际加载了另一份安装包）：
+
+```bash
+python /path/to/rl-matdesign/scripts/diagnose_hpo_restart.py --out ./runs/a2c_coarse
+```
+
+脚本输出实际包路径、旧/新源码指纹、是否登记兼容，以及具体变化字段。它不创建 campaign、不启动 worker、不加载模型张量、不修改实验目录。`campaign_contract_accepted` 仅表示外层契约可以通过，不代表内部断点已同步，之后仍需 `restart --check-only`。输出中的 `configuration_sources` 还会检查原 YAML 的字节指纹；注释变化也会被记录。诊断失败时保留原文件并根据差异定位原因，不改写 manifest 哈希或跳过校验。脚本位于 `scripts/`，新增它不会改变已登记的包源码指纹。
 
 `restart` 按 `state.json` 保存的阶段继续，不从头创建 HPO；原 `resume` 命令同样支持这套机制。检查在启动任何 worker 前读取所有已有任务，输出以下分类：
 

@@ -240,3 +240,20 @@
   files: [src/rl_matdesign/training.py, src/rl_matdesign/hpo/job_runner.py,
     scripts/prune_hpo_checkpoints.py, tests/test_hpo_checkpoint_retention.py]
   tags: [hpo, checkpoint-retention, recovery-accounting]
+
+- id: pitfall-hpo-restart-gate-diagnosis-001
+  date: '2026-11-13'
+  expires: '2027-02-13'
+  title: Diagnose the campaign contract before blaming checkpoint corruption
+  wrong: Treating the combined Campaign configuration/software/domain/assets error
+    as proof that a checkpoint cannot resume, or changing source to diagnose it
+    without accounting for exact registered source hashes.
+  right: Use scripts/diagnose_hpo_restart.py with the CLI's Python environment.
+    Compare actual imported package path and hashes, registration, resolved plan,
+    domain, assets and raw YAML hashes. The campaign gate runs before per-job
+    checkpoint checks. Keep diagnosis outside src so reviewed recovery hashes stay
+    unchanged; never rewrite archived hashes to bypass an unexplained difference.
+  impact: A legitimate old run, changed YAML comment, or another installed package
+    can produce the same opaque rejection despite intact checkpoint files.
+  files: [scripts/diagnose_hpo_restart.py, src/rl_matdesign/hpo/controller.py]
+  tags: [hpo, recovery, provenance, diagnostics]
