@@ -218,3 +218,25 @@
   impact: Resume could otherwise erase system errors and bless invalid experiments.
   files: [src/rl_matdesign/hpo/job_runner.py, tests/test_hpo_parallel_job_runner.py]
   tags: [hpo, recovery, provenance]
+
+- id: pitfall-hpo-checkpoint-history-001
+  date: '2026-11-13'
+  expires: '2027-02-13'
+  title: Frequent HPO recovery saves must not retain every full training snapshot
+  wrong: HPO requests save-checkpoint-freq 1 but DQN/A2C training writes a new
+    numbered file at every update and retains all prior full replay/optimizer
+    snapshots. Larger budgets and parallel workers rapidly exhaust disk.
+  right: HPO must atomically overwrite checkpoint.pt at the same synchronization
+    frequency, while normal experiment history remains opt-in through its existing
+    checkpoint settings. For old stopped campaigns use the standalone prune script
+    to delete only superseded numbered files, protecting the current symlink target
+    and recorded references. Copy that script alone to free space before upgrading.
+    The registered storage-repair release may restart exact approved old source
+    hashes without rewriting their original manifests or models.
+    Disk-full resume still requires the candidate ledger/archive and model state to
+    match; never reset paid attempts or treat partial_checkpoint.pt as resumable.
+  impact: GPU HPO jobs can all fail from shared-disk exhaustion; a surviving previous
+    checkpoint is not sufficient for exact resume if paid accounting has advanced.
+  files: [src/rl_matdesign/training.py, src/rl_matdesign/hpo/job_runner.py,
+    scripts/prune_hpo_checkpoints.py, tests/test_hpo_checkpoint_retention.py]
+  tags: [hpo, checkpoint-retention, recovery-accounting]

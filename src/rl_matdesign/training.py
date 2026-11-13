@@ -970,7 +970,11 @@ def train_dqn_online(
             or budget.consecutive_duplicates >= train_max_duplicate_attempts
         )
         if ckpt_path and ckpt_freq > 0 and (train_attempts % ckpt_freq == 0 or budget_stop):
-            _numbered = ckpt_path.replace(".pt", f"-ep{train_attempts}.pt")
+            # HPO resumes from the latest synchronized state; keeping every
+            # replay-buffer snapshot makes disk usage grow with every attempt.
+            # A direct atomic replacement also safely replaces an old symlink.
+            _numbered = (None if getattr(env, "hpo_recorder", None) is not None
+                         else ckpt_path.replace(".pt", f"-ep{train_attempts}.pt"))
             _save_checkpoint(ckpt_path, {
                 "type": "dqn",
                 "scaler_fingerprint": scaler_fingerprint(scaler),
@@ -992,7 +996,7 @@ def train_dqn_online(
                 "dp_cache": dict(dp_cache_ref) if dp_cache_ref is not None else {},
             }, numbered_path=_numbered)
             tqdm.write(f"[INFO] DQN checkpoint saved at episode {train_attempts} "
-                       f"(budget {completed}/{dqn_num_train_eps}) → {_numbered}")
+                       f"(budget {completed}/{dqn_num_train_eps}) → {_numbered or ckpt_path}")
 
     pbar.close()
     return qnet, scaler, metrics
@@ -1773,7 +1777,9 @@ def train_pg(
             (ckpt_freq > 0 and (it + 1) % ckpt_freq == 0)
             or stopping_incomplete or budget_finished
         ):
-            _numbered = ckpt_path.replace(".pt", f"-iter{it + 1}.pt")
+            # HPO needs the latest synchronized state, not iteration history.
+            _numbered = (None if getattr(env, "hpo_recorder", None) is not None
+                         else ckpt_path.replace(".pt", f"-iter{it + 1}.pt"))
             _save_checkpoint(ckpt_path, {
                 "type": "pg",
                 "scaler_fingerprint": scaler_fingerprint(scaler),
@@ -1796,7 +1802,7 @@ def train_pg(
                 **budget.snapshot(),
                 "training_budget_history_complete": budget_history_complete,
             }, numbered_path=_numbered)
-            tqdm.write(f"[INFO] PG checkpoint saved at iter {it + 1} → {_numbered}")
+            tqdm.write(f"[INFO] PG checkpoint saved at iter {it + 1} → {_numbered or ckpt_path}")
 
     outer_pbar.close()
     print(

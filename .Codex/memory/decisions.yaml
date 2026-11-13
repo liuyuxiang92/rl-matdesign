@@ -303,3 +303,31 @@
   - src/rl_matdesign/hpo/controller.py
   - src/rl_matdesign/config_schema.py
   tags: [hpo, configuration-contracts, scientific-evidence]
+
+- id: decision-hpo-storage-restart-001
+  date: '2026-11-13'
+  expires: '2027-05-13'
+  title: Permit reviewed HPO storage repairs without weakening scientific resume checks
+  choice: >-
+    Keep one latest full checkpoint per HPO training job at the existing save
+    frequency. A bundled JSON registry authorizes exact old/new package and
+    worker source fingerprint pairs for reviewed storage-only recovery changes.
+    Compare every other campaign, model, training and generation contract field
+    strictly; retain original manifests, completed artifacts and fingerprints,
+    record migrations separately, and write true current provenance for new work.
+    restart and resume run read-only per-job accounting/checkpoint preflight
+    before launching workers; restart --check-only performs no writes or sampling.
+  alternatives_considered:
+  - Ignoring source fingerprints generally would silently allow scientific protocol changes.
+  - Rewriting old manifests/models would destroy original execution evidence and break frozen hashes.
+  - Rolling back paid ledgers to a stale checkpoint would conceal costs and inflate efficiency.
+  trade_off: >-
+    Missing unsaved model updates cannot be reconstructed from candidate records;
+    damaged or ledger-ahead tasks remain blocked with explicit reasons. Future
+    source edits must not blindly regenerate the compatibility target hashes;
+    review the diff or retire the migration. The release registry test detects
+    missing or stale targets, and package data must include the JSON registry.
+  files: [src/rl_matdesign/hpo/restart.py, src/rl_matdesign/hpo/controller.py,
+    src/rl_matdesign/hpo/cli.py, src/rl_matdesign/utils/hpo_resume_compatibility.py,
+    src/rl_matdesign/utils/hpo_resume_compatibility.json]
+  tags: [hpo, checkpoint-compatibility, scientific-evidence]
