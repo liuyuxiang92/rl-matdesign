@@ -1,0 +1,45 @@
+checkpoint_version: 3.0.0
+created_at: '2026-11-13T05:16:44.308609+00:00'
+branch: codex/hpo-v1
+phase:
+  current: await_server_single_job_diagnostic
+  completed:
+  - interpreted_check_results
+  - generation_recovery_audit
+  - standalone_job_diagnostic
+  - regression_143
+  - readonly_real_checkpoint_smoke
+  next:
+  - commit_push_diagnostic
+  - user_runs_single_job_diagnostic
+  - assess_exact_generation_repair
+state:
+  server_check:
+    source_migration_accepted: true
+    parallel_jobs: 10
+    CACHED: 698
+    BLOCKED: 1
+    job_id: dd2b3a16877e54f40cdc52f3
+    phase: generation
+    attempts_started: 7
+    unique_evaluated: 7
+    reason: Candidate ledger advanced beyond checkpoint or is unsynchronized
+  production_source_changed: false
+  regression: 143 passed in11.58s
+blockers:
+- question: Exact checkpoint counters, archive prefix and temporary checkpoint state
+    on server
+  impact: Cannot determine exact continuation from aggregate mismatch alone
+  assumption: No server access; user runs readonly script
+artifacts:
+- path: scripts/diagnose_hpo_job.py
+  role: single-job diagnostic
+- path: /Users/liuyuxiang/Downloads/check.results
+  role: user server preflight evidence
+- path: /private/tmp/rlmat-job-diagnostic-k4iwdsbd-report.json
+  role: local synthetic stale checkpoint diagnostic, not server state
+resume_instructions: Verify HEAD/publication before retry. Server installed repo /aisi/yxliu/code/test_rl_material/oxyhydroxide-catalyst-gen.
+  Run scripts/diagnose_hpo_job.py --out ./runs/a2c_coarse --job-id dd2b3a16877e54f40cdc52f3
+  using same rl-glassnet environment. Preserve all original files; do not reset costs
+  or promote .tmp based only on matching counts/prefix. Current exact source registries
+  stay valid because production src unchanged.

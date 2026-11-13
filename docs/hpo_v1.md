@@ -240,6 +240,17 @@ python /path/to/rl-matdesign/scripts/diagnose_hpo_restart.py --out ./runs/a2c_co
 
 磁盘写满可能留下未完成的临时文件、截断的候选记录，或已领先模型断点的已付费账本；有 `checkpoint.pt` 并不保证任意中断点都能精确恢复。遇到 `accounting advanced beyond checkpoint`、`archive differs`、缺失/损坏文件或已记录的失败退出，应保留目录与报错逐项检查，不能删除账本、篡改哈希或把诊断 `partial_checkpoint.pt` 当作完整断点。`restart` 不会声称重建从未成功写入磁盘的网络更新，也不会悄悄从零训练或抹掉已花预算。已完成实验的有效结果不必因此全部重做。
 
+如果外层兼容检查已经通过，但某个任务因账本与 checkpoint 不同步而被标为 `BLOCKED`，停止该 campaign 的控制器和 worker 后，针对报告中的 job ID 进一步检查：
+
+```bash
+python /path/to/rl-matdesign/scripts/diagnose_hpo_job.py \
+  --out ./runs/a2c_coarse --job-id REPORT中的job_id
+```
+
+使用运行 CLI 的同一 Python 环境。此脚本只读取指定任务的本地可信 checkpoint（含可能遗留的 `.pt.tmp`），在 CPU 上提取计数与指纹；不运行模型或采样，也不修改文件。报告对比磁盘账本与断点中的各项计数，检查候选档案及断点对应前缀，并列出冻结模型文件指纹和失败日志。退出码 0 仅表示诊断资料读取完成，不表示可以恢复；退出码 2 表示有缺失、损坏或无法读取的诊断资料。
+
+生成任务先保存已评估候选及账本，再保存生成 checkpoint，因此账本领先不能直接判定训练网络或候选丢失。生成使用冻结的训练网络，但精确续跑仍需要同步的随机状态、预测器状态与预算。即使 `.pt.tmp` 可以加载且计数相符，也需要进一步核对全部契约，不能直接重命名替换。保留原文件并提供诊断输出；不回退账本、不删除已付费候选，也不把旧 checkpoint 的计数手动改成新值。
+
 ## GlassNet 初次验证与软件 smoke
 
 GlassNet 模板引用用户提供的 benchmark 场景根目录：
