@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "migrations": [
+    {
+      "id": "hpo-bounded-checkpoint-storage-20261113",
+      "reason": "Audited HPO checkpoint retention and recovery update; scientific configuration and runtime contracts remain unchanged.",
+      "reviewed_from_revision": "5d0d0dae",
+      "from": {
+        "package": "de0877ab451bccee168e8c8dee02c92eca9a64ba246bc0589a3d766d762286d8",
+        "source": "d8ce284b84fe7ca2b78d4e3a9f06749a84c437cb611745c22bc5b323592ad646"
+      },
+      "to": {
+        "package": "909f265fe8e8c9c305c14d1714bde161941406c08c06240b80b9d35ab3595e84",
+        "source": "e5716b0ecb31012be6adb81ab4f04d03ee423c838f382a98f59f74e0196b9913"
+      }
+    }
+  ]
+}

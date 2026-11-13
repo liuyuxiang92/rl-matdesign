@@ -80,3 +80,16 @@ A2C 每个生成设置实际使用 2 个冻结模型 × 2 次采样，共 4 次�
 | dqn_bootstrap | 33.91 | 13.25 | 一致 |
 
 以上耗时来自本地 dummy 运行，不代表 GlassNet 或 GPU 加速效果。结果与逐作业日志：`/private/tmp/rlmat-parallel-runtime-sg8ncnnw/verification.json`。第一次临时 smoke 将 A2C warmup设为0，scaler拟合没有样本而失败；修正临时场景为2次准备采样后在全新目录完成验证，未修改生产训练逻辑。
+
+
+## 2026-11-13：单份最新断点及旧版本 restart
+
+本次 Python 源码冻结指纹：package `909f265fe8e8c9c305c14d1714bde161941406c08c06240b80b9d35ab3595e84`，worker source `e5716b0ecb31012be6adb81ab4f04d03ee423c838f382a98f59f74e0196b9913`。包内 JSON 登记表只批准上一发布版本 `5d0d0dae` / 同源码 `b8e01748` 到此修复的精确指纹对；配置、资产、种子、数值环境和学习/生成规则仍须一致。旧 manifest 与完成模型不改写。
+
+相关 HPO、清理、恢复、模型契约、训练预算和生成回归：**619 passed，77 个既有 legacy 提示，74.23 秒**。随后增加发布登记表与真实源码匹配的检查，兼容模块 **27 passed，2.01 秒**。清理测试使用临时目录验证原 checkpoint 链接目标与结果哈希不变；写盘失败测试验证旧断点完整且不同步账本不能回滚。wheel 构建检查确认兼容 JSON 会随包分发。
+
+额外使用从 Git 精确导出的旧版源码创建三种算法的真实 CPU dummy campaign。每个 campaign 第一任务完成、第二任务在完整同步 checkpoint 后中断、第三任务尚未执行。新版本 `restart --check-only` 不修改文件；实际 restart/resume 复用第一任务，续跑第二任务并执行第三任务。续跑后的候选档案、计数和模型张量与旧版不中断对照完全一致；没有新增编号 checkpoint，原 manifest 与完成任务文件保持不变。三种方法的旧模型在新版本生成结果也与旧版对照相同。
+
+另外验证了实际 A2C 旧版生成断点：从一次已同步采样续到四次，最终记录与预算等于旧版连续生成，冻结模型/scaler 未变。重复恢复和生成不新增采样，迁移记录保持一条。证据在 `/private/tmp/rlmat-oldnew-restart-0ozktp2x/verification.json`，回归日志在 `/private/tmp/rlmat-hpo-restart-regression.log`。
+
+这不是 GlassNet/GPU 实验，也未访问或清理用户服务器。真实磁盘写满可能破坏未成功落盘的更新或让账本超前；此类任务由预检明确阻塞，不承诺重建丢失状态，不清空账本或从零重跑。

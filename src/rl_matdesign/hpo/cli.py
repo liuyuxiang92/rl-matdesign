@@ -21,8 +21,12 @@ def parser():
         if name == "run":
             command.add_argument("--out", required=True)
             command.add_argument("--stage", choices=("all", "ranges", "search", "train-budget", "train-search", "generation"), default="all")
-    for name in ("status", "resume"):
-        commands.add_parser(name).add_argument("--out", required=True)
+    for name in ("status", "resume", "restart"):
+        command = commands.add_parser(name)
+        command.add_argument("--out", required=True)
+        if name == "restart":
+            command.add_argument("--check-only", action="store_true",
+                                 help="Check saved job accounting/checkpoints without writes or sampling")
     return root
 
 
@@ -42,11 +46,21 @@ def main(argv=None) -> int:
             if not (directory / "manifest.json").exists():
                 raise CampaignError("No HPO campaign manifest exists in --out")
             return 0
-        if args.command == "resume":
+        if args.command in ("resume", "restart"):
             manifest = read_json(Path(args.out) / "manifest.json")
             state = read_json(Path(args.out) / "state.json")
             plan = load_plan(manifest["plan"]["source_path"], method=manifest["plan"]["method"])
             campaign = Campaign(plan, args.out)
+            from .restart import inspect_restart
+            report = inspect_restart(args.out)
+            report["software_migration"] = campaign.software_migration
+            report["requested_stage"] = state["requested_stage"]
+            _print({"restart_check": report})
+            if not report["ready"]:
+                print("HPO restart blocked: inspect the listed jobs; no new sampling was started.", file=sys.stderr)
+                return 2
+            if getattr(args, "check_only", False):
+                return 0
             result = campaign.run(state["requested_stage"])
             _print(result)
             return 0 if result["status"] == "COMPLETED" else 3

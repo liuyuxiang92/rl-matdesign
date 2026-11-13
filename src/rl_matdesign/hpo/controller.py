@@ -18,6 +18,7 @@ from .domain import design_space_info, minimum_training_budget, training_budget_
 from .job_runner import JobError, JobRunner
 from .range_search import initial_reference, run_range_search
 from .scheduling import run_jobs
+from ..utils.hpo_resume_compatibility import approved_upgrade
 
 STAGES = ("ranges", "train-budget", "train-search", "generation")
 SCOPES = {"all": STAGES, "search": STAGES[1:], **{s: (s,) for s in STAGES}}
@@ -85,9 +86,24 @@ class Campaign:
         contract["configuration_sources"] = {
             name: {"path": path, "sha256": file_digest(path)} for name, path in source_paths.items()}
         self.contract_digest = digest(contract)
+        self.software_migration = None
         if self.manifest_path.exists():
-            if read_json(self.manifest_path)["contract_digest"] != self.contract_digest:
-                raise CampaignError("Campaign configuration, software, domain or assets changed; use a new --out")
+            saved = read_json(self.manifest_path)
+            original = {key: saved.get(key) for key in contract}
+            if digest(original) != saved.get("contract_digest"):
+                raise CampaignError("Campaign manifest contract is damaged or was modified; preserve it for inspection")
+            if saved["contract_digest"] != self.contract_digest:
+                upgrade = approved_upgrade(original["software_digest"], contract["software_digest"], kind="package")
+                comparable = {**original, "software_digest": contract["software_digest"]}
+                if upgrade is None or comparable != contract:
+                    raise CampaignError("Campaign configuration, software, domain or assets changed; "
+                                        "only a registered checkpoint-storage repair can reuse an older campaign")
+                self.software_migration = {
+                    "migration": upgrade, "from_software_digest": original["software_digest"],
+                    "to_software_digest": contract["software_digest"],
+                    "original_contract_digest": saved["contract_digest"],
+                    "current_contract_digest": self.contract_digest,
+                }
         else:
             if self.out.exists() and any(self.out.iterdir()):
                 raise CampaignError(f"Output directory is nonempty and is not this HPO campaign: {self.out}")
@@ -493,9 +509,24 @@ class Campaign:
             result["generation_pairings"] = pairings
         return result
 
+    def record_software_migration(self):
+        if self.software_migration is None:
+            return
+        path = self.out / "software_migrations.json"
+        history = read_json(path) if path.exists() else {"migrations": []}
+        entries = history.get("migrations")
+        if not isinstance(entries, list):
+            raise CampaignError("Invalid software migration history; preserve it for inspection")
+        if not any(all(row.get(key) == value for key, value in self.software_migration.items())
+                   for row in entries):
+            entries.append({**self.software_migration,
+                            "recorded_at": datetime.now(timezone.utc).isoformat()})
+            atomic_json(path, history)
+
     def run(self, scope="all"):
         if scope not in SCOPES:
             raise CampaignError(f"Unknown stage {scope}")
+        self.record_software_migration()
         state = {"requested_stage": scope, "status": "RUNNING", "completed_stages": []}
         atomic_json(self.out / "state.json", state)
         try:
