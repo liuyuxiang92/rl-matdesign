@@ -61,6 +61,35 @@ def approved_upgrade(old_digest, new_digest, kind="package") -> dict | None:
     return None
 
 
+
+def normalize_legacy_serial_contract(actual, expected):
+    """Normalize only the implicit serial defaults added by parallel HPO.
+
+    This helper grants NO source compatibility. Callers must separately require
+    a reviewed exact software pair and equality of every remaining field. Never
+    mutate either original evidence document or accept an authored concurrency
+    change as a default migration.
+    """
+    result = copy.deepcopy(actual)
+    changed = []
+    if not isinstance(result, dict) or not isinstance(expected, dict):
+        return result, changed
+    old, new = result.get("plan"), expected.get("plan")
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return result, changed
+    old_sources, new_sources = old.get("sources"), new.get("sources")
+    authored = old.get("authored_config")
+    if (isinstance(old_sources, dict) and isinstance(new_sources, dict)
+            and isinstance(authored, dict) and "parallel_jobs" not in authored
+            and "parallel_jobs" not in old and "parallel_jobs" not in old_sources
+            and type(new.get("parallel_jobs")) is int and new["parallel_jobs"] == 1
+            and new_sources.get("parallel_jobs") == "default"):
+        old["parallel_jobs"] = 1
+        old_sources["parallel_jobs"] = "default"
+        changed = ["plan.parallel_jobs", "plan.sources.parallel_jobs"]
+    return result, changed
+
+
 def evaluation_contracts_equal(actual, expected, *, allow_source_upgrade=False) -> bool:
     if _same(actual, expected):
         return True

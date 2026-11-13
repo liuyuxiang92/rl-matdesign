@@ -255,6 +255,9 @@
     domain, assets and raw YAML hashes. For unknown digests inspect source_evidence
     for per-file changes, ignored extras and historical run commits. A match to an
     old tree plus current extras is evidence for review, never automatic approval.
+    The server case was exactly reproduced from50c25e9a plus six historical
+    predictor files; recorded workers also used5d0d0dae. Register all reviewed
+    worker versions while preserving that same extra-file variant.
     The campaign gate runs before per-job
     checkpoint checks. Keep diagnosis outside src so reviewed recovery hashes stay
     unchanged; never rewrite archived hashes to bypass an unexplained difference.

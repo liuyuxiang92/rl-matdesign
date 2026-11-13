@@ -18,7 +18,7 @@ from .domain import design_space_info, minimum_training_budget, training_budget_
 from .job_runner import JobError, JobRunner
 from .range_search import initial_reference, run_range_search
 from .scheduling import run_jobs
-from ..utils.hpo_resume_compatibility import approved_upgrade
+from ..utils.hpo_resume_compatibility import approved_upgrade, normalize_legacy_serial_contract
 
 STAGES = ("ranges", "train-budget", "train-search", "generation")
 SCOPES = {"all": STAGES, "search": STAGES[1:], **{s: (s,) for s in STAGES}}
@@ -94,8 +94,9 @@ class Campaign:
                 raise CampaignError("Campaign manifest contract is damaged or was modified; preserve it for inspection")
             if saved["contract_digest"] != self.contract_digest:
                 upgrade = approved_upgrade(original["software_digest"], contract["software_digest"], kind="package")
-                comparable = {**original, "software_digest": contract["software_digest"]}
-                if upgrade is None or comparable != contract:
+                comparable, plan_migrations = normalize_legacy_serial_contract(original, contract)
+                comparable["software_digest"] = contract["software_digest"]
+                if upgrade is None or digest(comparable) != self.contract_digest:
                     raise CampaignError("Campaign configuration, software, domain or assets changed; "
                                         "only a registered checkpoint-storage repair can reuse an older campaign")
                 self.software_migration = {
@@ -103,6 +104,7 @@ class Campaign:
                     "to_software_digest": contract["software_digest"],
                     "original_contract_digest": saved["contract_digest"],
                     "current_contract_digest": self.contract_digest,
+                    "normalized_plan_defaults": plan_migrations,
                 }
         else:
             if self.out.exists() and any(self.out.iterdir()):
@@ -508,6 +510,29 @@ class Campaign:
         if pairings is not None:
             result["generation_pairings"] = pairings
         return result
+
+    def record_execution_options(self, parallel_jobs=None):
+        """Record runtime scheduling separately from immutable experiment inputs.
+
+        Omitting the override restores the original YAML/default concurrency.
+        Check-only and failed preflight callers must never invoke this method.
+        """
+        original = self.plan.get("parallel_jobs", 1)
+        effective = original if parallel_jobs is None else parallel_jobs
+        if type(effective) is not int or effective < 1:
+            raise CampaignError("parallel_jobs must be a positive integer")
+        settings = {"original_parallel_jobs": original,
+                    "requested_parallel_jobs": parallel_jobs,
+                    "effective_parallel_jobs": effective}
+        path = self.out / "execution_options.json"
+        history = read_json(path) if path.exists() else {"history": []}
+        entries = history.get("history")
+        if not isinstance(entries, list) or any(not isinstance(row, dict) for row in entries):
+            raise CampaignError("Invalid execution options history; preserve it for inspection")
+        if not entries or any(entries[-1].get(key) != value for key, value in settings.items()):
+            entries.append({**settings, "recorded_at": datetime.now(timezone.utc).isoformat()})
+            atomic_json(path, history)
+        self.parallel_jobs = effective
 
     def record_software_migration(self):
         if self.software_migration is None:

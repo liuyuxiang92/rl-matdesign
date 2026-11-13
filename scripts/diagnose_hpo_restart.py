@@ -147,7 +147,7 @@ def inspect_campaign(out):
         from rl_matdesign.hpo import artifacts
         from rl_matdesign.hpo.domain import design_space_info
         from rl_matdesign.hpo.spec import load_plan
-        from rl_matdesign.utils.hpo_resume_compatibility import approved_upgrade
+        from rl_matdesign.utils.hpo_resume_compatibility import approved_upgrade, normalize_legacy_serial_contract
         report["package"] = {"path": str(Path(artifacts.__file__).resolve().parents[1]),
                              "digest": artifacts.package_digest()}
         saved = artifacts.read_json(Path(out) / "manifest.json")
@@ -189,12 +189,13 @@ def inspect_campaign(out):
         report["difference_count"] = len(diff)
         report["differences"] = diff[:50]
         report["differences_truncated"] = len(diff) > 50
-        nonsoftware_equal = all(original[key] == current[key]
-                                for key in CONTRACT_KEYS if key != "software_digest")
+        comparable, plan_migrations = normalize_legacy_serial_contract(original, current)
+        report["normalizable_plan_defaults"] = plan_migrations
+        comparable["software_digest"] = current["software_digest"]
         # Mirror the actual Campaign gate; this is NOT checkpoint readiness.
         report["campaign_contract_accepted"] = bool(report["manifest_integrity"] and (
             artifacts.digest(current) == saved.get("contract_digest")
-            or (upgrade is not None and nonsoftware_equal)))
+            or (upgrade is not None and artifacts.digest(comparable) == artifacts.digest(current))))
     except Exception as exc:
         report["errors"].append({"type": type(exc).__name__, "message": str(exc)})
     report["next_step"] = (

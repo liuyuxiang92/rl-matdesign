@@ -228,3 +228,42 @@ def test_release_registry_matches_the_actual_frozen_source_tree():
     assert entry["to"] == {"package": package_digest(), "source": worker.hexdigest()}
     assert compatibility.approved_upgrade(entry["from"]["package"], package_digest()) == entry
     assert compatibility.approved_upgrade(entry["from"]["source"], worker.hexdigest(), kind="source") == entry
+
+
+def test_registered_legacy_predictor_variant_preserves_exact_file_set():
+    import hashlib
+    from pathlib import PurePosixPath
+    from rl_matdesign.utils import hpo_resume_compatibility as compatibility
+    source_root = Path(compatibility.__file__).resolve().parents[2]
+    document = json.loads(compatibility._REGISTRY_PATH.read_text())
+    inventory = {str(path.relative_to(source_root)): hashlib.sha256(path.read_bytes()).hexdigest()
+                 for path in sorted(source_root.rglob("*.py"))}
+    extras = document["audited_extra_python_files"]
+    assert set(extras) == {"predictors/composite.py", "predictors/dp_property.py",
+                          "predictors/dp_structure.py", "predictors/hea.py",
+                          "predictors/perovskite.py", "predictors/sinter_calcine.py"}
+    combined = {**inventory, **{"rl_matdesign/" + path: sha for path, sha in extras.items()}}
+    package = {path.removeprefix("rl_matdesign/"): sha for path, sha in combined.items()
+               if path.startswith("rl_matdesign/")}
+    package_digest = hashlib.sha256(json.dumps(package, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    worker = hashlib.sha256()
+    for path in sorted(combined, key=PurePosixPath):
+        worker.update(path.encode())
+        worker.update(bytes.fromhex(combined[path]))
+    expected = {"package": package_digest, "source": worker.hexdigest()}
+    entries = document["migrations"]
+    variants = [row for row in entries if row["source_variant"] == "plus_six_legacy_predictors"]
+    assert len(variants) == 3
+    assert all(row["to"] == expected for row in variants)
+    # User's exact original campaign and current installed package are covered.
+    assert {row["from"]["package"] for row in variants} == {
+        "d495c572bb16672e6cfad8b2a0ba7d3bbee3b61fcd7a548df413f2185f5e27c2",
+        "0a6c2c8cc5299bb8fb10e0c58218f98a64b3da57134e6f20041774a39b1cda25",
+        "5621cee85788648dc17edcf384980309f5c45b419efebbc6c4fe428bc8b4bbe8"}
+    clean = next(row for row in entries if row["source_variant"] == "clean")
+    for row in variants:
+        assert compatibility.approved_upgrade(row["from"]["package"], package_digest) == row
+        assert compatibility.approved_upgrade(row["from"]["source"], worker.hexdigest(), kind="source") == row
+        # Do not silently remove modules referenced by a custom predictor config.
+        assert compatibility.approved_upgrade(row["from"]["package"], clean["to"]["package"]) is None
+        assert compatibility.approved_upgrade(row["from"]["source"], clean["to"]["source"], kind="source") is None

@@ -93,3 +93,16 @@ A2C 每个生成设置实际使用 2 个冻结模型 × 2 次采样，共 4 次�
 另外验证了实际 A2C 旧版生成断点：从一次已同步采样续到四次，最终记录与预算等于旧版连续生成，冻结模型/scaler 未变。重复恢复和生成不新增采样，迁移记录保持一条。证据在 `/private/tmp/rlmat-oldnew-restart-0ozktp2x/verification.json`，回归日志在 `/private/tmp/rlmat-hpo-restart-regression.log`。
 
 这不是 GlassNet/GPU 实验，也未访问或清理用户服务器。真实磁盘写满可能破坏未成功落盘的更新或让账本超前；此类任务由预检明确阻塞，不承诺重建丢失状态，不清空账本或从零重跑。
+
+
+## 2026-11-13：旧串行计划、历史模块组合与并行恢复
+
+从用户的逐文件报告重建了旧串行、并行和存储修复三个版本，每个版本分别审核干净源码和精确六个历史预测器文件的组合。服务器原始 `d495c572...` 与当前 `5621cee85...` 均精确匹配；同一 campaign 存在改造前后 worker 的情况由分别登记的 worker 指纹覆盖。源码例外仍为精确、单向且保持同一文件集合，未知修改不放行。
+
+旧 manifest 缺失并行字段时仅规范化为串行默认值，另行核验全部非源码字段。新增 `restart/resume --parallel-jobs N` 在原契约与所有作业预检通过后仅更改运行时调度，并独立记录设置历史。`--check-only`、预检失败不写运行设置；不传覆盖恢复原设置。自动化测试覆盖旧默认值迁移、未知源码拒绝、其他参数变更拒绝、精确服务器文件组合、并行覆盖只读检查与任务身份不变。
+
+相关完整回归 **668 passed，77 条既有兼容提示**（83.53 秒）。使用精确 `50c25e9a + 六个历史模块` 的 CPU dummy 旧实验，对 A2C、DQN MC、DQN Bootstrap 均完成“第一 seed 已完成、第二 seed 同步断点中断、第三 seed 未开始”的跨版本续跑；新版 `--parallel-jobs 10` 后候选档案、计数和模型张量与旧版不中断对照一致，已完成文件、原 manifest 不变，编号 checkpoint 不增加。三算法旧模型并行生成及另一次旧版生成断点续跑均通过。
+
+补充混合版本实测：campaign manifest 与第一模型来自 `50c25e9a + 六文件`，中断的第二 worker 来自 `5d0d0dae + 六文件`；新版并行恢复同样通过只读检查、已完成任务复用及与旧版对照的精确候选/模型比较。
+
+冻结源码目标：clean package `f46e85e2ade8649a7daf97bd1e5b589de4ce21f43d0e85359593aa847636af7c`；保留六文件的 package `4535f81ee9c871805e8775219f9e28e4266cd4e579f8d5e90339ffb3c2d7b7bf`。证据：`/private/tmp/rlmat-preparallel-restart-0au08yu6/verification.json`；回归日志：`/private/tmp/rlmat-serial-parallel-restart-regression.log`。这些 CPU 软件验证不代替真实 GPU 输出目录的 checkpoint 同步检查，也不证明 GlassNet 科学结果已达标。
