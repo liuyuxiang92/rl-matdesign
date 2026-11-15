@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .rollout_errors import InfeasibleEpisode
+from .candidate_budget import EfficiencyLimitReached
 
 
 def supports_partial_batch_prediction(predictor) -> bool:
@@ -103,6 +104,27 @@ class EpisodeBatchEvaluator:
         except Exception:
             return ""
 
+    def _check_hpo_efficiency(self, outcomes, phase):
+        if self.hpo_recorder is None:
+            return
+        if any(isinstance(outcome, Exception)
+               and not isinstance(outcome, (CandidateEvaluationFailed, InfeasibleEpisode))
+               for outcome in outcomes):
+            return  # Preserve unexpected predictor/system failures as errors.
+        try:
+            self.hpo_recorder.check_efficiency()
+        except EfficiencyLimitReached as exc:
+            # Every result in this wave was already evaluated and settled.
+            # Preserve failed timing here and let the trainer persist successful
+            # samples/budget rows without an unnecessary network update.
+            for outcome in outcomes:
+                if isinstance(outcome, Exception):
+                    self._record_failure(outcome, phase)
+            exc.evaluated_episodes = tuple(
+                outcome for outcome in outcomes if not isinstance(outcome, Exception)
+            )
+            raise
+
     def _timing(self, rollout_s, eval_share, count, details=None):
         return {
             **(details or {}),
@@ -144,6 +166,7 @@ class EpisodeBatchEvaluator:
                 failure.episode_timing = self._scalar_timing
                 failure.episode_formula = self._failed_formula()
                 self._record_failure(failure, phase)
+                self._check_hpo_efficiency((), phase)
 
     def _refresh_size(self):
         size_fn = getattr(self.reward_fn, "evaluation_batch_size", None)
@@ -271,11 +294,14 @@ class EpisodeBatchEvaluator:
                             self.hpo_recorder.failure()
                             raise CandidateEvaluationFailed("Terminal candidate was not evaluated")
                         self.hpo_recorder.success(episode)
+                    self._check_hpo_efficiency((episode,), phase)
                     return episode
                 count = min(self.size, limit)
                 if self.hpo_recorder is None:
                     count = min(count, self.max_retries + 1 - self.failures)
-                self.pending.extend(self._collect(rollout, count, metadata))
+                outcomes = self._collect(rollout, count, metadata)
+                self._check_hpo_efficiency(outcomes, phase)
+                self.pending.extend(outcomes)
             outcome = self.pending.popleft()
             if not isinstance(outcome, Exception):
                 self.failures = 0

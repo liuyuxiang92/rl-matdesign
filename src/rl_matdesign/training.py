@@ -42,6 +42,7 @@ from .env import CompositionEnv
 from .action_features import value_features, value_feature_dim
 from .predictors.base import PropertyPredictor
 from .utils.training_budget import TrainingBudget
+from .utils.candidate_budget import EfficiencyLimitReached
 from .utils.stage_timing import checkpoint_stage, checkpoint_prepared, record_checkpoint
 from .utils.checkpoint_serialization import save_checkpoint_payload
 from .utils.rollout_errors import InfeasibleEpisode, EvaluationProtocolError
@@ -106,6 +107,30 @@ def _record_episode_timing(timer, row) -> None:
         record(row)
 
 
+def _record_efficiency_stopped_wave(error, *, budget, timer, training_samples,
+                                   phase, first_episode, history_complete,
+                                   iteration=None, gamma=1.0):
+    """Keep paid observations from a rejected wave without a learning update."""
+    for index, episode in enumerate(error.evaluated_episodes, first_episode):
+        counted = budget.record(episode.terminal_key)
+        reward = float(episode.path[-1].reward)
+        discounted = reward * gamma ** (len(episode.path) - 1)
+        row = {
+            "phase": phase, "episode": index,
+            "iteration": index if iteration is None else iteration,
+            "terminal_comp_key": str(episode.terminal_key),
+            "budget_counted": counted, **budget.snapshot(),
+            "training_budget_history_complete": history_complete,
+            "return": discounted, "return_raw": discounted,
+            "terminal_reward": reward, "optimizer_steps": 0,
+            "update_skipped_reason": "INFEASIBLE_EFFICIENCY",
+            **_episode_timing_row(episode),
+        }
+        if training_samples is not None:
+            training_samples.record(episode, row)
+        _record_episode_timing(timer, row)
+
+
 def _rollout_with_retry(rollout_fn: Callable[[], None]) -> None:
     """Call ``rollout_fn()`` (which must drive one full episode via
     ``env.initialize()`` + ``env.step()`` to a terminal reward); on
@@ -167,6 +192,9 @@ def _save_checkpoint(path: str, data: dict, numbered_path: str | None = None) ->
             os.remove(link_tmp)
         os.symlink(os.path.basename(numbered_path), link_tmp)
         os.replace(link_tmp, path)
+    if "checkpoint_store_bytes" in measurements:
+        from .utils.checkpoint_store import checkpoint_published
+        checkpoint_published(target)
     measurements["checkpoint_replace_s"] = time.perf_counter() - replace_started
     record_checkpoint(target, measurements)
     from .utils.hpo_stop import checkpoint_committed
@@ -575,11 +603,14 @@ def _dqn_gradient_step(
         y = [float(r["mc_return"]) for r in batch]
     else:
     # --- END mc-target experiment ---
-        y = [
-            _compute_td_target(r, target_net, s_mat_scaler, elem_feats_scaled,
-                               fraction_set, device, gamma, target_cache=target_cache)
-            for r in batch
-        ]
+        from .utils.td_targets import compute_td_targets
+        # v2 batches/deduplicates within the minibatch only. A transient cache
+        # would change matrix shapes after resume and thus numerical results.
+        # Keep target_cache in this helper's signature for older callers/tests.
+        y = compute_td_targets(
+            batch, target_net, s_mat_scaler, elem_feats_scaled, fraction_set,
+            device, gamma,
+        )
     s_mat_b  = torch.tensor(
         s_mat_scaler.transform(np.asarray([r["s_mat_raw"] for r in batch], dtype=float)),
         dtype=torch.float32, device=device,
@@ -769,12 +800,21 @@ def train_dqn_online(
         warmup_attempts = 0
         while warmup_counted < n_warmup_eps:
             budget.check_can_sample()
-            episode = evaluator.next(
-                lambda: _rollout_random_episode(env),
-                limit=training_wave_limit(budget, n_warmup_eps - warmup_counted),
-                retry_scalar=_rollout_with_retry,
-                phase="dqn_warmup",
-            )
+            try:
+                episode = evaluator.next(
+                    lambda: _rollout_random_episode(env),
+                    limit=training_wave_limit(budget, n_warmup_eps - warmup_counted),
+                    retry_scalar=_rollout_with_retry,
+                    phase="dqn_warmup",
+                )
+            except EfficiencyLimitReached as exc:
+                _record_efficiency_stopped_wave(
+                    exc, budget=budget, timer=timer, training_samples=training_samples,
+                    phase="dqn_warmup", first_episode=warmup_attempts + 1,
+                    history_complete=budget_history_complete,
+                )
+                pbar.close()
+                raise
             counted = budget.record(episode.terminal_key)
             warmup_counted += int(counted)
             warmup_attempts += 1
@@ -863,8 +903,6 @@ def train_dqn_online(
         }
 
     pbar = tqdm(total=dqn_num_train_eps, initial=start_ep, desc="DQN train")
-    from .utils.td_target_cache import TDTargetCache
-    target_cache = TDTargetCache() if dqn_target_mode == "bootstrap" else None
 
     def _rollout_eps_greedy_episode() -> None:
         # Collect one episode with epsilon-greedy policy.
@@ -891,17 +929,26 @@ def train_dqn_online(
     while completed < dqn_num_train_eps:
         budget.check_can_sample()
         qnet.eval()
-        episode = evaluator.next(
-            _rollout_eps_greedy_episode,
-            limit=training_wave_limit(
-                budget, dqn_num_train_eps - completed,
-                checkpoint_freq=ckpt_freq if ckpt_path else 0,
-                completed_attempts=train_attempts,
-            ),
-            retry_scalar=_rollout_with_retry,
-            metadata={"epsilon_used": eps},
-            phase="dqn_train",
-        )
+        try:
+            episode = evaluator.next(
+                _rollout_eps_greedy_episode,
+                limit=training_wave_limit(
+                    budget, dqn_num_train_eps - completed,
+                    checkpoint_freq=ckpt_freq if ckpt_path else 0,
+                    completed_attempts=train_attempts,
+                ),
+                retry_scalar=_rollout_with_retry,
+                metadata={"epsilon_used": eps},
+                phase="dqn_train",
+            )
+        except EfficiencyLimitReached as exc:
+            _record_efficiency_stopped_wave(
+                exc, budget=budget, timer=timer, training_samples=training_samples,
+                phase="dqn_train", first_episode=train_attempts + 1,
+                history_complete=budget_history_complete,
+            )
+            pbar.close()
+            raise
         counted = budget.record(episode.terminal_key)
         completed += int(counted)
         train_attempts += 1
@@ -938,7 +985,6 @@ def train_dqn_online(
                     qnet, _batch, target_net, scaler,
                     elem_feats_scaled, fraction_set, optimizer, loss_fn, device, gamma,
                     target_mode=dqn_target_mode,
-                    target_cache=target_cache,
                 ))
             _check_hpo_numerical(env, *losses, models=(qnet,))
             mean_loss = float(np.mean(losses))
@@ -948,8 +994,6 @@ def train_dqn_online(
         if train_attempts % dqn_target_update_freq == 0:
             target_net.load_state_dict(qnet.state_dict())
             target_net.eval()
-            if target_cache is not None:
-                target_cache.clear()
 
         # 4. Linear epsilon anneal.
         eps = max(dqn_eps_min, 1.0 - (train_attempts - 1) / dqn_eps_anneal_eps)
@@ -1197,6 +1241,8 @@ def _fit_scaler_from_warmup(env: CompositionEnv, n_warmup_eps: int) -> StandardS
                     if recorder is not None:
                         recorder.failure(preparation=True)
             _rollout_with_retry(preparation_rollout)
+            if recorder is not None:
+                recorder.check_efficiency()
             for step in env.path:
                 all_s_mat.append(np.asarray(step.state_material_features, dtype=float))
             pbar.update(1)
@@ -1586,12 +1632,20 @@ def train_pg(
                     retry_scalar=_rollout_with_retry,
                     phase="pg_episode",
                 )
-            except BaseException:
+            except BaseException as exc:
                 # Collection can stop at the failure guard (or interruption)
                 # before this on-policy batch reaches its learning update.
                 # Preserve already-scored episodes with zero update cost.
                 for row in batch_ep_rows:
                     _record_episode_timing(timer, row)
+                if isinstance(exc, EfficiencyLimitReached):
+                    _record_efficiency_stopped_wave(
+                        exc, budget=budget, timer=timer, training_samples=training_samples,
+                        phase="pg_episode", first_episode=accepted + 1,
+                        history_complete=budget_history_complete,
+                        iteration=it + 1, gamma=gamma,
+                    )
+                outer_pbar.close()
                 raise
             path = episode.path
             if not path:
@@ -2010,6 +2064,13 @@ def generate_candidates(
                     limit=max(1, recorder.budget.target_unique - recorder.budget.unique_evaluated),
                     phase="generate",
                 )
+            except EfficiencyLimitReached as exc:
+                for episode in exc.evaluated_episodes:
+                    _record_episode_timing(predictor, {
+                        **_episode_timing_row(episode), "phase": "generate",
+                        "episode": recorder.budget.attempts_started,
+                    })
+                raise
             except (CandidateEvaluationFailed, InfeasibleEpisode):
                 checkpoint_generation()
                 continue

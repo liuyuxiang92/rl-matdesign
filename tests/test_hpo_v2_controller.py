@@ -172,7 +172,8 @@ def test_duplicate_search_trials_do_not_consume_validation_config_slots(
     # must not displace third place, and fourth place must not enter the panel.
     monkeypatch.setattr(run, "train_study", lambda *args: [trials[0], deepcopy(trials[0]), *trials[1:]])
     atomic_json(run.stage_path("train-budget"), {
-        "selection": {"selected_budget": 8}, "panel": []})
+        "selection": {"selected_budget": 8},
+        "panel": [{"pg_batch_eps": 2, "pg_lr_actor": .009}]})
     result = run.run_train_search()
     assert result["status"] == "COMPLETED"
     validated = result["results"]
@@ -180,6 +181,35 @@ def test_duplicate_search_trials_do_not_consume_validation_config_slots(
     for budget in {row["budget"] for row in validated}:
         assert len([row for row in validated if row["budget"] == budget]) == 3
     assert all(row["seeds"] == plan["training_search"]["validation_seeds"] for row in validated)
+
+
+def test_validation_replaces_previous_round_finalists(tmp_path, campaign_environment, monkeypatch):
+    plan = public_plan(tmp_path)
+    run = campaign(plan, tmp_path / "run", ReusableRunner())
+    atomic_json(run.stage_path("train-budget"), {
+        "selection": {"selected_budget": 4},
+        "panel": [{"pg_batch_eps": 2, "pg_lr_actor": .009}]})
+    seen_panels = []
+    original_scan = run.scan
+
+    def study(budget, name, *args):
+        rates = [.0001, .0002, .0003, .0004] if name == "revision-0" else [.001, .002, .003, .004]
+        rows = [run.evaluate({"pg_batch_eps": 2, "pg_lr_actor": rate}, budget,
+                             plan["training_search"]["seeds"]) for rate in rates]
+        for index, row in enumerate(rows):
+            row["score"] = .95 - index * .05
+        return rows
+
+    def scan(panel, *args):
+        seen_panels.append([row["pg_lr_actor"] for row in panel])
+        return original_scan(panel, *args)
+
+    monkeypatch.setattr(run, "train_study", study)
+    monkeypatch.setattr(run, "scan", scan)
+    result = run.run_train_search()
+    assert result["status"] == "COMPLETED"
+    assert result["budget_revisions"] == 1
+    assert seen_panels == [[.0001, .0002, .0003], [.001, .002, .003]]
 
 
 def test_generation_measurement_identity_includes_frozen_model(tmp_path, campaign_environment):

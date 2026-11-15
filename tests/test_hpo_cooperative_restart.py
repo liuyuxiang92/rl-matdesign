@@ -104,7 +104,8 @@ def _completed(campaign,result):
 
 
 def _checkpoint(path,name='checkpoint.pt'):
-    return torch.load(path/name,map_location='cpu',weights_only=False)
+    from rl_matdesign.utils.checkpoint_store import load_checkpoint
+    return load_checkpoint(path/name,map_location='cpu')
 
 
 def _single_checkpoint(path):

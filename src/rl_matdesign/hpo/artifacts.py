@@ -67,5 +67,6 @@ def asset_fingerprints(plan: dict) -> list[dict]:
 def checkpoint_files(directory: str | Path) -> dict[str, str]:
     directory = Path(directory)
     return {name: str(directory / name) for name in
-            ("qnet.pt", "policy.pt", "value_net.pt", "std_scaler.bin", "checkpoint.pt")
+            ("qnet.pt", "policy.pt", "value_net.pt", "std_scaler.bin", "checkpoint.pt",
+             "checkpoint_data.sqlite3")
             if (directory / name).is_file()}

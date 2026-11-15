@@ -1,4 +1,4 @@
-"""Real old-source HPO jobs resume exactly through the audited performance release.
+"""Real old-source HPO jobs continue through the audited protocol upgrade.
 
 Set RLMAT_PERFORMANCE_LEGACY_SRC to an immutable baseline ``src`` directory when
 testing a source export without Git history. Normal checkouts materialize the
@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -22,6 +23,7 @@ import yaml
 
 from rl_matdesign.hpo.algorithm_profiles import initial_parameters
 from rl_matdesign.utils import source_compatibility as compatibility
+from rl_matdesign.utils.checkpoint_store import load_checkpoint
 from tests.test_hpo_checkpoint_retention import _assert_nested_equal
 from tests.test_hpo_cooperative_restart import _plan
 
@@ -30,15 +32,17 @@ ROOT = Path(__file__).resolve().parents[1]
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="POSIX cooperative signals")
 
 
-@pytest.fixture(scope="module")
-def legacy_source(tmp_path_factory):
-    supplied = os.environ.get("RLMAT_PERFORMANCE_LEGACY_SRC")
+@pytest.fixture(scope="module", params=["baseline", "v1"])
+def legacy_source(tmp_path_factory, request):
+    version = request.param
+    revision = compatibility.BASELINE_REVISION if version == "baseline" else compatibility.V1_REVISION
+    supplied = os.environ.get("RLMAT_PERFORMANCE_LEGACY_SRC" if version == "baseline" else "RLMAT_PERFORMANCE_V1_SRC")
     if supplied:
         source = Path(supplied).resolve()
         assert source.is_dir(), f"Missing legacy source: {source}"
     else:
         archived = subprocess.run(
-            ["git", "archive", compatibility.BASELINE_REVISION, "src"],
+            ["git", "archive", revision, "src"],
             cwd=ROOT, capture_output=True, timeout=30,
         )
         if archived.returncode:
@@ -51,10 +55,25 @@ def legacy_source(tmp_path_factory):
                 assert ".." not in Path(member.name).parts
             archive.extractall(directory, filter="data")
         source = directory / "src"
-    assert compatibility.inventory_digests(compatibility.source_inventory(source)) == {
-        "package": compatibility.BASELINE_PACKAGE_SHA256,
-        "execution": compatibility.BASELINE_EXECUTION_SHA256,
+    expected = {
+        "package": compatibility.BASELINE_PACKAGE_SHA256 if version == "baseline" else compatibility.V1_PACKAGE_SHA256,
+        "execution": compatibility.BASELINE_EXECUTION_SHA256 if version == "baseline" else compatibility.V1_EXECUTION_SHA256,
     }
+    assert compatibility.inventory_digests(compatibility.source_inventory(source)) == expected
+    extras = os.environ.get("RLMAT_PERFORMANCE_LEGACY_PREDICTORS_DIR")
+    if extras:
+        copied = tmp_path_factory.mktemp("source-with-legacy-predictors") / "src"
+        shutil.copytree(source, copied)
+        for name, sha in compatibility.LEGACY_PREDICTOR_FILES.items():
+            origin = Path(extras) / Path(name).name
+            assert hashlib.sha256(origin.read_bytes()).hexdigest() == sha
+            shutil.copyfile(origin, copied / name)
+        source = copied
+        expected = {
+            "package": compatibility.LEGACY_PACKAGE_SHA256 if version == "baseline" else compatibility.V1_LEGACY_PACKAGE_SHA256,
+            "execution": compatibility.LEGACY_EXECUTION_SHA256 if version == "baseline" else compatibility.V1_LEGACY_EXECUTION_SHA256,
+        }
+        assert compatibility.inventory_digests(compatibility.source_inventory(source)) == expected
     return source
 
 
@@ -118,7 +137,7 @@ def _snapshot(directory):
 
 
 @pytest.mark.parametrize("method", ["dqn-mc", "dqn-bootstrap"])
-def test_legacy_hpo_check_only_and_restart_preserve_learning_exactly(tmp_path, legacy_source, method):
+def test_legacy_hpo_upgrade_preserves_paid_prefix_and_native_continuation(tmp_path, legacy_source, method):
     plan, _ = _plan(tmp_path, method)
     parameters = initial_parameters(plan)
     parameters["dqn_batch_size"] = 8
@@ -143,10 +162,18 @@ def test_legacy_hpo_check_only_and_restart_preserve_learning_exactly(tmp_path, l
     assert len(jobs) == 1
     job = jobs[0].parent
     # These are locally generated trusted fixtures, never user-provided pickle.
-    stopped = torch.load(job / "checkpoint.pt", map_location="cpu", weights_only=False)
+    stopped = load_checkpoint(job / "checkpoint.pt", map_location="cpu")
     assert stopped["training_episodes_completed"] >= 3
     prefix = (job / "candidate_records.jsonl").read_bytes()
     assert stopped["hpo_state"]["budget"]["unique_evaluated"] == 5
+
+    if method == "dqn-bootstrap":
+        # Batched target matrices can round differently from old scalar calls.
+        # Compare two upgraded continuations of the SAME paid old checkpoint;
+        # one is interrupted once more under v2. Do not claim old/new bit parity.
+        shutil.rmtree(control)
+        shutil.copytree(interrupted, control)
+        _success(_cli(ROOT / "src", tmp_path, "restart", "--out", str(control)))
 
     before = _snapshot(interrupted)
     checked = _cli(ROOT / "src", tmp_path, "restart", "--out", str(interrupted), "--check-only")
@@ -155,14 +182,17 @@ def test_legacy_hpo_check_only_and_restart_preserve_learning_exactly(tmp_path, l
     assert compatibility.UPGRADE_ID in checked.stdout
     assert _snapshot(interrupted) == before
 
+    if method == "dqn-bootstrap":
+        paused_again = _cli(ROOT / "src", tmp_path, "restart", "--out", str(interrupted), stop=True)
+        assert paused_again.returncode == 130, paused_again.stdout + paused_again.stderr
     _success(_cli(ROOT / "src", tmp_path, "restart", "--out", str(interrupted)))
     assert json.loads((interrupted / "state.json").read_text())["status"] == "COMPLETED"
     assert (job / "candidate_records.jsonl").read_bytes().startswith(prefix)
     control_jobs = list((control / "jobs").glob("*/checkpoint.pt"))
     assert len(control_jobs) == 1
     control_job = control_jobs[0].parent
-    expected = torch.load(control_job / "checkpoint.pt", map_location="cpu", weights_only=False)
-    actual = torch.load(job / "checkpoint.pt", map_location="cpu", weights_only=False)
+    expected = load_checkpoint(control_job / "checkpoint.pt", map_location="cpu")
+    actual = load_checkpoint(job / "checkpoint.pt", map_location="cpu")
     for key in ("type", "scaler_fingerprint", "environment_contract", "dqn_buffer_size",
                 "qnet_state", "target_net_state", "opt_state", "buffer", "eps", "dp_cache",
                 "training_episodes_completed", "episodes_completed", "rng_state",

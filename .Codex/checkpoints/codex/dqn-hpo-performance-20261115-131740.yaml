@@ -1,0 +1,53 @@
+checkpoint_version: 3.0.0
+created_at: '2026-11-15T13:17:40.004200+00:00'
+branch: codex/dqn-hpo-performance
+phase:
+  current: validated_ready_to_publish
+  completed:
+  - implementation
+  - independent_review
+  - sealed_source_validation
+  - wheel_validation
+  - reflection
+  next:
+  - commit
+  - push
+state:
+  parameters:
+  - name: max_attempt_ratio
+    value: 1.5
+    source: Existing user-approved HPO YAML default; remains user-configurable
+    confidence: high
+  - name: target_action_rows_per_chunk
+    value: 8192
+    source: Internal bounded batching implementation, tests/test_td_targets.py
+    confidence: high
+  experiments:
+  - name: native_release_upgrade_matrix
+    status: completed
+    results_path: /private/tmp/rlmat-v2-native-final-clean.log; /private/tmp/rlmat-v2-native-final-legacy.log
+    result: 12 passed; DQN MC/bootstrap/A2C, ba6/b947, clean/legacy-six origins
+  - name: full_regression
+    status: completed
+    results_path: /private/tmp/rlmat-v2-regression.log
+    result: 2596 passed, 6 skipped; one missing-PYTHONPATH subprocess test passed
+      after correction; final related213/store23/compat122 passed
+  decisions:
+  - decision: Preserve paid native state through an audited explicit protocol upgrade
+    rationale: User requests current calculations continue on optimized code; old/new
+      bootstrap arithmetic need not be bitwise identical.
+  - decision: Incremental latest checkpoint backing without reducing save cadence
+    rationale: Reduce repeated full history writes while preserving cooperative-stop
+      granularity.
+blockers: []
+artifacts:
+- path: docs/validation/dqn_hpo_performance_v2_20261115.md
+  role: validation report
+- path: src/rl_matdesign/utils/dqn_performance_v2_source.json
+  role: sealed release inventory
+resume_instructions: Verify branch HEAD/status and remote before any commit/push retry.
+  Final clean source package hash must remain 7bff4b49d231ec5a5fa5c2a9603284d273c633fc53239810936266ead917a45f.
+  After publication, stop old workers cooperatively, install this release without
+  changing YAML/assets/environment, then use rl-matdesign hpo restart --out ORIGINAL
+  --check-only followed by restart. Keep entire job directories including checkpoint_data.sqlite3.
+  Do not modify manifests or reset budget ledgers.

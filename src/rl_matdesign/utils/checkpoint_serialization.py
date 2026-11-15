@@ -153,12 +153,19 @@ def save_checkpoint_payload(path: str, payload: dict[str, Any]) -> dict[str, flo
     containers retain their original representation.
     """
     started = time.perf_counter()
+    from .checkpoint_store import prepare_checkpoint
+    payload, storage_measurements = prepare_checkpoint(path, payload)
     rows = payload.get('buffer')
     if type(rows) is list and rows and all(type(row) is dict for row in rows):
         payload = {**payload, 'buffer': PackedReplaySnapshot(rows)}
     packed = time.perf_counter()
     torch.save(payload, path, pickle_protocol=_CHECKPOINT_PICKLE_PROTOCOL)
+    if storage_measurements:
+        # Backing data was committed first; make the referencing checkpoint
+        # durable before its caller publishes it atomically.
+        with open(path, 'rb') as handle:
+            os.fsync(handle.fileno())
     serialized = time.perf_counter()
     return {'checkpoint_pack_s': packed - started,
             'checkpoint_serialize_s': serialized - packed,
-            'checkpoint_bytes': os.path.getsize(path)}
+            'checkpoint_bytes': os.path.getsize(path), **storage_measurements}

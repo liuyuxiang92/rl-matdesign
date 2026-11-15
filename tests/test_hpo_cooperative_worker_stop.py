@@ -11,6 +11,7 @@ import time
 
 import pytest
 import torch
+from rl_matdesign.utils.checkpoint_store import load_checkpoint
 import yaml
 
 from rl_matdesign import training
@@ -98,7 +99,7 @@ def test_committed_stop_runs_after_atomic_replace_and_failed_save_preserves_requ
         with pytest.raises(SystemExit) as stopped:
             training._save_checkpoint(str(target), checkpoint())
         assert stopped.value.code == 128 + signal.SIGTERM
-        saved = torch.load(target, map_location="cpu", weights_only=False)
+        saved = load_checkpoint(target, map_location="cpu")
         assert saved["hpo_state"] == checkpoint()["hpo_state"]
         assert saved["rng_state"]["schema_version"] == 1
 
@@ -150,7 +151,7 @@ def test_real_worker_signal_finishes_unit_then_resume_matches_control(tmp_path, 
 
     first = run_worker(source, resumed, stop_at=stop_at)
     assert first.returncode == 128 + signal.SIGTERM, (first.stdout, first.stderr)
-    saved = torch.load(resumed / "checkpoint.pt", map_location="cpu", weights_only=False)
+    saved = load_checkpoint(resumed / "checkpoint.pt", map_location="cpu")
     ledger = json.loads((resumed / "candidate_budget.json").read_text())
     assert ledger["status"] == "INTERRUPTED"
     assert ledger["pending"] == 0
@@ -170,8 +171,8 @@ def test_real_worker_signal_finishes_unit_then_resume_matches_control(tmp_path, 
     assert baseline.returncode == 0, (baseline.stdout, baseline.stderr)
     assert (resumed / "candidate_records.jsonl").read_bytes().startswith(prefix)
     assert (resumed / "candidate_records.jsonl").read_bytes() == (control / "candidate_records.jsonl").read_bytes()
-    actual = torch.load(resumed / "checkpoint.pt", map_location="cpu", weights_only=False)
-    expected = torch.load(control / "checkpoint.pt", map_location="cpu", weights_only=False)
+    actual = load_checkpoint(resumed / "checkpoint.pt", map_location="cpu")
+    expected = load_checkpoint(control / "checkpoint.pt", map_location="cpu")
     state_keys = (["policy_state", "value_net_state", "opt_actor_state", "opt_critic_state", "iteration"]
                   if method == "a2c" else ["qnet_state", "target_net_state", "opt_state", "buffer"])
     for name in (*state_keys, "rng_state", "training_budget_state", "hpo_state"):

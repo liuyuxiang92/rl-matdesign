@@ -91,13 +91,12 @@ def _require_fields(state, names, description):
 
 
 def _validate_checkpoint(directory, ledger, identities, method):
-    import torch
-
     phase = ledger["phase"]
     path = directory / ("generation_checkpoint.pt" if phase == "generation" else "checkpoint.pt")
     if not path.is_file():
         raise ValueError(f"Consumed attempts have no resumable checkpoint: {path}; paid cost cannot be reset")
-    saved = _mapping(torch.load(path, map_location="cpu", weights_only=False), "Checkpoint")
+    from ..utils.checkpoint_store import load_checkpoint
+    saved = _mapping(load_checkpoint(path, map_location="cpu"), "Checkpoint")
     if saved.get("resume_safe") is False:
         raise ValueError("Diagnostic partial checkpoint is not safe for training restart")
     _require_fields(saved, ("hpo_state", "rng_state", "predictor_ledger"), "Checkpoint")

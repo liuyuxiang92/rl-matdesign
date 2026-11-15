@@ -293,3 +293,23 @@
     src/rl_matdesign/utils/candidate_records.py, src/rl_matdesign/utils/timing.py,
     src/rl_matdesign/utils/stage_timing.py]
   tags: [performance, checkpoint-storage, paid-accounting]
+
+- id: pitfall-hpo-transient-efficiency-001
+  date: '2026-11-15'
+  expires: '2027-02-15'
+  title: Stop on impossible final efficiency, not a transient attempts-to-observed-unique ratio
+  wrong: >-
+    Rejecting A/U above 1.5 during warmup/preparation, or waiting for another training
+    update/checkpoint before noticing no final strict A/B bound is attainable.
+  right: >-
+    With target B, unique U and attempts A, after all in-flight results settle, stop if
+    A+(B-U) > ceil(ratio_limit*B)-1. Preserve every paid success/failure in the wave,
+    persist observed training rows with zero optimizer steps, skip further gradients
+    and partial-PG-batch filling, and classify as terminal INFEASIBLE_EFFICIENCY.
+    A=200,U=100,B=1000 can recover despite transient ratio2; A=1100,U=600 cannot reach
+    strict1.5 even if every remaining sample is new. Don't let this guard mask unexpected
+    predictor/system failures or erase already incurred costs.
+  impact: Premature rejection biases HPO; delayed rejection wastes updates and persistence.
+  files: [src/rl_matdesign/utils/candidate_budget.py,
+    src/rl_matdesign/utils/episode_batch.py, src/rl_matdesign/training.py]
+  tags: [hpo, early-stop, paid-accounting]

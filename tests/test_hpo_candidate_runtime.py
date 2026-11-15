@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from rl_matdesign.utils.checkpoint_store import load_checkpoint
 
 from rl_matdesign import training
 from rl_matdesign.utils.candidate_budget import CandidateBudget, EfficiencyLimitReached
@@ -84,9 +85,9 @@ def test_batch_does_not_launch_or_discard_extra_candidates(tmp_path):
     assert env.starts == ["A", "A", "A"]
     assert env.hpo_recorder.budget.status == "INFEASIBLE_EFFICIENCY"
     assert env.hpo_recorder.budget.pending == 0
-    partial = torch.load(tmp_path / "records/partial_checkpoint.pt", weights_only=False)
-    assert partial["resume_safe"] is False
-    assert "qnet_state" in partial
+    # A scientifically rejected trial is terminal, so no diagnostic model dump
+    # or resumable training state is needed to finalize it on restart.
+    assert not (tmp_path / "records/partial_checkpoint.pt").exists()
 
 
 def test_preparation_sampling_counts_without_unique_credit(tmp_path, monkeypatch):
@@ -163,7 +164,7 @@ def test_real_cli_writes_opt_in_hpo_artifacts(tmp_path, method):
     assert budget["preparation_only_attempts"] == (2 if method == "a2c" else 0)
     records = [json.loads(line) for line in (out / "candidate_records.jsonl").read_text().splitlines()]
     assert len(records) == 3 and all("dp_mean" in row["properties"] for row in records)
-    state = torch.load(out / "checkpoint.pt", map_location="cpu", weights_only=False)
+    state = load_checkpoint(out / "checkpoint.pt", map_location="cpu")
     assert state["hpo_state"]["budget"]["attempts_started"] == budget["attempts_started"]
 
 
