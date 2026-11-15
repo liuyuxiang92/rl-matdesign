@@ -60,20 +60,38 @@ class CandidateRecorder:
         self.phase = phase
         self.partial_checkpoint_factory = None
         self.constraint_check = None
+        self._records_hash = hashlib.sha256()
+        self._records_signature = None
         if resume_state is not None:
             self._restore(resume_state)
         elif self.records_path.exists() or self.budget_path.exists():
             raise ValueError("HPO candidate artifacts already exist; reuse the completed job or preserve this interrupted job and start a distinct job. Unsafe in-place restart is refused.")
         else:
             self.records_path.touch()
+            self._records_signature = self._archive_signature()
         self.flush()
+
+    def _archive_signature(self, stat=None):
+        stat = self.records_path.stat() if stat is None else stat
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+    def _check_archive_unchanged(self, stat=None):
+        # The recorder is the archive's sole writer. Detect replacement,
+        # truncation and external edits without rereading its entire history.
+        try:
+            signature = self._archive_signature(stat)
+        except FileNotFoundError as exc:
+            raise ValueError("HPO candidate archive changed outside the recorder") from exc
+        if signature != self._records_signature:
+            raise ValueError("HPO candidate archive changed outside the recorder")
 
     def checkpoint_state(self):
         if self.budget.pending:
             raise RuntimeError("Cannot checkpoint HPO accounting with pending evaluations")
+        self._check_archive_unchanged()
         return {"budget": self.budget.snapshot(), "phase": self.phase,
                 "seen": sorted(self.budget.seen),
-                "records_sha256": hashlib.sha256(self.records_path.read_bytes()).hexdigest()}
+                "records_sha256": self._records_hash.hexdigest()}
 
     def _restore(self, state):
         if not self.records_path.exists() or not self.budget_path.exists():
@@ -91,9 +109,15 @@ class CandidateRecorder:
                    "pending", "failed_attempts", "preparation_only_attempts")
         if any(disk.get(k) != saved.get(k) for k in compare) or saved.get("pending") != 0:
             raise ValueError("HPO accounting advanced beyond checkpoint; refusing to erase already spent attempts")
-        if hashlib.sha256(self.records_path.read_bytes()).hexdigest() != state.get("records_sha256"):
+        # Verify legacy checkpoints against the original bytes once. Continue
+        # the same digest as new records are durably appended after restart.
+        signature = self._archive_signature()
+        archived = self.records_path.read_bytes()
+        records_hash = hashlib.sha256(archived)
+        if (self._archive_signature() != signature
+                or records_hash.hexdigest() != state.get("records_sha256")):
             raise ValueError("HPO candidate archive differs from synchronized checkpoint")
-        rows = [json.loads(line) for line in self.records_path.read_text().splitlines()]
+        rows = [json.loads(line) for line in archived.decode("utf-8").splitlines()]
         seen = set(state.get("seen", ()))
         if (len(rows) != saved["unique_evaluated"] or len(seen) != len(rows)
                 or seen != {row["identity"] for row in rows}):
@@ -102,6 +126,8 @@ class CandidateRecorder:
         self.budget.attempts_started = saved["attempts_started"]
         self.budget.failures = saved["failed_attempts"]
         self.budget.preparation_only = saved["preparation_only_attempts"]
+        self._records_hash = records_hash
+        self._records_signature = signature
 
     def flush(self):
         temporary = self.budget_path.with_suffix(".tmp")
@@ -137,10 +163,18 @@ class CandidateRecorder:
         if fresh:
             record.update(attempts_started=self.budget.attempts_started,
                           unique_evaluated=self.budget.unique_evaluated)
-            with self.records_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+            # Match the UTF-8 text archive's existing native newline bytes.
+            encoded = (json.dumps(record, ensure_ascii=False, allow_nan=False) + os.linesep).encode("utf-8")
+            with self.records_path.open("ab") as handle:
+                self._check_archive_unchanged(os.fstat(handle.fileno()))
+                handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
+                signature = self._archive_signature(os.fstat(handle.fileno()))
+            if signature[2] != self._records_signature[2] + len(encoded):
+                raise ValueError("HPO candidate archive changed outside the recorder")
+            self._records_hash.update(encoded)
+            self._records_signature = signature
         self.flush()
         return fresh
 

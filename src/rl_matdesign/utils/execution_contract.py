@@ -153,7 +153,8 @@ def _contract_difference_paths(actual, expected, *, limit: int = 8) -> list[str]
 
 
 def require_execution_contract(actual, expected) -> None:
-    if not contracts_equal(actual, expected):
+    from .source_compatibility import execution_contracts_equal
+    if not execution_contracts_equal(actual, expected):
         changed = ", ".join(_contract_difference_paths(actual, expected))
         raise ValueError("Checkpoint oracle, runtime or training protocol differs "
                          f"(first differing fields: {changed}). Exact resume requires "

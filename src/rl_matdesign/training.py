@@ -42,6 +42,8 @@ from .env import CompositionEnv
 from .action_features import value_features, value_feature_dim
 from .predictors.base import PropertyPredictor
 from .utils.training_budget import TrainingBudget
+from .utils.stage_timing import checkpoint_stage, checkpoint_prepared, record_checkpoint
+from .utils.checkpoint_serialization import save_checkpoint_payload
 from .utils.rollout_errors import InfeasibleEpisode, EvaluationProtocolError
 from .utils.seeding import capture_rng_state, restore_rng_state
 from .utils.model_contract import bind_scaler, environment_contract, scaler_fingerprint
@@ -146,16 +148,18 @@ def _make_loss_fn(name: str) -> torch.nn.Module:
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
-def _save_checkpoint(path: str, data: dict, numbered_path: str | None = None) -> None:
+def _save_checkpoint(path: str, data: dict, numbered_path: str | None = None) -> dict:
     """Atomically write a checkpoint dict.
 
     If *numbered_path* is given, data is written there and *path* is updated
     as a relative symlink so ``checkpoint.pt`` always resolves to the latest.
     """
     import os
+    checkpoint_prepared()
     target = numbered_path if numbered_path else path
     tmp = target + ".tmp"
-    torch.save({**data, "rng_state": capture_rng_state()}, tmp)
+    measurements = save_checkpoint_payload(tmp, {**data, "rng_state": capture_rng_state()})
+    replace_started = time.perf_counter()
     os.replace(tmp, target)
     if numbered_path:
         link_tmp = path + ".lnk"
@@ -163,8 +167,11 @@ def _save_checkpoint(path: str, data: dict, numbered_path: str | None = None) ->
             os.remove(link_tmp)
         os.symlink(os.path.basename(numbered_path), link_tmp)
         os.replace(link_tmp, path)
+    measurements["checkpoint_replace_s"] = time.perf_counter() - replace_started
+    record_checkpoint(target, measurements)
     from .utils.hpo_stop import checkpoint_committed
     checkpoint_committed(data)
+    return measurements
 
 
 # ---------------------------------------------------------------------------
@@ -513,10 +520,16 @@ def _compute_td_target(
     fraction_set: List[str],
     device: torch.device,
     gamma: float,
+    target_cache=None,
 ) -> float:
     """TD target for one buffer row: r if done, else r + γ·max_a' Q_target(s', a')."""
     if row["done"] or not row["next_allowed_idx"]:
         return float(row["reward"])
+    cache_key = target_cache.key(row) if target_cache is not None else None
+    if target_cache is not None:
+        cached = target_cache.get(cache_key)
+        if cached is not None:
+            return float(row["reward"]) + gamma * cached
     next_idxs = row["next_allowed_idx"]
     n = len(next_idxs)
     ns_mat = s_mat_scaler.transform(row["s_mat_next_raw"].reshape(1, -1))[0]
@@ -531,7 +544,10 @@ def _compute_td_target(
             torch.tensor(a_e,       dtype=torch.float32, device=device),
             torch.tensor(a_c,       dtype=torch.float32, device=device),
         ).reshape(-1)
-    return float(row["reward"]) + gamma * float(q_next.max().item())
+    max_q = float(q_next.max().item())
+    if target_cache is not None:
+        target_cache.put(cache_key, max_q)
+    return float(row["reward"]) + gamma * max_q
 
 
 def _dqn_gradient_step(
@@ -546,6 +562,7 @@ def _dqn_gradient_step(
     device: torch.device,
     gamma: float,
     target_mode: str = "bootstrap",
+    target_cache=None,
 ) -> float:
     """One DQN gradient step: SmoothL1(Q(s,a), target).
 
@@ -560,7 +577,7 @@ def _dqn_gradient_step(
     # --- END mc-target experiment ---
         y = [
             _compute_td_target(r, target_net, s_mat_scaler, elem_feats_scaled,
-                               fraction_set, device, gamma)
+                               fraction_set, device, gamma, target_cache=target_cache)
             for r in batch
         ]
     s_mat_b  = torch.tensor(
@@ -846,6 +863,8 @@ def train_dqn_online(
         }
 
     pbar = tqdm(total=dqn_num_train_eps, initial=start_ep, desc="DQN train")
+    from .utils.td_target_cache import TDTargetCache
+    target_cache = TDTargetCache() if dqn_target_mode == "bootstrap" else None
 
     def _rollout_eps_greedy_episode() -> None:
         # Collect one episode with epsilon-greedy policy.
@@ -919,6 +938,7 @@ def train_dqn_online(
                     qnet, _batch, target_net, scaler,
                     elem_feats_scaled, fraction_set, optimizer, loss_fn, device, gamma,
                     target_mode=dqn_target_mode,
+                    target_cache=target_cache,
                 ))
             _check_hpo_numerical(env, *losses, models=(qnet,))
             mean_loss = float(np.mean(losses))
@@ -928,6 +948,8 @@ def train_dqn_online(
         if train_attempts % dqn_target_update_freq == 0:
             target_net.load_state_dict(qnet.state_dict())
             target_net.eval()
+            if target_cache is not None:
+                target_cache.clear()
 
         # 4. Linear epsilon anneal.
         eps = max(dqn_eps_min, 1.0 - (train_attempts - 1) / dqn_eps_anneal_eps)
@@ -977,26 +999,27 @@ def train_dqn_online(
             # A direct atomic replacement also safely replaces an old symlink.
             _numbered = (None if getattr(env, "hpo_recorder", None) is not None
                          else ckpt_path.replace(".pt", f"-ep{train_attempts}.pt"))
-            _save_checkpoint(ckpt_path, {
-                "type": "dqn",
-                "scaler_fingerprint": scaler_fingerprint(scaler),
-                "execution_contract": (checkpoint_cfg or {}).get("execution_contract"),
-                "predictor_ledger": timer.state_dict() if callable(getattr(timer, "state_dict", None)) else None,
-                "environment_contract": environment_contract(env),
-                "episodes_completed": completed,
-                "training_episodes_completed": train_attempts,
-                "training_sample_session_id": training_samples.session_id if training_samples else None,
-                "training_budget_state": budget.state_dict(),
-                "hpo_state": env.hpo_recorder.checkpoint_state() if getattr(env, "hpo_recorder", None) is not None else None,
-                "training_budget_history_complete": budget_history_complete,
-                "qnet_state": qnet.state_dict(),
-                "target_net_state": target_net.state_dict(),
-                "opt_state": optimizer.state_dict(),
-                "buffer": list(buffer),
-                "dqn_buffer_size": dqn_buffer_size,
-                "eps": eps,
-                "dp_cache": dict(dp_cache_ref) if dp_cache_ref is not None else {},
-            }, numbered_path=_numbered)
+            with checkpoint_stage("dqn_train", train_attempts):
+                _save_checkpoint(ckpt_path, {
+                    "type": "dqn",
+                    "scaler_fingerprint": scaler_fingerprint(scaler),
+                    "execution_contract": (checkpoint_cfg or {}).get("execution_contract"),
+                    "predictor_ledger": timer.state_dict() if callable(getattr(timer, "state_dict", None)) else None,
+                    "environment_contract": environment_contract(env),
+                    "episodes_completed": completed,
+                    "training_episodes_completed": train_attempts,
+                    "training_sample_session_id": training_samples.session_id if training_samples else None,
+                    "training_budget_state": budget.state_dict(),
+                    "hpo_state": env.hpo_recorder.checkpoint_state() if getattr(env, "hpo_recorder", None) is not None else None,
+                    "training_budget_history_complete": budget_history_complete,
+                    "qnet_state": qnet.state_dict(),
+                    "target_net_state": target_net.state_dict(),
+                    "opt_state": optimizer.state_dict(),
+                    "buffer": list(buffer),
+                    "dqn_buffer_size": dqn_buffer_size,
+                    "eps": eps,
+                    "dp_cache": dict(dp_cache_ref) if dp_cache_ref is not None else {},
+                }, numbered_path=_numbered)
             tqdm.write(f"[INFO] DQN checkpoint saved at episode {train_attempts} "
                        f"(budget {completed}/{dqn_num_train_eps}) → {_numbered or ckpt_path}")
 
@@ -1782,28 +1805,29 @@ def train_pg(
             # HPO needs the latest synchronized state, not iteration history.
             _numbered = (None if getattr(env, "hpo_recorder", None) is not None
                          else ckpt_path.replace(".pt", f"-iter{it + 1}.pt"))
-            _save_checkpoint(ckpt_path, {
-                "type": "pg",
-                "scaler_fingerprint": scaler_fingerprint(scaler),
-                "execution_contract": (checkpoint_cfg or {}).get("execution_contract"),
-                "predictor_ledger": timer.state_dict() if callable(getattr(timer, "state_dict", None)) else None,
-                "budget_target": budget_target,
-                "environment_contract": environment_contract(env),
-                "rl_method": rl_method,
-                "episodes_completed": accepted,
-                "iteration": it + 1,
-                "policy_state": policy.state_dict(),
-                "value_net_state": value_net.state_dict() if value_net is not None else None,
-                "opt_actor_state": opt_actor.state_dict(),
-                "opt_critic_state": opt_critic.state_dict() if opt_critic is not None else None,
-                "visit_counts": dict(visit_counts),
-                "entropy_coef_eff": coef_eff,
-                "training_sample_session_id": training_samples.session_id if training_samples else None,
-                "training_budget_state": budget.state_dict(),
-                "hpo_state": env.hpo_recorder.checkpoint_state() if getattr(env, "hpo_recorder", None) is not None else None,
-                **budget.snapshot(),
-                "training_budget_history_complete": budget_history_complete,
-            }, numbered_path=_numbered)
+            with checkpoint_stage("pg_train", it + 1):
+                _save_checkpoint(ckpt_path, {
+                    "type": "pg",
+                    "scaler_fingerprint": scaler_fingerprint(scaler),
+                    "execution_contract": (checkpoint_cfg or {}).get("execution_contract"),
+                    "predictor_ledger": timer.state_dict() if callable(getattr(timer, "state_dict", None)) else None,
+                    "budget_target": budget_target,
+                    "environment_contract": environment_contract(env),
+                    "rl_method": rl_method,
+                    "episodes_completed": accepted,
+                    "iteration": it + 1,
+                    "policy_state": policy.state_dict(),
+                    "value_net_state": value_net.state_dict() if value_net is not None else None,
+                    "opt_actor_state": opt_actor.state_dict(),
+                    "opt_critic_state": opt_critic.state_dict() if opt_critic is not None else None,
+                    "visit_counts": dict(visit_counts),
+                    "entropy_coef_eff": coef_eff,
+                    "training_sample_session_id": training_samples.session_id if training_samples else None,
+                    "training_budget_state": budget.state_dict(),
+                    "hpo_state": env.hpo_recorder.checkpoint_state() if getattr(env, "hpo_recorder", None) is not None else None,
+                    **budget.snapshot(),
+                    "training_budget_history_complete": budget_history_complete,
+                }, numbered_path=_numbered)
             tqdm.write(f"[INFO] PG checkpoint saved at iter {it + 1} → {_numbered or ckpt_path}")
 
     outer_pbar.close()

@@ -139,7 +139,7 @@ def test_latest_checkpoint_failure_preserves_previous_and_can_recover(
     previous = latest.read_bytes()
     with monkeypatch.context() as patch:
         if failure_point == "serialize":
-            def failed_save(data, path):
+            def failed_save(data, path, **kwargs):
                 Path(path).write_bytes(b"partial serialization")
                 raise OSError("simulated disk full")
             patch.setattr(training.torch, "save", failed_save)
@@ -184,7 +184,7 @@ def test_failed_checkpoint_cannot_roll_back_paid_hpo_attempts(tmp_path, monkeypa
     recorder.start()
     recorder.failure()  # This attempted prediction is paid even without success.
 
-    def disk_full(data, path):
+    def disk_full(data, path, **kwargs):
         Path(path).write_bytes(b"partial checkpoint")
         raise OSError("simulated disk full")
 
