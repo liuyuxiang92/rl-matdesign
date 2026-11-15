@@ -12,6 +12,9 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 import time
+import json
+from pathlib import Path
+import warnings
 from typing import Iterator
 
 
@@ -91,3 +94,42 @@ def summarize_stage_times(
         "config_attempted": None if config_attempted is None else int(config_attempted),
         "config_succeeded": int(config_succeeded),
     }
+
+
+# Checkpoint costs are separate from scientific episode/update measurements.
+_checkpoint_context = ContextVar('checkpoint_timing', default=None)
+
+
+@contextmanager
+def checkpoint_stage(phase, unit):
+    token = _checkpoint_context.set({'started': time.perf_counter(),
+                                     'phase': phase, 'unit': unit})
+    try:
+        yield
+    finally:
+        _checkpoint_context.reset(token)
+
+
+def checkpoint_prepared():
+    context = _checkpoint_context.get()
+    if context is not None:
+        context['checkpoint_prepare_s'] = time.perf_counter() - context['started']
+
+
+def record_checkpoint(path, measurements):
+    context = _checkpoint_context.get()
+    row = {'schema_version': 1, 'checkpoint': Path(path).name,
+           **measurements, 'checkpoint_prepare_s': None,
+           'checkpoint_total_s': None}
+    if context is not None:
+        row.update(phase=context['phase'], unit=context['unit'],
+                   checkpoint_prepare_s=context.get('checkpoint_prepare_s'),
+                   checkpoint_total_s=time.perf_counter() - context['started'])
+    try:
+        with (Path(path).parent / 'checkpoint_timing.jsonl').open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps(row, allow_nan=False) + '\n')
+    except OSError as exc:
+        # Timing is diagnostic. The scientific checkpoint was already committed;
+        # a telemetry failure must not suppress its cooperative-stop boundary.
+        warnings.warn(f"Checkpoint saved, but checkpoint timing could not be recorded: {exc}",
+                      RuntimeWarning, stacklevel=2)

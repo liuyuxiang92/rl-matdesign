@@ -85,14 +85,25 @@ class Campaign:
         contract["configuration_sources"] = {
             name: {"path": path, "sha256": file_digest(path)} for name, path in source_paths.items()}
         self.contract_digest = digest(contract)
+        self.source_upgrade = None
         if self.manifest_path.exists():
             saved = read_json(self.manifest_path)
             original = {key: saved.get(key) for key in contract}
             if digest(original) != saved.get("contract_digest"):
                 raise CampaignError("Campaign manifest contract is damaged or was modified; preserve it for inspection")
             if saved["contract_digest"] != self.contract_digest:
-                raise CampaignError("Campaign configuration, software, domain or assets changed; "
-                                    "restart requires the original campaign inputs and software")
+                from ..utils.source_compatibility import approved_performance_upgrade
+                source_only = {**original, "software_digest": contract["software_digest"]}
+                upgrade = (approved_performance_upgrade(original["software_digest"],
+                    contract["software_digest"], kind="package")
+                    if digest(source_only) == self.contract_digest else None)
+                if upgrade is None:
+                    raise CampaignError("Campaign configuration, software, domain or assets changed; "
+                                        "restart requires the original campaign inputs and software "
+                                        "or the exact audited DQN performance release")
+                self.source_upgrade = {**upgrade,
+                    "saved_contract_digest": saved["contract_digest"],
+                    "current_contract_digest": self.contract_digest}
         else:
             if self.out.exists() and any(self.out.iterdir()):
                 raise CampaignError(f"Output directory is nonempty and is not this HPO campaign: {self.out}")
@@ -498,6 +509,24 @@ class Campaign:
             result["generation_pairings"] = pairings
         return result
 
+    def record_source_upgrade(self):
+        """Persist audit evidence only when execution is actually requested.
+
+        The original manifest, checkpoints, job identifiers and result hashes
+        stay unchanged. Repeated restarts reuse this immutable receipt.
+        """
+        if self.source_upgrade is None:
+            return
+        path = self.out / "source_upgrades" / (self.source_upgrade["id"] + ".json")
+        if path.exists():
+            existing = read_json(path)
+            expected = {key: existing.get(key) for key in self.source_upgrade}
+            if digest(expected) != digest(self.source_upgrade):
+                raise CampaignError("Performance source-upgrade receipt changed; preserve it for inspection")
+            return
+        atomic_json(path, {**self.source_upgrade,
+                          "recorded_at": datetime.now(timezone.utc).isoformat()})
+
     def record_execution_options(self, parallel_jobs=None):
         """Record runtime scheduling separately from immutable experiment inputs.
 
@@ -524,6 +553,7 @@ class Campaign:
     def run(self, scope="all"):
         if scope not in SCOPES:
             raise CampaignError(f"Unknown stage {scope}")
+        self.record_source_upgrade()
         state = {"requested_stage": scope, "status": "RUNNING", "completed_stages": []}
         atomic_json(self.out / "state.json", state)
         try:

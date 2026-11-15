@@ -414,3 +414,31 @@
     src/rl_matdesign/training.py, src/rl_matdesign/hpo/job_runner.py,
     src/rl_matdesign/hpo/scheduling.py, src/rl_matdesign/hpo/cli.py]
   tags: [hpo, graceful-shutdown, recovery-accounting]
+
+- id: decision-dqn-performance-upgrade-001
+  date: '2026-11-15'
+  expires: '2027-05-15'
+  title: Permit one audited performance upgrade without restoring historical repair machinery
+  choice: >-
+    User explicitly requests stopping current slow DQN HPO and resuming on the faster
+    implementation. Accept only the exact ba6bc1cf baseline or its evidenced six-extra-
+    predictor variant, to this sealed release inventory. The six files exactly match
+    deleted Git history and are not auto-imported by builtin GlassNet. Keep manifests,
+    model contracts, cached job identities and paid ledgers immutable; write a separate
+    upgrade receipt only on actual restart. Models/assets/runtime/configuration and
+    learning contracts remain strict. Reject unknown source changes and damaged state.
+    Bootstrap memoizes scalar target results using exact state/action bytes, with a
+    bounded cache cleared after every target copy; forward shape and RNG remain unchanged.
+  alternatives_considered:
+  - A force-resume switch could admit changed scientific settings or hide spent budget.
+  - Batched target forwards may alter numerical results even with mathematically equal targets.
+  - Decreasing checkpoint frequency weakens the existing synchronized stopping guarantee.
+  trade_off: >-
+    Release source hashes must stay frozen after validation. Further source changes
+    are not implicitly approved. Packed checkpoints require the new reader module.
+    Target caching adds bounded RAM and benefits depend on replay reuse. CPU tests and
+    local storage measurements do not establish GlassNet/CUDA/NAS wall-clock speedup.
+  files: [src/rl_matdesign/utils/source_compatibility.py,
+    src/rl_matdesign/utils/dqn_performance_source.json,
+    src/rl_matdesign/utils/td_target_cache.py, tests/test_dqn_performance_resume.py]
+  tags: [performance, scientific-contracts, hpo-restart]

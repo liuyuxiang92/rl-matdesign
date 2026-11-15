@@ -151,7 +151,9 @@ class PredictorTimer:
                 "t_predict_s": self.t_predict_s, "best_mean": self.best_mean,
                 "diagnostic_requests": self._diagnostic_requests,
                 "diagnostic_failures": self._diagnostic_failures,
-                "phase": self.phase, "phase_costs": {name: {**deepcopy(cost), "seen": sorted(cost["seen"], key=repr)}
+                "phase": self.phase, "phase_costs": {name: {
+                    **deepcopy({key: value for key, value in cost.items() if key != "seen"}),
+                    "seen": sorted(cost["seen"], key=repr)}
                     for name, cost in self._phase_costs.items()}}
 
     def load_state_dict(self, state: dict) -> None:

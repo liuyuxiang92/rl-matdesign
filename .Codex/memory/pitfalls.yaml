@@ -245,7 +245,9 @@
     reconstruct duplicate, failed or pending attempts. Readable temporary checkpoints
     are evidence for further validation, not permission for automatic replacement.
     The user retired old repair scripts and source-migration exceptions and will
-    recompute those campaigns in new directories; do not recreate that machinery.
+    recompute those campaigns in new directories; do not recreate that repair machinery.
+    A later explicit request authorizes only the audited DQN performance source upgrade
+    for intact cooperatively stopped campaigns (see decision-dqn-performance-upgrade-001).
   impact: GPU HPO jobs can all fail from shared-disk exhaustion; a surviving previous
     checkpoint is not sufficient for exact resume if paid accounting has advanced.
   files: [src/rl_matdesign/training.py, src/rl_matdesign/hpo/job_runner.py,
@@ -265,8 +267,29 @@
     inputs, then per-job checkpoint/accounting synchronization. Compare actual
     imported package path and hashes, resolved plan, domain, assets and raw YAML
     hashes when the campaign gate fails. Do not rewrite archived fingerprints or
-    add source-version exceptions. Use the original environment or start a new run.
+    add ad hoc source-version exceptions. The audited DQN performance transition is
+    the sole explicit exception; preserve original evidence and enforce its full
+    inventory. Otherwise use the original environment or start a new run.
   impact: A legitimate old run, changed YAML comment, or another installed package
     can produce the same opaque rejection despite intact checkpoint files.
   files: [src/rl_matdesign/hpo/controller.py, src/rl_matdesign/hpo/restart.py]
   tags: [hpo, recovery, provenance, diagnostics]
+
+- id: pitfall-dqn-cumulative-checkpoint-cost-001
+  date: '2026-11-15'
+  expires: '2027-02-15'
+  title: Latest-only checkpoints still repeatedly serialize the full replay and history
+  wrong: Treating a single retained checkpoint as cheap, or attributing every gap
+    outside rollout/evaluation/update timing to physical disk I/O.
+  right: Measure preparation, replay packing, serialization and replacement separately.
+    Pack replay columns losslessly with dtype/schema preservation; incrementally hash
+    durable candidate appends and verify the complete archive once on restore. Avoid
+    deep copying cumulative sets that snapshot formatting immediately replaces.
+    Preserve checkpoint cadence and paid accounting. Diagnostic timing failures must
+    not prevent acknowledgement of an already committed cooperative-stop checkpoint.
+  impact: Larger replay and cumulative history can dominate wall time even when GPU
+    learning and property prediction are fast; frequent HPO saves amplify this cost.
+  files: [src/rl_matdesign/training.py, src/rl_matdesign/utils/checkpoint_serialization.py,
+    src/rl_matdesign/utils/candidate_records.py, src/rl_matdesign/utils/timing.py,
+    src/rl_matdesign/utils/stage_timing.py]
+  tags: [performance, checkpoint-storage, paid-accounting]

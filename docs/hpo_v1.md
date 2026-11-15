@@ -193,9 +193,9 @@ rl-matdesign hpo restart --out runs/my_hpo --parallel-jobs 10
 
 等待保存期间再次按 Ctrl+C 会强制结束进程组；这种强制停止、SIGKILL、断电或磁盘写满仍可能留下不同步文件，不能保证直接恢复。正常停止不会向正在计算的性质预测子进程发送终止信号，也不再用固定 10 秒超时截断尚未完成的批次。
 
-正常停止与恢复用于当前版本创建的 HPO。此前中断的旧任务重新计算时，使用新的空 `--out` 目录。
+正常停止与恢复用于当前版本创建的 HPO。另外，本次 DQN 性能更新支持从 `ba6bc1cf`（对应先前 HPO 源码）正常停止的任务直接升级续作，详见下文。更早的磁盘损坏、缺失日志等历史任务不在该升级范围内。
 
-新运行使用空输出目录。恢复仅复用配置、代码、资产与结果校验一致的作业；中断继续还要求检查点、随机状态和候选账本同步，不能抹掉已花费额度。配置、模型资产或源码发生变化时，使用新输出目录重新运行。ETA 随真实完整作业耗时更新，包含模型初始化、训练和账本持久化。
+新运行使用空输出目录。恢复仅复用配置、代码、资产与结果校验一致的作业；中断继续还要求检查点、随机状态和候选账本同步，不能抹掉已花费额度。配置、模型资产或未经审核的源码发生变化时，使用新输出目录重新运行。ETA 随真实完整作业耗时更新，包含模型初始化、训练和账本持久化。
 
 历史 `protocol: hpo_v1` YAML 仍由兼容读取器识别并发出提示，保留旧显式目标、归一化和阶段种子语义；它们不是当前推荐接口。六份模板已全部更新，路径保持不变。升级为精简配置会改变协议及评分契约，不能继续使用旧 campaign 目录。[第一版实现计划](hpo_v1_implementation_plan.md) 和历史验证报告描述此前版本，不代替本页。
 
@@ -219,6 +219,30 @@ rl-matdesign hpo restart --out runs/my_hpo --parallel-jobs 10
 HPO 训练只原子覆盖一份 `jobs/<id>/checkpoint.pt`，不再逐步累积 `checkpoint-epN.pt`（DQN）或 `checkpoint-iterN.pt`（A2C）。保存频率在 HPO 内部固定为 `--save-checkpoint-freq 1`：DQN 两种方法每完成一次候选 episode 及相应训练处理后保存（含重复候选，不是每个 action）；A2C 每完成一个训练 batch 并更新网络后保存，因此一个 batch 含多个候选时不是每个候选保存一次。断点保存优化器、随机状态、已花预算和 DQN replay buffer，用于恢复最新同步状态。评分使用候选档案，不读取历史训练快照；冻结生成使用被选中任务的最终模型。该策略在 HPO 内部固定，不新增 YAML 参数；普通非 HPO 训练仍保留编号快照。
 
 每个任务的最终 `qnet.pt` / `policy.pt` / `value_net.pt`、`std_scaler.bin`、最新完整断点以及候选档案、账本和结果仍保留。生成任务继续覆盖自己的 `generation_checkpoint.pt`；失败任务可能保留诊断用 `partial_checkpoint.pt`。单份断点避免同一任务内累积历史全量副本；整个 campaign 的磁盘占用仍随任务数量增加。原子写入期间需要同时容纳旧断点和新临时文件。
+
+### DQN 性能更新与现有任务续作
+
+DQN 的完整断点包含 replay buffer。新版按列打包并选择性无损压缩 replay，保持原始 dtype、形状、数值和字段；读取时自动还原原来的字典列表。候选档案 SHA256 改为追加时增量维护，恢复时仍校验已有完整档案；计时状态不再深拷贝随后会被替换的累计集合。bootstrap 的目标值使用有容量上限的缓存，target network 更新后立即清空，网络前向计算方式保持不变。MC 和 bootstrap 共用断点优化，A2C 也受益于档案和计时状态优化。
+
+这些改动不改变学习率、更新次数、replay 容量、预算或断点频率。普通 DQN 与 HPO 使用同一训练实现，因此都受益；普通 CLI 的 `--save-checkpoint-freq` 默认是 0，没有开启保存时不承担周期性全量断点开销。HPO 则仍按上述频率保存最新完整状态。
+
+每个训练任务新增 `checkpoint_timing.jsonl`，分别记录 `checkpoint_prepare_s`（整理状态）、`checkpoint_pack_s`（打包压缩）、`checkpoint_serialize_s`（序列化及写临时文件）、`checkpoint_replace_s`（原子替换）、`checkpoint_total_s` 和 `checkpoint_bytes`。没有外层准备计时的保存调用，其准备及总耗时为 `null`。写入耗时不等同于物理磁盘落盘耗时。此日志用于核对服务器上的实际瓶颈，不能把其他未归类耗时都当作磁盘 I/O。
+
+升级步骤如下，保留原 YAML、模型资产、Python 环境和 `--out`：
+
+1. 在旧程序中按一次 Ctrl+C（或向 HPO 控制器发送 SIGTERM），等所有 worker 保存完整断点并退出。
+2. 安装本次性能版本；不要在旧 worker 仍运行时替换源码。
+3. 运行只读检查，再正式恢复：
+
+```bash
+rl-matdesign hpo restart --out ./runs/dqn_mc_medium --check-only
+rl-matdesign hpo restart --out ./runs/dqn_mc_medium
+# bootstrap 使用自己的原目录
+rl-matdesign hpo restart --out ./runs/dqn_bootstrap_medium --check-only
+rl-matdesign hpo restart --out ./runs/dqn_bootstrap_medium
+```
+
+升级只接受已经审核的旧、新完整源码清单。服务器上额外保留的六个历史 predictor 文件按确切文件哈希识别；任意未知或修改的源码仍会拒绝。原 campaign manifest、已完成任务、预算账本和模型合同保持原样，正式恢复另存一份 `source_upgrades/dqn-checkpoint-storage-performance-v1.json` 审计记录。`--check-only` 不写该记录。中断任务继续原来的网络、优化器、replay 和 RNG 状态；已经完成或因效率门槛正常终止的任务复用结果。升级不会修复不完整的磁盘写入，也不会放宽模型、运行环境、种子、学习参数或评分设置的校验。
 
 ## GlassNet 初次验证与软件 smoke
 

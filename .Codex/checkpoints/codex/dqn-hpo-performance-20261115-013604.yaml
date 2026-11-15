@@ -1,0 +1,54 @@
+checkpoint_version: 3.0.0
+created_at: '2026-11-15T01:36:04.946135+00:00'
+branch: codex/dqn-hpo-performance
+phase:
+  current: implementation_validated
+  completed:
+  - diagnosis
+  - performance_optimization
+  - audited_restart_upgrade
+  - exact_legacy_integration
+  - regression
+  - wheel_validation
+  - reflection
+  next:
+  - publish_when_requested
+  - server_performance_measurement
+state:
+  parameters: []
+  experiments:
+  - name: related_regression
+    status: completed
+    result: 757 passed, 77 existing warnings
+  - name: legacy_to_fast_native_restart
+    status: completed
+    result: MC/bootstrap both clean and exact server six-file variant match old uninterrupted
+      science state
+  - name: checkpoint_20k_rows
+    status: completed
+    results_path: /private/tmp/rlmat-hpo-perf-20261115/checkpoint-compressed-comparison.json
+    result: median save0.919 to0.351s;69.76MB to9.58MB; localCPU only
+  decisions:
+  - decision: Seal one exact source-only performance transition
+    rationale: User explicitly requests continuing paid campaigns; never relax runtime/scientific/accounting
+      checks
+  - decision: Preserve checkpoint cadence and forward math
+    rationale: Maintain synchronized cooperative stop and exact observed learning
+      trajectory
+  source_digests:
+    clean_package: 4db450af563d86684ec83a349f598176cbd70997d89993dbfaecb0cffebdf0a3
+    clean_execution: 5e47246afb8325373a7189407fedfe30981611332d2cfebab4adc0e9eb126162
+blockers: []
+artifacts:
+- path: src/rl_matdesign/utils/dqn_performance_source.json
+  role: sealed exact source inventory
+- path: docs/hpo_v1.md
+  role: stop/update/restart instructions
+- path: /private/tmp/rlmat-dqn-performance-wheel/rl_matdesign-0.2.0-py3-none-any.whl
+  role: validated wheel
+resume_instructions: Work only in /Users/liuyuxiang/.codex/worktrees/dqn-hpo-performance/rl-matdesign.
+  Check git status and branch before commit/push. Source inventory is sealed; do not
+  modify .py or merge unrelated source into this release without re-audit. Default
+  cwd and hpo-v1 contain unrelated work. If user requests push, push this branch.
+  Server must stop old workers fully before update, preserve YAML/assets/runtime/out,
+  then native restart --check-only and restart. No server speedup measurement yet.

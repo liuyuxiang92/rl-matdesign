@@ -101,12 +101,15 @@ def _main(args) -> int:
                 "requested_parallel_jobs": args.parallel_jobs,
                 "effective_parallel_jobs": campaign.parallel_jobs,
             }
+            if campaign.source_upgrade is not None:
+                report["source_upgrade"] = campaign.source_upgrade
             _print({"restart_check": report})
             if not report["ready"]:
                 print("HPO restart blocked: inspect the listed jobs; no new sampling was started.", file=sys.stderr)
                 return 2
             if getattr(args, "check_only", False):
                 return 0
+            campaign.record_source_upgrade()
             campaign.record_execution_options(args.parallel_jobs)
             result = campaign.run(state["requested_stage"])
             _print(result)
