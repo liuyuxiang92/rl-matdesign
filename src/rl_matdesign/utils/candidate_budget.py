@@ -7,6 +7,10 @@ from decimal import Decimal, ROUND_CEILING
 class EfficiencyLimitReached(RuntimeError):
     """Even perfectly productive remaining attempts cannot meet the strict cap."""
 
+    # A settled predictor wave may have paid for several successful episodes
+    # before discovering infeasibility. Trainers persist these without learning.
+    evaluated_episodes = ()
+
 
 class NumericalTrainingError(RuntimeError):
     """A trial produced nonfinite training losses or model parameters."""
@@ -33,14 +37,22 @@ class CandidateBudget:
     def unique_evaluated(self):
         return len(self.seen)
 
-    def check_can_start(self):
+    def check_efficiency(self):
+        """Reject an irrecoverable settled prefix, never a transient A/U ratio."""
+        if self.status == "INFEASIBLE_EFFICIENCY":
+            raise EfficiencyLimitReached("Strict attempts/unique limit is no longer attainable")
         if self.status != "RUNNING":
-            raise RuntimeError(f"Cannot sample from budget in state {self.status}")
+            return
         if self.pending:
             return  # Check impossibility only after the evaluation wave settles.
         if self.attempts_started + self.target_unique - self.unique_evaluated > self.max_attempts:
             self.status = "INFEASIBLE_EFFICIENCY"
             raise EfficiencyLimitReached("Strict attempts/unique limit is no longer attainable")
+
+    def check_can_start(self):
+        self.check_efficiency()
+        if self.status != "RUNNING":
+            raise RuntimeError(f"Cannot sample from budget in state {self.status}")
         if self.unique_evaluated >= self.target_unique:
             raise RuntimeError("Candidate target already reached")
 

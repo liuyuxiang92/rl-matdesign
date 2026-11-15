@@ -100,7 +100,7 @@ class Campaign:
                 if upgrade is None:
                     raise CampaignError("Campaign configuration, software, domain or assets changed; "
                                         "restart requires the original campaign inputs and software "
-                                        "or the exact audited DQN performance release")
+                                        "or an explicitly audited performance/protocol upgrade")
                 self.source_upgrade = {**upgrade,
                     "saved_contract_digest": saved["contract_digest"],
                     "current_contract_digest": self.contract_digest}
@@ -364,7 +364,6 @@ class Campaign:
         initial = read_json(self.stage_path("train-budget"))
         budget = initial["selection"]["selected_budget"]
         settings = self.plan["training_search"]
-        panel = initial["panel"]
         studies = []
         selected = None
         for revision in range(settings["max_budget_revisions"] + 1):
@@ -381,7 +380,9 @@ class Campaign:
             finalists = list(distinct_ranked.values())[:settings["finalists"]]
             if not finalists:
                 return {"status": "NO_FEASIBLE_CONFIGURATION", "studies": studies}
-            panel = unique_parameters([*panel, *(r["parameters"] for r in finalists)])
+            # Validate only this round's distinct finalists. Reintroducing the
+            # calibration panel or prior rounds silently multiplies the work.
+            panel = [r["parameters"] for r in finalists]
             validated = self.scan(panel, "train", settings["validation_seeds"])
             selection = select_budget(validated, self.plan, "train")
             if not selection.get("selected"):

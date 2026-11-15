@@ -243,7 +243,8 @@ def _run_experiment(resources: ExitStack) -> None:
             source = (args.load_qnet if method == "dqn" else args.load_policy) or os.path.join(args.out, "checkpoint.pt")
             if not os.path.exists(source):
                 raise ValueError("HPO resume requires the original synchronized checkpoint")
-            saved_hpo = torch.load(source, map_location="cpu", weights_only=False)
+            from .utils.checkpoint_store import load_checkpoint
+            saved_hpo = load_checkpoint(source, map_location="cpu")
             if not isinstance(saved_hpo, dict) or any(saved_hpo.get(key) is None for key in ("hpo_state", "rng_state", "predictor_ledger")):
                 raise ValueError("HPO resume requires checkpoint accounting, RNG and predictor ledger; weights-only restart is refused")
             hpo_resume = saved_hpo["hpo_state"]
@@ -251,7 +252,8 @@ def _run_experiment(resources: ExitStack) -> None:
             source = os.path.join(args.out, "generation_checkpoint.pt")
             if not os.path.exists(source):
                 raise ValueError("Generation resume requires generation_checkpoint.pt")
-            hpo_generation_resume = torch.load(source, map_location="cpu", weights_only=False)
+            from .utils.checkpoint_store import load_checkpoint
+            hpo_generation_resume = load_checkpoint(source, map_location="cpu")
             if not isinstance(hpo_generation_resume, dict) or hpo_generation_resume.get("type") != "hpo_generation" or any(hpo_generation_resume.get(key) is None for key in ("hpo_state", "rng_state", "predictor_ledger", "generation_contract")):
                 raise ValueError("Generation checkpoint lacks synchronized accounting, RNG, predictor or sampling identity")
             hpo_resume = hpo_generation_resume["hpo_state"]

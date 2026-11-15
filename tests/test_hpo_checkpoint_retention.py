@@ -14,6 +14,7 @@ import torch
 import yaml
 
 from rl_matdesign import training
+from rl_matdesign.utils.checkpoint_store import load_checkpoint
 from tests.test_experiment_reproducibility import _config
 
 
@@ -97,7 +98,7 @@ def test_hpo_latest_checkpoint_retains_exact_resume(tmp_path, method, target):
     assert interrupted.returncode == 73, interrupted.stdout[-3000:] + interrupted.stderr[-5000:]
     before_records = (resumed / "candidate_records.jsonl").read_bytes()
     before_budget = json.loads((resumed / "candidate_budget.json").read_text())
-    stopped = torch.load(resumed / "checkpoint.pt", map_location="cpu", weights_only=False)
+    stopped = load_checkpoint(resumed / "checkpoint.pt", map_location="cpu")
     assert before_budget["status"] == "INTERRUPTED"
     assert 0 < before_budget["unique_evaluated"] < 6
     assert before_budget["attempts_started"] == stopped["hpo_state"]["budget"]["attempts_started"]
@@ -106,8 +107,8 @@ def test_hpo_latest_checkpoint_retains_exact_resume(tmp_path, method, target):
     _assert_success(_run_recorded(config_path, resumed, resume=True))
     assert (resumed / "candidate_records.jsonl").read_bytes().startswith(before_records)
 
-    left = torch.load(full / "checkpoint.pt", map_location="cpu", weights_only=False)
-    right = torch.load(resumed / "checkpoint.pt", map_location="cpu", weights_only=False)
+    left = load_checkpoint(full / "checkpoint.pt", map_location="cpu")
+    right = load_checkpoint(resumed / "checkpoint.pt", map_location="cpu")
     keys = ["training_budget_state", "hpo_state", "rng_state"]
     keys += (["policy_state", "value_net_state", "opt_actor_state", "opt_critic_state"]
              if method == "a2c" else ["qnet_state", "target_net_state", "opt_state", "buffer"])

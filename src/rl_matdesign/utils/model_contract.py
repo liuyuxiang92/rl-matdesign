@@ -131,7 +131,11 @@ def save_weights(path, model, env, role: str, *, scaler=None) -> None:
 def load_artifact(path, env, *, device="cpu", checkpoint: bool = False, scaler=None):
     import torch
 
-    raw = torch.load(path, map_location=device, weights_only=not checkpoint)
+    if checkpoint:
+        from .checkpoint_store import load_checkpoint
+        raw = load_checkpoint(path, map_location=device)
+    else:
+        raw = torch.load(path, map_location=device, weights_only=True)
     require_contract(raw.get("environment_contract") if isinstance(raw, dict) else None,
                      environment_contract(env), str(Path(path)))
     if scaler is not None:

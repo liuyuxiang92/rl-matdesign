@@ -418,7 +418,7 @@
 - id: decision-dqn-performance-upgrade-001
   date: '2026-11-15'
   expires: '2027-05-15'
-  title: Permit one audited performance upgrade without restoring historical repair machinery
+  title: First audited performance upgrade (superseded by performance-v2)
   choice: >-
     User explicitly requests stopping current slow DQN HPO and resuming on the faster
     implementation. Accept only the exact ba6bc1cf baseline or its evidenced six-extra-
@@ -442,3 +442,37 @@
     src/rl_matdesign/utils/dqn_performance_source.json,
     src/rl_matdesign/utils/td_target_cache.py, tests/test_dqn_performance_resume.py]
   tags: [performance, scientific-contracts, hpo-restart]
+
+- id: decision-dqn-performance-upgrade-002
+  date: '2026-11-15'
+  expires: '2027-05-15'
+  title: Batch bootstrap targets and incrementally persist HPO state with explicit protocol continuation
+  choice: >-
+    User requests the full performance corrections and native restart of current jobs.
+    Accept exact ba6bc1cf and b947208 origins, clean or with the evidenced six historical
+    predictor files, into a sealed v2 inventory. Batch legal next-action targets within
+    bounded action-row chunks and deduplicate within each minibatch only. Preserve
+    network/target/optimizer/RNG/replay and all paid observations when upgrading, while
+    explicitly recording that batched floating-point trajectories can differ from old code.
+    Keep per-learning-unit checkpoint cadence; externalize growing HPO containers into
+    immutable content chunks in a same-directory SQLite store, commit data then publish
+    and fsync the latest .pt directory before reclaiming stale chunks. Final results hash
+    both files. Keep ordinary non-HPO checkpoints standalone and frozen model exports unchanged.
+    Budget review uses only the current round's top three distinct configurations; earlier
+    experimental results remain cached but are not added to that panel.
+  alternatives_considered:
+  - Cross-update target caches alter minibatch shapes after restart unless persisted.
+  - Fewer checkpoints weakens safe stopping and does not resolve growing history serialization.
+  - Per-observation SQLite records increase index and restart overhead; content chunks amortize both.
+  trade_off: >-
+    Batched arithmetic preserves Bellman semantics, not old/new bitwise trajectories.
+    New/new exact continuation needs unchanged runtime and deterministic kernels.
+    Incremental saves still scan/hash current contents, first save builds the store,
+    and restart loads can be slower. Copy the whole job directory including its backing
+    database. GC uses bounded slack and reuses SQLite pages. No hard-kill/disk-full repair
+    or arbitrary source/runtime bypass is introduced. Never edit sealed source without
+    resealing and rerunning native upgrade coverage.
+  files: [src/rl_matdesign/utils/td_targets.py, src/rl_matdesign/utils/checkpoint_store.py,
+    src/rl_matdesign/utils/source_compatibility.py, src/rl_matdesign/hpo/controller.py,
+    src/rl_matdesign/hpo/artifacts.py]
+  tags: [performance, incremental-checkpoints, protocol-upgrade]

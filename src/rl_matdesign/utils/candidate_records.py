@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-from .candidate_budget import CandidateBudget, NumericalTrainingError
+from .candidate_budget import CandidateBudget, EfficiencyLimitReached, NumericalTrainingError
 
 
 def candidate_identity(value):
@@ -62,6 +62,8 @@ class CandidateRecorder:
         self.constraint_check = None
         self._records_hash = hashlib.sha256()
         self._records_signature = None
+        self._written_budget = None
+        self._budget_signature = None
         if resume_state is not None:
             self._restore(resume_state)
         elif self.records_path.exists() or self.budget_path.exists():
@@ -73,6 +75,10 @@ class CandidateRecorder:
 
     def _archive_signature(self, stat=None):
         stat = self.records_path.stat() if stat is None else stat
+        return self._stat_signature(stat)
+
+    @staticmethod
+    def _stat_signature(stat):
         return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
     def _check_archive_unchanged(self, stat=None):
@@ -130,18 +136,39 @@ class CandidateRecorder:
         self._records_signature = signature
 
     def flush(self):
+        snapshot = {**self.budget.snapshot(), "phase": self.phase}
+        if self._budget_signature is not None:
+            try:
+                signature = self._stat_signature(self.budget_path.stat())
+            except FileNotFoundError as exc:
+                raise ValueError("HPO candidate budget changed outside the recorder") from exc
+            if signature != self._budget_signature:
+                raise ValueError("HPO candidate budget changed outside the recorder")
+            if snapshot == self._written_budget:
+                return
         temporary = self.budget_path.with_suffix(".tmp")
         with temporary.open("w", encoding="utf-8") as handle:
-            json.dump({**self.budget.snapshot(), "phase": self.phase}, handle, indent=2, allow_nan=False)
+            json.dump(snapshot, handle, indent=2, allow_nan=False)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, self.budget_path)
+        self._budget_signature = self._stat_signature(self.budget_path.stat())
+        self._written_budget = snapshot
 
     def wave_limit(self, requested):
         try:
             return self.budget.wave_limit(requested)
         finally:
             self.flush()
+
+    def check_efficiency(self):
+        try:
+            self.budget.check_efficiency()
+        except EfficiencyLimitReached:
+            # Persist the terminal status before unwinding a partially collected
+            # training batch; no resumable model is needed for a rejected trial.
+            self.flush()
+            raise
 
     def start(self):
         try:
@@ -187,7 +214,8 @@ class CandidateRecorder:
                 self.budget.status = "INTERRUPTED" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "SYSTEM_ERROR"
         self.budget.finish()
         self.flush()
-        if self.budget.status != "COMPLETED" and self.partial_checkpoint_factory is not None:
+        if (self.budget.status not in {"COMPLETED", "INFEASIBLE_EFFICIENCY"}
+                and self.partial_checkpoint_factory is not None):
             # Diagnostic snapshot only: a failed wave may contain evaluated
             # trajectories which have not yet received their learning update.
             # Never present this file as a safe training resume checkpoint.

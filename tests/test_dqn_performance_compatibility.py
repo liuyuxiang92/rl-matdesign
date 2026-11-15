@@ -1,4 +1,4 @@
-"""A single audited source update never relaxes scientific restart evidence."""
+"""The approved v2 protocol transition never relaxes other restart evidence."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -21,21 +21,24 @@ from tests.test_hpo_v2_job_runner import public_plan_path
 @pytest.fixture
 def release(tmp_path, monkeypatch):
     """Test the real validator using an isolated inventory, not a mocked allow."""
-    shipped = json.loads(Path(compat.__file__).with_name("dqn_performance_source.json").read_text())
+    shipped = json.loads(Path(compat.__file__).with_name("dqn_performance_v2_source.json").read_text())
     baseline = shipped["baseline_files"]
+    previous = shipped["previous_release_files"]
     overrides = {"rl_matdesign/utils/source_compatibility.py":
                  hashlib.sha256(Path(compat.__file__).read_bytes()).hexdigest()}
-    target = {**baseline, **overrides}
+    target = {**baseline, **previous, **overrides}
     path = tmp_path / "release.json"
-    record = {"schema_version": 1, "id": compat.UPGRADE_ID,
+    record = {"schema_version": 2, "id": compat.UPGRADE_ID,
               "baseline_revision": compat.BASELINE_REVISION,
-              "baseline_files": baseline, "target_files": overrides}
+              "baseline_files": baseline, "previous_release_revision": compat.V1_REVISION,
+              "previous_release_files": previous, "target_files": overrides}
     path.write_text(json.dumps(record))
     installed = deepcopy(target)
     monkeypatch.setattr(compat, "_manifest_path", lambda: path)
     monkeypatch.setattr(compat, "source_inventory", lambda _: deepcopy(installed))
     return SimpleNamespace(path=path, record=record, installed=installed,
                            baseline=compat.inventory_digests(baseline),
+                           previous=compat.inventory_digests({**baseline, **previous}),
                            target=compat.inventory_digests(target))
 
 
@@ -73,10 +76,13 @@ def test_exact_audited_forward_upgrade_only(release, kind):
 
 
 @pytest.mark.parametrize("kind", ["package", "execution"])
+@pytest.mark.parametrize("saved_release", ["baseline", "previous"])
 @pytest.mark.parametrize("saved_legacy", [False, True])
 @pytest.mark.parametrize("installed_legacy", [False, True])
-def test_exact_server_legacy_source_variants(release, kind, saved_legacy, installed_legacy):
+def test_exact_server_legacy_source_variants(release, kind, saved_release, saved_legacy, installed_legacy):
     baseline = release.record["baseline_files"]
+    if saved_release == "previous":
+        baseline = {**baseline, **release.record["previous_release_files"]}
     if saved_legacy:
         baseline = {**baseline, **compat.LEGACY_PREDICTOR_FILES}
     if installed_legacy:
@@ -85,8 +91,12 @@ def test_exact_server_legacy_source_variants(release, kind, saved_legacy, instal
     new = compat.inventory_digests(release.installed)[kind]
     evidence = compat.approved_performance_upgrade(old, new, kind=kind)
     assert evidence is not None
+    assert evidence["baseline_revision"] == (compat.V1_REVISION if saved_release == "previous" else compat.BASELINE_REVISION)
     assert evidence["saved_inventory_variant"] == ("legacy_predictors" if saved_legacy else "clean")
     assert evidence["current_inventory_variant"] == ("legacy_predictors" if installed_legacy else "clean")
+    assert evidence["changed_source_files"] == sorted(
+        path for path in set(baseline) | set(release.installed)
+        if baseline.get(path) != release.installed.get(path))
 
 
 @pytest.mark.parametrize("mutation", ["changed", "missing_one", "unexpected_extra"])
@@ -107,6 +117,11 @@ def test_legacy_sources_must_be_exact_all_or_none(release, mutation):
 def test_server_inventory_hashes_are_independently_reproducible(release):
     hashes = compat.inventory_digests({**release.record["baseline_files"], **compat.LEGACY_PREDICTOR_FILES})
     assert hashes == {"package": compat.LEGACY_PACKAGE_SHA256, "execution": compat.LEGACY_EXECUTION_SHA256}
+    previous = {**release.record["baseline_files"], **release.record["previous_release_files"]}
+    assert compat.inventory_digests(previous) == {"package": compat.V1_PACKAGE_SHA256,
+                                                 "execution": compat.V1_EXECUTION_SHA256}
+    assert compat.inventory_digests({**previous, **compat.LEGACY_PREDICTOR_FILES}) == {
+        "package": compat.V1_LEGACY_PACKAGE_SHA256, "execution": compat.V1_LEGACY_EXECUTION_SHA256}
 
 
 @pytest.mark.parametrize("mutation", ["changed_scorer", "changed_target", "extra_file", "missing_file"])
@@ -123,7 +138,7 @@ def test_installed_inventory_drift_is_rejected(release, mutation):
         release.target["execution"], kind="execution") is None
 
 
-@pytest.mark.parametrize("mutation", ["bad_baseline", "scoring_override", "unsealed", "missing", "invalid_json", "invalid_type"])
+@pytest.mark.parametrize("mutation", ["bad_baseline", "bad_previous", "unknown_previous", "scoring_override", "unsealed", "missing", "invalid_json", "invalid_type"])
 def test_untrusted_or_incomplete_inventory_is_rejected(release, mutation):
     if mutation == "missing":
         release.path.unlink()
@@ -134,6 +149,10 @@ def test_untrusted_or_incomplete_inventory_is_rejected(release, mutation):
     else:
         if mutation == "bad_baseline":
             release.record["baseline_files"]["rl_matdesign/training.py"] = "f" * 64
+        elif mutation == "bad_previous":
+            release.record["previous_release_files"]["rl_matdesign/training.py"] = "f" * 64
+        elif mutation == "unknown_previous":
+            release.record["previous_release_revision"] = "unknown"
         elif mutation == "scoring_override":
             release.record["target_files"]["rl_matdesign/hpo/scoring.py"] = "f" * 64
         else:
@@ -197,19 +216,21 @@ def test_generation_restore_uses_source_only_comparator(release, monkeypatch):
 
 
 @pytest.mark.parametrize("checkpoint", [False, True])
-def test_frozen_model_load_accepts_upgrade_without_rewriting_weights(release, tmp_path, checkpoint):
+@pytest.mark.parametrize("saved_release", ["baseline", "previous"])
+def test_frozen_model_load_accepts_upgrade_without_rewriting_weights(release, tmp_path, checkpoint, saved_release):
     import numpy as np
     import torch
     from rl_matdesign.env import CompositionEnv
     from rl_matdesign.utils.model_contract import load_artifact, save_weights
     env = CompositionEnv(species_set=("Ni", "Fe", "Co"), fraction_set=["0.25", "0.50", "0.75"],
                          total_units=4, n_components=2, state_featurizer=lambda _: np.zeros(2))
-    env.evaluation_contract = execution(release.baseline["execution"])["evaluation"]
+    saved_hash = getattr(release, saved_release)["execution"]
+    env.evaluation_contract = execution(saved_hash)["evaluation"]
     path = tmp_path / "qnet.pt"
     save_weights(path, torch.nn.Linear(2, 1), env, "qnet")
     if checkpoint:
         raw = torch.load(path, weights_only=True)
-        raw["execution_contract"] = execution(release.baseline["execution"])
+        raw["execution_contract"] = execution(saved_hash)
         torch.save(raw, path)
     before = path.read_bytes(), path.stat().st_mtime_ns
     env.evaluation_contract = execution(release.target["execution"])["evaluation"]
@@ -256,6 +277,9 @@ def test_check_only_accepts_upgrade_without_any_filesystem_writes(campaign, monk
     assert main(["restart", "--out", str(campaign.out), "--check-only", "--parallel-jobs", "10"]) == 0
     report = json.loads(capsys.readouterr().out)["restart_check"]
     assert report["source_upgrade"]["id"] == compat.UPGRADE_ID
+    assert report["source_upgrade"]["migration_kind"] == "approved_code_and_protocol_update"
+    assert report["source_upgrade"]["bitwise_continuation"] is False
+    assert "floating-point" in report["source_upgrade"]["protocol_changes"]["bootstrap_targets"]
     assert report["execution_options"]["effective_parallel_jobs"] == 10
     assert {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in campaign.out.rglob("*") if p.is_file()} == before
 
@@ -263,6 +287,9 @@ def test_check_only_accepts_upgrade_without_any_filesystem_writes(campaign, monk
 @pytest.mark.parametrize("command", ["restart", "resume"])
 def test_actual_restart_records_idempotent_receipt_preserving_manifest(campaign, monkeypatch, capsys, command):
     manifest = (campaign.out / "manifest.json").read_bytes()
+    previous_receipt = campaign.out / "source_upgrades" / "dqn-checkpoint-storage-performance-v1.json"
+    atomic_json(previous_receipt, {"id": "dqn-checkpoint-storage-performance-v1", "immutable": "old audit evidence"})
+    previous_bytes = previous_receipt.read_bytes(), previous_receipt.stat().st_mtime_ns
     calls = []
     monkeypatch.setattr(Campaign, "run", lambda self, scope: calls.append(scope) or {"status": "COMPLETED"})
     args = [command, "--out", str(campaign.out)]
@@ -274,6 +301,7 @@ def test_actual_restart_records_idempotent_receipt_preserving_manifest(campaign,
     assert calls == ["ranges", "ranges"]
     assert (path.read_bytes(), path.stat().st_mtime_ns) == first
     assert (campaign.out / "manifest.json").read_bytes() == manifest
+    assert (previous_receipt.read_bytes(), previous_receipt.stat().st_mtime_ns) == previous_bytes
     capsys.readouterr()
 
 
@@ -323,7 +351,13 @@ def test_tampered_upgrade_receipt_is_not_overwritten(campaign):
 def test_sealed_release_inventory_matches_all_installed_source_files():
     current = compat.inventory_digests(compat.source_inventory(compat._source_root()))
     for kind, baseline in (("package", compat.BASELINE_PACKAGE_SHA256),
-                           ("execution", compat.BASELINE_EXECUTION_SHA256)):
+                           ("execution", compat.BASELINE_EXECUTION_SHA256),
+                           ("package", compat.LEGACY_PACKAGE_SHA256),
+                           ("execution", compat.LEGACY_EXECUTION_SHA256),
+                           ("package", compat.V1_PACKAGE_SHA256),
+                           ("execution", compat.V1_EXECUTION_SHA256),
+                           ("package", compat.V1_LEGACY_PACKAGE_SHA256),
+                           ("execution", compat.V1_LEGACY_EXECUTION_SHA256)):
         assert compat.approved_performance_upgrade(baseline, current[kind], kind=kind) is not None
 
 
