@@ -116,3 +116,19 @@ def test_generation_validates_before_restoring_ledger_or_rng(monkeypatch, path, 
     generation_resume.restore_generation(predictor, saved, generation())
     assert loaded == [{"calls": 7}]
     assert restored_rng == [{"state": "saved"}]
+
+
+@pytest.mark.parametrize("method", ["dqn", "reinforce", "a2c"])
+def test_shared_gamma_is_frozen_in_training_resume_contract(tmp_path, method):
+    import json
+    from rl_matdesign.config_schema import resolve_config
+    from rl_matdesign.utils.execution_contract import execution_contract
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"input_files": [], "runtime": {}}))
+    config = resolve_config({"method": method, "gamma": .9}).config
+    original = execution_contract(config, object(), manifest, "cpu")
+    changed = execution_contract({**config, "gamma": .8}, object(), manifest, "cpu")
+    assert original["learning"]["gamma"] == .9
+    assert original["evaluation"] == changed["evaluation"]
+    with pytest.raises(ValueError, match="learning.gamma"):
+        require_execution_contract(original, changed)

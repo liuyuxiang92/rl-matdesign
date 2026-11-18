@@ -9,25 +9,15 @@ import time
 from .utils.episode_batch import CandidateEvaluationFailed, supports_partial_batch_prediction
 from .utils.rollout_errors import EvaluationProtocolError
 from .config_schema import (
-    ALIASES as _FLAG_ALIASES,
     load_yaml_config,
-    normalize_aliases,
     validate_config,
 )
 
 
-def _apply_flag_aliases(cfg: dict) -> dict:
-    """Compatibility import for the shared, non-mutating alias normalizer."""
-    return normalize_aliases(cfg)
-
-
 def load_config(path: str) -> dict:
     """Read and validate authored settings without materializing defaults."""
-    cfg = normalize_aliases(load_yaml_config(path))
+    cfg = load_yaml_config(path)
     validate_config(cfg)
-    if "generated_columns" in cfg:
-        from .utils.metrics import validate_generated_columns
-        validate_generated_columns(cfg["generated_columns"])
     return cfg
 
 
@@ -216,9 +206,6 @@ def build_env(cfg, predictor):
     from .env_multigroup import MultiGroupEnv
     from .peptide_design import compile_groups
 
-    if "generated_columns" in cfg:
-        from .utils.metrics import validate_generated_columns
-        validate_generated_columns(cfg["generated_columns"])
     if not cfg.get("groups"):
         raise ValueError("A design needs a non-empty groups list")
     groups, adapter = compile_groups(cfg)

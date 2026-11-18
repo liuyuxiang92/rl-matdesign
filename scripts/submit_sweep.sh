@@ -159,7 +159,7 @@ for scen in $SCENARIOS; do
                  --method "$method"
                  --out "$run_out/"
                  --train-seed "$seed"
-                 --dp-seed "$((seed + 10000))"
+                 --eval-seed "$((seed + 10000))"
                  --gen-seed "$((seed + 20000))")
             [[ -n "$target" ]] && cmd+=(--dqn-target-mode "$target")
 

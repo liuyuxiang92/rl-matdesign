@@ -28,7 +28,6 @@ def _config():
         "dqn_target_update_freq": 2, "dqn_eps_anneal_eps": 4,
         "pg_warmup_eps": 4, "pg_num_iters": 2, "pg_batch_eps": 2,
         "pg_entropy_min": 0.0, "num_gen_eps": 3, "max_gen_attempts": 100,
-        "exploration_gen_eps": 1,
     }
 
 
@@ -103,3 +102,29 @@ def test_generation_reuses_saved_model_and_retains_training_evidence(tmp_path):
         assert (out / name).exists()
     assert len(list((out / "provenance").glob("*/manifest.json"))) == 2
     assert _scientific_rows(out / "generated.csv") == rows
+
+
+@pytest.mark.parametrize("method", ["dqn", "reinforce", "a2c"])
+def test_shared_gamma_reaches_each_training_algorithm(tmp_path, monkeypatch, method):
+    from rl_matdesign import experiment
+
+    cfg = _config()
+    cfg.update(method=method, gamma=0.37)
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump(cfg))
+    monkeypatch.setattr(sys, "argv", ["rl-matdesign", "--config", str(config),
+                                     "--out", str(tmp_path / "run"), "--device", "cpu",
+                                     "--skip-generation"])
+
+    class TrainingReached(RuntimeError):
+        pass
+
+    def capture_training(**kwargs):
+        assert kwargs["gamma"] == 0.37
+        assert kwargs["train_count_duplicates"] is False
+        raise TrainingReached
+
+    monkeypatch.setattr(experiment, "train_dqn_online" if method == "dqn" else "train_pg",
+                        capture_training)
+    with pytest.raises(TrainingReached):
+        experiment.main()

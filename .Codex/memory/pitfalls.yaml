@@ -404,3 +404,20 @@
   files: [src/rl_matdesign/amounts.py, src/rl_matdesign/categorical.py,
     tests/test_training_filters.py, docs/constraint_filter_contract.md]
   tags: [training-phases, constraints, configuration-ownership]
+
+
+- id: pitfall-shared-training-contract-fields-001
+  date: '2026-11-18'
+  expires: '2027-02-18'
+  title: Shared training parameters need explicit checkpoint contract membership
+  wrong: >-
+    Renaming dqn_gamma and pg_gamma to gamma while selecting learning settings only
+    by the active dqn_ or pg_ prefix drops the discount from resume compatibility.
+  right: >-
+    Add shared learning settings explicitly to execution_contract.learning when
+    consolidating names. Test each algorithm by building real contracts with two
+    gamma values; evaluation identity must remain equal and exact training resume
+    must reject learning.gamma before restoring state.
+  impact: A resumed run could silently change the return or bootstrap target definition.
+  files: [src/rl_matdesign/utils/execution_contract.py, tests/test_resume_contracts.py]
+  tags: [checkpointing, configuration-ownership, scientific-contracts]

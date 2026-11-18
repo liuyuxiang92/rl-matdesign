@@ -31,13 +31,14 @@ def configuration():
              "labels": ["left", "right", "cap"], "values": [0, True, "0"], "n_steps": 2},
         ],
         "eval_seed": 13, "train_seed": 17, "gen_seed": 19,
+        # This fixture checks fixed episode/update counts, including repeats.
+        "train_count_duplicates": True,
         "dqn_warmup_eps": 3, "dqn_num_train_eps": 3,
         "dqn_batch_size": 2, "dqn_buffer_size": 100,
         "dqn_grad_steps_per_ep": 1, "dqn_hidden_dim": 16,
         "dqn_target_update_freq": 2, "dqn_eps_anneal_eps": 4,
         "pg_warmup_eps": 3, "pg_num_iters": 1, "pg_batch_eps": 3,
         "pg_entropy_min": 0.0, "num_gen_eps": 3, "max_gen_attempts": 40,
-        "exploration_gen_eps": 0,
     }
 
 

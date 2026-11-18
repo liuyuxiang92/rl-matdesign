@@ -212,8 +212,7 @@ class JobRunner:
         cfg.update(hpo_recording=True, hpo_phase=phase, hpo_target_unique=budget,
                    hpo_ratio_limit=efficiency["max_attempts_per_unique"],
                    train_count_duplicates=False,
-                   train_max_duplicate_attempts=max(1000, 10 * budget),
-                   exploration_gen_eps=0)
+                   train_max_duplicate_attempts=max(1000, 10 * budget))
         if phase == "generation":
             cfg.update(num_gen_eps=budget, gen_epsilon=0.0, gen_top_frac=0.0, gen_temperature=0.0,
                        max_gen_attempts=max(1000, 10 * budget))

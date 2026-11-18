@@ -498,7 +498,7 @@ class Campaign:
                           "convergence_status": selection["convergence_status"]}
             else:
                 output = {"num_gen_eps": best["budget"], "gen_temperature": best["parameters"]["gen_temperature"],
-                          "gen_epsilon": 0., "gen_top_frac": 0., "exploration_gen_eps": 0,
+                          "gen_epsilon": 0., "gen_top_frac": 0.,
                           "convergence_status": selection["convergence_status"]}
             (self.out / "best_generation.yaml").write_text(yaml.safe_dump(output, sort_keys=False))
         result = {"status": status, "selection": selection, "results": results,

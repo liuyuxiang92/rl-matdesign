@@ -153,7 +153,7 @@ def test_generation_exports_combined_candidate_and_sends_it_to_metadata(monkeypa
     rows = training.generate_candidates(
         env=env, predictor=oracle, scaler=None, device=None,
         elem_feats_scaled=np.empty((0, 0)), action_values=env.action_values,
-        qnet=Model(), n_exploit=1, n_explore=0, max_attempts=1)
+        qnet=Model(), num_gen_eps=1, max_attempts=1)
     assert len(rows) == 1
     candidate = json.loads(rows[0]["candidate_json"])
     assert set(candidate) == {"n_terminal", "peptide"}

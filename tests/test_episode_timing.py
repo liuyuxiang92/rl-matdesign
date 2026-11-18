@@ -207,7 +207,7 @@ def test_generation_keeps_timing_out_of_candidate_schema(clock, monkeypatch):
         env=env, predictor=predictor, qnet=torch.nn.Linear(1, 1),
         scaler=StandardScaler().fit([[0.0, 1.0], [1.0, 1.0]]), device=torch.device("cpu"),
         elem_feats_scaled=np.array([[0.1, 0.2]]), action_values=["0.5"],
-        n_exploit=2, n_explore=0, max_attempts=4,
+        num_gen_eps=2, max_attempts=4,
     )
     assert [r["formula"] for r in rows] == ["A1", "B1"]
     assert [r["formula"] for r in recorder.rows] == ["X1", "A1", "A1", "B1"]

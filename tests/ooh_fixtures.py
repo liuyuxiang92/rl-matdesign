@@ -27,7 +27,7 @@ def slab_poscar(tmp_path):
 def oracle_factory(monkeypatch, slab_poscar, tmp_path):
     counter = 0
     def make(matrix=((0.,10.),(10.,0.)), *, adsorbates=None, output_index=0, seed=7,
-             objective='mean', uncertainty='model_spread', k=1., predict_cache_size=200000):
+             objective='mean', uncertainty='model_spread', k=1.):
         nonlocal counter
         root = tmp_path / f'oracle-{counter}'
         counter += 1
@@ -54,7 +54,7 @@ def oracle_factory(monkeypatch, slab_poscar, tmp_path):
         sys.modules['deepmd.pt.infer.deep_eval'].DeepProperty=Model
         cfg={'properties':[{'name':'overpotential','predictor':'ooh_frames','models':paths,
              'output_index':output_index,'direction':'min','objective':objective,'uncertainty':uncertainty}],
-             'k':k,'predict_cache_size':predict_cache_size,
+             'k':k,
              'structure':{'builder':'pipeline','base_poscar':slab_poscar,'n_random_configs':len(matrix[0]),'steps':[
                  {'type':'substitute','a_site_symbol':'Co','a_dopant_group':'alloy'},
                  {'type':'ooh_adsorbates','adsorbates':['O*','OH*','OOH*'] if adsorbates is None else list(adsorbates)}]}}

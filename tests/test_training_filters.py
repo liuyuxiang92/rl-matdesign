@@ -37,10 +37,12 @@ def test_filter_list_applies_consistently_in_warmup_learning_and_generation(
                     "amount_set": [1, 2], "n_steps": 2, "element_bounds": {"O": [1, 4]}}],
         "properties": [{"name": "score", "predictor": "dummy", "direction": "max", "objective": "mean"}],
         "method": method,
+        # This fixture checks fixed episode/update counts, including repeats.
+        "train_count_duplicates": True,
         "dqn_warmup_eps": 2, "dqn_num_train_eps": 1, "dqn_batch_size": 1,
         "dqn_grad_steps_per_ep": 1, "dqn_hidden_dim": 4, "dqn_buffer_size": 8,
         "pg_warmup_eps": 2, "pg_num_iters": 1, "pg_batch_eps": 1,
-        "num_gen_eps": 1, "exploration_gen_eps": 0, "max_gen_attempts": 2,
+        "num_gen_eps": 1, "max_gen_attempts": 2,
     }
     if filter_declaration != "absent":
         config["groups"][0]["filters"] = ([{"type": f"{__name__}:OxygenOnly"}]

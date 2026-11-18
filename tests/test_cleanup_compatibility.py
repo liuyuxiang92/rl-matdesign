@@ -46,5 +46,15 @@ def test_legacy_runner_config_imports():
     from rl_matdesign import configuration
 
     for name in ("load_config", "build_env", "build_predictor",
-                 "build_constraint_filter", "_apply_flag_aliases"):
+                 "build_constraint_filter"):
         assert getattr(run_experiment, name) is getattr(configuration, name)
+
+
+def test_retired_alias_helpers_are_not_exported():
+    import run_experiment
+    from rl_matdesign import config_schema, configuration, experiment
+
+    for module in (run_experiment, config_schema, configuration, experiment):
+        for name in ("ALIASES", "normalize_aliases", "_normalize_aliases",
+                     "_FLAG_ALIASES", "_apply_flag_aliases", "ConfigDeprecationWarning"):
+            assert not hasattr(module, name), (module.__name__, name)

@@ -141,7 +141,7 @@ def test_real_worker_signal_finishes_unit_then_resume_matches_control(tmp_path, 
                   dqn_batch_size=2, dqn_eps_min=1., pg_warmup_eps=2, pg_batch_eps=batch,
                   train_count_duplicates=False, train_budget=12,
                   hpo_recording=True, hpo_phase="train", hpo_target_unique=12,
-                  hpo_ratio_limit=1.5, num_gen_eps=0, exploration_gen_eps=0)
+                  hpo_ratio_limit=1.5, num_gen_eps=0)
     config.pop("pg_num_iters")
     config.pop("dqn_num_train_eps")
     source = tmp_path / "config.yaml"
@@ -185,7 +185,7 @@ def test_terminal_target_signal_finishes_final_model_export(tmp_path):
     config.update(method="a2c", pg_warmup_eps=2, pg_batch_eps=2, dqn_warmup_eps=1,
                   train_count_duplicates=False, train_budget=2,
                   hpo_recording=True, hpo_phase="train", hpo_target_unique=2,
-                  hpo_ratio_limit=20., num_gen_eps=0, exploration_gen_eps=0)
+                  hpo_ratio_limit=20., num_gen_eps=0)
     config.pop("pg_num_iters")
     config.pop("dqn_num_train_eps")
     source = tmp_path / "config.yaml"

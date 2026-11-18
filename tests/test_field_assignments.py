@@ -212,13 +212,11 @@ def test_typed_field_grid_and_rejections():
             _field_values(values)
 
 
-def test_generated_columns_validation_precedes_environment_work(tmp_path):
+def test_removed_output_configuration_is_rejected_at_load(tmp_path):
     path = tmp_path / "bad.yaml"
     path.write_text("generated_columns: {score: reward}\ngroups: []\n")
-    with pytest.raises(ValueError, match="preserve formula"):
+    with pytest.raises(ValueError, match="generated_columns"):
         load_config(path)
-    with pytest.raises(ValueError, match="preserve formula"):
-        build_env({"generated_columns": {"score": "reward"}}, object())
 
 
 def test_element_spelling_in_a_field_label_never_makes_it_a_chemical_count():

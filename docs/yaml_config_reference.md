@@ -189,9 +189,12 @@ python scripts/audit_scenarios.py --config configs/lips_sse.yaml
 python scripts/run_experiment.py --config configs/test_dummy.yaml --out runs/demo
 ```
 
-YAML is the base; explicit CLI flags override matching values. Shared training
-aliases such as `buffer_size` and the seed alias `dp_seed` still normalize to
-`dqn_buffer_size` and `eval_seed`; the group/structure cleanup does not remove
-these unrelated options. Prefer canonical names in newly written files.
+YAML is the base; explicit CLI flags override matching values. Only canonical
+training names are accepted. Use shared `gamma` for every method; DQN and PG
+warmup budgets are independent. `num_gen_eps` is the entire generation quota.
+Training counts distinct successful candidates by default; set
+`train_count_duplicates: true` or pass `--train-count-duplicates` to count
+repeats too. Scientific output columns and the 200,000-record prediction cache
+limit are fixed by the implementation.
 The fully resolved config and scientific contracts are stored with run artifacts.
 A metadata-only audit does not validate external model weights or template files.

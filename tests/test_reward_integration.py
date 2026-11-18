@@ -221,8 +221,7 @@ def test_gated_reward_reaches_training_and_generated_csv(tmp_path, method):
         reward=_cfg()['reward'],
         pg_warmup_eps=4, pg_num_iters=2, pg_batch_eps=2,
         pg_repeat_penalty_coef=0.0, dqn_warmup_eps=4, dqn_num_train_eps=6,
-        dqn_grad_steps_per_ep=1, dqn_batch_size=4, num_gen_eps=4,
-        exploration_gen_eps=2,
+        dqn_grad_steps_per_ep=1, dqn_batch_size=4, num_gen_eps=6,
     )
     cfg['reward']['objective']['terms'] = {'delta': 1.0}
     cfg['reward']['gates'][0]['min'] = 0.5
@@ -231,7 +230,7 @@ def test_gated_reward_reaches_training_and_generated_csv(tmp_path, method):
     out = tmp_path / method
     proc = subprocess.run(
         [sys.executable, str(repo / 'scripts/run_experiment.py'), '--config', str(path),
-         '--method', method, '--out', str(out), '--dp-seed', '0',
+         '--method', method, '--out', str(out), '--eval-seed', '0',
          '--train-seed', '0', '--gen-seed', '0'],
         cwd=repo, capture_output=True, text=True, timeout=180,
     )
@@ -367,7 +366,7 @@ def test_classification_ensemble_gate_and_generated_csv_preserve_probability_sta
     rows = training.generate_candidates(
         env=env, predictor=predictor, scaler=None, device=torch.device('cpu'),
         elem_feats_scaled=np.empty((0, 0)), action_values=[],
-        qnet=SimpleNamespace(eval=lambda: None), n_exploit=1, max_attempts=1,
+        qnet=SimpleNamespace(eval=lambda: None), num_gen_eps=1, max_attempts=1,
     )
     path = tmp_path / 'generated.csv'
     with path.open('w', newline='') as stream:
@@ -470,7 +469,7 @@ def test_combined_class_probability_reaches_ensemble_gate_and_generated_csv(
     rows = training.generate_candidates(
         env=env, predictor=predictor, scaler=None, device=torch.device('cpu'),
         elem_feats_scaled=np.empty((0, 0)), action_values=[],
-        qnet=SimpleNamespace(eval=lambda: None), n_exploit=1, max_attempts=1,
+        qnet=SimpleNamespace(eval=lambda: None), num_gen_eps=1, max_attempts=1,
     )
     path = tmp_path / 'generated.csv'
     with path.open('w', newline='') as stream:

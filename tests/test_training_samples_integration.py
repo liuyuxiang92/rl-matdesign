@@ -329,7 +329,7 @@ def test_dqn_permutation_replay_does_not_export_synthetic_samples(tmp_path):
     writer = TrainingSampleWriter(tmp_path / "training_samples.csv")
     _, _, logs = run_dqn(
         env, tmp_path, elem_feats_scaled=env.action_features(), action_values=value_alphabet(env),
-        n_warmup_eps=2, dqn_num_train_eps=1, augment_permutations=2,
+        n_warmup_eps=2, dqn_num_train_eps=1, augment_permutations=2, train_count_duplicates=True,
         checkpoint_cfg={"path": str(tmp_path / "checkpoint.pt"), "freq": 1},
         training_samples=writer,
     )

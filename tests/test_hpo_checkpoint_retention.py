@@ -85,7 +85,7 @@ def test_hpo_latest_checkpoint_retains_exact_resume(tmp_path, method, target):
                   dqn_warmup_eps=2, dqn_batch_size=1, dqn_eps_min=1., pg_warmup_eps=2,
                   pg_batch_eps=1, train_count_duplicates=False, train_budget=6,
                   hpo_recording=True, hpo_phase="train", hpo_target_unique=6,
-                  hpo_ratio_limit=20., num_gen_eps=0, exploration_gen_eps=0)
+                  hpo_ratio_limit=20., num_gen_eps=0)
     config.pop("pg_num_iters")
     config.pop("dqn_num_train_eps")
     config_path = tmp_path / "config.yaml"

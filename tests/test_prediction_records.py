@@ -86,7 +86,8 @@ def test_native_scientific_record_preserves_selected_missing_spread_and_metadata
 
 
 def test_batch_records_use_paired_outputs_metadata_after_lru_eviction(monkeypatch):
-    predictor = _named_predictor(predict_cache_size=1)
+    monkeypatch.setattr("rl_matdesign.predictors.structure_score._PREDICTION_CACHE_SIZE", 1)
+    predictor = _named_predictor()
     candidates = [{"value": value} for value in (.1, .2, .3)]
     predictions = predictor.batch_predict(candidates)
     assert len(predictor._stats_cache) == 1

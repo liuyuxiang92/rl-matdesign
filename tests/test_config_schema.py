@@ -5,10 +5,8 @@ from pathlib import Path
 import pytest
 
 from rl_matdesign.config_schema import (
-    ConfigDeprecationWarning,
     ConfigError,
     load_yaml_config,
-    normalize_aliases,
     resolve_config,
     schema_markdown,
     validate_config,
@@ -43,39 +41,30 @@ def test_yaml_merge_can_override_inherited_values(tmp_path):
     assert load_yaml_config(path)["model"] == {"count": 4}
 
 
-def test_aliases_normalize_without_mutation():
-    raw = {"dp_seed": 12, "buffer_size": 300, "groups": [{"name": "x"}]}
+@pytest.mark.parametrize("key", [
+    "buffer_size", "num_train_eps", "grad_steps_per_ep", "target_update_freq",
+    "eps_anneal_eps", "eps_min", "entropy_coef", "repeat_penalty_coef",
+    "repeat_penalty_shape", "dp_seed", "dqn_gamma", "pg_gamma",
+    "exploration_gen_eps", "predict_cache_size", "generated_columns",
+])
+@pytest.mark.parametrize("source", ["yaml", "override"])
+def test_removed_core_parameters_are_rejected(key, source):
+    raw, overrides = ({key: 1}, {}) if source == "yaml" else ({}, {key: 1})
+    with pytest.raises(ConfigError, match=f"Unknown experiment key '{key}'"):
+        resolve_config(raw, overrides)
+
+
+def test_removed_alias_is_rejected_even_with_a_canonical_override():
+    with pytest.raises(ConfigError, match="Unknown experiment key 'dp_seed'"):
+        resolve_config({"dp_seed": 9}, {"eval_seed": 10})
+
+
+def test_resolving_config_does_not_mutate_nested_authored_settings():
+    raw = {"eval_seed": 12, "properties": [{"name": "score", "predictor": "dummy"}]}
     original = deepcopy(raw)
-    with pytest.warns(ConfigDeprecationWarning):
-        cfg = normalize_aliases(raw)
-    assert cfg == {"eval_seed": 12, "dqn_buffer_size": 300, "groups": [{"name": "x"}]}
-    cfg["groups"][0]["name"] = "changed"
+    result = resolve_config(raw)
+    result.config["properties"][0]["name"] = "changed"
     assert raw == original
-
-
-def test_equal_alias_and_canonical_value_is_accepted_with_warning():
-    with pytest.warns(ConfigDeprecationWarning):
-        result = resolve_config({"buffer_size": 20, "dqn_buffer_size": 20})
-    assert result.config["dqn_buffer_size"] == 20
-    assert "buffer_size" not in result.config
-
-
-def test_numeric_alias_values_compare_after_normalization():
-    with pytest.warns(ConfigDeprecationWarning):
-        result = resolve_config({"eps_min": 0, "dqn_eps_min": 0.0})
-    assert result.config["dqn_eps_min"] == 0.0
-
-
-def test_conflicting_alias_and_canonical_value_is_an_error():
-    with pytest.raises(ConfigError, match="Conflicting config aliases"):
-        resolve_config({"buffer_size": 20, "dqn_buffer_size": 30})
-
-
-def test_cli_can_override_a_deprecated_yaml_spelling():
-    with pytest.warns(ConfigDeprecationWarning):
-        result = resolve_config({"dp_seed": 9}, {"eval_seed": 10})
-    assert result.config["eval_seed"] == 10
-    assert result.sources["eval_seed"] == "override"
 
 
 def test_defaults_preserve_distinct_dqn_and_pg_warmup():
@@ -84,6 +73,8 @@ def test_defaults_preserve_distinct_dqn_and_pg_warmup():
     assert result.config["pg_warmup_eps"] == 200
     assert result.sources["dqn_warmup_eps"] == "default"
     assert result.config["train_budget"] is None
+    assert result.config["train_count_duplicates"] is False
+    assert result.sources["train_count_duplicates"] == "default"
 
 
 def test_shared_budget_derives_both_algorithms_without_redundant_totals():
@@ -119,22 +110,26 @@ def test_equal_legacy_limits_are_accepted_but_have_shared_budget_origin():
 
 
 @pytest.mark.parametrize("raw,overrides,warmup,source", [
-    ({"pg_warmup_eps": 40}, {}, 40, "derived:pg_warmup_eps"),
-    ({"pg_warmup_eps": 40}, {"pg_warmup_eps": 70}, 70, "derived:pg_warmup_eps"),
+    ({"pg_warmup_eps": 40}, {}, 500, "default"),
+    ({"pg_warmup_eps": 40}, {"pg_warmup_eps": 70}, 500, "default"),
     ({"pg_warmup_eps": 40, "dqn_warmup_eps": 80}, {}, 80, "yaml"),
     ({"pg_warmup_eps": 40}, {"dqn_warmup_eps": 0}, 0, "override"),
 ])
-def test_explicit_warmup_fallback_and_override(raw, overrides, warmup, source):
+def test_dqn_warmup_is_independent_of_pg_warmup(raw, overrides, warmup, source):
     result = resolve_config(raw, overrides)
     assert result.config["dqn_warmup_eps"] == warmup
     assert result.sources["dqn_warmup_eps"] == source
 
 
-def test_gamma_fallbacks_apply_after_overrides():
-    result = resolve_config({"gamma": 0.8, "dqn_gamma": 0.6}, {"gamma": 0.95})
-    assert result.config["dqn_gamma"] == 0.6
-    assert result.config["pg_gamma"] == 0.95
-    assert result.sources["pg_gamma"] == "derived:gamma"
+def test_gamma_has_one_default_and_one_override():
+    default = resolve_config({})
+    assert default.config["gamma"] == 0.9
+    assert default.sources["gamma"] == "default"
+    result = resolve_config({"gamma": 0.8}, {"gamma": 0.95})
+    assert result.config["gamma"] == 0.95
+    assert result.sources["gamma"] == "override"
+    assert "dqn_gamma" not in result.config
+    assert "pg_gamma" not in result.config
 
 
 def test_false_zero_and_none_cli_values_have_distinct_meanings():
@@ -319,8 +314,9 @@ def test_validate_does_not_materialize_defaults_before_hpo_overrides():
     assert cfg == {"gamma": 0.9, "pg_warmup_eps": 10}
     cfg.update(gamma=0.7, pg_warmup_eps=20)
     result = resolve_config(cfg)
-    assert result.config["dqn_gamma"] == 0.7
-    assert result.config["dqn_warmup_eps"] == 20
+    assert result.config["gamma"] == 0.7
+    assert result.config["pg_warmup_eps"] == 20
+    assert result.config["dqn_warmup_eps"] == 500
 
 
 @pytest.mark.parametrize("raw", [
@@ -364,3 +360,28 @@ def test_removed_training_filter_cli_flags_are_rejected(flag, capsys):
         parse_args(["--config", "unused.yaml", "--out", "unused-output", flag])
     assert exc.value.code == 2
     assert f"unrecognized arguments: {flag}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("arguments", [["--dp-seed", "1"], ["--no-train-count-duplicates"]])
+def test_removed_cli_spellings_are_rejected(arguments, capsys):
+    from rl_matdesign.experiment import parse_args
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["--config", "unused.yaml", "--out", "unused-output", *arguments])
+    assert exc.value.code == 2
+    assert f"unrecognized arguments: {' '.join(arguments)}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("yaml_value", [None, False, True])
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_duplicate_cli_opt_in_preserves_yaml_when_absent(yaml_value, opt_in):
+    from rl_matdesign.experiment import parse_args
+    arguments = ["--config", "unused.yaml", "--out", "unused-output"]
+    if opt_in:
+        arguments.append("--train-count-duplicates")
+    args = parse_args(arguments)
+    assert args.train_count_duplicates is (True if opt_in else None)
+    raw = {} if yaml_value is None else {"train_count_duplicates": yaml_value}
+    resolved = resolve_config(raw, {"train_count_duplicates": args.train_count_duplicates})
+    assert resolved.config["train_count_duplicates"] is (True if opt_in else bool(yaml_value))
+    expected_source = "override" if opt_in else "default" if yaml_value is None else "yaml"
+    assert resolved.sources["train_count_duplicates"] == expected_source

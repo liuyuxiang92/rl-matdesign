@@ -124,9 +124,9 @@ come from the YAML. Override them by editing the config or creating a copy for e
 | `--train-seed N` | YAML `train_seed`, otherwise eval seed | Training random state. Deterministic Torch settings apply regardless of whether the seed is supplied by CLI or YAML. |
 | `--gen-seed N` | YAML `gen_seed`, otherwise eval seed | Generation random state, reset independently of training. |
 
-`--dp-seed` and YAML `dp_seed` remain migration aliases for `eval_seed`; they do
-not create another random stream. CLI values override YAML. Fixed seeds support
-repeatability within the recorded code/input/software/hardware environment;
+CLI values override YAML. Use `eval_seed` and `--eval-seed` for scientific
+evaluation. Fixed seeds support repeatability within the recorded
+code/input/software/hardware environment;
 they do not guarantee bitwise agreement across different environments.
 
 Validate and print effective settings before loading a predictor:
@@ -137,8 +137,8 @@ python scripts/run_experiment.py --config configs/test_dummy.yaml \
 ```
 
 Shared defaults and validation now come from one [configuration contract](docs/configuration_schema.md).
-A single YAML can keep both DQN and A2C settings. Duplicate keys, conflicting old/new
-aliases, and unknown core parameters are rejected. Scientific plugin settings
+A single YAML can keep both DQN and A2C settings. Duplicate keys, retired
+spellings, and unknown core parameters are rejected. Scientific plugin settings
 remain owned by their plugins; this is not yet a full nested scientific schema.
 Every invocation saves effective settings, their sources, and an append-only
 provenance record. `--only-generate` writes `generation_log.csv` and preserves the
@@ -229,13 +229,12 @@ Override the loss function from the CLI: `--dqn-loss smoothl1` (default) or `--d
 
 ### Counting repeated candidates in the training budget
 
-By default every completed training episode consumes one budget slot. To count
-only candidates that have not been evaluated earlier in training, add these
-top-level YAML fields:
+By default only the first successful occurrence of a candidate consumes a
+training budget slot. The default consecutive-duplicate limit is 1,000. To count
+repeated candidates as well, set this top-level YAML field:
 
 ```yaml
-train_count_duplicates: false       # default: true
-train_max_duplicate_attempts: 1000   # maximum consecutive completed duplicates
+train_count_duplicates: true
 ```
 
 Repeated episodes still enter the DQN replay buffer and receive normal training
@@ -254,8 +253,10 @@ episodes can require additional batches and updates. Batches contain at most
 `pg_batch_eps` sampled episodes, with a shorter final batch when the target is
 reached. PG's scaler-only warmup does not enter the seen-candidate set.
 
-Use `--no-train-count-duplicates` or `--train-count-duplicates` to override the
-YAML, and `--train-max-duplicate-attempts N` to override the duplicate limit. A new
+Use `--train-count-duplicates` to enable duplicate counting for an invocation,
+and `--train-max-duplicate-attempts N` to override the duplicate limit. To count
+only distinct candidates, omit the flag and leave the YAML setting absent or
+`false`. A new
 candidate resets the consecutive-duplicate counter. If the limit is reached,
 training stops with an error instead of sampling indefinitely in an exhausted
 search space. The limit applies only when duplicates do not consume budget.
@@ -703,21 +704,10 @@ Examples (already correctly prefixed): `dqn_lr`, `dqn_batch_size`,
 `pg_batch_eps`, `pg_lr_actor`, `pg_lr_critic`. Shared: `method`, `gamma`,
 `num_gen_eps`, `gen_temperature`, env keys, predictor keys.
 
-**Deprecated → new** (old names still work with a `DeprecationWarning`):
-
-| Deprecated | Use instead |
-|---|---|
-| `buffer_size` | `dqn_buffer_size` |
-| `num_train_eps` | `dqn_num_train_eps` |
-| `grad_steps_per_ep` | `dqn_grad_steps_per_ep` |
-| `target_update_freq` | `dqn_target_update_freq` |
-| `eps_anneal_eps` | `dqn_eps_anneal_eps` |
-| `eps_min` | `dqn_eps_min` |
-| `entropy_coef` | `pg_entropy_coef` |
-| `repeat_penalty_coef` | `pg_repeat_penalty_coef` |
-| `repeat_penalty_shape` | `pg_repeat_penalty_shape` |
-
-To silence the warnings, rename the keys in your YAML — the values are unchanged.
+Only canonical parameter names are accepted. `gamma` is the discount factor
+for every method. DQN and PG warmup budgets are independent: use
+`dqn_warmup_eps` and `pg_warmup_eps`, respectively. `num_gen_eps` is the full
+generation quota, sampled with the selected generation strategy.
 
 ---
 
@@ -735,7 +725,7 @@ To silence the warnings, rename the keys in your YAML — the values are unchang
 | `episode_timing.csv` | ✓ | ✓ | Incremental per-attempt wall time, MD/optimization task time, and RL update time |
 | `timing.json` | ✓ | ✓ | Run/phase totals and the current invocation's episode timing totals |
 | `generated.csv` | ✓ | ✓ | Candidates: formula, reward, dp_mean, dp_std |
-| `run_config.json` | ✓ | ✓ | Effective configuration after aliases, CLI overrides, defaults and fallbacks |
+| `run_config.json` | ✓ | ✓ | Effective configuration after CLI overrides, defaults and seed fallbacks |
 | `config_sources.json` | ✓ | ✓ | Origin of each effective top-level configuration value |
 | `provenance/*/manifest.json` | ✓ | ✓ | Per-invocation command, runtime flags, code/environment evidence and input hashes |
 
@@ -752,8 +742,8 @@ missing sample history explicitly. Existing source-code and protocol checks
 still apply to checkpoint loading. See [training samples](docs/training_samples.md)
 for resume details and a training-versus-generation delta comparison. Use
 `obj_<name>_mean` for physical-property distributions when `reward` or `dp_mean`
-includes a synthesis-gate penalty. `generated_columns` controls the generated
-report; the training export retains all available properties.
+includes a synthesis-gate penalty. Both exports retain all available scientific
+properties and metadata using the standard column names.
 
 ### Per-episode timing
 

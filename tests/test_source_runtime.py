@@ -120,9 +120,9 @@ def test_shared_structure_builds_once_and_cache_charges_no_work(factories):
 
 
 
-def test_order_batch_partition_cache_eviction_weights_and_property_order_do_not_change_samples(factories):
+def test_order_batch_partition_cache_eviction_weights_and_property_order_do_not_change_samples(factories, monkeypatch):
+    monkeypatch.setattr("rl_matdesign.predictors.structure_score._PREDICTION_CACHE_SIZE", 1)
     cfg = config()
-    cfg["predict_cache_size"] = 1
     first = {"Ni": .6, "Fe": .4}
     second = {"Fe": .2, "Ni": .8}
     p = StructureScorePredictor(cfg, seed=17)

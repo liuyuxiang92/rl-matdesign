@@ -141,11 +141,10 @@ def test_job_builder_explicit_selection_is_immune_to_stale_metadata(selected):
     assert raw == original
 
 
-def test_selection_does_not_change_generation_horizon_or_extra_exploration():
-    raw = {"gen_top_frac": 0.3, "num_gen_eps": 17, "max_gen_attempts": 40,
-           "exploration_gen_eps": 5}
+def test_selection_does_not_change_generation_horizon():
+    raw = {"gen_top_frac": 0.3, "num_gen_eps": 17, "max_gen_attempts": 40}
     cfg = resolve_config(raw).config
-    assert (cfg["num_gen_eps"], cfg["max_gen_attempts"], cfg["exploration_gen_eps"]) == (17, 40, 5)
+    assert (cfg["num_gen_eps"], cfg["max_gen_attempts"]) == (17, 40)
 
 
 def test_read_only_validation_accepts_internal_metadata_without_default_materialization():

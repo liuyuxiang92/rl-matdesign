@@ -105,9 +105,9 @@ def reconstruct_resume(state, qnet, scaler):
 
 
 @pytest.mark.parametrize("target_mode", ["mc", "bootstrap"])
-def test_unique_budget_trains_and_buffers_all_duplicate_rollouts(tmp_path, target_mode):
+def test_default_unique_budget_trains_and_buffers_all_duplicate_rollouts(tmp_path, target_mode):
     env = ScriptedEnv(["A", "A", "B", "A", "C", "C", "D"])
-    _, _, rows = run(env, tmp_path, train_count_duplicates=False, dqn_target_mode=target_mode)
+    _, _, rows = run(env, tmp_path, dqn_target_mode=target_mode)
     assert env.starts == 7
     assert [row["phase"] for row in rows] == ["dqn_warmup"] * 3 + ["dqn_train"] * 4
     assert [row["budget_counted"] for row in rows] == [True, False, True, False, True, False, True]
@@ -132,9 +132,9 @@ def test_unique_budget_trains_and_buffers_all_duplicate_rollouts(tmp_path, targe
 
 
 @pytest.mark.parametrize("target_mode", ["mc", "bootstrap"])
-def test_default_counts_duplicates_and_preserves_fixed_number_of_updates(tmp_path, target_mode):
+def test_explicit_duplicate_counting_preserves_fixed_number_of_updates(tmp_path, target_mode):
     env = ScriptedEnv(["A"] * 4)
-    _, _, rows = run(env, tmp_path, train_max_duplicate_attempts=1, dqn_target_mode=target_mode)
+    _, _, rows = run(env, tmp_path, train_count_duplicates=True, train_max_duplicate_attempts=1, dqn_target_mode=target_mode)
     assert env.starts == 4
     assert len(rows) == 4
     assert all(row["budget_counted"] for row in rows)

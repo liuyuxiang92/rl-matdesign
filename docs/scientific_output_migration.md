@@ -141,11 +141,10 @@ For built-in DeepMD paths, the engine reports attempted ensemble helper calls an
 requested model/configuration pairs. These are not network forward calls: the
 backend may batch or retry internally, so `network_forwards` remains unknown.
 
-The existing `predict_cache_size` bounds persistent candidate records, but each
-record now includes raw sample matrices and diagnostics; memory use therefore also
-scales with model count, configurations and property count. Batch records temporarily
-retain the current wave for consistent diagnostics. No additional configuration
-switch has been introduced for this contract.
+The prediction cache retains up to 200,000 candidate records using a fixed
+internal limit. Each record includes raw sample matrices and diagnostics, so
+memory use also scales with model count, configurations and property count.
+Batch records temporarily retain the current wave for consistent diagnostics.
 
 ## Verification boundary
 

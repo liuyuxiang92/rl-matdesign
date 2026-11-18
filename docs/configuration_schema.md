@@ -11,18 +11,16 @@ schemas owned by environments, predictors, builders, or constraints.
 1. `load_yaml_config(path)` accepts a YAML mapping and rejects duplicate keys at
    every nesting level, reporting their locations. Standard YAML merge defaults
    may still be overridden explicitly. Empty files and non-mapping roots fail.
-2. `normalize_aliases(raw)` returns a copy using canonical spellings. Old and new
-   spellings with conflicting values in one source fail instead of silently
-   choosing one. Equal values are accepted with a `ConfigDeprecationWarning`.
-3. `validate_config(raw)` checks canonical core keys without inserting defaults;
-   this is suitable before HPO modifies the raw configuration.
-4. `resolve_config(raw, overrides)` normalizes each source separately, applies
-   explicit overrides over YAML, derives fallbacks, and fills defaults. It returns
-   `ResolvedConfig(config, sources)`. A `None` override is absent; `False` and `0`
-   are real overrides. Overrides may legitimately supersede an old YAML alias.
+2. `validate_config(raw)` checks canonical core keys without inserting defaults;
+   this is suitable before HPO modifies the raw configuration. Retired spellings
+   are rejected.
+3. `resolve_config(raw, overrides)` applies explicit overrides over YAML,
+   validates the combined configuration, derives seed fallbacks, and fills defaults. It
+   returns `ResolvedConfig(config, sources)`. A `None` override is absent; `False`
+   and `0` are real overrides.
 
 The `sources` mapping records every effective top-level value as `yaml`,
-`override`, `default`, `yaml:alias:<old_name>`, or `derived:<dependency>`.
+`override`, `default`, or `derived:<dependency>`.
 Dependency origins remain available under the dependency's own key. Nested
 plugin options retain their complete mappings and the origin of that mapping;
 per-leaf plugin provenance is not implemented in this migration.
@@ -31,17 +29,12 @@ Both DQN and policy-gradient settings stay in the same effective configuration.
 Changing `method` does not delete inactive algorithm settings. Invalid shared
 parameter values are rejected even if their algorithm is inactive.
 
-Two historical fallback rules need care:
+`gamma` is the shared discount factor for every method, defaulting to 0.9.
+DQN and PG warmup budgets are independent: `dqn_warmup_eps` defaults to 500,
+and `pg_warmup_eps` defaults to 200. HPO applies sampled/fixed values before
+materializing defaults.
 
-- If `dqn_warmup_eps` is absent, an **explicit** `pg_warmup_eps` supplies its value.
-  If both are absent, DQN uses 500 and PG uses 200. Resolving the PG default must
-  not accidentally change DQN to 200.
-- Each method's explicit gamma overrides shared `gamma`; shared gamma overrides
-  the default 0.9. HPO must apply sampled/fixed values before materializing these
-  derived defaults.
-
-`eval_seed` replaces the name `dp_seed`; `train_seed` and `gen_seed` fall back to
-it. Seeds are integers in `[0, 2**32 - 1]`, compatible with NumPy's seed range.
+`train_seed` and `gen_seed` fall back to `eval_seed`. Seeds are integers in `[0, 2**32 - 1]`, compatible with NumPy's seed range.
 This naming change does not itself change a predictor's seed-to-structure
 algorithm. Runtime determinism and complete experiment archives are separate
 requirements; configuration resolution alone does not certify repeatability.
@@ -129,8 +122,8 @@ standalone builder settings are rejected, including empty placeholders.
 an environment or predictor. `run_config.json` stores all effective core values;
 `config_sources.json` stores their origins. Invocation evidence also retains the
 original YAML, exact command and operational flags. Generation-only runs preserve
-training logs. All seed sources enable the same deterministic Torch settings;
-`--dp-seed` is retained as a CLI migration alias.
+training logs. All seed sources enable the same deterministic Torch settings.
+Use `--eval-seed` to set the scientific evaluation seed.
 
 HPO trials use this same contract after fixed and sampled overrides. Budget
 scaling reads effective defaults, accepts only episode/iteration-budget fields,
@@ -179,19 +172,17 @@ parameter definitions. A test checks it for drift.
 | `hpo_phase` | str | 'train' | train, generation | HPO job phase. |
 | `hpo_target_unique` | int | None | >= 1 | HPO target successfully evaluated distinct candidates. |
 | `hpo_ratio_limit` | float | 1.5 | > 1 | Strict HPO attempts/unique upper bound. |
-| `train_count_duplicates` | bool | True | — | Count repeated terminal candidates toward training budgets. |
+| `train_count_duplicates` | bool | False | — | Count repeated terminal candidates toward training budgets. |
 | `train_budget` | int | None | >= 1 | Total paid training candidates; derives algorithm episode limits when set. |
 | `train_max_duplicate_attempts` | int | 1000 | >= 1 | Maximum consecutive duplicates in a unique-candidate budget. |
-| `gamma` | float | 0.9 | >= 0; <= 1 | Shared discount fallback for both algorithms. |
-| `dqn_gamma` | float | gamma; otherwise 0.9 | >= 0; <= 1 | DQN discount, overriding the shared fallback. |
-| `pg_gamma` | float | gamma; otherwise 0.9 | >= 0; <= 1 | Policy-gradient discount, overriding the shared fallback. |
+| `gamma` | float | 0.9 | >= 0; <= 1 | Discount factor used by DQN, REINFORCE and A2C. |
 | `dqn_hidden_dim` | int | 256 | >= 1 | DQN hidden-layer width. |
 | `dqn_lr` | float | 0.001 | > 0 | DQN optimizer learning rate. |
 | `dqn_buffer_size` | int | 50000 | >= 1 | DQN replay capacity in transitions. |
 | `dqn_eps_anneal_eps` | int | 10000 | >= 1 | DQN epsilon annealing episodes. |
 | `dqn_eps_min` | float | 0.05 | >= 0; <= 1 | DQN minimum exploration probability. |
 | `dqn_num_train_eps` | int | 20000 | >= 0 | DQN training episode budget. |
-| `dqn_warmup_eps` | int | explicit pg_warmup_eps; otherwise 500 | >= 0 | DQN warmup; explicit pg_warmup_eps is a legacy fallback. |
+| `dqn_warmup_eps` | int | 500 | >= 0 | DQN random warmup episodes. |
 | `dqn_batch_size` | int | 256 | >= 1 | DQN replay minibatch size. |
 | `dqn_grad_steps_per_ep` | int | 5 | >= 1 | DQN gradient updates per training episode. |
 | `dqn_target_update_freq` | int | 100 | >= 1 | DQN target-network update interval. |
@@ -207,8 +198,7 @@ parameter definitions. A test checks it for drift.
 | `pg_entropy_min` | float | 0.3 | >= 0; <= 1 | Normalized policy entropy floor. |
 | `pg_repeat_penalty_coef` | float | 0.0 | >= 0 | Repeated-candidate policy penalty coefficient. |
 | `pg_repeat_penalty_shape` | str | 'log' | log, sqrt, linear | Repeated-candidate penalty growth. |
-| `num_gen_eps` | int | 200 | >= 0 | Requested exploitation candidates. |
-| `exploration_gen_eps` | int | 0 | >= 0 | Additional random-exploration generation episodes. |
+| `num_gen_eps` | int | 200 | >= 0 | Requested distinct generated candidates. |
 | `max_gen_attempts` | int | 10 * num_gen_eps | >= 0 | Maximum candidate-generation attempts. |
 | `gen_temperature` | float | 1.0 | >= 0 | Generation softmax temperature; zero selects greedy behavior. |
 | `gen_top_frac` | float | 0.0 | >= 0; <= 1 | Generation top-action fraction; zero disables top-fraction sampling. |
@@ -216,30 +206,14 @@ parameter definitions. A test checks it for drift.
 | `k` | float | 1.0 | >= 0 | Default uncertainty coefficient passed to property evaluation. |
 <!-- schema:end -->
 
-## Deprecated spellings
-
-| Old spelling | Canonical spelling |
-|---|---|
-| `dp_seed` | `eval_seed` |
-| `buffer_size` | `dqn_buffer_size` |
-| `num_train_eps` | `dqn_num_train_eps` |
-| `grad_steps_per_ep` | `dqn_grad_steps_per_ep` |
-| `target_update_freq` | `dqn_target_update_freq` |
-| `eps_anneal_eps` | `dqn_eps_anneal_eps` |
-| `eps_min` | `dqn_eps_min` |
-| `entropy_coef` | `pg_entropy_coef` |
-| `repeat_penalty_coef` | `pg_repeat_penalty_coef` |
-| `repeat_penalty_shape` | `pg_repeat_penalty_shape` |
-
-Legacy aliases are a migration aid, not additional independent settings.
-
 ## Updating an authored design
 
 Use the current [group and pipeline guide](design_groups.md). Choose numerical
 increments and their final constraints explicitly; write each operating
 condition as a named property and combine those properties in `reward`.
 Historical domain/build/structure parameter normalization has been removed.
-The unrelated training/seed aliases listed above remain centralized.
+Training and seed parameters also require canonical names; no alias conversion
+is performed.
 
 Audit local files with `scripts/audit_scenarios.py --domains --inventory <local-report.json>`.
 The inventory is a local JSON object with `entries: [{"path": "relative/config.yaml"}]`.

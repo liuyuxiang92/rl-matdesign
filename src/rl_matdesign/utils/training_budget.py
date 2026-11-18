@@ -24,8 +24,8 @@ class TrainingBudget:
     ``check_can_sample`` before requesting another rollout if the phase still
     has budget remaining. In unique-only mode, exactly ``max_duplicate_attempts``
     consecutive duplicate rollouts are allowed; attempting the next rollout
-    raises. A new composition resets the streak. The default mode counts every
-    rollout and does not impose this guard.
+    raises. A new composition resets the streak. The default counts only new
+    candidates; counting every rollout requires an explicit opt-in.
 
     A restored state must use the same counting mode once any rollouts have been
     recorded. The duplicate limit can be changed on resume, for example to allow
@@ -35,7 +35,7 @@ class TrainingBudget:
 
     def __init__(
         self,
-        count_duplicates: bool = True,
+        count_duplicates: bool = False,
         max_duplicate_attempts: int = 1000,
         state: Mapping[str, Any] | None = None,
     ) -> None:

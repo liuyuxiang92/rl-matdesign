@@ -18,7 +18,6 @@ and the append-mode schema safety that the warmup rows put at risk.
 """
 from __future__ import annotations
 
-import collections
 import csv
 import subprocess
 import sys
@@ -48,7 +47,7 @@ def _run(tmp_path: Path, method: str) -> list[dict]:
             "--config", str(_CONFIG),
             "--method", method,
             "--out", str(out),
-            "--dp-seed", "0", "--train-seed", "0", "--gen-seed", "0",
+            "--eval-seed", "0", "--train-seed", "0", "--gen-seed", "0",
         ],
         capture_output=True, text=True, timeout=300, cwd=_REPO,
     )
@@ -76,23 +75,28 @@ def a2c_rows(tmp_path_factory) -> list[dict]:
 
 def test_dqn_logs_every_warmup_episode(dqn_rows):
     """Warmup pays a real predictor call per episode, so it belongs in the log."""
-    counts = collections.Counter(r["phase"] for r in dqn_rows)
-    assert counts["dqn_warmup"] == _DQN_WARMUP_EPS
-    assert counts["dqn_train"] == _DQN_TRAIN_EPS
+    for phase, target in (("dqn_warmup", _DQN_WARMUP_EPS), ("dqn_train", _DQN_TRAIN_EPS)):
+        rows = [row for row in dqn_rows if row["phase"] == phase]
+        assert len(rows) >= target
+        assert sum(row["budget_counted"].lower() == "true" for row in rows) == target
+    episodes = [row for row in dqn_rows if row["phase"] in {"dqn_warmup", "dqn_train"}]
+    assert [int(row["training_attempts"]) for row in episodes] == list(range(1, len(episodes) + 1))
 
 
 def test_pg_logs_every_sampled_episode(a2c_rows):
     """One row per episode, not per batch — the batch mean hides the tail."""
-    counts = collections.Counter(r["phase"] for r in a2c_rows)
-    assert counts["pg_episode"] == _PG_NUM_ITERS * _PG_BATCH_EPS
-    assert counts["pg_train"] == _PG_NUM_ITERS
+    episodes = [row for row in a2c_rows if row["phase"] == "pg_episode"]
+    assert sum(row["budget_counted"].lower() == "true" for row in episodes) == _PG_NUM_ITERS * _PG_BATCH_EPS
+    assert [int(row["training_attempts"]) for row in episodes] == list(range(1, len(episodes) + 1))
+    assert sum(row["phase"] == "pg_train" for row in a2c_rows) >= _PG_NUM_ITERS
 
 
 def test_warmup_rows_precede_training_rows(dqn_rows):
     """Warmup happens first, so the episode axis is the cumulative budget spent."""
     phases = [r["phase"] for r in dqn_rows if r["phase"].startswith("dqn_")]
-    assert phases[:_DQN_WARMUP_EPS] == ["dqn_warmup"] * _DQN_WARMUP_EPS
-    assert set(phases[_DQN_WARMUP_EPS:]) == {"dqn_train"}
+    warmup_count = phases.count("dqn_warmup")
+    assert warmup_count >= _DQN_WARMUP_EPS
+    assert phases == ["dqn_warmup"] * warmup_count + ["dqn_train"] * (len(phases) - warmup_count)
 
 
 # ---------------------------------------------------------------------------

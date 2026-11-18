@@ -24,11 +24,11 @@ python scripts/run_experiment.py \
 
 The export follows the existing `budget_counted` decision in `training_log.csv`:
 
-- With `train_count_duplicates: true` (the default), repeated materials are
-  retained as separate rows when their episodes consume budget.
-- With `train_count_duplicates: false` or `--no-train-count-duplicates`, only
-  the first budgeted occurrence is saved. Repeated episodes can still update
-  the model and remain visible in `training_log.csv`.
+- By default (`train_count_duplicates: false`), only the first budgeted
+  occurrence is saved. Repeated episodes can still update the model and remain
+  visible in `training_log.csv`.
+- With `train_count_duplicates: true` or `--train-count-duplicates`, repeated
+  materials are retained as separate rows when their episodes consume budget.
 - Failed evaluations that are retried without consuming training budget are
   absent. A successfully evaluated material that fails a reward gate is still
   saved when its episode consumes budget.
@@ -68,9 +68,8 @@ Multi-property scenarios instead expose `obj_<name>_mean` and
 `generated.csv`, such as `gate_passed`, `gate_<name>_value`, `primary_ok`, and
 `primary_label`.
 `candidate_json`, `metadata_json`, and applicable `meta_<name>` columns use
-the same representation as generation. `generated_columns` can select or
-rename columns for the generated report; the training sample file keeps the
-full available property record.
+the same representation as generation. Both files keep the full available
+property record with standard column names.
 
 Unavailable uncertainty estimates remain blank in CSV. For example, one
 model cannot estimate model spread, so `obj_<name>_std` is blank rather than

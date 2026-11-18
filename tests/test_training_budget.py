@@ -13,10 +13,10 @@ KEY_A = (("A", (("Ba", 32),)), ("B", (("Co", 26), ("Mn", 6))))
 KEY_B = (("A", (("Ba", 32),)), ("B", (("Co", 24), ("Mn", 8))))
 
 
-def test_default_budget_preserves_every_episode_and_tracks_duplicates():
-    budget = TrainingBudget(max_duplicate_attempts=1)
+def test_explicit_duplicate_counting_preserves_every_episode():
+    budget = TrainingBudget(count_duplicates=True, max_duplicate_attempts=1)
     assert [budget.record(key) for key in (KEY_A, KEY_A, KEY_B, KEY_A)] == [True] * 4
-    budget.check_can_sample()  # Default mode has no duplicate-streak guard.
+    budget.check_can_sample()  # Opt-in duplicate counting has no duplicate-streak guard.
     assert budget.snapshot() == {
         "training_attempts": 4,
         "training_budget_used": 4,
@@ -25,8 +25,8 @@ def test_default_budget_preserves_every_episode_and_tracks_duplicates():
     }
 
 
-def test_unique_budget_counts_composition_keys_across_training_phases():
-    budget = TrainingBudget(count_duplicates=False)
+def test_default_budget_counts_unique_compositions_across_training_phases():
+    budget = TrainingBudget()
     assert budget.record(KEY_A)  # Warmup.
     assert not budget.record(copy.deepcopy(KEY_A))  # Same composition in training.
     assert budget.record(KEY_B)

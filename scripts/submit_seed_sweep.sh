@@ -176,14 +176,14 @@ wait_for_slot() {
 # bash 3.2 by default, which doesn't support them; a case statement works
 # identically everywhere this script might run.
 arm_cmd() {
-    local arm="$1" seed="$2" dp_seed="$3" gen_seed="$4"
+    local arm="$1" seed="$2" eval_seed="$3" gen_seed="$4"
     case "$arm" in
         dqn_bootstrap)
-            echo "$RL_BIN --config $CONFIG --method dqn --dqn-target-mode bootstrap --train-seed $seed --dp-seed $dp_seed --gen-seed $gen_seed" ;;
+            echo "$RL_BIN --config $CONFIG --method dqn --dqn-target-mode bootstrap --train-seed $seed --eval-seed $eval_seed --gen-seed $gen_seed" ;;
         dqn_mc)
-            echo "$RL_BIN --config $CONFIG --method dqn --dqn-target-mode mc --train-seed $seed --dp-seed $dp_seed --gen-seed $gen_seed" ;;
+            echo "$RL_BIN --config $CONFIG --method dqn --dqn-target-mode mc --train-seed $seed --eval-seed $eval_seed --gen-seed $gen_seed" ;;
         a2c)
-            echo "$RL_BIN --config $CONFIG --method a2c --train-seed $seed --dp-seed $dp_seed --gen-seed $gen_seed" ;;
+            echo "$RL_BIN --config $CONFIG --method a2c --train-seed $seed --eval-seed $eval_seed --gen-seed $gen_seed" ;;
         bo)
             echo "python scripts/baselines/run_bo.py --config $CONFIG --seed $seed --budget $BUDGET" ;;
         ga)
@@ -197,7 +197,7 @@ for seed in $SEEDS; do
     # Decorrelated seeds: the training RNG, the predictor's random-decoration
     # sampling and the generation sampling get independent streams, so seed-to-seed
     # spread is real variance rather than one shared stream reused three times.
-    dp_seed=$((seed + 10000))
+    eval_seed=$((seed + 10000))
     gen_seed=$((seed + 20000))
 
     for arm in $ARMS_TO_RUN; do
@@ -210,7 +210,7 @@ for seed in $SEEDS; do
             continue
         fi
 
-        cmd=($(arm_cmd "$arm" "$seed" "$dp_seed" "$gen_seed") --out "$run_out/")
+        cmd=($(arm_cmd "$arm" "$seed" "$eval_seed" "$gen_seed") --out "$run_out/")
         log="$LOG_DIR/${name}.log"
 
         if [[ "$DRYRUN" == "1" ]]; then

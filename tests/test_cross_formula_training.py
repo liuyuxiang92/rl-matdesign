@@ -305,10 +305,10 @@ def test_generation_uses_snapshot_metadata_and_counts_failure_attempts(monkeypat
         env=env, predictor=predictor, qnet=torch.nn.Linear(1, 1),
         scaler=StandardScaler().fit([[0.0, 1.0], [1.0, 1.0]]), device=torch.device("cpu"),
         elem_feats_scaled=np.array([[0.1, 0.2]]), action_values=["0.5"],
-        n_exploit=2, n_explore=1, max_attempts=3,
+        num_gen_eps=3, max_attempts=5,
     )
     assert env.starts == ["X", "A", "B", "A", "C"]
-    assert predictor.waves == [["X", "A"], ["B"], ["A"], ["C"]]
+    assert predictor.waves == [["X", "A", "B"], ["A"], ["C"]]
     assert [r["formula"] for r in rows] == ["A2O3", "B2O3", "C2O3"]
     assert [r["reward"] for r in rows] == [1, 2, 3]
     assert [r["dp_mean"] for r in rows] == [10, 20, 30]
@@ -431,7 +431,7 @@ def test_generation_charge_gate_uses_each_snapshot_formula(monkeypatch):
         env=env, predictor=predictor, qnet=torch.nn.Linear(1, 1),
         scaler=StandardScaler().fit([[0.0, 1.0], [1.0, 1.0]]), device=torch.device("cpu"),
         elem_feats_scaled=np.array([[0.1, 0.2]]), action_values=["0.5"],
-        n_exploit=2, max_attempts=3, charge_filter=True,
+        num_gen_eps=2, max_attempts=3, charge_filter=True,
     )
     assert checked == ["A1", "B1", "C1"]
     assert [r["formula"] for r in rows] == ["B1", "C1"]

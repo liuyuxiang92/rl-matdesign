@@ -33,13 +33,15 @@ def test_synthetic_example_trains_and_generates(tmp_path, example, method, targe
     config = {
         "properties": [{"name": "quality", "predictor": "dummy", "direction": "max"}], **DOMAINS[example],
         "eval_seed": 23, "train_seed": 29, "gen_seed": 31,
+        # This fixture checks fixed episode/update counts, including repeats.
+        "train_count_duplicates": True,
         "dqn_warmup_eps": 2, "dqn_num_train_eps": 2,
         "dqn_batch_size": 2, "dqn_buffer_size": 16,
         "dqn_grad_steps_per_ep": 1, "dqn_hidden_dim": 8,
         "dqn_target_update_freq": 2, "dqn_eps_anneal_eps": 2,
         "pg_warmup_eps": 2, "pg_num_iters": 1, "pg_batch_eps": 2,
         "pg_entropy_min": 0.0, "num_gen_eps": 2, "max_gen_attempts": 100,
-        "gen_epsilon": 1.0, "exploration_gen_eps": 0,
+        "gen_epsilon": 1.0,
     }
     config_path = tmp_path / "synthetic.yaml"
     config_path.write_text(yaml.safe_dump(config))

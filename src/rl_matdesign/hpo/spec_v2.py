@@ -180,7 +180,7 @@ def load_simplified_plan(path: Path, value, method=None) -> dict:
         "training_search": training_search,
         "generation_search": {"parameter": parameter, "initial_values": sorted(initial_values),
                               "max_extra_values_per_direction": _GENERATION_MAX_EXTRA_VALUES_PER_DIRECTION,
-                              "fixed": {key: 0 for key in ("gen_epsilon", "gen_top_frac", "gen_temperature", "exploration_gen_eps")
+                              "fixed": {key: 0 for key in ("gen_epsilon", "gen_top_frac", "gen_temperature")
                                         if key != parameter},
                               "repeats_per_model": _integer(generation.get("repeats", 3), "generation.repeats", 1),
                               "master_seed": master},

@@ -78,7 +78,7 @@ class ConditionMetadataPredictor:
 def composite():
     from rl_matdesign.predictors.structure_score import StructureScorePredictor
 
-    def make(*property_specs, predict_cache_size=200000):
+    def make(*property_specs):
         properties = [{
             "name": "response", "direction": "max", "objective": "mean",
             "predictor": ("tests.test_predictor_metadata:SampledMetadataPredictor"
@@ -87,7 +87,7 @@ def composite():
             **spec,
         } for spec in (property_specs or ({},))]
         return StructureScorePredictor({
-            "properties": properties, "predict_cache_size": predict_cache_size,
+            "properties": properties,
             "reward": {"objective": {"terms": {prop["name"]: 1 for prop in properties}}},
         })
 
@@ -134,10 +134,11 @@ def test_composite_namespaces_multiple_objectives_and_models(
     assert predictor.candidate_metadata(candidate) == metadata
 
 
-def test_composite_keeps_matching_metadata_when_leaf_cache_evicts_and_evicts_together(composite):
+def test_composite_keeps_matching_metadata_when_leaf_cache_evicts_and_evicts_together(composite, monkeypatch):
+    monkeypatch.setattr("rl_matdesign.predictors.structure_score._PREDICTION_CACHE_SIZE", 2)
     # Different evaluations deliberately return different distributions. A leaf
     # with a smaller cache must not replace metadata held with composite stats.
-    predictor = composite({"cache_size": 1, "counter": True}, predict_cache_size=2)
+    predictor = composite({"cache_size": 1, "counter": True})
     first, second, third = ({"peptide": [token]} for token in ("A", "B", "C"))
     assert predictor.predict(first) == (1.0, None)
     assert predictor.predict(second) == (2.0, None)
@@ -180,8 +181,9 @@ def test_composite_metadata_defensive_copy_on_capture_and_return(
     assert predictor.candidate_metadata(candidate) == expected
 
 
-def test_batch_metadata_survives_leaf_and_lru_eviction_and_duplicate_reads(composite):
-    predictor = composite({"cache_size": 1, "counter": True}, predict_cache_size=1)
+def test_batch_metadata_survives_leaf_and_lru_eviction_and_duplicate_reads(composite, monkeypatch):
+    monkeypatch.setattr("rl_matdesign.predictors.structure_score._PREDICTION_CACHE_SIZE", 1)
+    predictor = composite({"cache_size": 1, "counter": True})
     first, second, third = ({"peptide": [token]} for token in ("A", "B", "C"))
     predictions = predictor.batch_predict([first, second, first.copy(), third])
     assert predictions == [(1., None), (2., None), (1., None), (3., None)]
@@ -200,7 +202,8 @@ def test_batch_metadata_survives_leaf_and_lru_eviction_and_duplicate_reads(compo
 
 
 def test_failed_metadata_is_not_cached_and_good_batch_neighbors_survive(composite, monkeypatch):
-    predictor = composite({"cache_size": 1, "counter": True}, predict_cache_size=1)
+    monkeypatch.setattr("rl_matdesign.predictors.structure_score._PREDICTION_CACHE_SIZE", 1)
+    predictor = composite({"cache_size": 1, "counter": True})
     leaf = predictor.properties[0]["instance"][0]
     original = leaf.candidate_metadata
     bad, good = {"peptide": ["A"]}, {"peptide": ["B"]}

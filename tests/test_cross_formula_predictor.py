@@ -183,8 +183,9 @@ def test_default_error_mode_raises_but_keeps_successful_neighbor_result():
     assert len(predictor._source_builders["structure"].calls) == 2
 
 
-def test_batch_diagnostics_do_not_rebuild_when_wave_exceeds_lru_capacity():
-    predictor = _predictor(predict_cache_size=1)
+def test_batch_diagnostics_do_not_rebuild_when_wave_exceeds_lru_capacity(monkeypatch):
+    monkeypatch.setattr("rl_matdesign.predictors.structure_score._PREDICTION_CACHE_SIZE", 1)
+    predictor = _predictor()
     candidates = [_candidate(value) for value in [0.1, 0.2, 0.3]]
     results = predictor.batch_predict(candidates)
     assert len(predictor._stats_cache) == 1
@@ -234,8 +235,9 @@ def test_recommended_wave_size_delegates_to_structure_builder():
     assert predictor.evaluation_batch_size() == 4
 
 
-def test_empty_predictor_batch_keeps_previous_wave_diagnostics():
-    predictor = _predictor(predict_cache_size=1)
+def test_empty_predictor_batch_keeps_previous_wave_diagnostics(monkeypatch):
+    monkeypatch.setattr("rl_matdesign.predictors.structure_score._PREDICTION_CACHE_SIZE", 1)
+    predictor = _predictor()
     candidates = [_candidate(0.1), _candidate(0.2)]
     predictor.batch_predict(candidates)
     assert predictor.batch_predict([]) == []

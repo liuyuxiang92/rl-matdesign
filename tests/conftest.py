@@ -1,8 +1,8 @@
 """Pytest shared setup.
 
 Ensures `src/` and `scripts/` are importable so tests can pull from
-`rl_matdesign.*`, `abcde_ooh.*`, and the `_apply_flag_aliases` helper in
-`scripts/run_experiment.py` regardless of installation mode.
+`rl_matdesign.*`, `abcde_ooh.*`, and script entry points regardless of
+installation mode.
 """
 from __future__ import annotations
 

@@ -44,7 +44,7 @@ import numpy as np
 import optuna
 import yaml
 
-from rl_matdesign.config_schema import load_yaml_config, normalize_aliases, resolve_config, validate_config
+from rl_matdesign.config_schema import load_yaml_config, resolve_config, validate_config
 
 from rl_matdesign.hpo import (
     TrialRunError,
@@ -147,12 +147,10 @@ def _build_trial_yaml(
     Budget scaling: multiplicative on integer-typed budget knobs. Applied
     AFTER sampled values are merged (so a sampled budget knob is also scaled).
     """
-    cfg = normalize_aliases(base_cfg)
-    cfg.update(normalize_aliases(fixed_overrides))
-    cfg.update(normalize_aliases(sampled))
+    cfg = {**base_cfg, **fixed_overrides, **sampled}
     cfg["method"] = method
     # Validate the same values the experiment consumes, but retain authored keys
-    # so later trial overrides do not freeze derived gamma/warmup defaults.
+    # so later trial overrides do not freeze unconfigured defaults.
     effective = resolve_config(cfg).config
     cfg = {key: effective[key] for key in cfg}
 
@@ -162,7 +160,7 @@ def _build_trial_yaml(
         "train_budget",
         "dqn_num_train_eps", "dqn_warmup_eps", "dqn_eps_anneal_eps",
         "pg_num_iters", "pg_warmup_eps", "num_gen_eps",
-        "exploration_gen_eps", "max_gen_attempts",
+        "max_gen_attempts",
     }
     for key, mult in (budget_scaling or {}).items():
         if key not in budget_keys:
@@ -186,7 +184,7 @@ def _build_trial_yaml(
 
 
 def _dump_trial_yaml(path: str, cfg: dict) -> None:
-    validate_config(normalize_aliases(cfg))
+    validate_config(cfg)
     with open(path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
 
@@ -421,7 +419,7 @@ def _write_final_report(
     lines.append(f"    --config {cfg_rel} \\")
     lines.append(f"    --method {hpo_cfg['method']} \\")
     lines.append(f"    --out runs/<your_name> \\")
-    lines.append(f"    --train-seed 0 --dp-seed 10000 --gen-seed 20000")
+    lines.append(f"    --train-seed 0 --eval-seed 10000 --gen-seed 20000")
     lines.append("```\n")
     lines.append("## Stage-2 ranking\n")
     lines.append("| rank | stage-1 trial id | mean | std | seed_scores |")
@@ -718,7 +716,7 @@ def main() -> None:
                 "    python scripts/run_experiment.py \\\n"
                 "        --config %s/stage1/trial_0000/config.yaml \\\n"
                 "        --method %s --out /tmp/repro \\\n"
-                "        --train-seed 0 --dp-seed 10000 --gen-seed 20000\n"
+                "        --train-seed 0 --eval-seed 10000 --gen-seed 20000\n"
                 "Or read %s/stderr.log directly.",
                 n_fail, out_root, hpo_cfg["method"], sample_dir,
             )

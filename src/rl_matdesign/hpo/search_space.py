@@ -41,7 +41,6 @@ _INT_TYPED_KEYS: Set[str] = {
     "pg_batch_eps",
     # Generation
     "num_gen_eps",
-    "exploration_gen_eps",
 }
 
 

@@ -27,7 +27,7 @@ def test_defaults_are_complete_and_paths_use_scenario_directory(tmp_path):
     assert len(plan["search_space"]) == 5
     assert plan["budget"]["train"]["min_fraction"] < plan["budget"]["train"]["initial_fraction"]
     assert phase_efficiency(plan, "generation")["max_attempts_per_unique"] == 1.5
-    assert plan["generation_search"]["fixed"] == {"gen_epsilon": 0, "gen_top_frac": 0, "exploration_gen_eps": 0}
+    assert plan["generation_search"]["fixed"] == {"gen_epsilon": 0, "gen_top_frac": 0}
     assert plan["sources"]["efficiency"] == "default"
 
 

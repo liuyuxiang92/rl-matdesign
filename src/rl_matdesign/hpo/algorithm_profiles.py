@@ -155,7 +155,6 @@ def resolve_parameters(plan: Mapping, params: Mapping, budget: int) -> dict:
         "pg_repeat_penalty_coef": 0.0,
         "gen_epsilon": 0.0,
         "gen_top_frac": 0.0,
-        "exploration_gen_eps": 0,
         "num_gen_eps": 0,
     })
     if method != "a2c":

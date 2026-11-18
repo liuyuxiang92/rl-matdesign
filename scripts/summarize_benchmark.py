@@ -56,7 +56,7 @@ def science_protocol(cfg):
     # second whitelist of potentially arbitrary plugin scientific options.
     selected = {key: value for key, value in cfg.items()
                 if key not in PARAMETERS or key in {"eval_seed", "k"}}
-    for key in ("generated_columns", "predict_cache_size", "config_file", "config_schema_version"):
+    for key in ("config_file", "config_schema_version"):
         selected.pop(key, None)
     return hashlib.sha256(json.dumps(selected, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 

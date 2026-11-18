@@ -19,6 +19,7 @@ from tests.test_parallel_structures import pool_factory
 def test_training_crosses_formula_boundary_on_four_worker_processes(
     pool_factory, tmp_path, monkeypatch, target_mode,
 ):
+    monkeypatch.setattr("rl_matdesign.predictors.structure_score._PREDICTION_CACHE_SIZE", 1)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,7,9,11")
     module = tmp_path / "fake_modules" / "composition_batch_builder.py"
     module.write_text('''
@@ -32,7 +33,6 @@ class Builder(Base):
 ''')
     root = tmp_path / "training_workers"
     inner = StructureScorePredictor({
-        "predict_cache_size": 1,
         "structure": {
             "builder": "composition_batch_builder:Builder", "test_root": str(root),
             "n_random_configs": 2,
@@ -73,7 +73,7 @@ class Builder(Base):
             device=torch.device("cpu"), hidden_dim=4, n_warmup_eps=2,
             dqn_num_train_eps=2, batch_size=1, dqn_grad_steps_per_ep=1,
             dqn_target_update_freq=2, dqn_eps_anneal_eps=10,
-            dqn_target_mode=target_mode, timer=predictor,
+            dqn_target_mode=target_mode, timer=predictor, train_count_duplicates=True,
         )
         assert [row["terminal_reward"] for row in rows] == [1, 2, 1, 3]
         assert rows[-1]["training_attempts"] == 4

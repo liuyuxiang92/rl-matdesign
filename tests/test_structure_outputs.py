@@ -68,8 +68,9 @@ def test_identical_inline_models_load_once_predict_once_and_close_once(registere
     assert instances[0].closes == 1
 
 
-def test_named_batch_preserves_records_after_lru_eviction(registered):
-    cfg = shared_config(); cfg["predict_cache_size"] = 1
+def test_named_batch_preserves_records_after_lru_eviction(registered, monkeypatch):
+    monkeypatch.setattr("rl_matdesign.predictors.structure_score._PREDICTION_CACHE_SIZE", 1)
+    cfg = shared_config()
     p = StructureScorePredictor(cfg, seed=1)
     candidates = [{"SiO2": value} for value in (1, 2, 3)]
     results = p.batch_predict_outputs(candidates)
@@ -275,6 +276,7 @@ def test_shared_model_explicit_condition_metadata_and_outputs_stay_paired(regist
 
 
 def test_external_rng_is_candidate_model_local_and_preserves_training_streams(registered, monkeypatch):
+    monkeypatch.setattr("rl_matdesign.predictors.structure_score._PREDICTION_CACHE_SIZE", 1)
     import random
     import torch
     from rl_matdesign.utils.seeding import capture_rng_state
@@ -287,7 +289,7 @@ def test_external_rng_is_candidate_model_local_and_preserves_training_streams(re
             value = self.offset + random.random() + np.random.random() + float(torch.rand(()))
             return {name: ScientificOutput(schema, value) for name, schema in self.output_schema.items()}
     monkeypatch.setattr(registry, "resolve_predictor", lambda *args, **kwargs: RandomOutput(args[1], **kwargs))
-    cfg = shared_config(); cfg["predict_cache_size"] = 1
+    cfg = shared_config()
     before = capture_rng_state()
     p = StructureScorePredictor(cfg, seed=23)
     first, second = {"Na2O": .2, "SiO2": .8}, {"Na2O": .3, "SiO2": .7}

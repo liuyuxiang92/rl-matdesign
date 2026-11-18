@@ -15,7 +15,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
-from rl_matdesign.config_schema import load_yaml_config, normalize_aliases, validate_config
+from rl_matdesign.config_schema import load_yaml_config, validate_config
 from rl_matdesign.configuration import build_env, load_config
 from rl_matdesign.hpo.search_space import validate_search_space
 from rl_matdesign.structure_sources import resolve_structure_plan
@@ -43,7 +43,7 @@ def audit_file(path: Path, root: Path, *, domains=False):
         if base is None:
             raise ValueError(f'base_config does not exist: {ref}')
         cfg = load_config(str(base))
-        overrides = normalize_aliases(raw.get('fixed_overrides', {}))
+        overrides = raw.get('fixed_overrides', {})
         validate_config({**cfg, **overrides, 'method': raw['method']})
         validate_search_space(raw['search_space'], fixed_overrides=overrides, base_values=cfg)
         # A typo in a sampled parameter must fail before an expensive HPO run.

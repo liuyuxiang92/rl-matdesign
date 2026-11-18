@@ -174,7 +174,7 @@ def _budget(raw, objective):
 def _search_settings(raw, generation=False):
     if generation:
         defaults = {"parameter": "gen_temperature", "initial_values": [0, .001, .01, .1, 1, 10, 100, 1000],
-                    "max_extra_values_per_direction": 2, "fixed": {"gen_epsilon": 0, "gen_top_frac": 0, "exploration_gen_eps": 0},
+                    "max_extra_values_per_direction": 2, "fixed": {"gen_epsilon": 0, "gen_top_frac": 0},
                     "paired_seeds": [401, 503, 607]}
         raw = _mapping(raw, "generation_search", defaults)
         cfg = {**deepcopy(defaults), **raw}

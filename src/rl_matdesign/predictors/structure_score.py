@@ -35,6 +35,8 @@ from .outputs import (OutputSchema, ModelSamples, ScientificOutput, aggregate_sa
                       inverse_transform_output)
 
 
+_PREDICTION_CACHE_SIZE = 200_000
+
 _DIRECTION_ALIASES = {"min": -1.0, "minimize": -1.0, "max": +1.0, "maximize": +1.0}
 # A third direction: hit a specific value rather than push it up or down. Needs
 # `target_value`; `target_tolerance` is a deadband inside which the term is at its
@@ -123,6 +125,8 @@ class StructureScorePredictor:
                 "direction: max|min, ...}."
             )
 
+        if "predict_cache_size" in cfg:
+            raise EvaluationProtocolError("Prediction cache capacity is fixed at 200000; remove predict_cache_size")
         retired = {"model", "models", "model_ref", "dp_models", "predictor",
                    "objective", "uncertainty", "output_index"} & cfg.keys()
         if retired:
@@ -419,18 +423,11 @@ class StructureScorePredictor:
         self._calc_cache: Dict[str, Any] = {}     # name -> ase calculators (energy backend)
         self._prop_cache: Dict[str, Tuple[List[Any], Dict[str, int]]] = {}  # name -> property models
         self._parallel_models_ready = False
-        # Persistent per-composition stats cache (LRU). Keyed by the canonical
-        # candidate key, it makes each unique composition build+relax+score
-        # exactly ONCE for the predictor's lifetime — so training repeats and
-        # duplicate generation rollouts of the same composition are free (the
-        # single biggest saving when geo_opt is expensive). `predict_cache_size`
-        # caps entries (<=0 = unbounded). Entries include paired metadata/sample
-        # diagnostics, so memory also depends on ensemble size. A cap of 1 keeps
-        # only the most recent entry.
+        # Fixed-capacity LRU of paired predictions, metadata and diagnostics.
+        # Repeated candidates reuse their evaluation while the record is cached.
         from collections import OrderedDict
 
         self._stats_cache: "OrderedDict[tuple, _EvaluationRecord]" = OrderedDict()
-        self._stats_cache_size: int = int(cfg.get("predict_cache_size", 200000))
         # Retain the most recent evaluation wave until consumers have logged its
         # raw/property statistics, even when the persistent LRU is smaller.
         self._batch_stats: Dict[tuple, _EvaluationRecord] = {}
@@ -1186,10 +1183,8 @@ class StructureScorePredictor:
 
     def _cache_evaluation(self, key: tuple, record: _EvaluationRecord) -> None:
         self._stats_cache[key] = record
-        cap = self._stats_cache_size
-        if cap and cap > 0:
-            while len(self._stats_cache) > cap:
-                self._stats_cache.popitem(last=False)   # evict least-recently used
+        while len(self._stats_cache) > _PREDICTION_CACHE_SIZE:
+            self._stats_cache.popitem(last=False)   # evict least-recently used
 
     def _score(
         self, prop: Dict[str, Any], structures: Any,

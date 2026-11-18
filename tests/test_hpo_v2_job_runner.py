@@ -135,7 +135,7 @@ def test_selected_generation_method_survives_zero_sorted_export_and_cache(
     assert selected_generation_parameter(cfg) == parameter
     assert cfg[parameter] == value
     assert all(cfg[key] == 0 for key in GENERATION_PARAMETERS if key != parameter)
-    assert cfg["exploration_gen_eps"] == 0
+    assert "exploration_gen_eps" not in cfg
     assert cfg["hpo_phase"] == "generation"
     assert cfg["train_budget"] == 8
     assert cfg["num_gen_eps"] == 4

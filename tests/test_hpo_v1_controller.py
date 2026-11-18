@@ -187,7 +187,7 @@ def test_job_runner_resolves_generation_temperature_and_reuses_completed_jobs(tm
     cfg = calls[-1]["config"]
     assert cfg["train_budget"] == 16 and cfg["num_gen_eps"] == 8
     assert cfg["gen_temperature"] == .1
-    assert cfg["gen_epsilon"] == cfg["gen_top_frac"] == cfg["exploration_gen_eps"] == 0
+    assert cfg["gen_epsilon"] == cfg["gen_top_frac"] == 0
     assert "--only-generate" in calls[-1]["args"]
     assert calls[-1]["env"]["PYTHONPATH"].split(":")[0].endswith("/src")
     count = len(calls)

@@ -221,8 +221,9 @@ def test_persistent_cache_recomputes_each_composition_once():
     assert len(p._stats_cache) == 2
 
 
-def test_cache_size_cap_evicts_lru():
-    p = StructureScorePredictor(_shared_cfg(predict_cache_size=2))
+def test_cache_size_cap_evicts_lru(monkeypatch):
+    monkeypatch.setattr("rl_matdesign.predictors.structure_score._PREDICTION_CACHE_SIZE", 2)
+    p = StructureScorePredictor(_shared_cfg())
     p._source_builders["structure"] = type("B", (), {
         "build": lambda self, cand, *, n_configs, rng: [object()]})()
     fixed = {"conductivity": (10.0, 1.0), "stability": (5.0, 0.5)}
@@ -230,6 +231,15 @@ def test_cache_size_cap_evicts_lru():
     for el in ("Mn", "Fe", "Co"):     # 3 comps, cap 2 -> oldest (Mn) evicted
         p.predict({"P_site": {el: 0.05}})
     assert len(p._stats_cache) == 2
+
+
+@pytest.mark.parametrize("value", [0, 1, 200000])
+def test_prediction_cache_capacity_is_not_a_user_setting(value):
+    from rl_matdesign.predictors.structure_score import _PREDICTION_CACHE_SIZE
+    from rl_matdesign.utils.rollout_errors import EvaluationProtocolError
+    assert _PREDICTION_CACHE_SIZE == 200000
+    with pytest.raises(EvaluationProtocolError, match="fixed at 200000"):
+        StructureScorePredictor(_shared_cfg(predict_cache_size=value))
 
 
 def test_score_breakdown_returns_structures_and_raw_combine_matches():

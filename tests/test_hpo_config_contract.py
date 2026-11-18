@@ -6,7 +6,7 @@ import yaml
 import hpo
 
 
-def test_hpo_overrides_keep_shared_defaults_derived_at_execution():
+def test_hpo_overrides_keep_one_shared_discount():
     config = hpo._build_trial_yaml(
         base_cfg={"properties": [{"name": "score", "predictor": "dummy", "direction": "max", "objective": "mean"}], "gamma": .9, "dqn_num_train_eps": 100},
         fixed_overrides={"gamma": .8}, sampled={"dqn_lr": .002},
@@ -15,7 +15,7 @@ def test_hpo_overrides_keep_shared_defaults_derived_at_execution():
     assert config["gamma"] == .8
     assert config["dqn_num_train_eps"] == 50
     assert "pg_gamma" not in config and "dqn_gamma" not in config
-    assert hpo.resolve_config(config).config["dqn_gamma"] == .8
+    assert hpo.resolve_config(config).config["gamma"] == .8
 
 
 def test_hpo_rejects_unknown_core_parameters():
@@ -117,3 +117,28 @@ def test_stage_two_replays_fraction_before_integer_validation(tmp_path, monkeypa
     assert len(result) == 1
     assert seen[0]["dqn_num_train_eps"] == 100
     assert seen[0]["dqn_eps_anneal_eps"] == 50
+
+
+@pytest.mark.parametrize("key", [
+    "dqn_gamma", "pg_gamma", "exploration_gen_eps", "generated_columns",
+    "predict_cache_size", "buffer_size", "num_train_eps", "grad_steps_per_ep",
+    "target_update_freq", "eps_anneal_eps", "eps_min", "entropy_coef",
+    "repeat_penalty_coef", "repeat_penalty_shape", "dp_seed",
+])
+@pytest.mark.parametrize("layer", ["base_cfg", "fixed_overrides", "sampled"])
+def test_hpo_trial_rejects_retired_parameters_in_every_layer(key, layer):
+    args = dict(base_cfg={}, fixed_overrides={}, sampled={},
+                budget_scaling={}, method="dqn")
+    args[layer][key] = 1
+    with pytest.raises(ValueError, match=key):
+        hpo._build_trial_yaml(**args)
+
+
+@pytest.mark.parametrize("method", ["dqn", "reinforce", "a2c"])
+def test_hpo_sampled_gamma_stays_shared_across_methods(method):
+    config = hpo._build_trial_yaml(
+        base_cfg={"gamma": .9}, fixed_overrides={}, sampled={"gamma": .75},
+        budget_scaling={}, method=method,
+    )
+    assert config == {"gamma": .75, "method": method}
+    assert hpo.resolve_config(config).config["gamma"] == .75

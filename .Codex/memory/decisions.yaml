@@ -95,8 +95,10 @@
   date: '2026-10-30'
   expires: '2027-04-30'
   title: Separate unique-candidate budget from sampled training episodes
-  choice: train_count_duplicates defaults to true. When false, count canonical environment
-    terminal keys once while retaining duplicate replay rows and learning updates. Share
+  choice: As of the 2026-11-18 cleanup, train_count_duplicates defaults to false;
+    --train-count-duplicates or explicit YAML true opts into counting repeats. The
+    negative CLI spelling is removed. Count canonical environment terminal keys once
+    by default while retaining duplicate replay rows and learning updates. Share
     DQN seen keys across rewarded warmup and online training; PG scaler warmup is excluded.
     Keep DQN schedules and PG batch sizes tied to actual sampled episodes, with bounded
     consecutive duplicates and checkpointed seen keys plus separate counters.
@@ -553,3 +555,29 @@
   files: [src/rl_matdesign/utils/parallel_structures.py,
     src/rl_matdesign/structure_sources.py, scripts/evaluate_lips.py]
   tags: [configuration-ownership, schema-cleanup, scientific-provenance]
+
+
+- id: decision-canonical-training-parameters-001
+  date: '2026-11-18'
+  expires: '2027-05-18'
+  title: One discount and generation quota with canonical training names
+  choice: >-
+    Use only gamma for DQN, REINFORCE and A2C and include it explicitly in the
+    learning execution contract. Remove algorithm-specific gamma fields, all ten
+    old training aliases, --dp-seed and the DQN fallback from pg_warmup_eps.
+    Generate from one num_gen_eps quota; remove exploration_gen_eps and its phase
+    loop. Prediction cache capacity is an internal 200000-entry LRU, and generated
+    CSV automatically exports recorded scientific fields without a column mapping.
+    Retired user keys reject instead of silently being translated or ignored.
+  alternatives_considered:
+  - Keeping aliases or fallback chains creates multiple supported configuration paths.
+  - A second generation quota uses the same policy and duplicates the phase machinery.
+  trade_off: >-
+    Old configurations and checkpoints require the matching archived runtime or a
+    fresh current configuration. Explicit duplicate-counting choices remain honored;
+    omission now means unique-candidate accounting. Preserve historical source
+    evidence and keep migrated scenario YAMLs local-only.
+  files: [src/rl_matdesign/config_schema.py, src/rl_matdesign/experiment.py,
+    src/rl_matdesign/training.py, src/rl_matdesign/utils/execution_contract.py,
+    src/rl_matdesign/utils/metrics.py, src/rl_matdesign/predictors/structure_score.py]
+  tags: [configuration-ownership, training, schema-cleanup]

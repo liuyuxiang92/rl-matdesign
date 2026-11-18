@@ -173,7 +173,7 @@ def test_generation_exports_full_formula_through_predictor(
         rows = training.generate_candidates(
             env=env, predictor=predictor, scaler=None, device=torch.device("cpu"),
             elem_feats_scaled=np.empty((0, 0)), action_values=[],
-            qnet=SimpleNamespace(eval=lambda: None), n_exploit=1, max_attempts=1,
+            qnet=SimpleNamespace(eval=lambda: None), num_gen_eps=1, max_attempts=1,
             charge_filter=charge_filter,
         )
         path = tmp_path / "generated.csv"

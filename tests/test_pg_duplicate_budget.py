@@ -97,9 +97,9 @@ def test_duplicates_keep_learning_with_optional_budget(monkeypatch, method, coun
         assert kwargs["value_net"].value.item() > 0
 
 
-def test_default_budget_counts_duplicates_without_guard(monkeypatch):
+def test_explicit_duplicate_counting_has_no_duplicate_guard(monkeypatch):
     kwargs, sampled, learned = _setup(monkeypatch, [0, 0, 0, 0])
-    rows = training.train_pg(**kwargs, train_max_duplicate_attempts=1)
+    rows = training.train_pg(**kwargs, train_count_duplicates=True, train_max_duplicate_attempts=1)
     assert sampled == learned == [0, 0, 0, 0]
     assert rows[-1]["training_budget_used"] == 4
     assert rows[-1]["training_duplicate_episodes"] == 3
@@ -189,9 +189,9 @@ def test_legacy_checkpoint_cannot_enable_unique_budget(monkeypatch, resume_field
     assert sampled == learned == []
 
 
-def test_legacy_checkpoint_default_mode_remains_supported(monkeypatch, capsys):
+def test_legacy_checkpoint_requires_explicit_duplicate_counting(monkeypatch, capsys):
     kwargs, sampled, learned = _setup(monkeypatch, [0, 0, 0, 0])
-    rows = training.train_pg(**kwargs, checkpoint_cfg={"start_episode": 10})
+    rows = training.train_pg(**kwargs, train_count_duplicates=True, checkpoint_cfg={"start_episode": 10})
     assert sampled == learned == [0, 0, 0, 0]
     assert rows[-1]["episode"] == 14
     assert rows[-1]["training_budget_history_complete"] is False

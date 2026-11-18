@@ -67,8 +67,6 @@ def execution_contract(config, predictor, manifest_path, device) -> dict:
     source_identity = getattr(predictor, "source_identity", None)
     scientific = {key: value for key, value in config.items()
                   if key not in PARAMETERS or key in {"eval_seed", "k"}}
-    scientific.pop("generated_columns", None)
-    scientific.pop("predict_cache_size", None)
     # This is resolved sampling provenance, not a predictor input. In
     # particular, choosing another generation policy must not invalidate a
     # frozen model's oracle contract. Exact generation resume locks the actual
@@ -87,7 +85,7 @@ def execution_contract(config, predictor, manifest_path, device) -> dict:
     active_prefix = "dqn_" if config["method"] == "dqn" else "pg_"
     adjustable_budgets = {"dqn_num_train_eps", "pg_num_iters"}
     learning = {key: value for key, value in config.items()
-                if key in {"method", "train_seed", "train_count_duplicates", "train_max_duplicate_attempts"}
+                if key in {"method", "gamma", "train_seed", "train_count_duplicates", "train_max_duplicate_attempts"}
                 or (key.startswith(active_prefix) and key not in adjustable_budgets)}
     # Saving limits DQN candidate prefetch waves. Changing this frequency
     # changes when the policy is updated relative to subsequent sampling.
@@ -107,7 +105,7 @@ def generation_sampling_contract(config) -> dict:
         "parameter": selected_generation_parameter(config),
         **{key: config[key] for key in (
             "gen_seed", "gen_temperature", "gen_top_frac", "gen_epsilon",
-            "num_gen_eps", "exploration_gen_eps")},
+            "num_gen_eps")},
     }
 
 

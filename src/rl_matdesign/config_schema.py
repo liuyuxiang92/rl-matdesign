@@ -13,7 +13,6 @@ from difflib import get_close_matches
 import math
 from pathlib import Path
 from typing import Any
-import warnings
 
 import yaml
 
@@ -22,28 +21,10 @@ class ConfigError(ValueError):
     """A configuration is ambiguous, malformed, or outside its contract."""
 
 
-class ConfigDeprecationWarning(DeprecationWarning):
-    """A supported configuration spelling should be migrated."""
-
-
 # Authored order selects one generation policy. These keys are intentionally not
 # sorted: iteration over the source mapping, rather than this tuple, decides.
 GENERATION_PARAMETERS = ("gen_temperature", "gen_top_frac", "gen_epsilon")
 _GENERATION_METADATA = "generation_selection"
-
-
-ALIASES = {
-    "buffer_size": "dqn_buffer_size",
-    "num_train_eps": "dqn_num_train_eps",
-    "grad_steps_per_ep": "dqn_grad_steps_per_ep",
-    "target_update_freq": "dqn_target_update_freq",
-    "eps_anneal_eps": "dqn_eps_anneal_eps",
-    "eps_min": "dqn_eps_min",
-    "entropy_coef": "pg_entropy_coef",
-    "repeat_penalty_coef": "pg_repeat_penalty_coef",
-    "repeat_penalty_shape": "pg_repeat_penalty_shape",
-    "dp_seed": "eval_seed",
-}
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -94,34 +75,6 @@ def load_yaml_config(path: str | Path) -> dict:
     return _mapping(value, f"Configuration {path}")
 
 
-def _normalize_aliases(raw: Mapping, source: str) -> tuple[dict, dict[str, str]]:
-    cfg = _mapping(raw, source)
-    sources = {key: source for key in cfg}
-    for old, new in ALIASES.items():
-        if old not in cfg:
-            continue
-        if new in cfg and PARAMETERS[new].normalize(old, cfg[old]) != PARAMETERS[new].normalize(new, cfg[new]):
-            raise ConfigError(
-                f"Conflicting config aliases {old!r}={cfg[old]!r} and "
-                f"{new!r}={cfg[new]!r} in {source}; keep only {new!r}."
-            )
-        warnings.warn(
-            f"Config key {old!r} is deprecated; use {new!r}.",
-            ConfigDeprecationWarning, stacklevel=3,
-        )
-        if new not in cfg:
-            cfg[new] = cfg[old]
-            sources[new] = f"{source}:alias:{old}"
-        del cfg[old]
-        del sources[old]
-    return cfg, sources
-
-
-def normalize_aliases(raw: Mapping) -> dict:
-    """Return a copy with canonical keys; conflicting spellings are errors."""
-    return _normalize_aliases(raw, "yaml")[0]
-
-
 @dataclass(frozen=True)
 class Parameter:
     kind: type
@@ -169,9 +122,7 @@ class Parameter:
         return value
 
 
-# These values are the existing experiment defaults, now specified in one place.
-# Dynamic fallbacks are resolved before defaults, so merely adding pg_warmup_eps
-# to the effective record cannot silently change DQN's 500-episode fallback.
+# Experiment defaults are defined once; each algorithm owns its warmup budget.
 PARAMETERS: dict[str, Parameter] = {
     "method": Parameter(str, "a2c", "Training algorithm; inactive algorithm settings are retained.", choices=("dqn", "reinforce", "a2c")),
     "eval_seed": Parameter(int, 0, "Random seed for property evaluation and structure sampling.", minimum=0, maximum=2**32 - 1),
@@ -182,19 +133,17 @@ PARAMETERS: dict[str, Parameter] = {
     "hpo_phase": Parameter(str, "train", "HPO job phase.", choices=("train", "generation")),
     "hpo_target_unique": Parameter(int, None, "HPO target successfully evaluated distinct candidates.", minimum=1, nullable=True),
     "hpo_ratio_limit": Parameter(float, 1.5, "Strict HPO attempts/unique upper bound.", minimum=1, exclusive_minimum=True),
-    "train_count_duplicates": Parameter(bool, True, "Count repeated terminal candidates toward training budgets."),
+    "train_count_duplicates": Parameter(bool, False, "Count repeated terminal candidates toward training budgets."),
     "train_budget": Parameter(int, None, "Total paid training candidates; derives algorithm episode limits when set.", minimum=1, nullable=True),
     "train_max_duplicate_attempts": Parameter(int, 1000, "Maximum consecutive duplicates in a unique-candidate budget.", minimum=1),
-    "gamma": Parameter(float, 0.9, "Shared discount fallback for both algorithms.", minimum=0, maximum=1),
-    "dqn_gamma": Parameter(float, 0.9, "DQN discount, overriding the shared fallback.", minimum=0, maximum=1, fallback="gamma"),
-    "pg_gamma": Parameter(float, 0.9, "Policy-gradient discount, overriding the shared fallback.", minimum=0, maximum=1, fallback="gamma"),
+    "gamma": Parameter(float, 0.9, "Discount factor used by DQN, REINFORCE and A2C.", minimum=0, maximum=1),
     "dqn_hidden_dim": Parameter(int, 256, "DQN hidden-layer width.", minimum=1),
     "dqn_lr": Parameter(float, 1e-3, "DQN optimizer learning rate.", minimum=0, exclusive_minimum=True),
     "dqn_buffer_size": Parameter(int, 50000, "DQN replay capacity in transitions.", minimum=1),
     "dqn_eps_anneal_eps": Parameter(int, 10000, "DQN epsilon annealing episodes.", minimum=1),
     "dqn_eps_min": Parameter(float, 0.05, "DQN minimum exploration probability.", minimum=0, maximum=1),
     "dqn_num_train_eps": Parameter(int, 20000, "DQN training episode budget.", minimum=0),
-    "dqn_warmup_eps": Parameter(int, 500, "DQN warmup; explicit pg_warmup_eps is a legacy fallback.", minimum=0, fallback="explicit pg_warmup_eps"),
+    "dqn_warmup_eps": Parameter(int, 500, "DQN random warmup episodes.", minimum=0),
     "dqn_batch_size": Parameter(int, 256, "DQN replay minibatch size.", minimum=1),
     "dqn_grad_steps_per_ep": Parameter(int, 5, "DQN gradient updates per training episode.", minimum=1),
     "dqn_target_update_freq": Parameter(int, 100, "DQN target-network update interval.", minimum=1),
@@ -210,8 +159,7 @@ PARAMETERS: dict[str, Parameter] = {
     "pg_entropy_min": Parameter(float, 0.3, "Normalized policy entropy floor.", minimum=0, maximum=1),
     "pg_repeat_penalty_coef": Parameter(float, 0.0, "Repeated-candidate policy penalty coefficient.", minimum=0),
     "pg_repeat_penalty_shape": Parameter(str, "log", "Repeated-candidate penalty growth.", choices=("log", "sqrt", "linear")),
-    "num_gen_eps": Parameter(int, 200, "Requested exploitation candidates.", minimum=0),
-    "exploration_gen_eps": Parameter(int, 0, "Additional random-exploration generation episodes.", minimum=0),
+    "num_gen_eps": Parameter(int, 200, "Requested distinct generated candidates.", minimum=0),
     "max_gen_attempts": Parameter(int, None, "Maximum candidate-generation attempts.", minimum=0, fallback="10 * num_gen_eps"),
     "gen_temperature": Parameter(float, 1.0, "Generation softmax temperature; zero selects greedy behavior.", minimum=0),
     "gen_top_frac": Parameter(float, 0.0, "Generation top-action fraction; zero disables top-fraction sampling.", minimum=0, maximum=1),
@@ -221,9 +169,9 @@ PARAMETERS: dict[str, Parameter] = {
 
 # Nested structure and group implementations own their scientific options.
 DELEGATED_KEYS = {
-    "environment": frozenset({"groups", "generated_columns"}),
+    "environment": frozenset({"groups"}),
     "structure": frozenset({"structure"}),
-    "reward": frozenset({"properties", "reward", "predict_cache_size"}),
+    "reward": frozenset({"properties", "reward"}),
 }
 _PROPERTY_OWNED_KEYS = frozenset({
     "predictor", "models", "model", "model_ref", "dp_models", "objective",
@@ -311,7 +259,6 @@ def with_generation_selection(raw: Mapping, parameter: str) -> dict:
 def validate_config(raw: Mapping) -> None:
     """Validate core values and ownership without materializing any defaults.
 
-    Call :func:`normalize_aliases` first if accepting deprecated spellings.
     Extension schemas retain authority over their own values and nested keys.
     """
     cfg = _mapping(raw, "Configuration")
@@ -404,7 +351,7 @@ def validate_config(raw: Mapping) -> None:
     for key in cfg:
         if key in known:
             continue
-        suggestions = get_close_matches(key, sorted(known | set(ALIASES)), n=1, cutoff=0.65)
+        suggestions = get_close_matches(key, sorted(known), n=1, cutoff=0.65)
         hint = f" Did you mean {suggestions[0]!r}?" if suggestions else ""
         raise ConfigError(
             f"Unknown experiment key {key!r}.{hint} "
@@ -422,29 +369,22 @@ def resolve_config(raw: Mapping, overrides: Mapping | None = None) -> ResolvedCo
     """Resolve explicit overrides over YAML, then fill fallbacks/defaults.
 
     ``None`` override values mean absent CLI options; ``False`` and ``0`` are
-    explicit values. Alias conflicts are checked within each source separately,
-    so a canonical CLI override can intentionally supersede an old YAML spelling.
+    explicit values. Only canonical parameter names are accepted.
     Both DQN and policy-gradient settings remain present regardless of method.
     """
-    cfg, sources = _normalize_aliases(raw, "yaml")
+    cfg = _mapping(raw, "Configuration")
+    sources = {key: "yaml" for key in cfg}
     selected, selection_source = _generation_selection(cfg)
     if overrides is not None:
         explicit = {key: value for key, value in _mapping(overrides, "Overrides").items() if value is not None}
-        cli, cli_sources = _normalize_aliases(explicit, "override")
+        cli = explicit
+        cli_sources = {key: "override" for key in cli}
         if any(key in cli for key in GENERATION_PARAMETERS) or _GENERATION_METADATA in cli:
             selected, selection_source = _generation_selection(cli, "override")
         cfg.update(cli)
         sources.update(cli_sources)
     validate_config(cfg)
     authored_keys = set(cfg)
-    # Resolve dependencies while presence still means explicitly specified.
-    if "dqn_warmup_eps" not in cfg and "pg_warmup_eps" in cfg:
-        cfg["dqn_warmup_eps"] = cfg["pg_warmup_eps"]
-        sources["dqn_warmup_eps"] = "derived:pg_warmup_eps"
-    for key in ("dqn_gamma", "pg_gamma"):
-        if key not in cfg and "gamma" in cfg:
-            cfg[key] = cfg["gamma"]
-            sources[key] = "derived:gamma"
     for key, spec in PARAMETERS.items():
         if key not in cfg and (spec.default is not None or spec.nullable):
             cfg[key] = deepcopy(spec.default)

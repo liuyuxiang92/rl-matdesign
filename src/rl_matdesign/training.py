@@ -591,7 +591,7 @@ def train_dqn_online(
     augment_permutations: int = 0,
     timer: Optional[object] = None,
     dqn_target_mode: str = "bootstrap",
-    train_count_duplicates: bool = True,
+    train_count_duplicates: bool = False,
     train_max_duplicate_attempts: int = 1000,
     training_samples=None,
 ) -> Tuple[torch.nn.Module, StandardScaler, List[dict]]:
@@ -1342,7 +1342,7 @@ def train_pg(
     pg_repeat_penalty_coef: float = 0.0,
     pg_repeat_penalty_shape: str = "log",
     max_train_attempts: Optional[int] = None,
-    train_count_duplicates: bool = True,
+    train_count_duplicates: bool = False,
     train_max_duplicate_attempts: int = 1000,
     checkpoint_cfg: Optional[dict] = None,
     timer: Optional[object] = None,
@@ -1868,8 +1868,7 @@ def generate_candidates(
     action_values: List[str],
     policy: Optional[torch.nn.Module] = None,
     qnet: Optional[torch.nn.Module] = None,
-    n_exploit: int = 200,
-    n_explore: int = 0,
+    num_gen_eps: int = 200,
     gen_epsilon: float = 0.0,
     gen_top_frac: float = 0.0,
     gen_temperature: float = 1.0,
@@ -1878,11 +1877,10 @@ def generate_candidates(
     charge_filter: bool = False,
     charge_use_pauling: bool = False,
 ) -> List[dict]:
-    """Generate candidate compositions in dual-phase mode.
+    """Generate up to ``num_gen_eps`` unique candidates using one sampling policy.
 
-    Produces exploitation and/or exploration candidates from the same trained
-    policy.  Unified generation flags (``gen_temperature``, ``gen_top_frac``,
-    ``gen_epsilon``) apply identically to DQN and PG methods.
+    Generation flags (``gen_temperature``, ``gen_top_frac``, ``gen_epsilon``)
+    apply identically to DQN and PG methods.
 
     Parameters
     ----------
@@ -1936,8 +1934,8 @@ def generate_candidates(
     if recorder is not None:
         # HPO consumes the immutable evaluation snapshot before scientific
         # postfilters; never query a stochastic/expensive predictor again.
-        if n_explore or n_exploit != recorder.budget.target_unique:
-            raise ValueError("HPO generation requires n_exploit=target_unique and n_explore=0")
+        if num_gen_eps != recorder.budget.target_unique:
+            raise ValueError("HPO generation requires num_gen_eps=target_unique")
         from .utils.generation_resume import predictor_snapshot, restore_generation
         contract = getattr(env, "hpo_generation_contract", None)
         resumed = getattr(env, "hpo_generation_resume", None)
@@ -1986,196 +1984,190 @@ def generate_candidates(
     seen_comp_keys: set = set()
     rows: List[dict] = []
 
-    phases = []
-    if n_exploit > 0:
-        phases.append(("exploit", n_exploit))
-    if n_explore > 0:
-        phases.append(("explore", n_explore))
+    n_target = num_gen_eps
+    accepted = 0
+    attempted = 0
+    dup_rejected = 0
+    charge_rejected = 0
+    seen_nonneutral: set = set()  # unique non-neutral keys, for diagnosis
+    max_att = max_attempts or (n_target * 20)
 
-    for purpose, n_target in phases:
-        accepted = 0
-        attempted = 0
-        dup_rejected = 0
-        charge_rejected = 0
-        seen_nonneutral: set = set()  # unique non-neutral keys, for diagnosis
-        max_att = max_attempts or (n_target * 20)
+    pbar = tqdm(total=n_target, desc="Generate")
+    while accepted < n_target and attempted < max_att:
+        attempted += 1
 
-        pbar = tqdm(total=n_target, desc=f"Generate [{purpose}]")
-        while accepted < n_target and attempted < max_att:
-            attempted += 1
+        try:
+            episode = evaluator.next(
+                rollout_generation,
+                limit=min(n_target - accepted, max_att - attempted + 1),
+                phase="generate",
+            )
+        except (CandidateEvaluationFailed, InfeasibleEpisode) as exc:
+            # Unlike training, generation already has a generous, separate
+            # attempts budget (max_att) distinct from `n_target` -- treat
+            # this exactly like a rejected duplicate/infeasible candidate
+            # (already counted via `attempted += 1` above) rather than
+            # retrying without counting.
+            print(f"[WARN] generation candidate failed evaluation, "
+                  f"skipping: {exc}")
+            continue
 
-            try:
-                episode = evaluator.next(
-                    rollout_generation,
-                    limit=min(n_target - accepted, max_att - attempted + 1),
-                    phase="generate",
-                )
-            except (CandidateEvaluationFailed, InfeasibleEpisode) as exc:
-                # Unlike training, generation already has a generous, separate
-                # attempts budget (max_att) distinct from `n_target` -- treat
-                # this exactly like a rejected duplicate/infeasible candidate
-                # (already counted via `attempted += 1` above) rather than
-                # retrying without counting.
-                print(f"[WARN] generation candidate failed evaluation, "
-                      f"skipping: {exc}")
-                continue
+        _record_episode_timing(predictor, {
+            **_episode_timing_row(episode),
+            "phase": "generate", "episode": attempted,
+        })
+        comp     = episode.composition
+        comp_key = episode.terminal_key
 
-            _record_episode_timing(predictor, {
-                **_episode_timing_row(episode),
-                "phase": "generate", "episode": attempted,
-            })
-            comp     = episode.composition
-            comp_key = episode.terminal_key
+        if comp_key in seen_comp_keys:
+            dup_rejected += 1
+            continue
 
-            if comp_key in seen_comp_keys:
-                dup_rejected += 1
-                continue
+        # Charge-neutrality gate on the WHOLE built formula (covers
+        # builder-derived anions, e.g. SSE). Gated entirely by config: when
+        # charge_filter is False this block is skipped (no smact import).
+        # Checked BEFORE adding to seen_comp_keys and BEFORE the (cached)
+        # predictor call so that (a) repeated non-neutral picks are counted
+        # as charge rejections — not duplicates — giving a clean diagnosis of
+        # why yield is low, and (b) we don't pay a predictor call on a
+        # candidate we're about to drop.
+        if charge_filter:
+            from .constraints.charge import charge_neutral
 
-            # Charge-neutrality gate on the WHOLE built formula (covers
-            # builder-derived anions, e.g. SSE). Gated entirely by config: when
-            # charge_filter is False this block is skipped (no smact import).
-            # Checked BEFORE adding to seen_comp_keys and BEFORE the (cached)
-            # predictor call so that (a) repeated non-neutral picks are counted
-            # as charge rejections — not duplicates — giving a clean diagnosis of
-            # why yield is low, and (b) we don't pay a predictor call on a
-            # candidate we're about to drop.
-            if charge_filter:
-                from .constraints.charge import charge_neutral
-
-                # Prefer the builder's full composition label (host/derived
-                # anions the env never sees); fall back to the env pick-only
-                # formula. Same resolution as the accepted-row path below.
-                _formula = episode.formula
-                _cf = getattr(predictor, "composition_formula", None)
-                if callable(_cf):
-                    try:
-                        _full = _cf(comp)
-                        if _full:
-                            _formula = _full
-                    except Exception:
-                        pass
+            # Prefer the builder's full composition label (host/derived
+            # anions the env never sees); fall back to the env pick-only
+            # formula. Same resolution as the accepted-row path below.
+            _formula = episode.formula
+            _cf = getattr(predictor, "composition_formula", None)
+            if callable(_cf):
                 try:
-                    neutral = charge_neutral(_formula, use_pauling=charge_use_pauling)
-                except Exception:
-                    neutral = True  # lenient: never crash generation on a bad parse
-                if not neutral:
-                    seen_nonneutral.add(comp_key)
-                    charge_rejected += 1
-                    continue
-
-            # Reward from the episode (env.reward_fn already called in env.step).
-            reward = float(episode.path[-1].reward) if episode.path else 0.0
-
-            # Raw predictor values for CSV columns. OOHCatalystPredictor caches
-            # internally so this is usually a cache hit when env.reward_fn
-            # already ran -- but for a non-caching predictor, or a builder
-            # whose cache doesn't cover this call shape, it is a genuinely
-            # separate call and can independently fail (e.g. a re-run MD
-            # realization). Skip the candidate rather than crash generation;
-            # don't mark comp_key as seen, so a later attempt on the same
-            # composition can still succeed and be reported.
-            try:
-                if use_predict_raw:
-                    raw_mean, std = predictor.predict_raw(comp)
-                elif episode.prediction is not None:
-                    raw_mean, std = episode.prediction
-                else:
-                    raw_mean, std = predictor.predict(comp)
-                per_stats = predictor.per_objective_stats(comp) if use_per_obj_stats else {}
-                details_fn = getattr(predictor, "reward_details", None)
-                details = details_fn(comp) if callable(details_fn) else {}
-                metadata_fn = getattr(predictor, "candidate_metadata", None)
-                metadata = metadata_fn(comp) if callable(metadata_fn) else {}
-                if not isinstance(metadata, dict):
-                    raise TypeError("candidate_metadata must return a mapping")
-                candidate_json = json.dumps(comp, sort_keys=True, ensure_ascii=False, allow_nan=False)
-                metadata_json = json.dumps(metadata, sort_keys=True, ensure_ascii=False, allow_nan=False)
-            except EvaluationProtocolError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - any predictor/builder failure
-                print(f"[WARN] generation candidate failed fetching raw stats, "
-                      f"skipping: {type(exc).__name__}: {exc}")
-                continue
-
-            seen_comp_keys.add(comp_key)
-
-            # Prefer the builder's full composition label (includes host/derived
-            # elements the env never sees — e.g. SSE's surviving S, derived Br,
-            # charge-balanced Li); fall back to the env's pick-only formula.
-            formula = episode.formula
-            comp_formula = getattr(predictor, "composition_formula", None)
-            if callable(comp_formula):
-                try:
-                    full = comp_formula(comp)
-                    if full:
-                        formula = full
+                    _full = _cf(comp)
+                    if _full:
+                        _formula = _full
                 except Exception:
                     pass
+            try:
+                neutral = charge_neutral(_formula, use_pauling=charge_use_pauling)
+            except Exception:
+                neutral = True  # lenient: never crash generation on a bad parse
+            if not neutral:
+                seen_nonneutral.add(comp_key)
+                charge_rejected += 1
+                continue
 
-            row: dict = {
-                "formula": formula,
-                "reward": reward,
-                "dp_mean": raw_mean,
-                "candidate_json": candidate_json,
-                "metadata_json": metadata_json,
-            }
-            for name, value in metadata.items():
-                if value is None or isinstance(value, (str, bool, int, float)):
-                    row[f"meta_{name}"] = value
-            if use_per_obj_stats:
-                # Composite predictor: each property keeps its own std in
-                # native physical units. A joint dp_std across mixed units
-                # would be meaningless, so dp_std / dp_mean_minus_std stay
-                # absent (pandas writes NaN). Per-property columns below.
-                for obj_name, (m, s) in per_stats.items():
-                    row[f"obj_{obj_name}_mean"] = float(m)
-                    row[f"obj_{obj_name}_std"] = None if s is None else float(s)
+        # Reward from the episode (env.reward_fn already called in env.step).
+        reward = float(episode.path[-1].reward) if episode.path else 0.0
+
+        # Raw predictor values for CSV columns. OOHCatalystPredictor caches
+        # internally so this is usually a cache hit when env.reward_fn
+        # already ran -- but for a non-caching predictor, or a builder
+        # whose cache doesn't cover this call shape, it is a genuinely
+        # separate call and can independently fail (e.g. a re-run MD
+        # realization). Skip the candidate rather than crash generation;
+        # don't mark comp_key as seen, so a later attempt on the same
+        # composition can still succeed and be reported.
+        try:
+            if use_predict_raw:
+                raw_mean, std = predictor.predict_raw(comp)
+            elif episode.prediction is not None:
+                raw_mean, std = episode.prediction
             else:
-                row["dp_std"] = std
-                row["dp_mean_minus_std"] = None if std is None else raw_mean - k * std
-            if details:
-                if details.get("type") == "gated":
-                    row["reward_objective"] = float(details["objective"])
-                    row["gate_passed"] = bool(details["gate_passed"])
-                    for gate in details["gates"]:
-                        prefix = f"gate_{gate['name']}"
-                        row[f"{prefix}_value"] = float(gate["score"])
-                        row[f"{prefix}_passed"] = bool(gate["passed"])
-                        row[f"{prefix}_violation"] = float(gate["violation"])
-            if use_check_phase:
-                phase_ok, phase_label = predictor.check_phase(comp)
-                row["primary_ok"] = bool(phase_ok)
-                row["primary_label"] = phase_label or ""
+                raw_mean, std = predictor.predict(comp)
+            per_stats = predictor.per_objective_stats(comp) if use_per_obj_stats else {}
+            details_fn = getattr(predictor, "reward_details", None)
+            details = details_fn(comp) if callable(details_fn) else {}
+            metadata_fn = getattr(predictor, "candidate_metadata", None)
+            metadata = metadata_fn(comp) if callable(metadata_fn) else {}
+            if not isinstance(metadata, dict):
+                raise TypeError("candidate_metadata must return a mapping")
+            candidate_json = json.dumps(comp, sort_keys=True, ensure_ascii=False, allow_nan=False)
+            metadata_json = json.dumps(metadata, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        except EvaluationProtocolError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - any predictor/builder failure
+            print(f"[WARN] generation candidate failed fetching raw stats, "
+                  f"skipping: {type(exc).__name__}: {exc}")
+            continue
 
-            rows.append(row)
-            accepted += 1
-            pbar.update(1)
-            pbar.set_postfix(
-                attempts=attempted, dups=dup_rejected, charge=charge_rejected
-            )
+        seen_comp_keys.add(comp_key)
 
-        pbar.close()
-        rate = accepted / max(attempted, 1)
-        print(
-            f"[INFO] Generated {accepted}/{n_target} {purpose} candidates "
-            f"({attempted} attempts, {dup_rejected} dups, "
-            f"{charge_rejected} non-neutral [{len(seen_nonneutral)} unique], "
-            f"rate={rate:.3f})"
+        # Prefer the builder's full composition label (includes host/derived
+        # elements the env never sees — e.g. SSE's surviving S, derived Br,
+        # charge-balanced Li); fall back to the env's pick-only formula.
+        formula = episode.formula
+        comp_formula = getattr(predictor, "composition_formula", None)
+        if callable(comp_formula):
+            try:
+                full = comp_formula(comp)
+                if full:
+                    formula = full
+            except Exception:
+                pass
+
+        row: dict = {
+            "formula": formula,
+            "reward": reward,
+            "dp_mean": raw_mean,
+            "candidate_json": candidate_json,
+            "metadata_json": metadata_json,
+        }
+        for name, value in metadata.items():
+            if value is None or isinstance(value, (str, bool, int, float)):
+                row[f"meta_{name}"] = value
+        if use_per_obj_stats:
+            # Composite predictor: each property keeps its own std in
+            # native physical units. A joint dp_std across mixed units
+            # would be meaningless, so dp_std / dp_mean_minus_std stay
+            # absent (pandas writes NaN). Per-property columns below.
+            for obj_name, (m, s) in per_stats.items():
+                row[f"obj_{obj_name}_mean"] = float(m)
+                row[f"obj_{obj_name}_std"] = None if s is None else float(s)
+        else:
+            row["dp_std"] = std
+            row["dp_mean_minus_std"] = None if std is None else raw_mean - k * std
+        if details:
+            if details.get("type") == "gated":
+                row["reward_objective"] = float(details["objective"])
+                row["gate_passed"] = bool(details["gate_passed"])
+                for gate in details["gates"]:
+                    prefix = f"gate_{gate['name']}"
+                    row[f"{prefix}_value"] = float(gate["score"])
+                    row[f"{prefix}_passed"] = bool(gate["passed"])
+                    row[f"{prefix}_violation"] = float(gate["violation"])
+        if use_check_phase:
+            phase_ok, phase_label = predictor.check_phase(comp)
+            row["primary_ok"] = bool(phase_ok)
+            row["primary_label"] = phase_label or ""
+
+        rows.append(row)
+        accepted += 1
+        pbar.update(1)
+        pbar.set_postfix(
+            attempts=attempted, dups=dup_rejected, charge=charge_rejected
         )
-        if charge_filter and accepted < n_target:
-            print(
-                f"[INFO] Shortfall diagnosis [{purpose}]: of {attempted} attempts, "
-                f"{dup_rejected} were duplicates and {charge_rejected} were "
-                f"non-charge-neutral. "
-                + (
-                    "Duplication dominates: the policy keeps proposing the same "
-                    "few compositions (raise gen_temperature / gen_epsilon, or the "
-                    "neutral subspace may simply be small)."
-                    if dup_rejected >= charge_rejected
-                    else "Charge-neutrality dominates: most proposed compositions "
-                    "aren't neutral on the 0.05 grid (the neutral subspace is the "
-                    "bottleneck, not exploration)."
-                )
+
+    pbar.close()
+    rate = accepted / max(attempted, 1)
+    print(
+        f"[INFO] Generated {accepted}/{n_target} candidates "
+        f"({attempted} attempts, {dup_rejected} dups, "
+        f"{charge_rejected} non-neutral [{len(seen_nonneutral)} unique], "
+        f"rate={rate:.3f})"
+    )
+    if charge_filter and accepted < n_target:
+        print(
+            f"[INFO] Shortfall diagnosis: of {attempted} attempts, "
+            f"{dup_rejected} were duplicates and {charge_rejected} were "
+            f"non-charge-neutral. "
+            + (
+                "Duplication dominates: the policy keeps proposing the same "
+                "few compositions (raise gen_temperature / gen_epsilon, or the "
+                "neutral subspace may simply be small)."
+                if dup_rejected >= charge_rejected
+                else "Charge-neutrality dominates: most proposed compositions "
+                "aren't neutral on the 0.05 grid (the neutral subspace is the "
+                "bottleneck, not exploration)."
             )
+        )
 
     return rows

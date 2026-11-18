@@ -52,13 +52,14 @@ def test_cli_trains_typed_domain(tmp_path, domain, method, target):
     cfg = {
         "properties": [{"name": "score", "predictor": "dummy", "direction": "max", "objective": "mean"}], "groups": [DOMAINS[domain]],
         "eval_seed": 13, "train_seed": 17, "gen_seed": 19,
+        # This fixture checks fixed episode/update counts, including repeats.
+        "train_count_duplicates": True,
         "dqn_warmup_eps": 3, "dqn_num_train_eps": 3,
         "dqn_batch_size": 2, "dqn_buffer_size": 100,
         "dqn_grad_steps_per_ep": 1, "dqn_hidden_dim": 16,
         "dqn_target_update_freq": 2, "dqn_eps_anneal_eps": 4,
         "pg_warmup_eps": 3, "pg_num_iters": 1, "pg_batch_eps": 3,
         "pg_entropy_min": 0.0, "num_gen_eps": 2, "max_gen_attempts": 40,
-        "exploration_gen_eps": 0,
     }
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(cfg))
@@ -126,7 +127,7 @@ def test_generation_uses_same_legacy_prediction_as_terminal_reward(size):
                      elem_dim=labels.shape[1], frac_dim=values.feature_dim, hidden_dim=8)
     rows = generate_candidates(env=env, predictor=predictor, scaler=scaler,
                                device=torch.device("cpu"), elem_feats_scaled=labels,
-                               action_values=values, qnet=qnet, n_exploit=2, max_attempts=10)
+                               action_values=values, qnet=qnet, num_gen_eps=2, max_attempts=10)
     assert len(rows) == 2
     assert all(row["reward"] == row["dp_mean"] for row in rows)
     assert predictor.calls == int(max(row["reward"] for row in rows))
@@ -168,7 +169,7 @@ def test_metadata_retry_never_reuses_an_independent_old_raw_value(monkeypatch):
     rows = generate_candidates(env=env, predictor=predictor, scaler=scaler,
                                device=torch.device("cpu"), elem_feats_scaled=env.action_features(),
                                action_values=value_alphabet(env), qnet=torch.nn.Linear(1, 1),
-                               n_exploit=2, max_attempts=3)
+                               num_gen_eps=2, max_attempts=3)
     assert len(rows) == 2 and predictor.calls == 3
     retried = next(row for row in rows if json.loads(row["candidate_json"])["fields"]["id"] == "A")
     assert retried["reward"] == retried["dp_mean"] == retried["obj_value_mean"] == retried["meta_serial"] == 3

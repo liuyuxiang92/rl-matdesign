@@ -28,6 +28,12 @@ phase:
   - lips_pipeline_override_removed
   - filter_presence_validation
   - local_code_commit
+  - canonical_training_settings
+  - single_generation_quota
+  - fixed_prediction_cache
+  - automatic_generated_csv
+  - unique_budget_default
+  - training_settings_validation
   next: []
 state:
   parameters:
@@ -78,6 +84,11 @@ state:
     value: 'groups[].filters is the sole switch: listed filters always apply; absent or empty skips optional filters
       in every phase. constrain_training and constraints_enabled are removed.'
     source: Latest explicit user removal request 2026-11-18; verified across DQN, REINFORCE and A2C
+    confidence: high
+  - name: canonical_training_settings
+    value: Only gamma; only num_gen_eps generation quota; fixed internal200000 prediction LRU; automatic CSV fields;
+      duplicate counting false by default with positive opt-in; no old training aliases or DQN PG-warmup fallback.
+    source: Explicit user cleanup request after DQN parameter inventory, 2026-11-18
     confidence: high
   experiments:
   - name: scenario_audit
@@ -200,6 +211,21 @@ state:
     result: 543 unique tests passed:272presence/schema,127parallel,11LiPS,133integration/resume/HPO. All29config/domain
       audits pass.25filebundle matchescurrentYAML;freshinstalledwheel probe passes and all90sourcefiles match finalworktree.
     results_path: /tmp/rlmat-filter-presence-verification.json
+  - name: training_settings_initial_full_suite
+    status: failed
+    result: 2674passed,11failed,3external-asset skips in631.57seconds.
+    reason: 'Eleven fixtures assumed the old count-every-episode default: finite domains exhausted, scripted rollouts
+      ended, or fixed row/update counts mismatched unique accounting.'
+    resolution: Fixed-budget fixtures explicitly opt in; logging assertions now verify every actual rollout plus
+      unique counted totals. Source unchanged.
+    results_path: /tmp/rlmat-settings-full.xml
+  - name: training_settings_final_validation
+    status: completed
+    result: Combined unique full-suite plus corrective coverage:2685passed,3external-asset skips,zero unresolved
+      failures. Corrective suites4+38+31passed. Earlier177schema/CLI and301downstream tests also passed. All29config/domain
+      audits and installed-wheel checks pass; all92packaging input hashes remain unchanged;117Python source/script
+      files parse.
+    results_path: /tmp/rlmat-settings-final-verification.json
   decisions:
   - decision: Remove backward compatibility for retired group parameters and superseded domain/builder implementations.
     rationale: User explicitly confirmed removal; one current API avoids maintaining parallel paths. Descriptor
@@ -227,8 +253,8 @@ limitations:
 - Real DeepMD, GP, GlassPy and LAMMPS production assets are not all available locally; no numerical production parity
   claim.
 - Perovskite MD model placeholders must be replaced by compatible frozen models before simulation.
-- Code is committed locally; all configs/ changes remain uncommitted by user request. No merge or push requested
-  or performed.
+- Earlier refactor committed as d6aa69c4332fba4741aedf3a6968897d18fc94be. The verified training-parameter cleanup is
+  committed locally; use git log -1 for the final amended identity. Config YAML changes remain local-only and unstaged; no push or merge authorized.
 artifacts:
 - path: docs/design_groups.md
   role: implemented schema, descriptor and pipeline guide
@@ -239,6 +265,13 @@ artifacts:
 - path: /tmp/rl-matdesign-standard-scenario-configs-20261118/application_scenarios.zip
   role: 25 exact migrated YAMLs, including local private scenarios
 resume_instructions:
+- 'Latest cleanup complete and validated: /tmp/rlmat-settings-final-verification.json records2685unique passing
+  tests/3asset skips,29config audits and installed-wheel parity. Only gamma and one num_gen_eps quota remain. Prediction
+  cache is internal200000; CSV exports standard fields; duplicate counting defaultsfalse with positive opt-in. All
+  ten old aliases, --dp-seed, negative duplicate flag and PG-to-DQN warmup fallback removed. Latest changes are
+  committed locally on top of d6aa69c4; use git log -1 for the final amended identity. Only configs/ changes
+  remain uncommitted. Preserve local-only configs and sealed historical source evidence. No push or merge authorized.
+  Earlier commit-state notes below are historical.'
 - 'Latest user request handled: local code commit on codex/unified-material-groups, followed by DQN parameter reference.
   Use git log -1 for final amended commit identity. All configs/ changes are excluded and remain local. No merge
   or push authorized. Earlier uncommitted-state notes below are historical.'
@@ -266,4 +299,4 @@ resume_instructions:
 - Keep the25 application configs updated in this worktree configs/ directory, including locally ignored scenarios.
   User requests local-only YAML changes; exclude them from any future commit/push unless explicitly overridden.
   Do not copy into the unrelated old-code original checkout automatically.
-updated_at: '2026-11-18T08:23:23.086235+00:00'
+updated_at: '2026-11-18T08:59:54.057892+00:00'

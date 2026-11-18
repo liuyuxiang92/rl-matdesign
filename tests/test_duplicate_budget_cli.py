@@ -39,7 +39,7 @@ def _config(*, method="dqn", count_duplicates=False, categorical=False):
         "dqn_target_update_freq": 2,
         "pg_warmup_eps": 2, "pg_num_iters": 1, "pg_batch_eps": 3,
         "pg_entropy_min": 0.0, "pg_entropy_coef": 0.01,
-        "num_gen_eps": 0, "exploration_gen_eps": 0,
+        "num_gen_eps": 0,
     }
 
 
@@ -92,13 +92,13 @@ def test_dqn_unique_budget_keeps_duplicate_training_and_replay(tmp_path, target_
 
 
 @pytest.mark.parametrize("use_override", [False, True])
-def test_cli_default_or_override_counts_duplicates_and_records_effective_config(tmp_path, use_override):
+def test_yaml_or_cli_opt_in_counts_duplicates_and_records_effective_config(tmp_path, use_override):
     cfg = _config()
     cfg["dqn_num_train_eps"] = 5  # More episodes than distinct candidates.
     if use_override:
         args = ["--train-count-duplicates", "--train-max-duplicate-attempts", "7"]
     else:
-        del cfg["train_count_duplicates"]
+        cfg["train_count_duplicates"] = True
         del cfg["train_max_duplicate_attempts"]
         args = []
     proc, out = _run(tmp_path, cfg, *args)
@@ -113,10 +113,26 @@ def test_cli_default_or_override_counts_duplicates_and_records_effective_config(
     assert effective["train_max_duplicate_attempts"] == (7 if use_override else 1000)
 
 
+def test_cli_absent_setting_defaults_to_unique_candidate_budget(tmp_path):
+    cfg = _config()
+    del cfg["train_count_duplicates"]
+    proc, out = _run(tmp_path, cfg)
+    rows = _successful_rows(proc, out)
+    episodes = [r for r in rows if r["phase"] in {"dqn_warmup", "dqn_train"}]
+    assert sum(_counted(r) for r in episodes) == 3
+    assert len({r["terminal_comp_key"] for r in episodes}) == 3
+    assert len(episodes) > 3
+    assert any(not _counted(r) for r in episodes)
+    effective = json.loads((out / "run_config.json").read_text())
+    sources = json.loads((out / "config_sources.json").read_text())
+    assert effective["train_count_duplicates"] is False
+    assert sources["train_count_duplicates"] == "default"
+
+
 @pytest.mark.parametrize("method", ["reinforce", "a2c"])
 def test_pg_unique_budget_uses_categorical_identity_and_extra_updates(tmp_path, method):
-    cfg = _config(method=method, count_duplicates=True, categorical=True)
-    proc, out = _run(tmp_path, cfg, "--no-train-count-duplicates")
+    cfg = _config(method=method, categorical=True)
+    proc, out = _run(tmp_path, cfg)
     rows = _successful_rows(proc, out)
     episodes = [r for r in rows if r["phase"] == "pg_episode"]
     updates = [r for r in rows if r["phase"] == "pg_train"]

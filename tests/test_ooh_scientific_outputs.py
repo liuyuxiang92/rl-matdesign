@@ -111,8 +111,9 @@ def test_oracle_identity_records_assets_seed_and_selected_output_without_reward(
     assert predictor.oracle_identity()==original
 
 
-def test_lru_bounds_results_and_recomputes_evicted_candidates(oracle_factory):
-    predictor,counts,_=oracle_factory(((2.,),),predict_cache_size=2)
+def test_lru_bounds_results_and_recomputes_evicted_candidates(oracle_factory, monkeypatch):
+    monkeypatch.setattr("rl_matdesign.predictors.structure_score._PREDICTION_CACHE_SIZE", 2)
+    predictor,counts,_=oracle_factory(((2.,),))
     a,b,c=COMP,{'alloy':{'Ni':.6,'Fe':.4}},{'alloy':{'Ni':.7,'Fe':.3}}
     for candidate in (a,b,a,c): predictor.predict_outputs(candidate)
     assert len(predictor._stats_cache)==2 and predictor._key(b) not in predictor._stats_cache

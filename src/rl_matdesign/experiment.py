@@ -43,8 +43,6 @@ import numpy as np
 import torch
 
 from rl_matdesign.configuration import (
-    _FLAG_ALIASES,
-    _apply_flag_aliases,
     build_constraint_filter,
     build_env,
     build_predictor,
@@ -84,11 +82,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--out", help="Output directory (required unless --validate-config)")
     p.add_argument("--validate-config", action="store_true",
                    help="Print resolved settings and their sources without loading a predictor.")
-    evaluation_seed = p.add_mutually_exclusive_group()
-    evaluation_seed.add_argument("--eval-seed", type=int, default=None,
+    p.add_argument("--eval-seed", type=int, default=None,
                    help="Evaluation/structure-sampling seed; overrides YAML (default 0).")
-    evaluation_seed.add_argument("--dp-seed", dest="eval_seed", type=int, default=None,
-                   help="Deprecated alias of --eval-seed.")
     p.add_argument("--train-seed", type=int, default=None,
                    help="Training RNG seed; overrides YAML, otherwise falls back to eval_seed.")
     p.add_argument("--train-budget", type=int, default=None,
@@ -142,10 +137,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--max-gen-attempts", type=int, default=None,
                    dest="max_gen_attempts",
                    help="Max generation attempts before stopping. Default: 10 × num_gen_eps.")
-    p.add_argument("--train-count-duplicates", action=argparse.BooleanOptionalAction,
+    p.add_argument("--train-count-duplicates", action="store_true",
                    default=None,
-                   help="Count repeated terminal candidates toward training budgets (default true). "
-                        "--no-train-count-duplicates counts new candidates only; repeats still train.")
+                   help="Count repeated terminal candidates toward training budgets (default false). "
+                        "Without this flag, preserve the YAML setting; repeats still train.")
     p.add_argument("--train-max-duplicate-attempts", type=int, default=None,
                    help="Stop after this many consecutive duplicate training episodes in "
                         "unique-budget mode (default 1000). Overrides YAML.")
@@ -536,7 +531,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     dqn_target_update_freq=int(cfg["dqn_target_update_freq"]),
                     dqn_eps_anneal_eps=_eps_anneal,
                     dqn_eps_min=_eps_min,
-                    gamma=float(cfg["dqn_gamma"]),
+                    gamma=float(cfg["gamma"]),
                     hidden_dim=_hidden,
                     lr=_lr_dqn,
                     loss_name=_dqn_loss,
@@ -570,7 +565,7 @@ def _run_experiment(resources: ExitStack) -> None:
         if not args.skip_generation:
             predictor.set_phase("generate")
             set_global_seed(gen_seed, deterministic=True)
-            _n_exploit = int(cfg["num_gen_eps"])
+            _num_gen_eps = int(cfg["num_gen_eps"])
             _max_attempts = cfg["max_gen_attempts"]
             from rl_matdesign.registry import charge_check_enabled, charge_use_pauling
             with phases("generate"):
@@ -579,8 +574,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     qnet=qnet,
                     elem_feats_scaled=elem_feats_scaled,
                     action_values=action_values,
-                    n_exploit=_n_exploit,
-                    n_explore=int(cfg["exploration_gen_eps"]),
+                    num_gen_eps=_num_gen_eps,
                     gen_temperature=gen_temperature,
                     gen_top_frac=gen_top_frac,
                     gen_epsilon=gen_epsilon_gen,
@@ -603,7 +597,7 @@ def _run_experiment(resources: ExitStack) -> None:
         lr_critic            = float(cfg["pg_lr_critic"])
         pg_entropy_coef         = float(cfg["pg_entropy_coef"])
         pg_entropy_min          = float(cfg["pg_entropy_min"])
-        gamma                   = float(cfg["pg_gamma"])
+        gamma                   = float(cfg["gamma"])
         pg_repeat_penalty_coef  = float(cfg["pg_repeat_penalty_coef"])
         pg_repeat_penalty_shape = cfg["pg_repeat_penalty_shape"]
 
@@ -750,7 +744,7 @@ def _run_experiment(resources: ExitStack) -> None:
         if not args.skip_generation:
             predictor.set_phase("generate")
             set_global_seed(gen_seed, deterministic=True)
-            _n_exploit = int(cfg["num_gen_eps"])
+            _num_gen_eps = int(cfg["num_gen_eps"])
             _max_attempts = cfg["max_gen_attempts"]
             from rl_matdesign.registry import charge_check_enabled, charge_use_pauling
             with phases("generate"):
@@ -759,8 +753,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     policy=policy,
                     elem_feats_scaled=elem_feats_scaled,
                     action_values=action_values,
-                    n_exploit=_n_exploit,
-                    n_explore=int(cfg["exploration_gen_eps"]),
+                    num_gen_eps=_num_gen_eps,
                     gen_temperature=gen_temperature,
                     gen_top_frac=gen_top_frac,
                     gen_epsilon=gen_epsilon_gen,
@@ -782,9 +775,7 @@ def _run_experiment(resources: ExitStack) -> None:
     metrics.to_csv(_log_path, mode=_log_mode)
     print(f"[INFO] Training log {'appended to' if _log_mode == 'a' else 'written to'} {_log_path}", flush=True)
 
-    metrics.to_generated_csv(
-        os.path.join(args.out, "generated.csv"), columns=cfg.get("generated_columns"),
-    )
+    metrics.to_generated_csv(os.path.join(args.out, "generated.csv"))
 
     top10     = metrics.top_k("dp_mean", k=10, phase="generate")
     diversity = metrics.diversity(phase="generate")

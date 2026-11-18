@@ -29,7 +29,7 @@ def _run_smoke(tmp_path: Path, method: str) -> Path:
             "--config", str(_CONFIG),
             "--method", method,
             "--out", str(out),
-            "--dp-seed", "0",
+            "--eval-seed", "0",
             "--train-seed", "0",
             "--gen-seed", "0",
         ],

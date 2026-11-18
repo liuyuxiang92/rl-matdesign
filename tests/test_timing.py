@@ -223,7 +223,7 @@ def _run(tmp_path: Path, method: str, target_mode: str | None) -> Path:
         "--config", str(_CONFIG),
         "--method", method,
         "--out", str(out),
-        "--dp-seed", "0", "--train-seed", "0", "--gen-seed", "0",
+        "--eval-seed", "0", "--train-seed", "0", "--gen-seed", "0",
     ]
     if target_mode is not None:
         cmd += ["--dqn-target-mode", target_mode]

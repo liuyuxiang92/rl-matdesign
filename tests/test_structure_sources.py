@@ -102,13 +102,13 @@ def test_seed_is_candidate_local_typed_and_order_independent():
     assert joined == split and all(0 <= value < 2**64 for value in joined)
 
 
-def test_reward_property_order_runtime_and_cache_settings_cannot_change_seed():
+def test_reward_property_order_and_runtime_settings_cannot_change_seed():
     cfg = config()
     before = source()
     cfg["properties"].reverse()
     cfg["properties"][0].update(scale=100, direction="min")
     cfg["reward"] = {"objective": {"terms": {"a": 1, "b": 91}}}
-    cfg.update(k=5, predict_cache_size=1, method="dqn", dqn_batch_size=32)
+    cfg.update(k=5, method="dqn", dqn_batch_size=32)
     cfg["structure"]["structure_parallel"] = {"devices": [0, 1], "candidate_batch_size": 8}
     after = resolve_structure_plan(cfg, needs_structure=["b", "a"]).structure
     assert before.physical_protocol == after.physical_protocol

@@ -75,7 +75,7 @@ def test_generation_counts_rejected_attempts_without_query(size):
     rows = training.generate_candidates(
         env=env, predictor=predictor, scaler=StandardScaler().fit([[0., 1.], [1., 1.]]),
         device=torch.device("cpu"), elem_feats_scaled=np.array([[.1, .2]]), action_values=["0.5"],
-        qnet=model, n_exploit=2, max_attempts=3,
+        qnet=model, num_gen_eps=2, max_attempts=3,
     )
     assert len(rows) == 2 and env.starts == ["blocked", "A", "B"]
     assert predictor.scalar + [item for wave in predictor.waves for item in wave] == list("AB")
