@@ -41,7 +41,7 @@ class LatestPrediction:
 def _run_capture(enabled):
     inner = LatestPrediction()
     timer = PredictorTimer(inner, eval_seed=17)
-    adapter = _TerminalReward(timer, "multi_group")
+    adapter = _TerminalReward(timer)
     adapter.capture_prediction_records = enabled
     candidates = [{"x": 1}, {"x": -1}, {"x": 2}, {"x": 1}]
     results = adapter.evaluate_many(candidates)
@@ -88,7 +88,7 @@ def test_scalar_fallback_keeps_fatal_protocol_error_and_does_not_try_later_candi
 
     inner = Broken()
     timer = PredictorTimer(inner)
-    adapter = _TerminalReward(timer, "multi_group")
+    adapter = _TerminalReward(timer)
     adapter.capture_prediction_records = True
     with pytest.raises(EvaluationProtocolError, match="invalid scientific output"):
         adapter.evaluate_many([{"x": 1}, {"x": 2}, {"x": 3}])
@@ -113,7 +113,7 @@ def test_native_candidate_seeded_batch_stays_batched_when_capturing():
             return {"obj_delta_mean": self.records[candidate["x"]], "obj_delta_std": None}
 
     inner = SharedBatch()
-    adapter = _TerminalReward(PredictorTimer(inner), "multi_group")
+    adapter = _TerminalReward(PredictorTimer(inner))
     adapter.capture_prediction_records = True
     assert adapter.evaluate_many([{"x": 1}, {"x": 2}]) == [1., 2.]
     assert inner.calls == 1

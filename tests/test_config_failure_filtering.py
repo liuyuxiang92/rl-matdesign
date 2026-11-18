@@ -4,51 +4,63 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from tests.test_cross_formula_predictor import enable_source_geo_opt, RecordingBuilder, _candidate, _predictor
+from tests.test_cross_formula_predictor import RecordingBuilder, _candidate, _config
+from rl_matdesign.predictors.structure_score import StructureScorePredictor
+
+
+def _predictor(n_random_configs):
+    cfg = _config()
+    cfg["structure"]["n_random_configs"] = n_random_configs
+    return StructureScorePredictor(cfg, seed=17)
 
 
 @pytest.mark.parametrize("mode", ["scalar", "batch", "batch_scalar_builder"])
-@pytest.mark.parametrize("shared", [True, False])
-def test_top_level_relaxation_drops_failed_configs_once_and_averages_survivors(mode, shared):
-    predictor = _predictor(n_random_configs=4, share_structure=shared)
-    enable_source_geo_opt(predictor)
-    relaxed = []
-    scored = []
-    builders = ([predictor._source_builders["default"]] if shared else list(predictor._source_builders.values()))
-    if mode == "batch_scalar_builder":
-        for builder in builders:
-            builder.build_many_seeded = None
-
-    def relax(cell, *, source_id):
-        relaxed.append((cell.candidate, cell.index))
-        if cell.candidate["Fe"] == 0.1 or cell.index < 2:
-            raise RuntimeError("MD/optimizer failed or did not converge")
-        return cell
-
-    def score(prop, cells):
-        scored.append((prop["name"], cells[0].candidate, [c.index for c in cells]))
-        return float(np.mean([10.0 * c.index for c in cells])), 0.0
-
-    predictor._relax = relax
-    predictor._score = score
-    bad, good = _candidate(0.1), _candidate(0.2)
-    if mode == "scalar":
-        with pytest.raises(ValueError, match="No usable configurations"):
+def test_pipeline_relaxation_drops_failed_samples_once_and_averages_survivors(mode, tmp_path, monkeypatch):
+    from collections import Counter
+    from ase import Atoms
+    path=tmp_path / "POSCAR"
+    Atoms("Ni10",positions=np.arange(30).reshape(-1,3),cell=[50]*3,pbc=True).write(path,format="vasp")
+    cfg=_config()
+    cfg["structure"]={"builder":"pipeline","base_poscar":str(path),"n_random_configs":4,"steps":[
+        {"type":"substitute","a_site_symbol":"Ni","a_dopant_group":"alloy"},
+        {"type":"geo_opt","model":"unused.pt"}]}
+    predictor=StructureScorePredictor(cfg,seed=17)
+    builder=predictor._source_builders["structure"]
+    if mode=="batch_scalar_builder":
+        builder.build_many_seeded=None
+    calls={1:0,2:0}; relaxed=[]; scored=[]
+    def relax(atoms,*args):
+        iron=Counter(atoms.get_chemical_symbols())["Fe"]
+        index=calls[iron];calls[iron]+=1
+        relaxed.append((iron,index))
+        if iron==1 or index<2:
+            raise RuntimeError("optimizer failed or did not converge")
+        atoms.info['test_index']=index
+        return atoms
+    monkeypatch.setattr(builder,"_relax",relax)
+    def score(prop,cells):
+        indices=[cell.info['test_index'] for cell in cells]
+        scored.append((prop['name'],indices))
+        return float(np.mean([10.*index for index in indices])),0.
+    predictor._score=score
+    bad={'alloy':{'Fe':.1,'Ni':.9}}; good={'alloy':{'Fe':.2,'Ni':.8}}
+    if mode=='scalar':
+        with pytest.raises(RuntimeError,match='No structure samples succeeded'):
             predictor.predict(bad)
-        result = predictor.predict(good)
+        result=predictor.predict(good)
     else:
-        results = predictor.batch_predict([bad, good], return_exceptions=True)
-        assert isinstance(results[0], ValueError)
-        result = results[1]
+        results=predictor.batch_predict([bad,good],return_exceptions=True)
+        assert isinstance(results[0],RuntimeError)
+        result=results[1]
+    assert result==pytest.approx((2*25-25/5,None))
+    assert predictor.per_objective_stats(good)=={'benefit':(25.,0.),'cost':(25.,0.)}
+    assert all(indices==[2,3] for _,indices in scored)
+    assert len(relaxed)==8 and predictor._key(bad) not in predictor._stats_cache
+    diagnostics=predictor.source_diagnostics(good)['structure']
+    assert [row['status'] for row in diagnostics['samples']]==['failed','failed','succeeded','succeeded']
+    assert len(diagnostics['surviving_samples'])==2
 
-    # Each raw mean is (20+30)/2=25, with no denominator contribution from failures.
-    assert result == pytest.approx((2 * 25 - 25 / 5, None))
-    assert predictor.per_objective_stats(good) == {"benefit": (25.0, 0.0), "cost": (25.0, 0.0)}
-    assert all(candidate == good and indices == [2, 3] for _, candidate, indices in scored)
-    assert predictor._key(bad) not in predictor._stats_cache
-    assert len(relaxed) == (8 if shared else 12)  # Failed first property stops that formula.
-    # Diagnostics reuse the successful result, including the shortened ensemble.
-    assert sum(candidate == good for candidate, _ in relaxed) == (4 if shared else 8)
+
 
 
 @pytest.mark.parametrize("mode", ["scalar", "batch", "batch_scalar_builder"])
@@ -80,7 +92,7 @@ def test_serial_external_md_builder_observes_strict_nonconvergence(mode, monkeyp
     builder.build = build
     if mode == "batch_scalar_builder":
         builder.build_many_seeded = None
-    predictor._source_builders["default"] = builder
+    predictor._source_builders["structure"] = builder
     seen = []
     predictor._score = lambda prop, cells: (seen.append([c.index for c in cells]) or 1.0, 0.0)
     candidate = _candidate(0.2)

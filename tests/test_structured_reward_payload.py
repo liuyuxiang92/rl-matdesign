@@ -4,17 +4,19 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from rl_matdesign.configuration import _TerminalReward
+from rl_matdesign.configuration import _TerminalReward, build_env
 from rl_matdesign.encoding import decode_one_hot
-from rl_matdesign.env import CompositionEnv
+from rl_matdesign.amounts import ChemicalAmountsGroup
 from rl_matdesign.featurization import featurize_formula
 from rl_matdesign.utils.episode_batch import EpisodeBatchEvaluator
 
 
 def assign(env, label, amount):
+    active = env._active() if hasattr(env, "_active") else env
     action = next(action for action in env.allowed_actions()
-                  if decode_one_hot(action[0], env.species_set) == label
-                  and float(decode_one_hot(action[1], env.fraction_set)) == amount)
+                  for local in [env._from_union(action) if hasattr(env, "_from_union") else action]
+                  if decode_one_hot(local[0], active.species_set) == label
+                  and float(decode_one_hot(local[1], active.action_values)) == amount)
     env.step(action)
 
 
@@ -29,9 +31,9 @@ def test_scalar_and_deferred_rewards_keep_component_labels_and_amounts(size):
             self.seen.append(candidate.copy())
             return candidate["SiO2"], 0.0
     oracle = Oracle()
-    env = CompositionEnv(species_set=["SiO2", "B2O3", "Na2O"],
-                         fraction_set=["0.25", "0.50", "0.75"], n_components=2,
-                         total_units=4, reward_fn=_TerminalReward(oracle, "fraction"))
+    env, _, _ = build_env({"groups": [{"name": "glass", "kind": "composition",
+        "species_set": ["SiO2", "B2O3", "Na2O"], "amount_set": [.25, .5, .75],
+        "total": 1, "unique": True, "n_steps": 2}]}, oracle)
     paths = iter([[('SiO2', .25), ('B2O3', .75)], [('Na2O', .5), ('SiO2', .5)]])
     def rollout():
         env.initialize()
@@ -48,19 +50,19 @@ def test_scalar_and_deferred_rewards_keep_component_labels_and_amounts(size):
 
 
 def test_compound_descriptor_uses_formula_units_not_suffix_concatenation():
-    env = CompositionEnv(species_set=["SiO2", "B2O3"], fraction_set=["0.25", "0.75"],
-                         n_components=2, total_units=4)
+    env = ChemicalAmountsGroup(species_set=["SiO2", "B2O3"], amount_set=[.25, .75],
+                         n_steps=2, total=1, unique=True)
     assign(env, 'SiO2', .25)
     assign(env, 'B2O3', .75)
     assert "(SiO2)0.25" in env.terminal_formula
     np.testing.assert_allclose(featurize_formula(env.state), featurize_formula("Si0.25B1.5O2.75"))
 
 
-def test_plain_formula_callbacks_remain_supported():
-    calls = []
-    env = CompositionEnv(species_set=["Ni", "Fe"], fraction_set=["0.25", "0.75"],
-                         n_components=2, total_units=4, reward_fn=lambda formula: calls.append(formula) or 7)
-    assign(env, 'Ni', .25)
-    assign(env, 'Fe', .75)
-    assert calls == [env.terminal_formula]
-    assert env.path[-1].reward == 7
+def test_terminal_reward_requires_explicit_structured_mapping():
+    class Oracle:
+        def predict(self, candidate):
+            return 7, 0
+    reward = _TerminalReward(Oracle())
+    with pytest.raises(TypeError, match="mapping"):
+        reward("Ni0.25Fe0.75")
+    assert reward({"Ni": .25, "Fe": .75}) == 7

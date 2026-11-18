@@ -44,7 +44,6 @@ import torch
 
 from rl_matdesign.configuration import (
     _FLAG_ALIASES,
-    _FAILED_CANDIDATE_REWARD,
     _apply_flag_aliases,
     build_constraint_filter,
     build_env,
@@ -108,7 +107,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Load an existing model/checkpoint and continue training. "
                         "For PG: loads std_scaler.bin + checkpoint.pt and continues toward the total budget. "
                         "For DQN: loads std_scaler.bin + checkpoint.pt (qnet, target_net, optimizer, replay "
-                        "buffer, dp_cache, epsilon, episode counter) for exact-state resume; falls back to "
+                        "buffer, prediction caches, epsilon, episode counter) for exact-state resume; falls back to "
                         "qnet.pt (weights only — buffer/epsilon/episode reset) when no mid-checkpoint exists. "
                         "Cannot be combined with --only-generate.")
     p.add_argument("--skip-generation", action="store_true",
@@ -150,14 +149,6 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--train-max-duplicate-attempts", type=int, default=None,
                    help="Stop after this many consecutive duplicate training episodes in "
                         "unique-budget mode (default 1000). Overrides YAML.")
-    p.add_argument("--constrain-training", dest="constrain_training",
-                   action="store_true", default=None,
-                   help="Apply in-episode constraint filters during training "
-                        "(overrides config; default behavior).")
-    p.add_argument("--no-constrain-training", dest="constrain_training",
-                   action="store_false",
-                   help="Skip in-episode constraint filters during training "
-                        "(generation stays constrained). For A/B comparison.")
     args = p.parse_args(argv)
     if not args.out and not args.validate_config:
         p.error("--out is required unless --validate-config is used")
@@ -211,7 +202,7 @@ def _run_experiment(resources: ExitStack) -> None:
     override_keys = (
         "method", "eval_seed", "train_seed", "gen_seed", "dqn_loss", "train_budget",
         "dqn_augment_permutations", "dqn_target_mode", "max_gen_attempts",
-        "train_count_duplicates", "train_max_duplicate_attempts", "constrain_training",
+        "train_count_duplicates", "train_max_duplicate_attempts",
     )
     resolved = resolve_config(raw_cfg, {key: getattr(args, key) for key in override_keys})
     cfg = resolved.config
@@ -295,7 +286,7 @@ def _run_experiment(resources: ExitStack) -> None:
         # through the timer: those are the only place a training reward is
         # produced, so this single wrap accounts for every predictor call in
         # every phase. The proxy delegates unknown attributes to the real
-        # predictor, so `_cache` checkpointing and `predict_raw` still work.
+        # predictor, so result-cache checkpointing and `predict_raw` still work.
         with isolated_rng(eval_seed):
             inner_predictor = build_predictor(cfg, seed=eval_seed)
         predictor = PredictorTimer(
@@ -321,14 +312,6 @@ def _run_experiment(resources: ExitStack) -> None:
         with (manifest_path.parent / "execution_contract.json").open("w") as stream:
             json.dump(run_contract, stream, indent=2, allow_nan=False)
 
-    # Whether to apply in-episode constraint filters DURING TRAINING. Generation
-    # always stays constrained (+ post-episode drop). CLI overrides the config;
-    # default True = current behavior. Used for the constrain_training A/B test.
-    constrain_training = cfg["constrain_training"]
-    if not constrain_training:
-        print("[INFO] constrain_training=False: in-episode constraint filtering is "
-              "DISABLED during training (generation still constrained).", flush=True)
-
     if hpo_recorder is not None:
         env.hpo_recorder = hpo_recorder
         if cfg["hpo_phase"] == "generation":
@@ -350,15 +333,15 @@ def _run_experiment(resources: ExitStack) -> None:
                 use_pauling=charge_use_pauling(cfg),
             )
 
-    step_dim     = env.n_components
-    fraction_set = value_alphabet(env)
+    step_dim     = env.max_steps
+    action_values = value_alphabet(env)
 
     # Labels retain identity; values use numeric or categorical features.
     elem_feats_scaled, _elem_scaler = _precompute_elem_features(
         env.species_set, env.state_featurizer, env=env
     )
     elem_dim = int(elem_feats_scaled.shape[1])
-    frac_dim = fraction_set.feature_dim
+    frac_dim = action_values.feature_dim
 
     print(f"[INFO] step_dim={step_dim}, label_dim={elem_dim}, frac_dim={frac_dim}")
 
@@ -466,13 +449,12 @@ def _run_experiment(resources: ExitStack) -> None:
                 elif args.load_qnet:
                     raise SystemExit(f"--load-qnet path not found: {args.load_qnet}")
 
-                _predictor_cache = getattr(predictor, "_cache", None)
-
                 if _mid is not None:
                     require_execution_contract(_mid.get("execution_contract"), run_contract)
                     if _mid.get("rng_state") is None or _mid.get("predictor_ledger") is None:
                         raise ValueError("Exact resume requires RNG state and predictor ledger")
-                    predictor.load_state_dict(_mid["predictor_ledger"])
+                    from .utils.generation_resume import restore_predictor_state
+                    restore_predictor_state(predictor, _mid)
                     qnet.load_state_dict(_mid["qnet_state"])
                     target_net.load_state_dict(_mid["target_net_state"])
                     optimizer.load_state_dict(_mid["opt_state"])
@@ -486,14 +468,12 @@ def _run_experiment(resources: ExitStack) -> None:
                             f"current={_buf_size}; kept loaded rows under new maxlen.",
                             flush=True,
                         )
-                    if _predictor_cache is not None:
-                        _predictor_cache.update(_mid.get("dp_cache", {}))
                     start_ep = int(_mid["episodes_completed"])
                     eps_val  = float(_mid.get("eps", max(_eps_min, 1.0 - start_ep / _eps_anneal)))
                     print(
                         f"[INFO] DQN resume from {_resume_src}: ep={start_ep}, "
                         f"eps={eps_val:.4f}, buffer_rows={len(buffer)}, "
-                        f"dp_cache_rows={len(_predictor_cache) if _predictor_cache is not None else 0}",
+                        f"prediction_cache_rows={sum(len(value) for value in _mid.get('predictor_caches', {}).values())}",
                         flush=True,
                     )
                 else:
@@ -535,22 +515,18 @@ def _run_experiment(resources: ExitStack) -> None:
                     ),
                 }
 
-            # Thread the predictor cache into checkpoint_cfg so periodic saves include it.
+            # Save the scaler beside the first synchronized training checkpoint.
             if checkpoint_cfg is not None:
                 checkpoint_cfg["scaler_path"] = os.path.join(args.out, "std_scaler.bin")
-                _pcache = getattr(predictor, "_cache", None)
-                if _pcache is not None:
-                    checkpoint_cfg["dp_cache"] = _pcache
 
             _dqn_loss = cfg["dqn_loss"]
             _aug_K = cfg["dqn_augment_permutations"]
-            env.constraints_enabled = constrain_training  # toggle in-episode filter for training
             _t_train_start = time.perf_counter() - t_start
             with phases("train"):
                 qnet, scaler, train_rows = train_dqn_online(
                     env=env,
                     elem_feats_scaled=elem_feats_scaled,
-                    fraction_set=fraction_set,
+                    action_values=action_values,
                     device=device,
                     n_warmup_eps=int(cfg["dqn_warmup_eps"]),
                     dqn_num_train_eps=_n_train_eps,
@@ -594,7 +570,6 @@ def _run_experiment(resources: ExitStack) -> None:
         if not args.skip_generation:
             predictor.set_phase("generate")
             set_global_seed(gen_seed, deterministic=True)
-            env.constraints_enabled = True  # generation is always constrained
             _n_exploit = int(cfg["num_gen_eps"])
             _max_attempts = cfg["max_gen_attempts"]
             from rl_matdesign.registry import charge_check_enabled, charge_use_pauling
@@ -603,7 +578,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     env=env, predictor=predictor, scaler=scaler, device=device,
                     qnet=qnet,
                     elem_feats_scaled=elem_feats_scaled,
-                    fraction_set=fraction_set,
+                    action_values=action_values,
                     n_exploit=_n_exploit,
                     n_explore=int(cfg["exploration_gen_eps"]),
                     gen_temperature=gen_temperature,
@@ -677,7 +652,8 @@ def _run_experiment(resources: ExitStack) -> None:
                     require_execution_contract(_raw.get("execution_contract"), run_contract)
                     if _raw.get("rng_state") is None or _raw.get("predictor_ledger") is None:
                         raise ValueError("Exact resume requires RNG state and predictor ledger")
-                    predictor.load_state_dict(_raw["predictor_ledger"])
+                    from .utils.generation_resume import restore_predictor_state
+                    restore_predictor_state(predictor, _raw)
                     policy.load_state_dict(_raw["policy_state"])
                     if value_net is not None and _raw.get("value_net_state") is not None:
                         value_net.load_state_dict(_raw["value_net_state"])
@@ -740,7 +716,6 @@ def _run_experiment(resources: ExitStack) -> None:
             value_net = ValueNet(state_dim=state_dim, step_dim=step_dim).to(device) if method == "a2c" else None
 
         if not args.only_generate:
-            env.constraints_enabled = constrain_training  # toggle in-episode filter for training
             with phases("train"):
                 train_rows = train_pg(
                     policy=policy,
@@ -748,7 +723,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     env=env,
                     scaler=scaler,
                     elem_feats_scaled=elem_feats_scaled,
-                    fraction_set=fraction_set,
+                    action_values=action_values,
                     device=device,
                     num_iters=pg_num_iters,
                     batch_eps=pg_batch_eps,
@@ -775,7 +750,6 @@ def _run_experiment(resources: ExitStack) -> None:
         if not args.skip_generation:
             predictor.set_phase("generate")
             set_global_seed(gen_seed, deterministic=True)
-            env.constraints_enabled = True  # generation is always constrained
             _n_exploit = int(cfg["num_gen_eps"])
             _max_attempts = cfg["max_gen_attempts"]
             from rl_matdesign.registry import charge_check_enabled, charge_use_pauling
@@ -784,7 +758,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     env=env, predictor=predictor, scaler=scaler, device=device,
                     policy=policy,
                     elem_feats_scaled=elem_feats_scaled,
-                    fraction_set=fraction_set,
+                    action_values=action_values,
                     n_exploit=_n_exploit,
                     n_explore=int(cfg["exploration_gen_eps"]),
                     gen_temperature=gen_temperature,

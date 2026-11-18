@@ -21,9 +21,8 @@ from rl_matdesign.training import (
 
 ROOT = Path(__file__).resolve().parents[1]
 DOMAINS = {
-    "blank": {"name": "peptide", "kind": "sequence", "tokens": ["A", "B", "C"], "length": 3},
-    "parent": {"name": "peptide", "kind": "sequence", "tokens": ["A", "B", "C"],
-               "parent": ["A", "B", "C"], "num_mutations": 3},
+    "blank": {"name": "peptide", "kind": "categorical", "labels": [1, 2, 3], "values": ["A", "B", "C"], "n_steps": 3},
+    "subset": {"name": "peptide", "kind": "categorical", "labels": [1, 2, 3], "values": ["A", "B", "C"], "n_steps": 2},
     "fields": {"name": "conditions", "kind": "categorical", "choices": [
         {"name": "temperature", "values": [300, 350]},
         {"name": "linker", "values": [True, 1, "1"]},
@@ -31,22 +30,12 @@ DOMAINS = {
 }
 
 
-def test_stop_ends_random_rollout_and_mc_return_uses_actual_path():
+def test_exact_assignment_budget_and_mc_returns():
     calls = []
-    env = MultiGroupEnv(groups=[DOMAINS["parent"]], reward_fn=lambda candidate: calls.append(candidate) or 2.0)
-
-    def choose():
-        actions = env.allowed_actions()
-        inner = env._active()
-        if env.counter:
-            return next(a for a in actions if np.argmax(env._from_union(a)[0]) == inner._stop_label)
-        return actions[0]
-
-    env.sample_random_action = choose
+    env = MultiGroupEnv(groups=[DOMAINS["subset"]], reward_fn=lambda c: calls.append(c) or 2.0)
     _rollout_random_episode(env)
-    assert env.is_terminal and len(env.path) == 2 < env.n_components
-    assert len(calls) == 1
-    assert sum(a != b for a, b in zip(calls[0]["peptide"], DOMAINS["parent"]["parent"])) == 1
+    assert env.is_terminal and len(env.path) == env.max_steps == 2
+    assert len(calls) == 1 and len(calls[0]["peptide"]) == 2
     values = value_alphabet(env)
     buffer = collections.deque()
     labels, _ = _precompute_elem_features(env.species_set, env.state_featurizer, env=env)
@@ -61,7 +50,7 @@ def test_stop_ends_random_rollout_and_mc_return_uses_actual_path():
 @pytest.mark.parametrize("method,target", [("dqn", "mc"), ("dqn", "bootstrap"), ("a2c", "bootstrap")])
 def test_cli_trains_typed_domain(tmp_path, domain, method, target):
     cfg = {
-        "predictor": "dummy", "groups": [DOMAINS[domain]],
+        "properties": [{"name": "score", "predictor": "dummy", "direction": "max", "objective": "mean"}], "groups": [DOMAINS[domain]],
         "eval_seed": 13, "train_seed": 17, "gen_seed": 19,
         "dqn_warmup_eps": 3, "dqn_num_train_eps": 3,
         "dqn_batch_size": 2, "dqn_buffer_size": 100,
@@ -80,7 +69,7 @@ def test_cli_trains_typed_domain(tmp_path, domain, method, target):
     process = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=120)
     assert process.returncode == 0, process.stdout[-4000:] + process.stderr[-5000:]
     weights = torch.load(out / ("qnet.pt" if method == "dqn" else "policy.pt"), weights_only=True)
-    assert weights["environment_contract"]["artifact_schema_version"] == 3
+    assert weights["environment_contract"]["artifact_schema_version"] == 4
     with (out / "generated.csv").open() as stream:
         rows = list(csv.DictReader(stream))
     assert len(rows) == 2
@@ -90,15 +79,13 @@ def test_cli_trains_typed_domain(tmp_path, domain, method, target):
             assert candidate["conditions"]["temperature"] in [300, 350]
             assert type(candidate["conditions"]["linker"]) in (bool, int, str)
         else:
-            assert len(candidate["peptide"]) == 3
-            if domain == "parent":
-                assert 1 <= sum(a != b for a, b in zip(candidate["peptide"], DOMAINS["parent"]["parent"])) <= 3
+            assert len(candidate["peptide"]) == DOMAINS[domain]["n_steps"]
 
 
 def test_permutation_augmentation_retains_mc_targets_and_bounds_memory(monkeypatch):
     import itertools
     from rl_matdesign.training import _augment_episode_in_buffer
-    spec = {"name": "sequence", "kind": "sequence", "tokens": ["A", "B"], "length": 10}
+    spec = {"name": "positions", "kind": "categorical", "labels": list(range(10)), "values": ["A", "B"], "n_steps": 10}
     env = MultiGroupEnv(groups=[spec], reward_fn=lambda _: 4.0)
     _rollout_random_episode(env)
     original = list(env.path)
@@ -135,11 +122,11 @@ def test_generation_uses_same_legacy_prediction_as_terminal_reward(size):
     scaler = _fit_scaler_from_warmup(env, 3)
     labels, _ = _precompute_elem_features(env.species_set, env.state_featurizer, env=env)
     values = value_alphabet(env)
-    qnet = QRegressor(state_dim=scaler.n_features_in_, step_dim=env.n_components,
+    qnet = QRegressor(state_dim=scaler.n_features_in_, step_dim=env.max_steps,
                      elem_dim=labels.shape[1], frac_dim=values.feature_dim, hidden_dim=8)
     rows = generate_candidates(env=env, predictor=predictor, scaler=scaler,
                                device=torch.device("cpu"), elem_feats_scaled=labels,
-                               fraction_set=values, qnet=qnet, n_exploit=2, max_attempts=10)
+                               action_values=values, qnet=qnet, n_exploit=2, max_attempts=10)
     assert len(rows) == 2
     assert all(row["reward"] == row["dp_mean"] for row in rows)
     assert predictor.calls == int(max(row["reward"] for row in rows))
@@ -180,7 +167,7 @@ def test_metadata_retry_never_reuses_an_independent_old_raw_value(monkeypatch):
     monkeypatch.setattr(training, "_rollout_policy_episode", rollout)
     rows = generate_candidates(env=env, predictor=predictor, scaler=scaler,
                                device=torch.device("cpu"), elem_feats_scaled=env.action_features(),
-                               fraction_set=value_alphabet(env), qnet=torch.nn.Linear(1, 1),
+                               action_values=value_alphabet(env), qnet=torch.nn.Linear(1, 1),
                                n_exploit=2, max_attempts=3)
     assert len(rows) == 2 and predictor.calls == 3
     retried = next(row for row in rows if json.loads(row["candidate_json"])["fields"]["id"] == "A")

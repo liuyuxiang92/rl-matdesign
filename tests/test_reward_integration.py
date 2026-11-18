@@ -1,4 +1,4 @@
-"""Reward rules across structure, composition, sweep and generation consumers."""
+"""Reward rules across structure, composition, explicit conditions and generation consumers."""
 from __future__ import annotations
 
 import sys
@@ -14,17 +14,17 @@ from rl_matdesign.registry import build_reward
 class CompositionProperty:
     """Deterministic model-free leaf with property values supplied by candidate."""
     def __init__(self, cfg, *, seed=None):
-        self.name = cfg['name']
+        self.quantity = cfg['quantity']
 
     def score(self, candidate):
-        return candidate[self.name]
+        return candidate[self.quantity]
 
 
 def _cfg():
     return {
         'properties': [
-            {'name': name, 'predictor': f'{__name__}:CompositionProperty',
-             'direction': 'max', 'objective': 'mean', 'weight': 17.0}
+            {'name': name, 'predictor': f'{__name__}:CompositionProperty', 'quantity': name,
+             'direction': 'max', 'objective': 'mean'}
             for name in ['delta', 'pure', 'cost']
         ],
         'reward': {
@@ -44,7 +44,7 @@ def test_composition_only_gate_has_no_builder_and_preserves_raw_delta():
     assert not predictor._source_builders
     good = {'delta': 1200.0, 'pure': 0.8, 'cost': 20.0}
     bad = {'delta': 100000.0, 'pure': 0.6, 'cost': 0.0}
-    # Explicit reward weights replace each property's 17, with no delta scaling.
+    # Reward terms combine the unscaled benefit with half the cost.
     assert predictor.predict(good) == (1190.0, None)
     assert predictor.predict(bad)[0] == pytest.approx(-10.4)
     assert predictor.predict_raw(bad)[0] == pytest.approx(-10.4)
@@ -77,29 +77,35 @@ def test_multiple_gates_and_weighted_gate_score():
     assert [gate['passed'] for gate in details['gates']] == [True, False]
 
 
-def test_gated_sweep_and_breakdown_choose_feasible_value_and_reuse_build():
-    cfg = _cfg()
-    cfg.update(base_poscar='unused', sweep={'name': 'temperature', 'values': [300, 500]})
-    for prop in cfg['properties']:
-        prop.update(predictor='dp_property', models=['unused'], fparam=[None])
-    p = StructureScorePredictor(cfg)
-    builds = []
-    p._source_builders["default"] = SimpleNamespace(build=lambda *a, **k: builds.append(1) or [object()])
-    def score(prop, structures, *, fparam=None):
-        values = {'delta': 1000 if fparam[0] == 500 else 20,
-                  'pure': 0.2 if fparam[0] == 500 else 0.9, 'cost': 0}
-        return float(values[prop['name']]), 0.0
-    p._score = score
-    candidate = {'Fe': 1}
-    assert p.predict(candidate)[0] == 20.0
-    assert p.per_objective_stats(candidate)['temperature'] == (300.0, None)
-    assert p.reward_details(candidate)['gate_passed'] is True
-    assert len(builds) == 1  # diagnostics used the cached stats
-    breakdown = p.score_breakdown(candidate)
-    assert breakdown['best']['value'] == 300.0
-    assert breakdown['best']['reward'] == 20.0
-    assert breakdown['rows'][1]['reward_details']['gate_passed'] is False
-    assert p.raw_combine(breakdown['best']['stats']) == 20.0
+def _structure(count=1):
+    return {'builder':'pipeline','base_poscar':'unused','n_random_configs':count,
+            'steps':[{'type':'substitute','a_site_symbol':'Fe','a_dopant_group':'alloy'}]}
+
+
+def test_explicit_condition_pairs_and_breakdown_preserve_shared_condition_maximum():
+    cfg={'structure':_structure(),'properties':[
+        {'name':f'{quantity}_{temp}','predictor':'dp_property','models':[quantity],
+         'fparam':[temp],'direction':'max','objective':'mean'}
+        for temp in (300,500) for quantity in ('conductivity','stability')],
+        'reward':{'type':'max','alternatives':[
+            {'name':f'T{temp}','terms':{f'conductivity_{temp}':.5,f'stability_{temp}':.5}}
+            for temp in (300,500)]}}
+    p=StructureScorePredictor(cfg)
+    builds=[]
+    p._source_builders['structure']=SimpleNamespace(build=lambda *a,**k:builds.append(1) or [object()])
+    values={'conductivity_300':8,'stability_300':0,'conductivity_500':1,'stability_500':9}
+    p._score=lambda prop,structures:(float(values[prop['name']]),0.)
+    candidate={'Fe':1}
+    assert p.predict(candidate)==(5.,None)
+    assert p.reward_details(candidate)['selected_alternative']=='T500'
+    assert p.per_objective_stats(candidate)=={name:(float(value),0.) for name,value in values.items()}
+    assert len(builds)==1
+    breakdown=p.score_breakdown(candidate)
+    assert breakdown['reward']==5.
+    assert breakdown['reward_details']['alternatives']==[{'name':'T300','score':4.},{'name':'T500','score':5.}]
+    assert p.raw_combine(breakdown['stats'])==5.
+
+
 
 
 def _class_cfg(index=2, **overrides):
@@ -107,7 +113,7 @@ def _class_cfg(index=2, **overrides):
             'head': 'synthesizability', 'output_index': index, 'direction': 'max',
             'objective': 'mean'}
     prop.update(overrides)
-    return {'base_poscar': 'unused', 'n_random_configs': 3, 'properties': [prop]}
+    return {'structure': _structure(3), 'properties': [prop]}
 
 
 @pytest.mark.parametrize('index', [None, -1, 1.5, True])
@@ -145,22 +151,15 @@ def test_classification_rejects_ambiguous_or_non_probability_config(override, ma
 
 
 @pytest.mark.parametrize('nclasses', [2, 3])
-@pytest.mark.parametrize('shared', [True, False])
-def test_classification_probability_fold_for_each_structure_regime(monkeypatch, nclasses, shared):
+def test_classification_probability_fold_for_shared_structure(monkeypatch, nclasses):
     import rl_matdesign.utils.dp_eval as dp_eval
     cfg = _class_cfg(index=nclasses - 1)
-    if not shared:
-        from tests.test_cross_formula_predictor import independent_source_config
-        cfg = independent_source_config(cfg)
     p = StructureScorePredictor(cfg)
     seen = []
     def build(candidate, *, n_configs, rng):
         seen.append(n_configs)
         return [object()] * n_configs
-    if shared:
-        p._source_builders["default"] = SimpleNamespace(build=build)
-    else:
-        p._source_builders['pure'] = SimpleNamespace(build=build)
+    p._source_builders["structure"] = SimpleNamespace(build=build)
     p._get_prop_models = lambda prop: ([object()], {})
     def evaluate(structures, models, elements, **kwargs):
         assert len(structures) == 3
@@ -216,7 +215,6 @@ def test_gated_reward_reaches_training_and_generated_csv(tmp_path, method):
 
     repo = Path(__file__).resolve().parents[1]
     cfg = yaml.safe_load((repo / 'configs/test_dummy.yaml').read_text())
-    cfg.pop('predictor')
     cfg.update(
         properties=[{'name': name, 'predictor': 'dummy', 'direction': 'max',
                      'objective': 'mean'} for name in ['delta', 'pure']],
@@ -315,9 +313,8 @@ def test_classification_weighted_sum_keeps_explicit_property_objective():
     ([[0.9, 1.0], [0.7, 0.8], [0.8, 0.9]], 0.85, np.sqrt(0.02 / 3.0)),
     ([[0.8, 1.0]], 0.9, None),
 ])
-@pytest.mark.parametrize('shared', [True, False])
 def test_classification_ensemble_gate_and_generated_csv_preserve_probability_stats(
-    monkeypatch, tmp_path, probabilities, expected_mean, expected_std, shared,
+    monkeypatch, tmp_path, probabilities, expected_mean, expected_std,
 ):
     """Use surviving configs, average each model first, and export raw statistics."""
     import csv
@@ -326,9 +323,6 @@ def test_classification_ensemble_gate_and_generated_csv_preserve_probability_sta
     import rl_matdesign.utils.dp_eval as dp_eval
 
     cfg = _classification_gate_cfg(n_models=len(probabilities))
-    if not shared:
-        from tests.test_cross_formula_predictor import independent_source_config
-        cfg = independent_source_config(cfg)
     predictor = StructureScorePredictor(cfg)
     built = []
 
@@ -337,11 +331,7 @@ def test_classification_ensemble_gate_and_generated_csv_preserve_probability_sta
         built.append(candidate)
         return [object(), object()]  # One of three requested configs was unusable.
 
-    if shared:
-        predictor._source_builders["default"] = SimpleNamespace(build=build)
-    else:
-        predictor._source_builders = {prop['name']: SimpleNamespace(build=build)
-                               for prop in predictor.properties}
+    predictor._source_builders["structure"] = SimpleNamespace(build=build)
     predictor._get_prop_models = lambda prop: ([object()] * len(prop['models']), {})
 
     def classify(structures, models, elements, **kwargs):
@@ -376,7 +366,7 @@ def test_classification_ensemble_gate_and_generated_csv_preserve_probability_sta
     monkeypatch.setattr(training, '_rollout_policy_episode', rollout)
     rows = training.generate_candidates(
         env=env, predictor=predictor, scaler=None, device=torch.device('cpu'),
-        elem_feats_scaled=np.empty((0, 0)), fraction_set=[],
+        elem_feats_scaled=np.empty((0, 0)), action_values=[],
         qnet=SimpleNamespace(eval=lambda: None), n_exploit=1, max_attempts=1,
     )
     path = tmp_path / 'generated.csv'
@@ -397,7 +387,7 @@ def test_classification_ensemble_gate_and_generated_csv_preserve_probability_sta
     assert float(row['dp_mean']) == pytest.approx(expected_raw_reward)
     assert float(row['reward_objective']) == pytest.approx(20.0)
     # Generation and raw diagnostics reuse the same evaluated configurations.
-    assert len(built) == (1 if shared else 2)
+    assert len(built) == 1
 
 
 @pytest.mark.parametrize('probabilities,expected_mean,expected_std', [
@@ -451,7 +441,7 @@ def test_combined_class_probability_reaches_ensemble_gate_and_generated_csv(
         return SimpleNamespace(predict_proba=predict_proba, get_num_classes=lambda: 3)
 
     models = [classifier(values, i) for i, values in enumerate(probabilities)]
-    predictor._source_builders["default"] = SimpleNamespace(build=build)
+    predictor._source_builders["structure"] = SimpleNamespace(build=build)
     predictor._get_prop_models = lambda prop: (
         models if prop['name'] == 'pure' else [object(), object()], {'Fe': 0},
     )
@@ -479,7 +469,7 @@ def test_combined_class_probability_reaches_ensemble_gate_and_generated_csv(
     monkeypatch.setattr(training, '_rollout_policy_episode', rollout)
     rows = training.generate_candidates(
         env=env, predictor=predictor, scaler=None, device=torch.device('cpu'),
-        elem_feats_scaled=np.empty((0, 0)), fraction_set=[],
+        elem_feats_scaled=np.empty((0, 0)), action_values=[],
         qnet=SimpleNamespace(eval=lambda: None), n_exploit=1, max_attempts=1,
     )
     path = tmp_path / 'generated.csv'

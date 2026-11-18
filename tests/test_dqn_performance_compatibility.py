@@ -200,10 +200,9 @@ def test_generation_restore_uses_source_only_comparator(release, monkeypatch):
 def test_frozen_model_load_accepts_upgrade_without_rewriting_weights(release, tmp_path, checkpoint):
     import numpy as np
     import torch
-    from rl_matdesign.env import CompositionEnv
+    from rl_matdesign.env_multigroup import MultiGroupEnv
     from rl_matdesign.utils.model_contract import load_artifact, save_weights
-    env = CompositionEnv(species_set=("Ni", "Fe", "Co"), fraction_set=["0.25", "0.50", "0.75"],
-                         total_units=4, n_components=2, state_featurizer=lambda _: np.zeros(2))
+    env = MultiGroupEnv(groups=[{'species_set': ("Ni", "Fe", "Co"), 'amount_set': ["0.25", "0.50", "0.75"], 'n_steps': 2, 'name': 'composition', 'kind': 'composition', 'unique': True, 'total': 1}], state_featurizer=lambda _: np.zeros(2))
     env.evaluation_contract = execution(release.baseline["execution"])["evaluation"]
     path = tmp_path / "qnet.pt"
     save_weights(path, torch.nn.Linear(2, 1), env, "qnet")
@@ -320,11 +319,47 @@ def test_tampered_upgrade_receipt_is_not_overwritten(campaign):
     assert path.read_bytes() == before
 
 
-def test_sealed_release_inventory_matches_all_installed_source_files():
-    current = compat.inventory_digests(compat.source_inventory(compat._source_root()))
+@pytest.mark.parametrize("installed_legacy", [False, True])
+def test_shipped_sealed_manifest_authenticates_only_its_recorded_target(monkeypatch, installed_legacy):
+    """The historical release remains valid without sealing today's runtime."""
+    path = Path(compat.__file__).with_name("dqn_performance_source.json")
+    original = path.read_bytes()
+    record = json.loads(original)
+    assert compat.inventory_digests(record["baseline_files"]) == {
+        "package": compat.BASELINE_PACKAGE_SHA256,
+        "execution": compat.BASELINE_EXECUTION_SHA256,
+    }
+    target = {**record["baseline_files"], **record["target_files"]}
+    if installed_legacy:
+        target.update(compat.LEGACY_PREDICTOR_FILES)
+    # Only the observed inventory is isolated. The shipped seal and the real
+    # validator are unchanged, unlike the synthetic mutation fixtures above.
+    monkeypatch.setattr(compat, "source_inventory", lambda _: dict(target))
+    current = compat.inventory_digests(target)
     for kind, baseline in (("package", compat.BASELINE_PACKAGE_SHA256),
                            ("execution", compat.BASELINE_EXECUTION_SHA256)):
-        assert compat.approved_performance_upgrade(baseline, current[kind], kind=kind) is not None
+        evidence = compat.approved_performance_upgrade(baseline, current[kind], kind=kind)
+        assert evidence is not None
+        assert evidence["inventory_sha256"] == hashlib.sha256(original).hexdigest()
+        assert evidence["changed_source_files"] == sorted(record["target_files"])
+        assert evidence["current_inventory_variant"] == ("legacy_predictors" if installed_legacy else "clean")
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("kind", ["package", "execution"])
+@pytest.mark.parametrize("saved_legacy", [False, True])
+def test_semantic_material_group_runtime_is_not_the_sealed_performance_release(kind, saved_legacy):
+    installed = compat.source_inventory(compat._source_root())
+    record = json.loads(Path(compat.__file__).with_name("dqn_performance_source.json").read_text())
+    sealed = {**record["baseline_files"], **record["target_files"]}
+    # This refactor adds a new scientific action domain. It must never inherit
+    # the historical storage-only migration's exact-learning guarantee.
+    assert "rl_matdesign/amounts.py" in installed
+    assert "rl_matdesign/amounts.py" not in sealed
+    baseline = (compat.LEGACY_PACKAGE_SHA256 if kind == "package" else compat.LEGACY_EXECUTION_SHA256) \
+        if saved_legacy else (compat.BASELINE_PACKAGE_SHA256 if kind == "package" else compat.BASELINE_EXECUTION_SHA256)
+    current = compat.inventory_digests(installed)[kind]
+    assert compat.approved_performance_upgrade(baseline, current, kind=kind) is None
 
 
 def test_evidence_script_is_standalone_and_does_not_import_or_modify_package(tmp_path):

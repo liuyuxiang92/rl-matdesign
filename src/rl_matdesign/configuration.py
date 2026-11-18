@@ -4,12 +4,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
 import math
-import re
 import time
-import warnings
 
-from .env import CompositionEnv
-from .env_integer import IntegerRatioEnv, normalize_integer_group_spec
 from .utils.episode_batch import CandidateEvaluationFailed, supports_partial_batch_prediction
 from .utils.rollout_errors import EvaluationProtocolError
 from .config_schema import (
@@ -32,24 +28,8 @@ def load_config(path: str) -> dict:
     if "generated_columns" in cfg:
         from .utils.metrics import validate_generated_columns
         validate_generated_columns(cfg["generated_columns"])
-    return _normalize_integer_domains(cfg)
+    return cfg
 
-
-def _normalize_integer_domains(cfg: dict) -> dict:
-    """Resolve known legacy domain declarations before recording run settings."""
-    if "groups" not in cfg:
-        return cfg
-    return {**cfg, "groups": [normalize_integer_group_spec(group)
-                              if group.get("kind") == "integer" else group
-                              for group in cfg["groups"]]}
-
-
-# ---------------------------------------------------------------------------
-# Predictor / constraint factories — thin wrappers around the registry.
-# YAML keys 'predictor' and 'constraint_filter' accept either a built-in
-# short name or a fully-qualified 'pkg.module:ClassName' for user plug-ins.
-# See src/rl_matdesign/registry.py for the dispatch logic.
-# ---------------------------------------------------------------------------
 
 def build_predictor(cfg: dict, seed: int = None):
     from rl_matdesign.registry import build_reward
@@ -57,29 +37,16 @@ def build_predictor(cfg: dict, seed: int = None):
 
 
 def build_constraint_filter(cfg: dict, env=None):
+    """Build the list of optional scientific filters for one group."""
     from rl_matdesign.registry import build_constraints
     return build_constraints(cfg, env=env)
-
-
-# Fallback reward for a terminal formula that fails to even PARSE as a valid
-# composition (env_type == "integer_ratio" only) -- this indicates a bug in
-# the env, not a legitimate build/predictor failure, so unlike a
-# CandidateEvaluationFailed (see reward_fn/mg_reward_fn below, which retries
-# with a fresh candidate instead) there is no obviously-better candidate to
-# retry with; score it as a very bad episode and move on. Large enough to be
-# unambiguous against any of this repo's real reward scales (Kelvin-scale
-# sintering temps, eV-scale energies) without risking overflow in downstream
-# mean/std or CSV arithmetic.
-_FAILED_CANDIDATE_REWARD = -2000.0
 
 
 class _TerminalReward:
     """One conversion/error policy for immediate and deferred terminal rewards."""
 
-    def __init__(self, predictor, env_type: str, anion_formula: str = "", *, k: float = 1.0):
+    def __init__(self, predictor, *, k: float = 1.0):
         self.predictor = predictor
-        self.env_type = env_type
-        self.anion_formula = anion_formula
         self.last_evaluation_timings = []
         self.last_evaluation_wall_s = 0.0
         self.last_predictions = []
@@ -114,29 +81,15 @@ class _TerminalReward:
         size = getattr(self.predictor, "evaluation_batch_size", None)
         return size() if callable(size) else 1
 
-    def _candidate(self, payload):
-        if isinstance(payload, Mapping):
-            return deepcopy(payload)
-        if self.env_type == "multi_group":
-            return payload
-        if self.env_type == "integer_ratio":
-            from pymatgen.core.composition import Composition
-            try:
-                comp = dict(Composition(payload).fractional_composition.as_dict())
-                return {str(k): float(v) for k, v in comp.items()}
-            except Exception:
-                return None  # Preserve the existing invalid-formula penalty.
-        parts = re.findall(r"([A-Z][a-z]?)([0-9]*\.?[0-9]+)", payload)
-        comp = {el: float(frac) for el, frac in parts}
-        if self.anion_formula:
-            for el, _ in re.findall(r"([A-Z][a-z]?)([0-9]*\.?[0-9]+)", self.anion_formula):
-                comp.pop(el, None)
-        return comp
+    @staticmethod
+    def _candidate(payload):
+        if not isinstance(payload, Mapping):
+            raise TypeError("Terminal candidate must be a structured mapping")
+        return deepcopy(payload)
 
     def _failure(self, payload, exc):
-        label = "candidate" if self.env_type == "multi_group" else "formula"
         return CandidateEvaluationFailed(
-            f"predictor.predict failed for {label} {payload!r}: "
+            f"predictor.predict failed for candidate {payload!r}: "
             f"{type(exc).__name__}: {exc}"
         )
 
@@ -152,14 +105,6 @@ class _TerminalReward:
         self.reset_evaluation_timing()
         started = time.perf_counter()
         candidate = self._candidate(payload)
-        if candidate is None:
-            self.last_evaluation_timings = [{}]
-            self.last_evaluation_wall_s = time.perf_counter() - started
-            self.last_prediction_records = [{
-                "reward": _FAILED_CANDIDATE_REWARD,
-                "prediction_record_error": "Invalid terminal formula; no property prediction",
-            }]
-            return _FAILED_CANDIDATE_REWARD
         try:
             result = self.predictor.predict(candidate)
             mean = self._mean(result)
@@ -182,19 +127,11 @@ class _TerminalReward:
         self.reset_evaluation_timing()
         started = time.perf_counter()
         self.last_evaluation_timings = [{} for _ in payloads]
-        results = [_FAILED_CANDIDATE_REWARD] * len(payloads)
+        results = [None] * len(payloads)
         self.last_predictions = [None] * len(payloads)
-        self.last_prediction_records = [{
-            "reward": _FAILED_CANDIDATE_REWARD,
-            "prediction_record_error": "Invalid terminal formula; no property prediction",
-        } for _ in payloads]
-        candidates, indices = [], []
-        for index, payload in enumerate(payloads):
-            candidate = self._candidate(payload)
-            if candidate is not None:
-                indices.append(index)
-                candidates.append(candidate)
-                self.last_prediction_records[index] = {}
+        self.last_prediction_records = [{} for _ in payloads]
+        candidates = [self._candidate(payload) for payload in payloads]
+        indices = list(range(len(candidates)))
         if not candidates:
             self.last_evaluation_wall_s = time.perf_counter() - started
             return results
@@ -219,7 +156,7 @@ class _TerminalReward:
                 for candidate, result in zip(candidates, predicted)
             ]
         else:
-            # A legacy plug-in need only implement predict; do not assume it
+            # A scalar plug-in need only implement predict; do not assume it
             # inherits the Protocol's default batch implementation.
             predicted = []
             timings = []
@@ -253,142 +190,64 @@ class _TerminalReward:
         return results
 
 
-def build_env(cfg: dict, predictor):
-    """Build the env + reward_fn + constraint filter used by an experiment run.
+class _SingleChemicalCandidate:
+    """Keep existing formula-only predictors' flat input at the adapter boundary."""
 
-    Single source of truth for the search space and constraints, shared by
-    ``main()`` and the baseline optimizers (``scripts/baselines/*``) so that
-    "valid candidate" means exactly the same thing for RL, BO, and GA.
+    def __init__(self, name, *, empirical=False):
+        self.name = name
+        self.empirical = empirical
 
-    Every config uses ``groups:`` — there is no separate ``env_type`` public
-    knob. Returns ``(env, env_type, flat_cfg)`` where ``env_type`` is
-    ``"fraction"`` / ``"integer_ratio"`` / ``"multi_group"`` (an *internal*
-    label describing which class ``env`` ended up being, derived from the
-    groups rather than read from the config) and ``flat_cfg`` is ``cfg``
-    except when a lone group is collapsed to a flat env (then the group's
-    params are merged in). The returned env already has its ``phase_filter``
-    attached (per-group for ``multi_group``).
-    """
-    cfg = _normalize_integer_domains(cfg)
+    def assemble_candidate(self, candidate):
+        amounts = {label: value for label, value in candidate[self.name].items() if value != 0}
+        if self.empirical:
+            from functools import reduce
+            from math import gcd
+            divisor = reduce(gcd, (abs(int(value)) for value in amounts.values()), 0) or 1
+            amounts = {label: int(value) // divisor for label, value in amounts.items() if value}
+        return amounts
+
+    def design_schema(self):
+        return {"version": 1, "kind": "single_chemical_candidate", "group": self.name,
+                "empirical_formula": self.empirical}
+
+
+def build_env(cfg, predictor):
+    """Compile the two public domains without exposing structure recipes in groups."""
+    from .env_multigroup import MultiGroupEnv
+    from .peptide_design import compile_groups
+
     if "generated_columns" in cfg:
         from .utils.metrics import validate_generated_columns
         validate_generated_columns(cfg["generated_columns"])
     if not cfg.get("groups"):
-        raise ValueError(
-            "Config has no 'groups:' — every scenario is expressed as one or "
-            "more sublattice groups now (kind: composition / categorical / "
-            "integer / sequence). See any configs/*.yaml "
-            "for examples."
-        )
-
-    from rl_matdesign.env_multigroup import normalize_group_spec
-
-    groups = cfg["groups"]
-    env_type = "multi_group"
-    flat_cfg = cfg
-
-    # Single-group auto-collapse: a lone `composition` or `integer` group is
-    # transparently built as the flat CompositionEnv/IntegerRatioEnv — same
-    # chemistry, but a flat `{el: frac}` candidate instead of
-    # `{group: {el: frac}}` — so a single-sublattice scenario can be written in
-    # the groups syntax without breaking flat predictors/builders (substitute,
-    # rf_magpie). `categorical` single groups keep group semantics and stay on
-    # MultiGroupEnv (no flat equivalent).
-    collapse_kind = str(groups[0].get("kind", "composition")) if len(groups) == 1 else None
-    if collapse_kind in ("composition", "integer"):
-        gspec = normalize_group_spec(groups[0])
-        # Group params (species_set/fraction_set/ratio_set/bounds/...) override;
-        # top-level keys (anion_formula, episode_style, builder/reward, ...) are kept.
-        flat_cfg = {**cfg, **gspec}
-        env_type = "integer_ratio" if collapse_kind == "integer" else "fraction"
-        print(f"[INFO] single {collapse_kind} group "
-              f"{groups[0].get('name', '?')!r} -> collapsed to flat "
-              f"{'IntegerRatioEnv' if collapse_kind == 'integer' else 'CompositionEnv'}")
-
-    reward_fn = _TerminalReward(predictor, env_type, cfg.get("anion_formula", ""),
-                               k=float(cfg.get("k", 1.0)))
-
-    # Build env first (without filter), then build the filter using env's
-    # feasibility tables (_allowed_units, _possible_sums_by_k), then attach.
-    # This is required for the ooh_phase filter and avoids the previous probe
-    # episode that burned RNG state before warmup (Bug 3).
-    if env_type == "integer_ratio":
-        env = IntegerRatioEnv(
-            species_set=flat_cfg["species_set"],
-            ratio_set=flat_cfg["ratio_set"],
-            n_components=flat_cfg.get("n_components", 5),
-            reward_fn=reward_fn,
-            phase_filter=None,
-            token_requirements=flat_cfg.get("token_requirements"),
-        )
-    elif env_type == "multi_group":
-        from rl_matdesign.env_multigroup import MultiGroupEnv
-
-        # Normalize each group's fraction_set/total_units, then build the
-        # per-group constraint instance (env=None — multi-group filters mask
-        # by element/level/prior-group).
-        built_groups = []
-        for g in groups:
-            gspec = normalize_group_spec(g)
-            if gspec.get("kind") == "sequence":
-                # Retained parent IDs belong to the predictor's chemical
-                # universe but never silently become replacement actions.
-                from .sequence import _token_list
-                tokens = _token_list(gspec.get("tokens"), label="sequence tokens")
-                parent = (_token_list(gspec["parent"], label="sequence parent", unique=False)
-                          if "parent" in gspec else [])
-                hook = getattr(predictor, "sequence_constraints", None)
-                if callable(hook):
-                    inferred = hook(gspec.get("name", ""), list(dict.fromkeys(tokens + parent)))
-                    if not isinstance(inferred, list) or any(not isinstance(bound, dict) for bound in inferred):
-                        raise ValueError("sequence_constraints must return a list of count-constraint mappings")
-                    configured = gspec.get("count_constraints", [])
-                    if not isinstance(configured, list):
-                        raise ValueError("count_constraints must be a list")
-                    bounds = deepcopy(configured)
-                    for bound in inferred:
-                        if bound not in bounds:
-                            bounds.append(deepcopy(bound))
-                    gspec["count_constraints"] = bounds
-            gspec["constraint_filter"] = build_constraint_filter(gspec, env=None)
-            built_groups.append(gspec)
-        env = MultiGroupEnv(groups=built_groups, reward_fn=reward_fn)
-    else:
-        env = CompositionEnv(
-            species_set=flat_cfg["species_set"],
-            fraction_set=flat_cfg["fraction_set"],
-            anion_formula=flat_cfg.get("anion_formula", ""),
-            n_components=flat_cfg.get("n_components", 5),
-            reward_fn=reward_fn,
-            phase_filter=None,
-            total_units=flat_cfg["total_units"],
-            element_bounds=flat_cfg.get("element_bounds"),
-            episode_style=flat_cfg.get("episode_style", "element_then_amount"),
-        )
-
-    # Single-group envs attach a top-level filter post-construction (some filters
-    # need the env's feasibility tables). multi_group filters live per-group.
-    # For a collapsed single group, the filter is built from the merged flat_cfg
-    # (so the group's own filters: entries are preserved).
-    if env_type != "multi_group":
-        env.phase_filter = build_constraint_filter(flat_cfg, env=env)
-        from .action_encoding import ValueSpec
-        env.value_specs = [ValueSpec(float(value), "numeric") for value in env.fraction_set]
-
-    # Keep declarative design constraints in artifact compatibility checks;
-    # mutable filter caches and RNG state are not part of this contract.
-    env.design_spec = {
-        key: deepcopy(cfg[key]) for key in (
-            "groups", "filters", "anion_formula", "episode_style",
-            "scaffold_formula", "scaffold_poscar", "scaffold_site_symbol",
-            "site_symbol", "constrain_training",
-        ) if key in cfg
-    }
-    if env_type == "multi_group":
-        # Include predictor-supplied intrinsic bounds in checkpoint contracts;
-        # transient filter objects and caches must never enter serialization.
-        env.design_spec["groups"] = [
-            {key: deepcopy(value) for key, value in group.items() if key != "constraint_filter"}
-            for group in built_groups
-        ]
-    return env, env_type, flat_cfg
+        raise ValueError("A design needs a non-empty groups list")
+    groups, adapter = compile_groups(cfg)
+    if adapter is not None:
+        validate = getattr(adapter, "validate_constraints", None)
+        hook = getattr(predictor, "sequence_constraints", None)
+        if callable(validate) and callable(hook):
+            validate(hook("peptide", list(adapter.tokens)))
+    if (adapter is None and len(groups) == 1 and groups[0].get("kind", "composition") == "composition"
+            and not cfg.get("structure")):
+        from .amounts import _menu
+        amount_spec = groups[0]["amount_set"]
+        menu = (tuple(value for values in amount_spec.values() for value in _menu(values))
+                if isinstance(amount_spec, dict) and set(amount_spec) != {"min", "max", "step"}
+                else _menu(amount_spec))
+        empirical = (groups[0].get("total") is None and all(value.denominator == 1 and value >= 0 for value in menu))
+        adapter = _SingleChemicalCandidate(groups[0]["name"], empirical=empirical)
+    reward_fn = _TerminalReward(predictor, k=float(cfg.get("k", 1.0)))
+    env = MultiGroupEnv(groups=groups, reward_fn=reward_fn, candidate_adapter=adapter)
+    for spec, inner in zip(groups, env._inners):
+        # Some filters need the domain's exact lattice tables; attach only after
+        # construction. Prior groups are supplied at each action by the wrapper.
+        inner.filters = build_constraint_filter(spec, env=inner)
+    structure = cfg.get("structure", {})
+    if structure.get("builder") == "pipeline":
+        from .design_domains import bind_pipeline_domains
+        bind_pipeline_domains(structure, groups, env)
+        env.requires_builder_formula = True
+    env.design_spec = {"schema_version": 3, "groups": deepcopy(cfg["groups"])}
+    if structure:
+        env.design_spec["structure"] = deepcopy(structure)
+    return env, "multi_group", cfg

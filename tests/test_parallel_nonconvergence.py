@@ -1,4 +1,4 @@
-"""Real worker processes discard unconverged configs in both relaxation paths."""
+"""Real workers discard unconverged external and pipeline-stage structures."""
 from __future__ import annotations
 
 import pytest
@@ -26,7 +26,7 @@ class Builder(_OriginalBuilder):
 '''
 
 
-_TOP_LEVEL_RELAXATION = '''
+_PIPELINE_RELAXATION = '''
 _OriginalDP = DP
 
 class DP(_OriginalDP):
@@ -49,7 +49,28 @@ class DP(_OriginalDP):
 '''
 
 
-@pytest.fixture(params=["external_builder", "geo_opt"])
+_PIPELINE_BUILDER = '''
+import os
+from rl_matdesign.predictors.builders.pipeline import PipelineBuilder
+
+class Builder(PipelineBuilder):
+    def __init__(self, cfg, *, seed=None):
+        super().__init__({key: cfg[key] for key in ("base_poscar", "steps")}, seed=seed)
+
+    def _build_one(self, candidate, index, rng):
+        self.candidate_id = candidate.get("id", "good")
+        return super()._build_one(candidate, index, rng)
+
+    def _relax(self, atoms, index, step, masks):
+        # Only attach test metadata; the real pipeline executes its geo_opt
+        # stage, calculator caching, convergence checks, and timing helper.
+        atoms.info.update(candidate_id=self.candidate_id,
+                          device=os.environ["CUDA_VISIBLE_DEVICES"])
+        return super()._relax(atoms, index, step, masks)
+'''
+
+
+@pytest.fixture(params=["external_builder", "pipeline_geo_opt"])
 def relaxation_pool(request, pool_factory, tmp_path):
     modules = tmp_path / "fake_modules"
     cfg = {}
@@ -58,13 +79,20 @@ def relaxation_pool(request, pool_factory, tmp_path):
         source.write_text(source.read_text() + _EXTERNAL_RELAXATION)
     else:
         source = modules / "deepmd" / "calculator.py"
-        source.write_text(source.read_text() + _TOP_LEVEL_RELAXATION)
-        cfg["geo_opt"] = {
-            "model": str(tmp_path / "calculator_initializations.jsonl"),
-            "relax_cell": False,
-            "steps": 0,
-        }
+        source.write_text(source.read_text() + _PIPELINE_RELAXATION)
+        from ase import Atoms
+        from ase.io import write
+        template = tmp_path / "POSCAR"
+        write(template, Atoms("H2", positions=[[0, 0, 0], [0, 0, .75]], cell=[5, 5, 5], pbc=True), format="vasp")
+        model = tmp_path / "calculator.pt"
+        model.write_bytes(b"fake model")
+        cfg.update(base_poscar=str(template), steps=[{
+            "type": "geo_opt", "model": str(model), "relax_cell": False, "steps": 0,
+        }])
+        (modules / "pipeline_test_builder.py").write_text(_PIPELINE_BUILDER)
     pool, _ = pool_factory(cfg_extra=cfg)
+    if request.param == "pipeline_geo_opt":
+        pool.kind = "pipeline_test_builder:Builder"
     return pool
 
 

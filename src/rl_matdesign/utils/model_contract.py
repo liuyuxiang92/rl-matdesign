@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 
-ARTIFACT_SCHEMA_VERSION = 3
+ARTIFACT_SCHEMA_VERSION = 4
 
 
 def environment_contract(env) -> dict[str, Any]:
@@ -21,13 +21,9 @@ def environment_contract(env) -> dict[str, Any]:
         # Training APIs also accept minimal external environments. Record their
         # missing alphabet explicitly; never invent a compatible material domain.
         "species": list(env.species_set) if hasattr(env, "species_set") else None,
-        "values": list(env.fraction_set) if hasattr(env, "fraction_set") else None,
-        "complete": hasattr(env, "species_set") and hasattr(env, "fraction_set"),
-        "max_steps": int(env.n_components),
-        "episode_style": getattr(env, "episode_style", "integer_accumulation"),
-        "anion_formula": getattr(env, "anion_formula", ""),
-        "total_units": getattr(env, "_total_units", None),
-        "bounds": getattr(env, "_element_unit_bounds_by_sym", None),
+        "values": list(env.action_values) if hasattr(env, "action_values") else None,
+        "complete": hasattr(env, "species_set") and hasattr(env, "action_values"),
+        "max_steps": int(env.max_steps),
         "design_spec": getattr(env, "design_spec", None),
     }
     for name in ("design_schema", "action_feature_schema"):
@@ -39,8 +35,8 @@ def environment_contract(env) -> dict[str, Any]:
         result["value_features"] = value_alphabet(env).to_schema()
     if hasattr(env, "_inners"):
         result["groups"] = [
-            {"name": name, "sites": sites, "contract": environment_contract(inner)}
-            for name, sites, inner in zip(env.group_names, env._sites, env._inners)
+            {"name": name, "contract": environment_contract(inner)}
+            for name, inner in zip(env.group_names, env._inners)
         ]
     # Tuples must compare identically after JSON/Torch serialization.
     return json.loads(json.dumps(result, sort_keys=True))

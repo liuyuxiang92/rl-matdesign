@@ -4,13 +4,14 @@ from __future__ import annotations
 import math
 
 import numpy as np
+from rl_matdesign.action_features import value_alphabet
 import pytest
 from sklearn.preprocessing import StandardScaler
 
 torch = pytest.importorskip("torch")
 
 from rl_matdesign import training
-from rl_matdesign.env import CompositionEnv
+from rl_matdesign.env_multigroup import MultiGroupEnv
 
 
 class _Policy(torch.nn.Module):
@@ -33,12 +34,7 @@ class _Value(torch.nn.Module):
 
 def _setup(monkeypatch, sequence, *, method="reinforce"):
     """Control sampled actions, retaining real env episodes and gradient terms."""
-    env = CompositionEnv(
-        species_set=["Na", "K", "Ca", "Sr"], fraction_set=["1.00"],
-        n_components=1, total_units=1,
-        state_featurizer=lambda _formula: np.array([0.0]),
-        reward_fn=lambda formula: 1.0 + len(formula),
-    )
+    env = MultiGroupEnv(groups=[{'species_set': ["Na", "K", "Ca", "Sr"], 'amount_set': ["1.00"], 'n_steps': 1, 'name': 'composition', 'kind': 'composition', 'unique': True, 'total': 1}], state_featurizer=lambda _formula: np.array([0.0]), reward_fn=lambda formula: 1.0 + len(formula))
     samples = iter(sequence)
     sampled = []
     learned = []
@@ -65,7 +61,7 @@ def _setup(monkeypatch, sequence, *, method="reinforce"):
     kwargs = dict(
         policy=policy, value_net=value_net, env=env,
         scaler=StandardScaler().fit([env.current_state_features()]),
-        elem_feats_scaled=np.eye(4), fraction_set=["1.00"],
+        elem_feats_scaled=np.eye(4), action_values=value_alphabet(env),
         device=torch.device("cpu"), num_iters=2, batch_eps=2,
         pg_repeat_penalty_coef=0.2, rl_method=method,
     )

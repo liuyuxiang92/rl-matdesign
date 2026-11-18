@@ -17,8 +17,9 @@ def test_audit_detects_missing_hpo_reference(tmp_path):
 def test_audit_detects_singleton_uncertainty(tmp_path):
     cfg = {'properties': [{'name': 'e', 'predictor': 'dp_energy', 'models': ['x.pt'],
                           'direction': 'min', 'objective': 'mean_minus_kstd',
-                          'uncertainty': 'model_spread', 'source': 'bulk'}],
-           'structure_sources': {'bulk': {'builder': 'substitute', 'base_poscar': 'missing'}}}
+                          'uncertainty': 'model_spread'}],
+           'structure': {'builder': 'pipeline', 'base_poscar': 'missing',
+                         'steps': [{'type': 'substitute', 'a_site_symbol': 'Ni', 'a_dopant_group': 'metal'}]}}
     (tmp_path / 'test.yaml').write_text(yaml.safe_dump(cfg))
     report = AUDIT(tmp_path, ['test.yaml'])
     assert report['failed'] == 1
@@ -27,8 +28,8 @@ def test_audit_detects_singleton_uncertainty(tmp_path):
 
 def test_audit_keeps_invalid_filters_visible(tmp_path):
     cfg = {'groups': [{'name': 'alloy', 'kind': 'composition', 'species_set': ['Ni', 'Fe'],
-                      'n_components': 2, 'fraction_set': ['0.5'],
-                      'filters': [{'type': 'misspelled_filter'}]}], 'predictor': 'dummy'}
+                      'n_steps': 2, 'amount_set': [.5], 'total': 1, 'unique': True,
+                      'filters': [{'type': 'misspelled_filter'}]}], 'properties': [{'name': 'quality', 'predictor': 'dummy', 'direction': 'max'}]}
     (tmp_path / 'test.yaml').write_text(yaml.safe_dump(cfg))
     report = AUDIT(tmp_path, ['test.yaml'], domains=True)
     assert report['failed'] == 1
@@ -39,7 +40,7 @@ def test_hpo_accepts_absolute_base_outside_repository(tmp_path):
     root = tmp_path / 'repo'
     root.mkdir()
     base = tmp_path / 'external.yaml'
-    base.write_text('predictor: dummy\nmethod: dqn\n')
+    base.write_text('properties: [{name: quality, predictor: dummy, direction: max}]\nmethod: dqn\n')
     (root / 'hpo.yaml').write_text(yaml.safe_dump({'base_config': str(base), 'method': 'dqn',
         'search_space': {'dqn_lr': {'dist': 'uniform', 'low': 0.0001, 'high': 0.001}}}))
     report = AUDIT(root, ['hpo.yaml'])

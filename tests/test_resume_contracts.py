@@ -70,11 +70,10 @@ def test_execution_rejects_nonfinite_contract_even_when_both_sides_match(value):
 def test_model_loading_rejects_changed_source_for_hpo_and_normal_runs(tmp_path, hpo, checkpoint):
     import numpy as np
     import torch
-    from rl_matdesign.env import CompositionEnv
+    from rl_matdesign.env_multigroup import MultiGroupEnv
     from rl_matdesign.utils.model_contract import load_artifact, save_weights
 
-    env = CompositionEnv(species_set=("Ni", "Fe", "Co"), fraction_set=["0.25", "0.50", "0.75"],
-                         total_units=4, n_components=2, state_featurizer=lambda _: np.zeros(2))
+    env = MultiGroupEnv(groups=[{'species_set': ("Ni", "Fe", "Co"), 'amount_set': ["0.25", "0.50", "0.75"], 'n_steps': 2, 'name': 'composition', 'kind': 'composition', 'unique': True, 'total': 1}], state_featurizer=lambda _: np.zeros(2))
     if hpo:
         env.hpo_recorder = object()
     env.evaluation_contract = execution()["evaluation"]

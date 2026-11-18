@@ -5,7 +5,8 @@ property values with direction, uncertainty objective, and scale already
 applied for reward optimization. This module never normalizes either input.
 Structure scoring uses mean minus std for classification gates, raw means for
 other gates; those statistics are selected by the caller.
-An omitted reward configuration preserves the existing property-weighted sum.
+Reward terms own all coefficients. A sole property has implicit coefficient 1;
+multiple properties require an explicit reward objective.
 
 A gated reward is a piecewise scalar objective, not a guarantee that every
 feasible candidate outranks every infeasible one: that guarantee also needs a
@@ -13,7 +14,7 @@ known lower bound on the passing objective and a lower failure reward.
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import math
 from numbers import Real
@@ -55,13 +56,13 @@ class _Gate:
 
 
 class RewardCombiner:
-    """Validate and evaluate ``weighted_sum`` or ``gated`` reward configuration.
+    """Validate and evaluate ``weighted_sum``, ``gated``, or ``max`` rewards.
 
     ``cfg`` is the optional ``reward:`` mapping, not the whole experiment
-    configuration. ``property_weights`` maps every available property name to
-    its legacy weight. An explicit ``objective.terms`` replaces those weights;
-    it never multiplies them a second time. Every gate scores the supplied
-    ``raw_values`` in native units; the caller selects their statistics without
+    configuration. ``property_names`` identifies the available properties.
+    All coefficients belong in reward terms; only a sole property's objective
+    can be omitted, in which case its coefficient is 1. Every gate scores the
+    supplied ``raw_values`` in native units; the caller selects their statistics without
     applying objective direction, scale, or uncertainty mode.
 
     Gate bounds are inclusive. All gates must pass; otherwise the reward is
@@ -72,32 +73,56 @@ class RewardCombiner:
     def __init__(
         self,
         cfg: Mapping[str, Any] | None,
-        property_weights: Mapping[str, float],
+        property_names: Sequence[str],
     ) -> None:
-        weights = _mapping(property_weights, "property_weights")
-        if not weights:
-            raise ValueError("property_weights must contain at least one property.")
-        self._property_weights: dict[str, float] = {}
-        for name, weight in weights.items():
+        if isinstance(property_names, (str, bytes)) or not isinstance(property_names, Sequence):
+            raise ValueError("property_names must be a sequence of names; coefficients belong in reward terms.")
+        if not property_names:
+            raise ValueError("property_names must contain at least one property.")
+        self._property_names: set[str] = set()
+        for name in property_names:
             if not isinstance(name, str) or not name.strip():
                 raise ValueError("Property names must be non-empty strings.")
-            self._property_weights[name] = _number(weight, f"property_weights[{name!r}]")
+            if name in self._property_names:
+                raise ValueError(f"Property name {name!r} duplicates an earlier property.")
+            self._property_names.add(name)
 
         config = {} if cfg is None else _mapping(cfg, "reward")
         self.type = config.get("type", "weighted_sum")
-        if self.type not in ("weighted_sum", "gated"):
-            raise ValueError("reward.type must be 'weighted_sum' or 'gated'.")
+        if self.type not in ("weighted_sum", "gated", "max"):
+            raise ValueError("reward.type must be 'weighted_sum', 'gated', or 'max'.")
         allowed = {"type", "objective"}
+        if self.type == "max":
+            allowed = {"type", "alternatives"}
         if self.type == "gated":
             allowed |= {"gates", "failure"}
         _keys(config, allowed, "reward")
 
-        self.objective_terms = (
-            self._terms(config["objective"], "reward.objective")
-            if "objective" in config else dict(self._property_weights)
-        )
+        self.objective_terms: dict[str, float] = {}
         self._gates: list[_Gate] = []
         self._failure_reward = 0.0
+        self.alternatives: list[tuple[str, dict[str, float]]] = []
+        if self.type == "max":
+            alternatives = config.get("alternatives")
+            if not isinstance(alternatives, list) or not alternatives:
+                raise ValueError("reward.alternatives must be a non-empty list for a max reward.")
+            names = set()
+            for index, item in enumerate(alternatives):
+                context = f"reward.alternatives[{index}]"
+                item = _mapping(item, context)
+                _keys(item, {"name", "terms"}, context)
+                name = item.get("name")
+                if not isinstance(name, str) or not name.strip() or name in names:
+                    raise ValueError(f"{context}.name must be a unique non-empty string.")
+                names.add(name)
+                self.alternatives.append((name, self._terms({"terms": item.get("terms")}, context)))
+            return
+        if "objective" in config:
+            self.objective_terms = self._terms(config["objective"], "reward.objective")
+        elif len(self._property_names) == 1:
+            self.objective_terms = {property_names[0]: 1.0}
+        else:
+            raise ValueError("Multiple properties require explicit reward.objective.terms.")
         if self.type == "weighted_sum":
             return
 
@@ -145,7 +170,7 @@ class RewardCombiner:
             raise ValueError(f"{context}.terms must be non-empty.")
         result: dict[str, float] = {}
         for name, weight in terms.items():
-            if name not in self._property_weights:
+            if name not in self._property_names:
                 raise ValueError(f"{context}.terms references unknown property {name!r}.")
             result[name] = _number(weight, f"{context}.terms[{name!r}]")
         return result
@@ -166,12 +191,20 @@ class RewardCombiner:
     ) -> dict[str, Any]:
         """Return the reward, objective, and per-gate diagnostics.
 
-        Extra unreferenced input keys are harmless (for example, sweep metadata).
+        Extra unreferenced input keys are harmless (for example, diagnostic metadata).
         Every referenced value must be present and finite. The returned mapping
         is fresh on each call and contains only ordinary JSON-compatible values.
         """
         raw = _mapping(raw_values, "raw_values")
         adjusted = _mapping(objective_values, "objective_values")
+        if self.type == "max":
+            alternatives = [{"name": name, "score": self._sum(terms, adjusted, "objective_values")}
+                            for name, terms in self.alternatives]
+            # Python's stable max preserves the first declared alternative on ties.
+            best = max(alternatives, key=lambda alternative: alternative["score"])
+            return {"reward": best["score"], "type": self.type, "objective": best["score"],
+                    "selected_alternative": best["name"], "alternatives": alternatives,
+                    "gate_passed": True, "gates": []}
         objective = self._sum(self.objective_terms, adjusted, "objective_values")
         diagnostics = []
         total_penalty = 0.0

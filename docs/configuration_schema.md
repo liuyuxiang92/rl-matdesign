@@ -50,33 +50,48 @@ requirements; configuration resolution alone does not certify repeatability.
 
 The core validates shared parameter types, finite numbers, ranges and choices.
 It accepts existing top-level fields declared in `DELEGATED_KEYS` according to
-ownership (environment, reward, builders, constraints, and flat predictors).
-These declarations are compatibility boundaries, **not** a claim that every
-nested option has a complete schema. `groups`, `properties`, and `filters` have
+ownership (groups, reward, structure builders, and property predictors).
+These declarations define ownership boundaries, **not** a claim that every
+nested option has a complete schema. `groups`, `properties`, and group `filters` have
 basic container validation; their scientific values are validated by owners.
 
-`structure_sources` is owned by the lightweight structure-source schema. Core
-validation checks each named source definition and the type of
-`properties[].source`, without loading templates or models, changing the authored
-configuration, or guessing external predictor capabilities. After adapters are
-resolved, `normalize_structure_sources` checks source references, unused sources,
-composition-only properties and conflicting legacy builder settings. Named sources
-are independent identities even when their definitions match.
+The singular `structure` block owns the builder, templates, sample count and
+ordered operations. Built-in structure declarations use `builder: pipeline`;
+peptide assembly uses `builder: peptide`. All structure-consuming properties
+share the resulting ensemble. `resolve_structure_plan` checks ownership and
+rejects unused structures or properties that require a missing structure without
+loading model weights or templates. Per-property sources and standalone builder
+inheritance are not supported.
 
-Invocation provenance uses the same `resolve_source_assets` function as source
-evaluation. It records and hashes list/dictionary templates, explicit relaxation
-models and the default relaxation model when enabled. A relative path owned by
+Invocation provenance uses the same `resolve_source_assets` function as structure
+evaluation. It records and hashes list/dictionary templates, explicit models in MD and relaxation operations. A relative path owned by
 an unknown external builder stays unresolved; it cannot silently become a cwd
 file merely because a file of that name exists there. Supply resolved explicit
 assets for such plugins when packaging an experiment.
 
-Reusable model instances are declared in a top-level `models` mapping. A property
-selects one with `model_ref` and chooses its named `output`. Model definitions own
-adapter options; properties own `direction`, `weight`, `scale`, `objective`,
-`source`, `output`, `unit`, `representation`, `transform`, and `uncertainty`.
-Repeating a model-defined setting at a reference is an error even when equal.
-Inline property models remain supported. A legacy top-level `models` list retains
-its flat-adapter meaning and is not a named model table.
+Every scenario declares a nonempty `properties` list. Each entry owns its
+`predictor`, optional checkpoint `models: [...]`, model options and output/reward
+selection. There is no top-level predictor shortcut, top-level model registry,
+`model_ref`, or property `model`/`dp_models` alias. A one-checkpoint model uses a
+one-item `models` list. Adapters such as GlassNet and installed peptide plugins
+may obtain their pretrained assets internally and do not require an explicit list.
+
+Identical model declarations are reused automatically. Different operating
+conditions such as `fparam` remain distinct inference requests; properties selecting
+different outputs of the same candidate and model request share the raw outputs.
+This keeps YAML explicit without loading the same ensemble repeatedly.
+
+Authored scenario files place sections in this order: `groups`, optional
+`structure`, `properties`, `reward`, then training and generation controls.
+The section order improves review; YAML key order does not change evaluation.
+
+Reward coefficients are declared only under `reward`: objective terms, gate
+score terms, or maximum-alternative terms. Property `weight` is a retired key and
+is rejected rather than migrated at runtime. A single-property weighted sum can
+omit objective terms and uses coefficient 1. Multiple-property weighted sums and
+gated rewards require explicit objective terms, which identify exactly which
+properties contribute. A property used only by a gate or retained for diagnostics
+is not passed through adjusted objective arithmetic.
 
 `representation` is `physical`, `ln`, `log10` or `pIC50`; `transform` is `none`,
 `identity`, `exp` or `pow10`. Transform validity requires the predictor's output
@@ -87,22 +102,26 @@ property objective is `mean`. An uncertainty objective needs an available select
 statistic; a missing estimate is never fabricated as zero. These changes require
 explicit review of older results that relied on implicit uncertainty penalties.
 
-An unknown top-level key is an error for built-in applications, with spelling
+An unknown top-level key is an error, with spelling
 suggestions. Predictor-specific options should normally live in that predictor's
 `properties` entry. Those entries may contain arbitrary options owned by the
 selected external predictor; a property-level FQN does not open the experiment
 root to arbitrary keys.
 
-Existing **flat** custom predictors and builders named `module:Class`, and FQN
-filters inheriting the top-level configuration, may still own additional flat
-keys. Core prefixes (`dqn_`, `pg_`, `train_`, `gen_`, `eval_`) and clear misspellings
-of core names remain reserved. No import of the plugin is needed to load this
-configuration. The plugin remains responsible for validating its own options.
+External predictors use `properties[].predictor: module:Class`; their options
+stay inside that property. Custom builder options stay inside `structure`; custom
+filter options stay inside the applicable group's filter entry. No plugin opens
+the experiment root to arbitrary keys. No plugin import is needed to load the
+configuration; the plugin validates its own scientific options.
 
-`constraint_filter: null` is tolerated while old files migrate; a non-null value
-is rejected because the current runtime requires `filters: [{type: ...}]`.
-Legacy shared structure settings are handled by the source migration owner;
-they are not reinterpreted by the core parameter defaults.
+Chemical groups require `species_set`, `amount_set`, and `n_steps`; categorical
+groups require explicit targets, available values, and `n_steps`. Only these two
+group kinds are supported. Final totals, uniqueness and bounds are intrinsic
+domain rules. Optional scientific checks use `filters: [{type: ...}]` on the
+applicable group. Listed filters always apply during warmup, training and generation;
+omitting the list (or using `filters: []`) skips optional scientific filters.
+Removed group fields, source registries, sweep declarations and
+standalone builder settings are rejected, including empty placeholders.
 
 ## Runner and HPO integration
 
@@ -160,7 +179,6 @@ parameter definitions. A test checks it for drift.
 | `hpo_phase` | str | 'train' | train, generation | HPO job phase. |
 | `hpo_target_unique` | int | None | >= 1 | HPO target successfully evaluated distinct candidates. |
 | `hpo_ratio_limit` | float | 1.5 | > 1 | Strict HPO attempts/unique upper bound. |
-| `constrain_training` | bool | True | — | Apply configured constraints during training. |
 | `train_count_duplicates` | bool | True | — | Count repeated terminal candidates toward training budgets. |
 | `train_budget` | int | None | >= 1 | Total paid training candidates; derives algorithm episode limits when set. |
 | `train_max_duplicate_attempts` | int | 1000 | >= 1 | Maximum consecutive duplicates in a unique-candidate budget. |
@@ -215,13 +233,15 @@ parameter definitions. A test checks it for drift.
 
 Legacy aliases are a migration aid, not additional independent settings.
 
-## Migrating authored pre-0.2 files
+## Updating an authored design
 
-Safe aliases are centralized; historical scientific defaults are not silently
-restored throughout the runtime. `scripts/migrate_config.py` prints a one-time
-conversion diff and can write a distinct new local file. Scientific decisions
-must be resolved explicitly; it never imports models or guesses physical units.
+Use the current [group and pipeline guide](design_groups.md). Choose numerical
+increments and their final constraints explicitly; write each operating
+condition as a named property and combine those properties in `reward`.
+Historical domain/build/structure parameter normalization has been removed.
+The unrelated training/seed aliases listed above remain centralized.
+
 Audit local files with `scripts/audit_scenarios.py --domains --inventory <local-report.json>`.
 The inventory is a local JSON object with `entries: [{"path": "relative/config.yaml"}]`.
-It contains paths, not embedded configuration bodies. Old YAML acceptance is
-distinct from compatibility of old RL weights or buffers.
+This checks configuration and initial legal actions without running a model.
+It cannot establish compatibility of old RL weights, replay, or physical models.

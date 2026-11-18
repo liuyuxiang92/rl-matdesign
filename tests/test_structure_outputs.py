@@ -10,6 +10,12 @@ from rl_matdesign.predictors.structure_score import StructureScorePredictor
 from rl_matdesign.utils.rollout_errors import EvaluationProtocolError
 
 
+def structure_config(n_configs=1):
+    """A current declaration; tests replace only the expensive construction."""
+    return {"builder": "pipeline", "base_poscar": "fake", "n_random_configs": n_configs,
+            "steps": [{"type": "substitute", "a_site_symbol": "Fe", "a_dopant_group": "alloy"}]}
+
+
 class MultiOutput:
     output_schema = {"temperature": OutputSchema("temperature", "K"),
                      "expansion": OutputSchema("expansion", "K^-1")}
@@ -39,12 +45,12 @@ def registered(monkeypatch):
 
 
 def shared_config():
-    return {"models": {"glass": {"predictor": "test:Multi", "model": "external.ckpt"}},
-            "properties": [{"name": "T", "model_ref": "glass", "output": "temperature", "direction": "max"},
-                           {"name": "alpha", "model_ref": "glass", "output": "expansion", "direction": "min"}]}
+    return {"properties": [{"name": "T", "predictor": "test:Multi", "models": ["external.ckpt"], "output": "temperature", "direction": "max"},
+                           {"name": "alpha", "predictor": "test:Multi", "models": ["external.ckpt"], "output": "expansion", "direction": "min"}],
+            "reward": {"objective": {"terms": {"T": 1, "alpha": 1}}}}
 
 
-def test_model_reference_loads_once_predicts_once_and_closes_once(registered):
+def test_identical_inline_models_load_once_predict_once_and_close_once(registered):
     _, instances = registered
     p = StructureScorePredictor(shared_config(), seed=12)
     candidate = {"SiO2": .8, "Na2O": .2}
@@ -73,13 +79,16 @@ def test_named_batch_preserves_records_after_lru_eviction(registered):
 
 
 @pytest.mark.parametrize("edit", [
-    lambda c: c["properties"][0].update(predictor="test:Multi"),
+    lambda c: c.update(models={"old": {"predictor": "test:Multi"}}),
+    lambda c: c.update(predictor="structure_score"),
+    lambda c: c.update(model="old.ckpt"),
+    lambda c: c.update(objective="mean"),
+    lambda c: c.update(uncertainty="model_spread"),
     lambda c: c["properties"][0].update(model="again"),
+    lambda c: c["properties"][0].update(dp_models=["again"]),
     lambda c: c["properties"][0].update(model_ref="missing"),
-    lambda c: c["models"].update(unused={"predictor": "test:Multi"}),
-    lambda c: c["models"]["glass"].update(direction="min"),
 ])
-def test_ambiguous_model_configuration_is_rejected(registered, edit):
+def test_retired_model_formats_are_rejected(registered, edit):
     cfg = shared_config(); edit(cfg)
     with pytest.raises(EvaluationProtocolError):
         StructureScorePredictor(cfg)
@@ -107,7 +116,7 @@ def scalar_predictor(monkeypatch, *, rows=None, folded=None, transform="none", *
     cfg = {"properties": [{"name": "p", "predictor": "test:Leaf", "direction": "max",
                             "transform": transform, **settings}]}
     if rows is not None:
-        cfg["structure_sources"] = {"s": {"builder": "substitute", "base_poscar": "fake"}}
+        cfg["structure"] = structure_config(len(rows))
         class Builder:
             def build(self, candidate, **kwargs):
                 return [object()] * len(rows)
@@ -160,18 +169,32 @@ def test_named_output_unit_conflict_and_missing_selector_are_fatal(registered):
         StructureScorePredictor(cfg).predict({"SiO2": 1})
 
 
-def test_named_sources_use_separate_inference_payloads(registered, monkeypatch):
+def test_shared_structure_reuses_matching_conditions_and_separates_distinct_conditions(registered, monkeypatch):
     registry, instances = registered
     class StructMulti(MultiOutput):
         predict_structure_outputs = MultiOutput.predict_outputs
     monkeypatch.setattr(registry, "resolve_predictor", lambda *args, **kwargs: (instances.append(StructMulti({})) or instances[-1]))
+    builds = []
     class Builder:
-        def build(self, candidate, **kwargs): return [object()]
+        def build(self, candidate, **kwargs):
+            builds.append(candidate)
+            return [object()]
     monkeypatch.setattr(registry, "resolve_builder", lambda *args, **kwargs: Builder())
-    cfg = shared_config(); cfg["structure_sources"] = {name: {"builder": "substitute", "base_poscar": "fake"} for name in ("a", "b")}
-    for prop, source in zip(cfg["properties"], ("a", "b")): prop["source"] = source
-    StructureScorePredictor(cfg).predict({"Fe": 1})
-    assert len(instances[0].calls) == 2
+    cfg = shared_config()
+    cfg["structure"] = structure_config()
+    for prop in cfg["properties"]:
+        prop["fparam"] = [300]
+    cfg["properties"].append({"name": "T_other", "predictor": "test:Multi", "models": ["external.ckpt"], "output": "temperature",
+                              "direction": "max", "fparam": [500]})
+    predictor = StructureScorePredictor(cfg)
+    candidate = {"Fe": 1}
+    outputs = predictor.predict_outputs(candidate)
+    assert set(outputs) == {"T", "alpha", "T_other"}
+    assert len(builds) == 1
+    assert len(instances) == 1
+    assert [call[1]["fparam"] for call in instances[0].calls] == [[300], [500]]
+    assert predictor.predict_outputs(candidate) == outputs
+    assert len(builds) == 1 and len(instances[0].calls) == 2
 
 
 def test_candidate_value_error_preserves_neighbor_but_invalid_contract_is_fatal(registered):
@@ -192,7 +215,7 @@ def test_candidate_value_error_preserves_neighbor_but_invalid_contract_is_fatal(
 
 def test_dp_rectangular_model_and_configuration_axes_and_raw_exp(monkeypatch):
     import rl_matdesign.utils.dp_eval as dp
-    cfg = {"base_poscar": "fake", "properties": [{"name": "p", "predictor": "dp_property", "models": ["a", "b"],
+    cfg = {"structure": structure_config(2), "properties": [{"name": "p", "predictor": "dp_property", "models": ["a", "b"],
                             "direction": "max", "transform": "exp"}]}
     p = StructureScorePredictor(cfg)
     p._get_prop_models = lambda prop: ([object(), object()], {})
@@ -206,20 +229,24 @@ def test_dp_rectangular_model_and_configuration_axes_and_raw_exp(monkeypatch):
 
 def test_physical_oracle_identity_ignores_reward_and_records_model_assets(registered, tmp_path):
     model = tmp_path / "model.ckpt"; model.write_text("weights")
-    cfg = shared_config(); cfg["models"]["glass"]["model"] = str(model)
+    cfg = shared_config()
+    for prop in cfg["properties"]:
+        prop["models"] = [str(model)]
     a = StructureScorePredictor(cfg, seed=1)
-    cfg["properties"][0].update(weight=5, scale=3, direction="min", objective="mean_plus_kstd")
+    cfg["properties"][0].update(scale=3, direction="min", objective="mean_plus_kstd")
+    cfg["reward"]["objective"]["terms"]["T"] = 5
     b = StructureScorePredictor(cfg, seed=1)
     assert a.oracle_identity() == b.oracle_identity()
-    assert a.oracle_identity()["model_assets"]["glass"][0]["status"] == "resolved"
+    assets = list(a.oracle_identity()["model_assets"].values())
+    assert len(assets) == 1 and assets[0][0]["status"] == "resolved"
     model.write_text("new weights")
     with pytest.raises(EvaluationProtocolError, match="asset changed"):
         a.predict({"SiO2": 1})
 
 
-def test_shared_model_sweep_metadata_and_outputs_use_matching_conditions(registered, monkeypatch):
+def test_shared_model_explicit_condition_metadata_and_outputs_stay_paired(registered, monkeypatch):
     registry, instances = registered
-    class Swept(MultiOutput):
+    class Conditioned(MultiOutput):
         def predict_outputs(self, candidate, *, fparam):
             self.current = fparam[0]
             self.calls.append(self.current)
@@ -227,18 +254,24 @@ def test_shared_model_sweep_metadata_and_outputs_use_matching_conditions(registe
                     for name, schema in self.output_schema.items()}
         def candidate_metadata(self, candidate):
             return {"condition": self.current}
-    monkeypatch.setattr(registry, "resolve_predictor", lambda *args, **kwargs: (instances.append(Swept({})) or instances[-1]))
-    cfg = shared_config(); cfg["sweep"] = {"name": "condition", "values": [1, 2, 3]}
-    cfg["properties"][0]["fparam"] = [None]
-    cfg["properties"][1].update(fparam=[5], weight=0)
+    monkeypatch.setattr(registry, "resolve_predictor", lambda *args, **kwargs: (instances.append(Conditioned({})) or instances[-1]))
+    cfg = shared_config()
+    cfg["properties"] = [
+        {"name": f"T{value}", "predictor": "test:Multi", "models": ["external.ckpt"], "output": "temperature", "direction": "max", "fparam": [value]}
+        for value in (1, 2, 3)] + [
+        {"name": "alpha", "predictor": "test:Multi", "models": ["external.ckpt"], "output": "expansion", "direction": "min", "fparam": [5]}]
+    cfg["reward"] = {"type": "max", "alternatives": [
+        {"name": f"condition{value}", "terms": {f"T{value}": 1.}} for value in (1, 2, 3)]}
     p = StructureScorePredictor(cfg)
     candidate = {"SiO2": 1}
     assert p.predict(candidate) == (10., None)
-    assert p.per_objective_stats(candidate)["condition"] == (2., None)
-    assert p.predict_outputs(candidate)["T"].mean == 10
-    metadata = p.candidate_metadata(candidate)
-    assert metadata == {"T": [{"condition": 2}], "alpha": [{"condition": 5}]}
-    assert instances[0].calls == [1, 5, 2, 3]  # Fixed condition reused across the entire sweep.
+    assert p.reward_details(candidate)["selected_alternative"] == "condition2"
+    assert p.per_objective_stats(candidate) == {"T1": (9., None), "T2": (10., None), "T3": (9., None), "alpha": (5., None)}
+    assert {name: output.mean for name, output in p.predict_outputs(candidate).items()} == {
+        "T1": 9., "T2": 10., "T3": 9., "alpha": 5.}
+    assert p.candidate_metadata(candidate) == {
+        "T1": [{"condition": 1}], "T2": [{"condition": 2}], "T3": [{"condition": 3}], "alpha": [{"condition": 5}]}
+    assert instances[0].calls == [1, 2, 3, 5]
 
 
 def test_external_rng_is_candidate_model_local_and_preserves_training_streams(registered, monkeypatch):
@@ -273,15 +306,16 @@ def test_external_rng_is_candidate_model_local_and_preserves_training_streams(re
     assert torch.equal(before["torch_cpu"], after["torch_cpu"])
 
 
-def test_dp_model_reference_shares_full_vector_inference(monkeypatch):
+def test_dp_identical_inline_models_share_full_vector_inference(monkeypatch):
     import rl_matdesign.registry as registry
     import rl_matdesign.utils.dp_eval as dp
     class Builder:
         def build(self, candidate, **kwargs): return [object(), object()]
     monkeypatch.setattr(registry, "resolve_builder", lambda *args, **kwargs: Builder())
-    cfg = {"base_poscar": "fake", "models": {"dpa": {"predictor": "dp_property", "models": ["a", "b"]}},
-           "properties": [{"name": "one", "model_ref": "dpa", "output_index": 0, "direction": "max"},
-                          {"name": "two", "model_ref": "dpa", "output_index": 1, "direction": "max"}]}
+    cfg = {"structure": structure_config(2),
+           "properties": [{"name": "one", "predictor": "dp_property", "models": ["a", "b"], "output_index": 0, "direction": "max"},
+                          {"name": "two", "predictor": "dp_property", "models": ["a", "b"], "output_index": 1, "direction": "max"}],
+           "reward": {"objective": {"terms": {"one": 1, "two": 1}}}}
     p = StructureScorePredictor(cfg)
     p._get_prop_models = lambda prop: ([object(), object()], {})
     calls = []
@@ -323,7 +357,7 @@ def test_cost_counters_deduplicate_shared_instances_and_keep_unknown(registered)
 
 
 def test_multiple_self_folded_models_require_raw_samples(monkeypatch):
-    p = scalar_predictor(monkeypatch, folded=(7., .2), model=["a", "b"])
+    p = scalar_predictor(monkeypatch, folded=(7., .2), models=["a", "b"])
     with pytest.raises(EvaluationProtocolError, match="Multiple self-folding"):
         p.predict({"Fe": 1})
 
@@ -334,7 +368,7 @@ def test_classifier_gate_uses_model_spread_when_reward_selects_config_spread(mon
     class Builder:
         def build(self, candidate, **kwargs): return [object(), object()]
     monkeypatch.setattr(registry, "resolve_builder", lambda *args, **kwargs: Builder())
-    cfg = {"base_poscar": "fake", "properties": [{"name": "pure", "predictor": "dp_classification",
+    cfg = {"structure": structure_config(2), "properties": [{"name": "pure", "predictor": "dp_classification",
            "models": ["a", "b"], "output_index": 1, "direction": "max",
            "objective": "mean_minus_kstd", "uncertainty": "config_spread"}],
            "reward": {"type": "gated", "gates": [{"name": "purity", "score": {"terms": {"pure": 1}}, "min": .85}],
@@ -348,3 +382,97 @@ def test_classifier_gate_uses_model_spread_when_reward_selects_config_spread(mon
     assert p.reward_details(candidate)["gate_passed"] is True
     assert p.predict(candidate) == pytest.approx((.8, None))
     assert p.raw_combine(stats) == pytest.approx(.9)
+
+
+@pytest.mark.parametrize("changed", [
+    {"models": ["different.ckpt"]}, {"head": "different"},
+    {"output_index": 1}, {"adapter_setting": True},
+])
+def test_inline_sharing_preserves_leaf_constructor_configuration(registered, changed):
+    cfg = shared_config()
+    cfg["properties"][1].update(changed)
+    predictor = StructureScorePredictor(cfg)
+    assert len(registered[1]) == 2
+    assert predictor.properties[0]["model_key"] != predictor.properties[1]["model_key"]
+
+
+def test_dp_inline_temperatures_share_loaded_ensemble_and_separate_all_conditions(monkeypatch):
+    import sys
+    import types
+    import rl_matdesign.registry as registry
+    import rl_matdesign.utils.dp_eval as dp
+
+    class Builder:
+        def build(self, candidate, **kwargs):
+            return [object()]
+    monkeypatch.setattr(registry, "resolve_builder", lambda *args, **kwargs: Builder())
+    loaded = []
+    class Model:
+        def __init__(self, model_file, **kwargs):
+            loaded.append((model_file, kwargs.get("head")))
+        def get_type_map(self):
+            return ["Fe"]
+    for name in ("deepmd", "deepmd.pt", "deepmd.pt.infer", "deepmd.pt.infer.deep_eval"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    sys.modules["deepmd.pt.infer.deep_eval"].DeepProperty = Model
+    calls = []
+    def evaluate(structures, models, types, *, fparam, aparam):
+        calls.append((fparam[0], aparam[0]))
+        value = fparam[0] + aparam[0]
+        return np.array([[[value, 10 * value]], [[value + 2, 10 * value + 2]]])
+    monkeypatch.setattr(dp, "eval_property_outputs", evaluate)
+    cfg = {"structure": structure_config(), "properties": [
+        {"name": name, "predictor": "dp_property", "models": ["one.pt", "two.pt"],
+         "head": "experiment", "direction": "max", "fparam": [temperature],
+         "aparam": [atomic], "output_index": output}
+        for name, temperature, atomic, output in (
+            ("low", 460, 1, 0), ("high", 470, 1, 0),
+            ("other_atom", 460, 2, 0), ("other_output", 460, 1, 1))],
+        "reward": {"objective": {"terms": {"low": 1, "high": 1, "other_atom": 1, "other_output": 1}}}}
+    predictor = StructureScorePredictor(cfg)
+    outputs = predictor.predict_outputs({"Fe": 1})
+    assert loaded == [("one.pt", "experiment"), ("two.pt", "experiment")]
+    assert calls == [(460, 1), (470, 1), (460, 2)]
+    assert {name: value.mean for name, value in outputs.items()} == {
+        "low": 462, "high": 472, "other_atom": 463, "other_output": 4611}
+    predictor.predict_outputs({"Fe": 2})
+    assert len(loaded) == 2 and len(calls) == 6
+
+
+def test_inline_scalar_properties_reuse_physical_call_and_matching_metadata(monkeypatch):
+    import rl_matdesign.registry as registry
+    calls = []
+    class Leaf:
+        def score(self, candidate):
+            calls.append(deepcopy(candidate))
+            return len(calls)
+        def candidate_metadata(self, candidate):
+            return {"call": len(calls)}
+    monkeypatch.setattr(registry, "resolve_predictor", lambda *args, **kwargs: Leaf())
+    cfg = {"properties": [
+        {"name": "min", "predictor": "test:Scalar", "direction": "min"},
+        {"name": "max", "predictor": "test:Scalar", "direction": "max"}],
+        "reward": {"objective": {"terms": {"min": 1, "max": 1}}}}
+    predictor = StructureScorePredictor(cfg)
+    first = predictor.predict_outputs({"Fe": 1})
+    assert {name: output.mean for name, output in first.items()} == {"min": 1, "max": 1}
+    assert predictor.candidate_metadata({"Fe": 1}) == {
+        "min": [{"call": 1}], "max": [{"call": 1}]}
+    second = predictor.predict_outputs({"Ni": 1})
+    assert {name: output.mean for name, output in second.items()} == {"min": 2, "max": 2}
+    assert calls == [{"Fe": 1}, {"Ni": 1}]
+
+
+@pytest.mark.parametrize("predictor", ["rf_magpie", "mgtransformer", "lookup", "ooh_frames",
+                                      "rl_matdesign.predictors.ooh_frames:OOHFramesPredictor"])
+def test_checkpoint_leaf_requires_public_models_before_construction(registered, predictor):
+    with pytest.raises(EvaluationProtocolError, match="needs models"):
+        StructureScorePredictor({"properties": [{"name": "p", "predictor": predictor, "direction": "max"}]})
+    assert registered[1] == []
+
+
+@pytest.mark.parametrize("models", [None, (), ("one.pt",), [], "one.pt", [None]])
+def test_public_models_is_one_strict_nonempty_list_format(registered, models):
+    with pytest.raises(EvaluationProtocolError, match="models must"):
+        StructureScorePredictor({"properties": [{"name": "p", "predictor": "test:Leaf", "direction": "max", "models": models}]})
+    assert registered[1] == []

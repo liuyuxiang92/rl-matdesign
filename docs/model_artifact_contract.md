@@ -1,9 +1,8 @@
 # State and action compatibility of RL artifacts
 
 The explicit composition state changes the inputs seen by all algorithms. It
-contains material descriptors, absolute values on fixed species labels, a
-selected mask when zero-valued assignments are legal, and remaining amount and
-slot resources. Equivalent assignments in different execution orders have the
+contains material descriptors, accumulated raw amounts on fixed species labels,
+per-label pick counts, and remaining amount and action budgets. Equivalent assignments in different execution orders have the
 same state. Different absolute budgets remain distinguishable even when their
 normalized material descriptors coincide.
 
@@ -18,8 +17,8 @@ New weight files contain `environment_contract` and a role-specific state dict:
 `rl_matdesign_contract_`. Mid-training checkpoints record the same contract
 alongside the optimizer and replay data. Contract version 3 records typed numeric/categorical action value features and the state
 schema, action vocabularies in their actual index order, environment kind,
-episode length, declared design constraints, group labels/sites, bounds and
-anion formula. Numeric scientific values use their magnitudes; categorical tokens
+episode length, declared design constraints, group labels, structure symbol
+bindings, final bounds and categorical initialization context. Numeric scientific values use their magnitudes; categorical tokens
 use identity channels, never artificial ordinal numbers. Boolean/string/number
 identities and group/position labels remain explicit. Contracts compare serialized
 types strictly (Python `True == 1` is insufficient). Equal tensor shapes alone are not evidence of compatibility.

@@ -15,7 +15,11 @@
   title: Separate native-unit gate statistics from adjusted reward objectives
   choice: reward.type defaults to weighted_sum; gated compares weighted native-unit
     property scores against inclusive bounds and applies the adjusted weighted objective
-    only when every gate passes. Explicit objective terms replace property weights.
+    only when every gate passes. Reward terms exclusively own coefficients; property
+    weight parsing and storage were removed at the user's request on 2026-11-18.
+    A single property defaults to coefficient one; multiple properties require explicit
+    objective terms (or max alternatives). Gate-only and diagnostic properties do not
+    execute adjusted objective arithmetic. HPO and reporting use the same reward terms.
     Classification selects an explicit model class index or a list of distinct indices.
     Lists sum class probabilities within each model/configuration before averaging
     surviving configurations per model and computing ensemble mean and population std.
@@ -33,8 +37,8 @@
     of the DeepMD predict_proba API.
   trade_off: A failure baseline gives strict feasible dominance only below a known
     lower bound of the feasible objective. Classification requires a compatible DeepMD
-    runtime and correct training class order. One checkpoint has zero ensemble std;
-    1-p is not this uncertainty. generate_candidates currently records gate_passed
+    runtime and correct training class order. One checkpoint cannot estimate model
+    spread; its gate margin defaults to zero. 1-p is not this uncertainty. generate_candidates currently records gate_passed
     and failed rewards without filtering failed gates from generated.csv; a final
     feasible-only list requires an explicit output filter. Configuration averaging
     uses surviving structures and cannot turn moderate probabilities into near-one
@@ -442,3 +446,110 @@
     src/rl_matdesign/utils/dqn_performance_source.json,
     src/rl_matdesign/utils/td_target_cache.py, tests/test_dqn_performance_resume.py]
   tags: [performance, scientific-contracts, hpo-restart]
+
+- id: decision-unified-design-groups-001
+  date: '2026-11-18'
+  expires: '2027-05-18'
+  title: Two public group domains and a singular composable structure pipeline
+  choice: >-
+    New configs use composition with additive amount_set, n_steps, optional total,
+    unique and final element_bounds, or categorical assignments to immutable targets.
+    Keep parent/novel peptide assembly in the structure adapter. Preserve original
+    POSCAR header blocks before ASE normalization; alphabetical site declarations
+    resolve successive blocks of each symbol without a site_map. Pipeline operations
+    consume their predecessor's structure, sharing one sampled ensemble across properties.
+    LiPS explicitly lists eight inline properties using two automatically reused ensembles and a best shared
+    temperature reward. The user explicitly confirmed "Remove retired compatibility code":
+    delete the old composition/integer/sequence readers and parameter handlers, including
+    orphan utilities after migrating behavioral coverage. Descriptor contract version 4
+    requires fresh training and do not broaden historical source-compatibility allowlists.
+  alternatives_considered:
+  - Separate fraction/integer domains and oxygen-last tokens unnecessarily constrain action order.
+  - Application-specific source registries and builders repeating template loading complicate composition.
+  - Residue-symbol lookup after each mutation cannot distinguish repeated original parent positions.
+  trade_off: >-
+    Old configs and checkpoints require migration or their archived runtime; no compatibility
+    fallback remains in the public group API. Optional CLC/DeepMD backends and real
+    scientific model/template assets remain required for numerical production validation.
+  files: [src/rl_matdesign/amounts.py, src/rl_matdesign/categorical.py,
+    src/rl_matdesign/peptide_design.py, src/rl_matdesign/predictors/builders/pipeline.py,
+    docs/design_groups.md]
+  tags: [design-domains, structure-pipeline, peptide-assignment]
+
+- id: decision-inline-properties-001
+  date: '2026-11-18'
+  expires: '2027-05-18'
+  title: One public property schema with automatic internal model reuse
+  choice: >-
+    All experiments declare properties entries with predictor, direction, objective,
+    and optional models lists. Reject top-level predictor/model/models and property
+    model/model_ref/dp_models; delete the OOH expansion shim and named-model normalizer.
+    Derive private model-sharing identities from physical constructor settings; keep
+    output selection and reward settings outside model load identity, and operating
+    conditions in inference identity. Internal single-member leaf constructors may
+    receive scalar model after the engine splits the public models list.
+    Retain 25 full scenarios: one 29-species OOH DQN MC, one attached binary-gated
+    perovskite, three default oxide objectives, and the other application families.
+    Keep those YAML files current inside the local branch's configs directory even
+    when ignored by Git. The user explicitly requires local config changes to remain
+    out of remote submissions; do not stage or include scenario YAML changes in future
+    commits/pushes without a later instruction overriding this restriction. Preserve
+    existing ignore rules and tracked status rather than untracking files implicitly.
+  alternatives_considered:
+  - A public named-model registry or OOH shortcut creates multiple config paths and hidden defaults.
+  - Loading a new model for every inline property duplicates expensive models and multioutput inference.
+  trade_off: >-
+    Inline checkpoint lists repeat across different conditions. The engine deduplicates
+    identical physical definitions internally. Old configs require migration; sealed
+    historical runtime artifacts and source hashes remain unchanged.
+  files: [src/rl_matdesign/config_schema.py, src/rl_matdesign/registry.py,
+    src/rl_matdesign/predictors/structure_score.py, src/rl_matdesign/predictors/ooh_frames.py,
+    docs/configuration_schema.md]
+  tags: [configuration, model-sharing, scientific-identity]
+
+- id: decision-flat-filter-lists-001
+  date: '2026-11-18'
+  expires: '2027-05-18'
+  title: Group filters are plain lists with implicit AND
+  choice: >-
+    Resolve groups[].filters directly to a list and apply all entries in declaration
+    order through constraints.base.apply_filters. Remove phase_pattern and chain
+    factories, classes, modules and superseded tests; current scenarios use only
+    smact_charge, pauling_en and ooh_phase. Preserve strict subset validation, empty
+    propagation and caller-input protection without a composite filter class.
+    The list is the only enable condition across warmup, training, generation and
+    baselines. No constrain_training parameter or constraints_enabled bypass exists.
+  alternatives_considered:
+  - Keeping a registered chain wrapper duplicates the list syntax and configuration ownership.
+  - Keeping unused declarative phase patterns adds unsupported scenario surface.
+  - A second phase-specific toggle contradicts the configured scientific domain; omit filters to skip them.
+  trade_off: >-
+    Old custom Python code must pass filters=[instances] instead of phase_filter.
+    Unknown-chemistry policies and remaining scientific intervals are unchanged.
+    Historical source hashes and dated validation records remain immutable evidence.
+  files: [src/rl_matdesign/constraints/base.py, src/rl_matdesign/registry.py,
+    src/rl_matdesign/amounts.py, src/rl_matdesign/categorical.py,
+    docs/constraint_filter_contract.md]
+  tags: [configuration-ownership, constraints, schema-cleanup]
+
+- id: decision-remove-noop-execution-options-001
+  date: '2026-11-18'
+  expires: '2027-05-18'
+  title: Remove fixed or ignored settings and scientific pipeline bypasses
+  choice: >-
+    Remove structure_parallel.workers_per_device, min_speedup and
+    min_successful_configs: execution already uses one worker per GPU and accepts
+    every nonempty successful ensemble. Remove LiPS --no-geo-opt; geometry runs
+    exactly when a geo_opt operation is declared. Removed keys/flags reject rather
+    than warn and ignore. Keep settings that select actual policies or physics,
+    including unique, train_count_duplicates, relax_cell, energy_per_atom,
+    allow_alloys, keep_scratch and HPO accounting/resume controls.
+  alternatives_considered:
+  - Retaining no-op knobs preserves apparent configurability while providing no behavior.
+  - Removing all booleans would eliminate meaningful choices unrelated to optional block presence.
+  trade_off: >-
+    Old configs need obsolete keys deleted. Unrelaxed standalone LiPS evaluation
+    requires a config without a geo_opt step, so scientific provenance stays explicit.
+  files: [src/rl_matdesign/utils/parallel_structures.py,
+    src/rl_matdesign/structure_sources.py, scripts/evaluate_lips.py]
+  tags: [configuration-ownership, schema-cleanup, scientific-provenance]

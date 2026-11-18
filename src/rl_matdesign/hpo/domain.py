@@ -13,7 +13,7 @@ def design_space_info(plan: dict) -> dict:
     info = {"status": "unknown", "size": None, "episode_steps": 1,
             "reason": "No exact cardinality adapter for this configured domain",
             "domain_digest": digest({k: cfg.get(k) for k in
-                ("groups", "coupling_constraints", "constraint_filter", "constraints", "anion_formula")})}
+                ("groups", "structure")})}
     # Counting paths would overcount order-equivalent compositions. Only use the
     # existing DP when its canonical-composition and filter contracts apply.
     if len(groups) == 1 and groups[0].get("kind", "composition") == "composition":
@@ -23,8 +23,8 @@ def design_space_info(plan: dict) -> dict:
         # plan stdout parseable as JSON without suppressing those diagnostics.
         with redirect_stdout(sys.stderr):
             env, _, _ = build_env(cfg, object())
-        info["episode_steps"] = int(getattr(env, "max_steps", getattr(env, "n_components", 1)))
-        if getattr(env, "phase_filter", None) is not None or cfg.get("filters") or groups[0].get("filters"):
+        info["episode_steps"] = int(env.max_steps)
+        if getattr(env, "filters", ()) or groups[0].get("filters"):
             info["reason"] = "Configured action filters have no exact counted-domain adapter"
         else:
             try:

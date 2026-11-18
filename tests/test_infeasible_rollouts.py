@@ -57,7 +57,7 @@ def test_pg_discards_prefix_before_learning_and_budget(size, method):
     value = ValueNet(state_dim=2, step_dim=2, hidden_dim=4) if method == "a2c" else None
     rows = training.train_pg(
         policy=policy, value_net=value, env=env, scaler=StandardScaler().fit([[0., 1.], [1., 1.]]),
-        elem_feats_scaled=np.array([[.1, .2]]), fraction_set=["0.5"], device=torch.device("cpu"),
+        elem_feats_scaled=np.array([[.1, .2]]), action_values=["0.5"], device=torch.device("cpu"),
         num_iters=1, batch_eps=3, rl_method=method, timer=predictor,
     )
     episodes = [row for row in rows if row["phase"] == "pg_episode"]
@@ -74,7 +74,7 @@ def test_generation_counts_rejected_attempts_without_query(size):
     model = QRegressor(state_dim=2, step_dim=2, elem_dim=2, frac_dim=1, hidden_dim=4)
     rows = training.generate_candidates(
         env=env, predictor=predictor, scaler=StandardScaler().fit([[0., 1.], [1., 1.]]),
-        device=torch.device("cpu"), elem_feats_scaled=np.array([[.1, .2]]), fraction_set=["0.5"],
+        device=torch.device("cpu"), elem_feats_scaled=np.array([[.1, .2]]), action_values=["0.5"],
         qnet=model, n_exploit=2, max_attempts=3,
     )
     assert len(rows) == 2 and env.starts == ["blocked", "A", "B"]

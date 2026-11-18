@@ -2,7 +2,7 @@
 
 Two extension paths:
 
-1. **Short name** — `predictor: ooh` or a `filters:` entry `type: smact_charge`
+1. **Short name** — `properties[].predictor: ooh_frames` or a `filters:` entry `type: smact_charge`
    in YAML resolves to a built-in factory registered in :data:`PREDICTORS` /
    :data:`CONSTRAINTS`.
 
@@ -39,28 +39,6 @@ def _make_rf_magpie(cfg: dict, **_):
     return RFMagpiePredictor(model_path=cfg["model"])
 
 
-def _make_ooh(cfg: dict, *, seed: Optional[int] = None, **_):
-    from .predictors.ooh import OOHCatalystPredictor
-    return OOHCatalystPredictor(
-        base_poscar=cfg["base_poscar"],
-        dp_models=cfg["dp_models"],
-        objective=cfg.get("objective", "mean"),
-        k=float(cfg.get("k", 1.0)),
-        n_random_configs=int(cfg.get("n_random_configs", 10)),
-        ads_height=float(cfg.get("ads_height", 1.9)),
-        ads_dz=float(cfg.get("ads_dz", 1.0)),
-        geo_opt=bool(cfg.get("geo_opt", False)),
-        geo_opt_model=str(cfg.get("geo_opt_model", "./DPA-3.1-3M_1.pt")),
-        rng_seed=seed if seed is not None else 123,
-        uncertainty=cfg.get("uncertainty", "models"),
-        output_index=int(cfg.get("output_index", 0)),
-        # Absent key => None => all three intermediates (historical behaviour).
-        # An explicit empty list means the bare parent slab, so `.get(...)` must
-        # not collapse [] to the default.
-        adsorbates=cfg.get("adsorbates", None),
-    )
-
-
 def _make_dummy(cfg: dict, *, seed: Optional[int] = None, **_):
     import random as _random
     from .utils.seeding import candidate_seed
@@ -76,8 +54,7 @@ def _make_dummy(cfg: dict, *, seed: Optional[int] = None, **_):
     return _DummyPredictor()
 
 
-# Leaf predictors usable as a flat `predictor:` or as a `properties[].predictor:`
-# inside the reward engine. `dp_energy`/`dp_property`/`dp_classification` are NOT here — they are
+# Leaf predictors selected by `properties[].predictor` inside the reward engine. `dp_energy`/`dp_property`/`dp_classification` are NOT here — they are
 # structure-scoring branches handled internally by the engine (they need its
 # build/relax machinery), not standalone composition leaves.
 def _make_mgtransformer(cfg: dict, *, seed: Optional[int] = None, **_):
@@ -98,9 +75,8 @@ def _make_glassnet(cfg: dict, **_):
 
 
 PREDICTORS: Dict[str, Factory] = {
-    "structure_score":    _make_structure_score,   # the multi-objective reward engine
     "rf_magpie":          _make_rf_magpie,
-    "ooh":                _make_ooh,
+    "ooh_frames":         lambda cfg, **kwargs: _load_fqn("rl_matdesign.predictors.ooh_frames:OOHFramesPredictor")(cfg, **kwargs),
     "mgtransformer":      _make_mgtransformer,     # bridge to ../MGTransformer
     "lookup":             _make_lookup,
     "glassnet":           _make_glassnet,
@@ -112,31 +88,17 @@ PREDICTORS: Dict[str, Factory] = {
 # Built-in structure-builder factories (composition/groups -> ASE Atoms)
 # ---------------------------------------------------------------------------
 
-def _make_substitute_builder(cfg: dict, *, seed: Optional[int] = None, **_):
-    from .predictors.builders.substitute import SubstituteBuilder
-    return SubstituteBuilder(cfg, seed=seed)
+
+def _make_pipeline_builder(cfg: dict, *, seed: Optional[int] = None, **_):
+    from .predictors.builders.pipeline import PipelineBuilder
+    return PipelineBuilder(cfg, seed=seed)
 
 
-def _make_sse_builder(cfg: dict, *, seed: Optional[int] = None, **_):
-    from .predictors.builders.sse import SSESupercellBuilder
-    return SSESupercellBuilder(cfg, seed=seed)
 
-
-def _make_site_pick_builder(cfg: dict, *, seed: Optional[int] = None, **_):
-    from .predictors.builders.site_pick import SitePickBuilder
-    return SitePickBuilder(cfg, seed=seed)
-
-
-def _make_defect_site_builder(cfg: dict, *, seed: Optional[int] = None, **_):
-    from .predictors.builders.defect_site import DefectSiteBuilder
-    return DefectSiteBuilder(cfg, seed=seed)
 
 
 BUILDERS: Dict[str, Factory] = {
-    "substitute":  _make_substitute_builder,
-    "sse":         _make_sse_builder,
-    "site_pick":   _make_site_pick_builder,
-    "defect_site": _make_defect_site_builder,
+    "pipeline": _make_pipeline_builder,
 }
 
 
@@ -159,62 +121,30 @@ def resolve_builder(kind: str, cfg: dict, *, seed: Optional[int] = None):
 # ---------------------------------------------------------------------------
 
 def _resolve_scaffold(cfg: dict):
-    """Resolve ``(scaffold_fixed, n_sites, anions)`` shared by the smact_charge and
-    pauling_en factories (so the two never diverge).
-
-    Scaffold = "the whole formula before substitution" (host + fixed anions that
-    are NOT optimised by the agent). Three ways to supply it, in priority order:
-      1. scaffold_poscar (+ scaffold_site_symbol) — parse a template (perovskite).
-      2. scaffold_formula / anion_formula — an explicit per-f.u. fixed formula.
-      3. none — the agent picks every element itself (oxides).
-    """
-    scaffold_fixed = None
-    n_sites = 1
+    """Resolve fixed counts relative to the substituted formula unit."""
+    scaffold_fixed, n_sites = None, 1
     if cfg.get("scaffold_poscar"):
         from .constraints.charge import template_scaffold
-
-        site_symbol = cfg.get("scaffold_site_symbol", cfg.get("site_symbol", "X"))
-        scaffold_fixed, n_sites = template_scaffold(cfg["scaffold_poscar"], site_symbol)
-    elif cfg.get("scaffold_formula") or cfg.get("anion_formula"):
+        scaffold_fixed, n_sites = template_scaffold(
+            cfg["scaffold_poscar"], cfg["scaffold_site_symbol"])
+    elif cfg.get("scaffold_formula"):
         from .constraints.charge import parse_formula
-
-        scaffold_fixed = parse_formula(cfg.get("scaffold_formula") or cfg.get("anion_formula"))
-
-    # Deprecated explicit anion list (old oxide configs) — passed through for
-    # backward compatibility; the filter ignores anions the agent picks itself.
-    anions = cfg.get("smact_anions")
-    if anions is None and any(
-        k in cfg for k in ("smact_anion", "smact_anion_charge", "smact_anion_stoich")
-    ):
-        anions = [{
-            "symbol": cfg.get("smact_anion", "O"),
-            "charge": int(cfg.get("smact_anion_charge", -2)),
-            "stoich": float(cfg.get("smact_anion_stoich", 1.5)),
-        }]
-    return scaffold_fixed, n_sites, anions
+        scaffold_fixed = parse_formula(cfg["scaffold_formula"])
+    return scaffold_fixed, n_sites
 
 
 def _make_smact_charge(cfg: dict, **_):
     from .constraints.smact_filter import SMACTChargeFilter
-
-    scaffold_fixed, n_sites, anions = _resolve_scaffold(cfg)
-    return SMACTChargeFilter(
-        anions=anions,
-        scaffold_fixed=scaffold_fixed,
-        scaffold_n_sites=n_sites,
-    )
+    scaffold_fixed, n_sites = _resolve_scaffold(cfg)
+    return SMACTChargeFilter(scaffold_fixed=scaffold_fixed, scaffold_n_sites=n_sites,
+                             **{key: cfg[key] for key in ("allow_alloys", "tol") if key in cfg})
 
 
 def _make_pauling_en(cfg: dict, **_):
-    """``pauling_en`` — charge neutrality AND Pauling electronegativity (smact)."""
     from .constraints.smact_filter import ElectronegativityFilter
-
-    scaffold_fixed, n_sites, anions = _resolve_scaffold(cfg)
-    return ElectronegativityFilter(
-        anions=anions,
-        scaffold_fixed=scaffold_fixed,
-        scaffold_n_sites=n_sites,
-    )
+    scaffold_fixed, n_sites = _resolve_scaffold(cfg)
+    return ElectronegativityFilter(scaffold_fixed=scaffold_fixed, scaffold_n_sites=n_sites,
+                                   **{key: cfg[key] for key in ("allow_alloys", "tol") if key in cfg})
 
 
 def _cfg_names_constraint(cfg: dict, name: str) -> bool:
@@ -228,13 +158,6 @@ def _cfg_names_constraint(cfg: dict, name: str) -> bool:
 
 
 def _has_constraint(cfg: dict, name: str) -> bool:
-    if _cfg_names_constraint(cfg, name):
-        return True
-    # multi_group configs attach constraints per-group (cfg["groups"][i]), not
-    # top-level — build_env resolves each group's own filters independently
-    # (see build_env's multi_group branch). Scan those too, so e.g. a
-    # smact_charge attached only to a perovskite's B_site group is still
-    # detected by the post-episode generate_candidates drop below.
     for g in cfg.get("groups") or []:
         if isinstance(g, dict) and _cfg_names_constraint(g, name):
             return True
@@ -242,12 +165,12 @@ def _has_constraint(cfg: dict, name: str) -> bool:
 
 
 def smact_charge_enabled(cfg: dict) -> bool:
-    """True when a ``smact_charge`` constraint is configured (flat or in a chain)."""
+    """True when a ``smact_charge`` constraint is configured in a group filter list."""
     return _has_constraint(cfg, "smact_charge")
 
 
 def pauling_en_enabled(cfg: dict) -> bool:
-    """True when a ``pauling_en`` constraint is configured (flat or in a chain)."""
+    """True when a ``pauling_en`` constraint is configured in a group filter list."""
     return _has_constraint(cfg, "pauling_en")
 
 
@@ -264,18 +187,6 @@ def charge_use_pauling(cfg: dict) -> bool:
     return pauling_en_enabled(cfg)
 
 
-def _make_last_step_element(cfg: dict, **_):
-    from .constraints.last_step_element import LastStepElementFilter
-    return LastStepElementFilter(
-        required_elements=cfg["required_elements"],
-        nonzero_ratio=bool(cfg.get("nonzero_ratio_at_last", True)),
-        reserve_for_last=bool(cfg.get("reserve_for_last", True)),
-    )
-
-
-def _make_phase_pattern(cfg: dict, **_):
-    from .constraints.phase_pattern import PhasePatternFilter
-    return PhasePatternFilter(patterns=cfg["phase_patterns"])
 
 
 def _make_ooh_phase(cfg: dict, *, env=None, **_):
@@ -290,28 +201,16 @@ def _make_ooh_phase(cfg: dict, *, env=None, **_):
         target_phase=cfg.get("target_phases", ["any"]),
         allowed_units=env._allowed_units,
         possible_sums_by_k=env._possible_sums_by_k,
-        total_units=env._total_units,
+        amount_scale=env.amount_scale,
     )
 
 
-def _make_chain(cfg: dict, *, env=None, **_):
-    from .constraints.chain import ChainConstraintFilter
-    return ChainConstraintFilter(cfg, env=env)
-
-
-def _make_sse_doping(cfg: dict, *, env=None, **_):
-    from .constraints.sse_doping import SSEDopingFilter
-    return SSEDopingFilter(cfg, env=env)
 
 
 CONSTRAINTS: Dict[str, Factory] = {
     "smact_charge":      _make_smact_charge,
     "pauling_en":        _make_pauling_en,
-    "last_step_element": _make_last_step_element,
     "ooh_phase":         _make_ooh_phase,
-    "phase_pattern":     _make_phase_pattern,
-    "chain":             _make_chain,
-    "sse_doping":        _make_sse_doping,
 }
 
 
@@ -359,29 +258,16 @@ def resolve_predictor(kind: str, cfg: dict, *, seed: Optional[int] = None):
 
 
 def build_reward(cfg: dict, *, seed: Optional[int] = None):
-    """Build the run's reward predictor from a config.
-
-    Routing is by the **shape** of the config, so there is no engine name to
-    learn and no single-vs-multi mode to set:
-
-    * ``properties:`` is a non-empty list  -> the multi-objective reward engine
-      (:class:`StructureScorePredictor`). It auto-detects single (one entry) vs
-      multi (many) objectives and combines them.
-    * otherwise -> a flat single predictor named by the legacy ``predictor:`` key
-      (registry short name or FQN).
-    """
-    props = cfg.get("properties")
-    if isinstance(props, list) and props:
-        return _make_structure_score(cfg, seed=seed)
-    if "reward" in cfg:
-        raise ValueError("A 'reward' combination rule requires a non-empty 'properties' list.")
-    kind = cfg.get("predictor")
-    if not kind:
+    """Build the reward engine from the single supported properties format."""
+    retired = {"predictor", "models", "model", "dp_models", "model_ref"} & cfg.keys()
+    if retired:
         raise ValueError(
-            "Reward config needs either a non-empty 'properties' list (the "
-            "reward engine) or a flat 'predictor' name."
+            f"Removed top-level model settings: {sorted(retired)}; "
+            "use properties entries with predictor and models."
         )
-    return resolve_predictor(kind, cfg, seed=seed)
+    if not isinstance(cfg.get("properties"), list) or not cfg["properties"]:
+        raise ValueError("Reward config requires a non-empty 'properties' list.")
+    return _make_structure_score(cfg, seed=seed)
 
 
 def resolve_constraint(kind: Optional[str], cfg: dict, *, env=None):
@@ -398,20 +284,41 @@ def resolve_constraint(kind: Optional[str], cfg: dict, *, env=None):
             f"Built-ins: {sorted(CONSTRAINTS)}. "
             f"For a custom filter, use the FQN form: 'pkg.module:ClassName'."
         )
+    owned = {
+        "smact_charge": {"scaffold_poscar", "scaffold_site_symbol", "scaffold_formula", "allow_alloys", "tol"},
+        "pauling_en": {"scaffold_poscar", "scaffold_site_symbol", "scaffold_formula", "allow_alloys", "tol"},
+        "ooh_phase": {"target_phases"},
+    }
+    unused = set(cfg) - owned[kind]
+    if unused:
+        raise ValueError(f"Filter {kind!r} has unused parameters: {sorted(unused)}")
     return factory(cfg, env=env)
 
 
-def build_constraints(cfg: dict, *, env=None):
-    """Build the constraint filter for a config from its ``filters:`` list.
+def build_constraints(cfg: dict, *, env=None) -> list:
+    """Resolve a group's filters in declaration order; every filter must pass.
 
-    Mirrors :func:`build_reward`: a non-empty ``filters:`` list is wrapped in a
-    :class:`ChainConstraintFilter`, applied in list order — a single-entry list
-    is fine too (it just runs that one filter, with the chain's safety
-    fallback), so ``filters:`` is the only public spelling; you never write
-    ``type: chain`` yourself. Returns ``None`` when ``filters:`` is absent or
-    empty.
+    An absent or empty list means no optional scientific filters. Each entry owns
+    its options and resolves directly to a built-in or custom filter instance.
     """
-    filters = cfg.get("filters")
-    if isinstance(filters, list) and filters:
-        return _make_chain(cfg, env=env)
-    return None
+    specs = cfg.get("filters", [])
+    if not isinstance(specs, list):
+        raise ValueError("'filters' must be a list of filter declarations.")
+    filters = []
+    for index, spec in enumerate(specs):
+        if isinstance(spec, str):
+            kind, options = spec, {}
+        elif isinstance(spec, dict):
+            options = dict(spec)
+            kind = options.pop("type", None)
+            if not kind:
+                raise ValueError(f"filters[{index}] is missing 'type'.")
+        else:
+            raise ValueError(f"filters[{index}] must be a dict or a bare string.")
+        if not isinstance(kind, str) or not kind.strip():
+            raise ValueError(f"filters[{index}].type must be a nonempty string.")
+        filter_ = resolve_constraint(kind, options, env=env)
+        if not callable(getattr(filter_, "filter_actions", None)):
+            raise ValueError(f"filters[{index}].type={kind!r} must implement filter_actions().")
+        filters.append(filter_)
+    return filters

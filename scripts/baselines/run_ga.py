@@ -13,7 +13,7 @@ for the last step, charge-neutrality) and so searched a different, easier space.
 
 Genome
 ------
-Each individual is a list of ``n_components`` integers (one per env step).  At
+Each individual is a list of ``max_steps`` integers (one per env step).  At
 step ``k`` the env offers a constraint-filtered, feasibility-guaranteed list of
 allowed actions ``L_k``; gene ``g_k`` selects ``L_k[g_k % len(L_k)]``.  All
 crossover/mutation operators stay within ``[0, UB)`` and any genome decodes to a
@@ -143,7 +143,7 @@ def main() -> None:
     pop_size = args.pop_size or 50
     budget = args.budget or C.default_budget(cfg)
     n_gen = args.n_gen or max(1, budget // pop_size)
-    print(f"[GA] env_type={env_type}, n_components={n}, action_ub={ub}, "
+    print(f"[GA] env_type={env_type}, max_steps={n}, action_ub={ub}, "
           f"pop_size={pop_size}, n_gen={n_gen}, budget(valid evals)={pop_size * n_gen}")
 
     cache: dict = {}

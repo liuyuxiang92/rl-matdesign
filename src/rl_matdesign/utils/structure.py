@@ -11,11 +11,6 @@ Two layers live here:
   their original species. This is the general "count-diff vs the base POSCAR"
   builder used by multi-sublattice scenarios (e.g. doped Li6PS6).
 
-  :func:`substitute_sites` is a thin one-operation wrapper over the engine,
-  preserving the original Random-Solid-Solution behavior (fill all placeholder
-  sites by fractional composition); it backs the ``substitute`` builder used by
-  the HEA / perovskite / ti_alloy ``structure_score`` configs.
-
 * **Relaxation.** :func:`relax_structure` is the shared geometry-optimization
   capability (LBFGS + cell filter + a DeepMD calculator with a named head),
   lifted out of the OOH predictor so any structure-based predictor can reuse it.
@@ -578,52 +573,12 @@ def _candidate_free_radius_from(
     return float(dists.min())
 
 
-# ---------------------------------------------------------------------------
-# Backward-compatible one-operation wrapper (Random Solid Solution)
-# ---------------------------------------------------------------------------
-
-def substitute_sites(
-    template_poscar: str,
-    composition: Dict[str, float],
-    site_symbol: str = "X",
-    n_configs: int = 5,
-    rng: Optional[np.random.Generator] = None,
-) -> List["ase.Atoms"]:
-    """Fill all ``site_symbol`` sites of a template per fractional *composition*.
-
-    Thin wrapper over :func:`build_substituted_structure` preserving the original
-    HEA/perovskite/ti_alloy behavior: one sublattice, no vacancies, integer counts
-    allocated from fractions (largest-remainder).
-    """
-    try:
-        from ase.io import read as ase_read
-    except ImportError as exc:  # pragma: no cover
-        raise ImportError("substitute_sites requires ASE: pip install ase") from exc
-
-    if rng is None:
-        rng = np.random.default_rng()
-
-    template = ase_read(template_poscar)
-    site_indices = [
-        i for i, s in enumerate(template.get_chemical_symbols()) if s == site_symbol
-    ]
-    if not site_indices:
-        raise ValueError(
-            f"No sites with symbol '{site_symbol}' found in {template_poscar}. "
-            "Check that site_symbol matches the placeholder element in the template."
-        )
-
-    counts = _fractions_to_counts(composition, len(site_indices))
-    op = SublatticeOp(sites=site_symbol, put=counts, remove=0)
-    return build_substituted_structure(template, [op], n_configs=n_configs, rng=rng)
-
-
 def _fractions_to_counts(composition: Dict[str, float], n_sites: int) -> Dict[str, int]:
     """Allocate integer atom counts from fractional composition.
 
     Uses a largest-remainder method to guarantee sum == n_sites exactly.
     """
-    elements = list(composition.keys())
+    elements = sorted(composition)
     fracs = [composition[e] for e in elements]
 
     raw = [f * n_sites for f in fracs]
@@ -634,7 +589,7 @@ def _fractions_to_counts(composition: Dict[str, float], n_sites: int) -> Dict[st
     if deficit < 0 or deficit > len(elements):
         raise ValueError(f"Cannot allocate {n_sites} sites from fractions {composition}.")
 
-    remainders.sort(reverse=True)
+    remainders.sort(key=lambda item: (-item[0], elements[item[1]]))
     counts_list = floors[:]
     for k in range(deficit):
         counts_list[remainders[k][1]] += 1

@@ -34,7 +34,7 @@ def _plan(path, method, *, repeats=1, parallel=1):
         'properties': [{'name':'energy', 'predictor':'dummy', 'direction':'min', 'objective':'mean'}],
         'groups': [{'name':'metal','kind':'composition',
                     'species_set':['Ni','Fe','Co','Cr','Mn','Cu','Zn','Ti'],
-                    'fraction_set':[f'{i/10:.1f}' for i in range(1,9)],'n_components':3}],
+                    'amount_set':[i/10 for i in range(1,9)],'n_steps':3,'total':1,'unique':True}],
         'eval_seed':13, 'pg_warmup_eps':2, 'pg_batch_eps':2,
         'dqn_hidden_dim':16, 'dqn_buffer_size':100, 'dqn_grad_steps_per_ep':2,
         'gen_temperature':1., 'num_gen_eps':0, 'exploration_gen_eps':0,

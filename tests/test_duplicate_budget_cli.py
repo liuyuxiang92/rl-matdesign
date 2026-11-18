@@ -23,13 +23,13 @@ _RUNNER = _REPO / "scripts" / "run_experiment.py"
 def _config(*, method="dqn", count_duplicates=False, categorical=False):
     group = (
         {"name": "oxygen", "kind": "categorical",
-         "choices": [{"element": "O", "values": [0.0, 1.0, 2.0]}]}
+         "choices": [{"name": "amount", "values": [0.0, 1.0, 2.0]}], "n_steps": 1}
         if categorical else
         {"name": "metal", "kind": "composition", "species_set": ["Fe", "Co", "Ni"],
-         "fraction_set": ["1.0"], "n_components": 1}
+         "amount_set": [1], "n_steps": 1, "total": 1, "unique": True}
     )
     return {
-        "groups": [group], "predictor": "dummy", "method": method,
+        "groups": [group], "properties": [{"name": "score", "predictor": "dummy", "direction": "max", "objective": "mean"}], "method": method,
         "train_count_duplicates": count_duplicates,
         "train_max_duplicate_attempts": 100,
         "dqn_warmup_eps": 1, "dqn_num_train_eps": 2,

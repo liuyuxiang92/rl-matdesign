@@ -1,4 +1,4 @@
-# Code layout and compatibility
+# Code layout and artifact contracts
 
 ## Entry points
 
@@ -20,9 +20,10 @@ terminal-composition baseline is `scripts/baselines/run_random.py`.
 | Location | Responsibility |
 |---|---|
 | `config_schema.py`, `configuration.py` | Core parameter ownership, YAML/CLI/HPO resolution and environment construction |
-| `env.py`, `env_integer.py`, `env_multigroup.py`, `sequence.py` | Composition, accumulated tokens, labelled groups, explicit peptide positions and typed fields |
+| `amounts.py`, `categorical.py`, `env_multigroup.py`, `domain_runtime.py` | Exact chemical additions, labelled assignments, group coordination and transitions |
+| `peptide_design.py`, `design_domains.py` | Application-owned initialization and operation-specific chemistry |
 | `action_features.py`, `action_encoding.py` | Shared typed action encoding |
-| `structure_sources.py`, `utils/structure_samples.py` | Source ownership, sample plans and candidate-local structure randomness |
+| `structure_sources.py`, `predictors/builders/pipeline.py`, `utils/structure_samples.py` | Singular structure ownership, ordered operations and candidate-local sample randomness |
 | `predictors/outputs.py`, `predictors/structure_score.py` | Named scientific outputs, aligned sample statistics, shared model inference and reward integration |
 | `predictors/glassnet.py` | Pinned composition-only GlassNet oracle and bounded cache |
 | `training.py`, `model.py`, `experiment.py` | Algorithm updates, checkpoints and run orchestration |
@@ -30,7 +31,7 @@ terminal-composition baseline is `scripts/baselines/run_random.py`.
 | `utils/composition.py`, `utils/design_count.py` | Canonical candidate identity, exact counting and uniform sampling |
 | `utils/model_contract.py`, `utils/execution_contract.py`, `utils/seeding.py` | Artifact/scaler compatibility, oracle/runtime identity and RNG continuation |
 | `utils/timing.py`, `utils/provenance.py` | Evaluation ledger, timing and append-only invocation evidence |
-| `src/abcde_ooh/` | OOH implementation and compatibility imports using the common contracts |
+| `src/abcde_ooh/constraints/` | OOH phase rules used by the generic chemical amount domain |
 | `tests/` | Domain, scientific contract, runner and subprocess repeatability checks |
 
 Candidates preserve labels and exact numeric distinctions; generic keys do not
@@ -38,7 +39,7 @@ round all fields to six decimals. Environment adapters own chemical zero removal
 and integer GCD normalization. Evaluation identity additionally includes the
 scientific model, source, preprocessing and conditions.
 
-## Version 0.2 compatibility boundary
+## Scientific artifact boundary
 
 This refactor intentionally changes state/action features, some construction
 MDPs, the sample seed protocol and scientific output statistics. Old weights,
@@ -51,7 +52,7 @@ A2C implementation remain distinct. Equivalent labelled assignments share a
 state and final evaluation; a different partial amount or peptide position
 remains distinguishable. Both algorithm parameter families remain in one YAML.
 
-Source migration and output/uncertainty semantics are described in
+Structure ownership and output/uncertainty semantics are described in
 [development contracts](development_contracts.md). Actual experiment YAMLs,
 migration inventories, private model paths and detailed run evidence stay local.
 This code release does not update remote GPU environments or historical runs.

@@ -1,8 +1,5 @@
-"""OOH integration with real ASE structures and explicitly fake DeepMD models."""
-from __future__ import annotations
-
+"""OOH population statistics, cache and asset integrity through shared scoring."""
 from copy import deepcopy
-from dataclasses import replace
 import math
 import os
 from pathlib import Path
@@ -10,225 +7,142 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from abcde_ooh import dp_predictor as dpp
-from rl_matdesign.predictors.ooh import OOHCatalystPredictor, _OutputLRU
+from rl_matdesign.predictors.ooh_frames import OOHFramesPredictor
 from rl_matdesign.utils.rollout_errors import EvaluationProtocolError
-from tests.test_ooh_adsorbates import slab_poscar
+from tests.ooh_fixtures import COMP, leaf, oracle_factory, slab_poscar
 
 
-COMP = {'Ni': .5, 'Fe': .5}
+def test_physical_outputs_and_reward_share_one_matrix(oracle_factory):
+    predictor,counts,_=oracle_factory()
+    scientific=predictor.predict_outputs(COMP)['overpotential']
+    assert scientific.mean==5
+    assert scientific.schema.unit is None and scientific.schema.representation=='physical'
+    assert scientific.model_spread==scientific.config_spread==0
+    assert scientific.pooled_spread==5 and scientific.native_uncertainty is None
+    assert [row.values for row in scientific.samples]==[(0,10),(10,0)]
+    assert scientific.samples[0].configuration_ids==scientific.samples[1].configuration_ids
+    assert len(set(scientific.samples[0].configuration_ids))==2
+    assert predictor.predict_raw(COMP)==(-5,None)
+    assert predictor.predict(COMP)==(-5,None)
+    predictor.batch_predict_outputs([COMP,{'alloy':{'Fe':.5,'Ni':.5}}])
+    assert counts['loaded']==2 and counts['evals']==4
 
 
-@pytest.fixture
-def oracle_factory(monkeypatch, slab_poscar, tmp_path):
-    """Actual adapter + ASE path; deterministic fake model/config matrix."""
-    from ase import Atoms
-    from ase.data import chemical_symbols
-    from ase.io import read, write
-    counter = 0
-    def make(matrix=((0., 10.), (10., 0.)), **kwargs):
-        nonlocal counter
-        root = tmp_path / f'oracle-{counter}'
-        counter += 1
-        root.mkdir()
-        paths = []
-        for index in range(len(matrix)):
-            path = root / f'model-{index}.pt'
-            path.write_bytes(f'fake unit-test weights {index}'.encode())
-            paths.append(str(path))
-        counters = {'loaded': 0, 'evals': 0}
-        class FakeModel:
-            def __init__(self, model_file, **_):
-                self.index = paths.index(str(model_file))
-                self.calls = 0
-                counters['loaded'] += 1
-            def eval(self, **_):
-                value = matrix[self.index][self.calls % len(matrix[self.index])]
-                self.calls += 1
-                counters['evals'] += 1
-                return np.asarray([[value, value + 100.]])
-        monkeypatch.setattr(dpp, '_lazy_import_ase_deepmd',
-                            lambda: (Atoms, read, write, chemical_symbols, FakeModel))
-        options = {'adsorbates': [], 'n_random_configs': len(matrix[0]), **kwargs}
-        predictor = OOHCatalystPredictor(slab_poscar, paths, **options)
-        return predictor, counters, paths
-    return make
+def test_selected_uncertainty_penalty_applies_once(oracle_factory):
+    predictor,counts,_=oracle_factory(uncertainty='pooled_spread',objective='mean_minus_kstd',k=2)
+    assert predictor.predict(COMP)==(-15,None)
+    assert predictor.per_objective_stats(COMP)['overpotential']==(5,5)
+    assert predictor.predict_raw(COMP)==(-5,None)
+    assert counts['evals']==4
 
 
-def test_named_raw_and_legacy_views_use_one_matrix_without_sign_or_penalty_duplication(oracle_factory):
-    predictor, counts, _ = oracle_factory()
-    scientific = predictor.predict_outputs(COMP)['overpotential']
-    assert scientific.mean == 5
-    assert scientific.schema.unit is None and scientific.schema.representation == 'physical'
-    assert scientific.model_spread == scientific.config_spread == 0
-    assert scientific.pooled_spread == 5
-    assert scientific.native_uncertainty is None
-    assert [row.values for row in scientific.samples] == [(0, 10), (10, 0)]
-    assert scientific.samples[0].configuration_ids == scientific.samples[1].configuration_ids
-    assert len(set(scientific.samples[0].configuration_ids)) == 2
-    assert predictor.predict_raw(COMP) == (5, 0)
-    assert predictor.predict(COMP) == (-5, 0)
-    predictor.uncertainty = 'total'
-    predictor.objective = 'mean_minus_kstd'
-    predictor.k = 2
-    assert predictor.predict(COMP) == (-15, 5)
-    assert predictor.predict_outputs(COMP)['overpotential'] is scientific
-    predictor.batch_predict_outputs([COMP, {'Fe': .5, 'Ni': .5}, {'Co': 0, **COMP}])
-    assert counts == {'loaded': 2, 'evals': 4}
+@pytest.mark.parametrize('matrix,model_spread,config_spread,pooled',[
+    (((2.,),),None,None,None), (((1.,3.),),None,1.,1.),
+    (((1.,),(3.,)),1.,None,1.), (((1.,3.),(5.,7.)),2.,1.,math.sqrt(5))])
+def test_population_axis_definitions_and_missing_singletons(oracle_factory,matrix,model_spread,config_spread,pooled):
+    predictor,_,_=oracle_factory(matrix)
+    output=predictor.predict_outputs(COMP)['overpotential']
+    assert output.model_spread==model_spread
+    assert output.config_spread==config_spread
+    assert output.pooled_spread==pytest.approx(pooled) if pooled is not None else output.pooled_spread is None
+    assert predictor.per_objective_stats(COMP)['overpotential']==(output.mean,model_spread)
 
 
-@pytest.mark.parametrize('matrix,model_spread,config_spread,pooled', [
-    (((2.,),), None, None, None),
-    (((1., 3.),), None, 1., 1.),
-    (((1.,), (3.,)), 1., None, 1.),
-    (((1., 3.), (5., 7.)), 2., 1., math.sqrt(5)),
-])
-def test_population_axis_definitions_and_missing_singleton_statistics(oracle_factory, matrix, model_spread, config_spread, pooled):
-    predictor, _, _ = oracle_factory(matrix)
-    output = predictor.predict_outputs(COMP)['overpotential']
-    assert output.model_spread == model_spread
-    assert output.config_spread == config_spread
-    assert output.pooled_spread == pytest.approx(pooled) if pooled is not None else output.pooled_spread is None
-    raw_mean, raw_spread = predictor.predict_raw(COMP)
-    assert raw_mean == output.mean and raw_spread == model_spread
-
-
-def test_missing_penalty_statistic_is_configuration_error_not_zero(oracle_factory):
-    predictor, counts, _ = oracle_factory(((2., 4.),), objective='mean_minus_kstd')
-    assert predictor.predict_outputs(COMP)['overpotential'].model_spread is None
-    with pytest.raises(EvaluationProtocolError, match='insufficient observations'):
+def test_missing_penalty_statistic_is_not_invented_zero(oracle_factory):
+    predictor,_,_=oracle_factory(((2.,4.),),objective='mean_minus_kstd')
+    with pytest.raises((ValueError,EvaluationProtocolError),match='unavailable|insufficient'):
         predictor.predict(COMP)
-    predictor.objective = 'mean'
-    assert predictor.predict(COMP) == (-3, None)
-    predictor.objective = 'mean_minus_kstd'
-    predictor.k = 0
-    assert predictor.predict(COMP) == (-3, None)
-    assert counts['evals'] == 2
+    mean_only,_,_=oracle_factory(((2.,4.),),objective='mean')
+    assert mean_only.predict(COMP)==(-3,None)
+    assert mean_only.per_objective_stats(COMP)['overpotential']==(3,None)
 
 
-@pytest.mark.parametrize('bad_values', [[1.], [1., 2., 3.], [1., float('nan')],
-                                        [1., float('inf')], [1., True], [1., '2']])
-def test_every_configuration_requires_all_models_and_finite_real_scalars(oracle_factory, bad_values):
-    predictor, _, _ = oracle_factory()
-    predictor._predictor._eval_models_on_prepared_inputs = lambda *_: bad_values
-    with pytest.raises(EvaluationProtocolError, match='every model'):
+@pytest.mark.parametrize('bad',[float('nan'),float('inf')])
+def test_nonfinite_model_scalar_does_not_enter_cache(oracle_factory,bad):
+    predictor,_,_=oracle_factory()
+    leaf(predictor).models[1].eval=lambda **_: np.asarray([[bad]])
+    with pytest.raises(EvaluationProtocolError,match='scalar') as error:
         predictor.predict_outputs(COMP)
-    assert len(predictor._cache) == 0
-    assert predictor._predictor.last_scientific_output is None
+    assert 'finite' in str(error.value.__cause__)
+    assert not predictor._stats_cache
 
 
-def test_failed_later_configuration_does_not_leave_partial_or_cached_scientific_output(oracle_factory):
-    predictor, _, _ = oracle_factory()
-    responses = iter([[1., 2.], [3.]])
-    predictor._predictor._eval_models_on_prepared_inputs = lambda *_: next(responses)
-    with pytest.raises(EvaluationProtocolError):
+def test_later_configuration_failure_cannot_cache_partial_output(oracle_factory):
+    predictor,_,_=oracle_factory()
+    model=leaf(predictor).models[1]
+    values=iter([np.asarray([[3.]]),np.empty((0,))])
+    model.eval=lambda **_: next(values)
+    with pytest.raises(EvaluationProtocolError,match='scalar'):
         predictor.predict_outputs(COMP)
-    assert len(predictor._predictor.last_sample_records) == 1
-    assert predictor._predictor.last_scientific_output is None
-    assert not predictor._cache
+    assert not predictor._stats_cache
 
 
-def test_direct_compatibility_details_are_derived_from_same_population_matrix(oracle_factory):
-    predictor, counts, _ = oracle_factory(((1., 3.), (5., 7.)))
-    mean, spread, details = predictor._predictor.predict_overpotential(
-        COMP, uncertainty='configs', return_per_model=True)
-    assert (mean, spread) == (4., 1.)
-    assert details['per_model_means'] == [2., 6.]
-    assert details['per_model_stds_over_configs'] == [1., 1.]
-    assert details['pooled_spread'] == pytest.approx(math.sqrt(5))
-    assert len(details['samples']) == 2 and counts['evals'] == 4
-
-
-def test_missing_assets_fail_before_importing_model_dependencies(monkeypatch, tmp_path):
-    monkeypatch.setattr(dpp, '_lazy_import_ase_deepmd',
-                        lambda: pytest.fail('Must validate assets before model import'))
+def test_missing_assets_fail_before_model_import(tmp_path):
     with pytest.raises(FileNotFoundError):
-        OOHCatalystPredictor(str(tmp_path / 'missing'), [str(tmp_path / 'missing.pt')])
+        OOHFramesPredictor({'models':[str(tmp_path/'missing.pt')]})
 
 
-@pytest.mark.parametrize('asset_kind', ['model', 'template', 'deleted_model'])
-def test_cached_results_reject_changed_or_deleted_assets(oracle_factory, asset_kind):
-    predictor, counters, paths = oracle_factory()
+@pytest.mark.parametrize('kind',['model','template','deleted_model'])
+def test_cached_results_reject_changed_or_deleted_assets(oracle_factory,kind):
+    predictor,counts,paths=oracle_factory()
     predictor.predict_outputs(COMP)
-    expected_calls = counters['evals']
-    path = Path(paths[0] if asset_kind != 'template' else predictor._predictor.cfg.base_poscar)
-    stat = path.stat()
-    if asset_kind == 'deleted_model':
-        path.unlink()
+    calls=counts['evals']
+    path=Path(paths[0] if kind!='template' else predictor.source_plan.structure.effective_config['base_poscar'])
+    stat=path.stat()
+    if kind=='deleted_model': path.unlink()
     else:
-        content = path.read_bytes()
-        path.write_bytes(bytes([content[0] ^ 1]) + content[1:])
-        # Even a same-size edit with restored mtime must be caught by ctime.
-        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
-    with pytest.raises(EvaluationProtocolError, match='asset changed'):
+        content=path.read_bytes(); path.write_bytes(bytes([content[0]^1])+content[1:])
+        os.utime(path,ns=(stat.st_atime_ns,stat.st_mtime_ns))
+    with pytest.raises(EvaluationProtocolError,match='changed|disappeared'):
         predictor.predict_outputs(COMP)
-    assert counters['evals'] == expected_calls
+    assert counts['evals']==calls
 
 
-@pytest.mark.parametrize('change', [
-    {'seed': 222}, {'n_random_configs': 3}, {'output_index': 1}, {'adsorbates': ('O*',)},
-])
-def test_cached_results_reject_in_place_scientific_configuration_changes(oracle_factory, change):
-    predictor, _, _ = oracle_factory()
-    predictor.predict_outputs(COMP)
-    predictor._predictor.cfg = replace(predictor._predictor.cfg, **change)
-    with pytest.raises(EvaluationProtocolError, match='configuration changed'):
-        predictor.predict_outputs(COMP)
+def test_oracle_identity_records_assets_seed_and_selected_output_without_reward(oracle_factory):
+    predictor,_,paths=oracle_factory(output_index=1,seed=27)
+    identity=predictor.oracle_identity()
+    assert identity['sources']['eval_seed']==27
+    assert identity['outputs']['overpotential']['output_index']==1
+    model_records=[item for records in identity['model_assets'].values() for item in records]
+    assert {record['path'] for record in model_records}==set(paths)
+    assert all(len(record['sha256'])==64 for record in model_records)
+    assert identity['sources']['structure']['physical_protocol']['asset_sha256']
+    original=deepcopy(identity); predictor.k=5
+    assert predictor.oracle_identity()==original
 
 
-def test_oracle_identity_contains_all_assets_seed_source_and_selected_output(oracle_factory):
-    predictor, _, paths = oracle_factory(output_index=1, rng_seed=27)
-    identity = predictor.oracle_identity()
-    assert identity['config']['eval_seed'] == 27 and identity['config']['output_index'] == 1
-    assert set(identity['assets']) == {*paths, predictor._predictor.cfg.base_poscar}
-    assert all(len(record['sha256']) == 64 for record in identity['assets'].values())
-    assert 'source' in identity and identity['statistic_ddof'] == 0
-    original = deepcopy(identity)
-    predictor._predictor.cfg.debug_dir = 'debug_only'
-    predictor._predictor.cfg.debug_max_configs = 1
-    predictor.k = 5
-    predictor.uncertainty = 'total'
-    assert predictor.oracle_identity() == original
-    source = predictor.source_identity()
-    assert source['eval_seed'] == 27 and source['property_sources'] == {'overpotential': 'ooh_slab'}
-
-
-def test_lru_evicts_old_candidates_and_bounds_checkpoint_update(oracle_factory):
-    predictor, counts, _ = oracle_factory(((2.,),))
-    predictor._cache = _OutputLRU(capacity=2)
-    a, b, c = COMP, {'Ni': .6, 'Fe': .4}, {'Ni': .7, 'Fe': .3}
-    predictor.predict_outputs(a)
+def test_lru_bounds_results_and_recomputes_evicted_candidates(oracle_factory):
+    predictor,counts,_=oracle_factory(((2.,),),predict_cache_size=2)
+    a,b,c=COMP,{'alloy':{'Ni':.6,'Fe':.4}},{'alloy':{'Ni':.7,'Fe':.3}}
+    for candidate in (a,b,a,c): predictor.predict_outputs(candidate)
+    assert len(predictor._stats_cache)==2 and predictor._key(b) not in predictor._stats_cache
     predictor.predict_outputs(b)
-    predictor.predict_outputs(a)  # Make b the least recently used candidate.
-    predictor.predict_outputs(c)
-    assert len(predictor._cache) == 2 and predictor._comp_key(b) not in predictor._cache
-    predictor.predict_outputs(b)
-    assert counts['evals'] == 4
-    predictor._cache.update({index: ('legacy', 'entry') for index in range(10)})
-    assert list(predictor._cache) == [8, 9]
-    # Even a stale tuple installed under the current identity is not scientific data.
-    predictor._cache[predictor._comp_key(a)] = (123, 0)
-    assert predictor.predict_outputs(a)['overpotential'].mean == 2
-    assert counts['evals'] == 5
+    assert counts['evals']==4
 
 
-
-def test_output_selection_incompatible_with_model_is_protocol_error(oracle_factory):
-    predictor, _, _ = oracle_factory(output_index=99)
-    with pytest.raises(EvaluationProtocolError, match='configured scalar output'):
+def test_incompatible_output_index_is_protocol_error(oracle_factory):
+    predictor,_,_=oracle_factory(output_index=99)
+    with pytest.raises(EvaluationProtocolError,match='scalar'):
         predictor.predict_outputs(COMP)
-    assert not predictor._cache
+    assert not predictor._stats_cache
 
 
-def test_asset_drift_during_evaluation_is_rejected_before_caching(oracle_factory):
-    predictor, _, paths = oracle_factory(((1.,),))
-    model = predictor._predictor.dp_models[0]
-    original = model.eval
-    def changing_model(**kwargs):
+def test_asset_drift_during_inference_rejected_before_caching(oracle_factory):
+    predictor,_,paths=oracle_factory(((1.,),))
+    model=leaf(predictor).models[0]; original=model.eval
+    def changing(**kwargs):
         Path(paths[0]).write_bytes(b'changed during evaluation')
         return original(**kwargs)
-    model.eval = changing_model
-    with pytest.raises(EvaluationProtocolError, match='asset changed'):
+    model.eval=changing
+    with pytest.raises(EvaluationProtocolError,match='changed'):
         predictor.predict_outputs(COMP)
-    assert predictor._predictor.last_scientific_output is None
-    assert not predictor._cache
+    assert not predictor._stats_cache
+
+
+@pytest.mark.parametrize('bad',[True,'2'])
+def test_non_numeric_model_scalar_is_not_coerced_into_scientific_data(oracle_factory,bad):
+    predictor,_,_=oracle_factory()
+    leaf(predictor).models[1].eval=lambda **_: np.asarray([[bad]])
+    with pytest.raises(EvaluationProtocolError,match='real|numeric|scalar'):
+        predictor.predict_outputs(COMP)
+    assert not predictor._stats_cache

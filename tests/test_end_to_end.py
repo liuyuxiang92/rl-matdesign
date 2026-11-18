@@ -18,7 +18,7 @@ _CONFIG = _REPO / "configs" / "test_dummy.yaml"
 _RUNNER = _REPO / "scripts" / "run_experiment.py"
 
 # Columns we expect to find in generated.csv regardless of method.
-_EXPECTED_COLS = {"formula", "reward", "dp_mean", "dp_std"}
+_EXPECTED_COLS = {"formula", "reward", "dp_mean", "obj_quality_mean", "obj_quality_std"}
 
 
 def _run_smoke(tmp_path: Path, method: str) -> Path:

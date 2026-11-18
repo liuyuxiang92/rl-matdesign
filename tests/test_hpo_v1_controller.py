@@ -286,21 +286,19 @@ def test_reporting_exception_does_not_hide_original_failure(tmp_path, campaign_e
     assert read_json(run.out / "state.json")["report_error"] == "report unavailable"
 
 
-@pytest.mark.parametrize("filters_location", [None, "top", "group", "env"])
-def test_exact_domain_uses_default_composition_kind_and_rejects_every_filter(tmp_path, monkeypatch, filters_location):
+@pytest.mark.parametrize("filters_location", [None, "group", "env"])
+def test_exact_domain_uses_default_composition_kind_and_rejects_group_filters(tmp_path, monkeypatch, filters_location):
     # Exercise only the adapter contract; do not import a materials backend.
     configuration = ModuleType("rl_matdesign.configuration")
-    env = SimpleNamespace(max_steps=3, phase_filter=object() if filters_location == "env" else None)
-    configuration.build_env = lambda cfg, predictor: (env, "fraction", cfg)
+    env = SimpleNamespace(max_steps=3, filters=[object()] if filters_location == "env" else None)
+    configuration.build_env = lambda cfg, predictor: (env, "multi_group", cfg)
     counter = ModuleType("rl_matdesign.utils.design_count")
     counter.sampler_from_env = lambda _: SimpleNamespace(size=120)
     monkeypatch.setitem(sys.modules, "rl_matdesign.configuration", configuration)
     monkeypatch.setitem(sys.modules, "rl_matdesign.utils.design_count", counter)
     plan = small_plan(tmp_path)
     plan["base_config_data"]["groups"] = [{"name": "composition"}]
-    if filters_location == "top":
-        plan["base_config_data"]["filters"] = [{"type": "test"}]
-    elif filters_location == "group":
+    if filters_location == "group":
         plan["base_config_data"]["groups"][0]["filters"] = [{"type": "test"}]
     info = design_space_info(plan)
     assert info["episode_steps"] == 3

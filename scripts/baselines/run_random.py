@@ -67,7 +67,7 @@ def main(argv=None):
         while len(seen) < args.budget:
             units = sampler.sample(rng)
             key = tuple(sorted(units.items()))
-            comp = {name: amount / sampler.total_units for name, amount in units.items()}
+            comp = {name: float(amount * sampler.amount_quantum) for name, amount in units.items()}
             # Sampling is uniform with replacement. Duplicate requests and any
             # recomputation after cache eviction remain in the cost ledger.
             try:

@@ -6,13 +6,14 @@ import copy
 from types import SimpleNamespace
 
 import numpy as np
+from rl_matdesign.action_features import value_alphabet
 import pytest
 import torch
 from sklearn.preprocessing import StandardScaler
 
 from rl_matdesign import training
-from rl_matdesign.configuration import _TerminalReward, _FAILED_CANDIDATE_REWARD
-from rl_matdesign.env import EpisodeStep
+from rl_matdesign.configuration import _TerminalReward
+from rl_matdesign.domain_runtime import EpisodeStep
 from rl_matdesign.utils.episode_batch import EpisodeBatchEvaluator
 
 
@@ -59,15 +60,15 @@ class Predictor:
 
 class ScriptedEnv:
     """Two-step paths with a prescribed terminal identity and real reward hook."""
-    n_components = 2
-    phase_filter = None
+    max_steps = 2
+    filters = []
 
     def __init__(self, candidates, predictor):
         self.candidates = iter(candidates)
         self.starts = []
         self.path = []
         self.counter = 0
-        self.reward_fn = _TerminalReward(predictor, "multi_group")
+        self.reward_fn = _TerminalReward(predictor)
 
     def initialize(self):
         self.candidate = next(self.candidates)
@@ -107,7 +108,7 @@ class ScriptedEnv:
 
 def run_dqn(env, tmp_path, **overrides):
     kwargs = dict(
-        env=env, elem_feats_scaled=np.array([[0.1, 0.2]]), fraction_set=["0.5"],
+        env=env, elem_feats_scaled=np.array([[0.1, 0.2]]), action_values=["0.5"],
         device=torch.device("cpu"), hidden_dim=4, n_warmup_eps=2,
         dqn_num_train_eps=3, dqn_buffer_size=100, batch_size=1,
         dqn_grad_steps_per_ep=1, dqn_target_update_freq=2,
@@ -217,22 +218,21 @@ class Value(torch.nn.Module):
 
 
 def pg_setup(monkeypatch, sequence, size=4, method="reinforce"):
-    from rl_matdesign.env import CompositionEnv
+    from rl_matdesign.env_multigroup import MultiGroupEnv
     predictor = Predictor(size)
     # Real env paths/log probabilities; predictor sees slot names A-D through
     # conversion so reward identity is easy to inspect in expected sequences.
     species = ["Na", "K", "Ca", "Sr"]
     def candidate(payload):
+        payload = payload.get("composition", payload)
         for i, name in enumerate(species):
             if ((isinstance(payload, dict) and payload.get(name) == 1)
                     or (isinstance(payload, str) and payload.startswith(name + "1"))):
                 return {chr(ord("A") + i): 1.0}
         raise AssertionError(payload)
-    adapter = _TerminalReward(predictor, "fraction")
+    adapter = _TerminalReward(predictor)
     adapter._candidate = candidate
-    env = CompositionEnv(species_set=species, fraction_set=["1.00"], n_components=1,
-                         total_units=1, state_featurizer=lambda _: np.array([0.0]),
-                         reward_fn=adapter)
+    env = MultiGroupEnv(groups=[{'species_set': species, 'amount_set': ["1.00"], 'n_steps': 1, 'name': 'composition', 'kind': 'composition', 'unique': True, 'total': 1}], state_featurizer=lambda _: np.array([0.0]), reward_fn=adapter)
     choices = iter(sequence)
     sampled_params = []
     policy = Policy()
@@ -248,7 +248,7 @@ def pg_setup(monkeypatch, sequence, size=4, method="reinforce"):
     return predictor, sampled_params, dict(
         policy=policy, value_net=Value() if method == "a2c" else None, env=env,
         scaler=StandardScaler().fit([env.current_state_features()]), elem_feats_scaled=np.eye(4),
-        fraction_set=["1.00"], device=torch.device("cpu"), num_iters=1, batch_eps=4,
+        action_values=value_alphabet(env), device=torch.device("cpu"), num_iters=1, batch_eps=4,
         pg_repeat_penalty_coef=.2, rl_method=method,
     )
 
@@ -304,7 +304,7 @@ def test_generation_uses_snapshot_metadata_and_counts_failure_attempts(monkeypat
     rows = training.generate_candidates(
         env=env, predictor=predictor, qnet=torch.nn.Linear(1, 1),
         scaler=StandardScaler().fit([[0.0, 1.0], [1.0, 1.0]]), device=torch.device("cpu"),
-        elem_feats_scaled=np.array([[0.1, 0.2]]), fraction_set=["0.5"],
+        elem_feats_scaled=np.array([[0.1, 0.2]]), action_values=["0.5"],
         n_exploit=2, n_explore=1, max_attempts=3,
     )
     assert env.starts == ["X", "A", "B", "A", "C"]
@@ -316,28 +316,27 @@ def test_generation_uses_snapshot_metadata_and_counts_failure_attempts(monkeypat
     assert checked == ["A", "B", "C"]
 
 
-@pytest.mark.parametrize("env_type,payload,expected", [
-    ("fraction", "Ni0.50Fe0.50O2H1", {"Ni": .5, "Fe": .5}),
-    ("integer_ratio", "Fe3O2", {"Fe": .6, "O": .4}),
-    ("multi_group", {"cation": {"Ni": .5, "Fe": .5}}, {"cation": {"Ni": .5, "Fe": .5}}),
+@pytest.mark.parametrize("payload", [
+    {"Ni": .5, "Fe": .5}, {"Fe": 3, "O": 2},
+    {"cation": {"Ni": .5, "Fe": .5}},
 ])
-def test_adapter_scalar_and_batch_candidate_conversion_matches(env_type, payload, expected):
+def test_adapter_preserves_scalar_and_batch_candidate_mappings(payload):
     seen = []
     predictor = SimpleNamespace(predict=lambda c: (seen.append(c) or (2.0, 0.0)))
-    adapter = _TerminalReward(predictor, env_type, "O2H1")
+    adapter = _TerminalReward(predictor)
     assert adapter(payload) == 2.0
     assert adapter.evaluate_many([payload]) == [2.0]
-    assert seen == [expected, expected]
+    assert seen == [payload, payload]
 
 
-def test_adapter_keeps_invalid_integer_penalty_and_legacy_batch_fallback():
-    predictor = SimpleNamespace(predict=lambda _: pytest.fail("invalid formula evaluated"))
-    adapter = _TerminalReward(predictor, "integer_ratio")
-    assert adapter("not_a_formula") == _FAILED_CANDIDATE_REWARD
-    assert adapter.evaluate_many(["not_a_formula"]) == [_FAILED_CANDIDATE_REWARD]
+def test_adapter_requires_mapping_and_falls_back_from_unbatched_predictor():
+    predictor = SimpleNamespace(predict=lambda _: pytest.fail("invalid candidate evaluated"))
+    adapter = _TerminalReward(predictor)
+    with pytest.raises((TypeError, ValueError)):
+        adapter("Fe3O2")
     predictor = Predictor(4)
-    predictor.batch_predict = lambda _: pytest.fail("legacy batch API invoked")
-    adapter = _TerminalReward(predictor, "multi_group")
+    predictor.batch_predict = lambda _: pytest.fail("non-protocol batch API invoked")
+    adapter = _TerminalReward(predictor)
     results = adapter.evaluate_many([{"A": 1}, {"X": 1}, {"B": 1}])
     assert results[0] == 1 and results[2] == 2
     assert isinstance(results[1], training.CandidateEvaluationFailed)
@@ -345,7 +344,7 @@ def test_adapter_keeps_invalid_integer_penalty_and_legacy_batch_fallback():
 
 
 def test_adapter_rejects_nonfinite_scalar_and_batch_rewards():
-    adapter = _TerminalReward(Predictor(), "multi_group")
+    adapter = _TerminalReward(Predictor())
     with pytest.raises(training.CandidateEvaluationFailed, match="nonfinite"):
         adapter({"nan": 1})
     result = adapter.evaluate_many([{"A": 1}, {"nan": 1}])
@@ -431,7 +430,7 @@ def test_generation_charge_gate_uses_each_snapshot_formula(monkeypatch):
     rows = training.generate_candidates(
         env=env, predictor=predictor, qnet=torch.nn.Linear(1, 1),
         scaler=StandardScaler().fit([[0.0, 1.0], [1.0, 1.0]]), device=torch.device("cpu"),
-        elem_feats_scaled=np.array([[0.1, 0.2]]), fraction_set=["0.5"],
+        elem_feats_scaled=np.array([[0.1, 0.2]]), action_values=["0.5"],
         n_exploit=2, max_attempts=3, charge_filter=True,
     )
     assert checked == ["A1", "B1", "C1"]

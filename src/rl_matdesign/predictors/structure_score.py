@@ -1,8 +1,8 @@
 """Compose rewards from named scientific quantities while preserving their units.
 
-Model definitions may be inline in ``properties`` or shared through top-level
-``models`` and property ``model_ref``/``output`` selections. The existing registry
-constructs one adapter per named model/member. Adapters exposing named
+Every property declares its predictor and optional ``models`` inline. Identical
+physical model configurations automatically share loaded adapters and matching
+inference, without a second public declaration format. Adapters exposing named
 ``ScientificOutput`` records take priority over legacy score/predict methods.
 
 Engine-folded results preserve a rectangular model/configuration sample matrix.
@@ -15,10 +15,10 @@ The default objective is ``mean``. An explicit uncertainty penalty must select a
 available statistic. Combined rewards return no synthetic standard deviation:
 quantities in unrelated units cannot be averaged into reward uncertainty.
 
-Structure objectives reference frozen named structure sources; each candidate's
-source is sampled/relaxed once and reused by its objectives. Named model inference
-is shared for equal candidate/source/conditions. Cached outputs, metadata, sample
-diagnostics and the winning sweep condition are one evaluation record. Global RNG
+Structure objectives share one frozen structure definition. Each candidate is
+built once and reused by its objectives. Model inference is shared for
+equal candidate/structure/conditions. Cached outputs, metadata, and sample
+diagnostics belong to the same evaluation record. Global RNG
 streams are isolated from external leaf construction and candidate-local inference.
 """
 from __future__ import annotations
@@ -46,49 +46,10 @@ _OBJECTIVES = ("mean", "mean_minus_kstd", "mean_plus_kstd")
 # mean/std fold (so heads that regress log(value) report the real value).
 _TRANSFORMS = ("none", "identity", "exp", "pow10")
 _UNCERTAINTIES = ("model_spread", "config_spread", "native_uncertainty", "pooled_spread")
-
-
-def normalize_model_references(cfg: Dict[str, Any]) -> Tuple[Dict[str, dict], List[dict]]:
-    """Validate named model ownership and return detached effective properties.
-
-    This performs no model construction or file I/O. Model definitions own model
-    arguments; property references own reward/output selection and source use.
-    Repeating a model-owned field at a reference is rejected even if equal.
-    """
-    definitions = deepcopy(cfg.get("models", {}))
-    if not isinstance(definitions, dict):
-        raise EvaluationProtocolError("Top-level models must be a mapping of model IDs to definitions")
-    for model_id, definition in definitions.items():
-        if not isinstance(model_id, str) or not model_id.strip() or not isinstance(definition, dict):
-            raise EvaluationProtocolError("Each named model needs a nonempty ID and a mapping definition")
-        if not definition.get("predictor") or "model_ref" in definition:
-            raise EvaluationProtocolError(f"Model {model_id!r} needs predictor and cannot reference another model")
-        forbidden = {"direction", "weight", "scale", "objective", "source", "transform", "uncertainty",
-                     "target_value", "target_tolerance"} & definition.keys()
-        if forbidden:
-            raise EvaluationProtocolError(f"Model {model_id!r} contains property-owned settings: {sorted(forbidden)}")
-    properties = cfg.get("properties", [])
-    if not isinstance(properties, list) or any(not isinstance(prop, dict) for prop in properties):
-        raise EvaluationProtocolError("properties must be a list of mappings")
-    used, resolved = set(), []
-    for original in properties:
-        prop = deepcopy(original)
-        model_ref = prop.get("model_ref")
-        if model_ref is not None:
-            if not isinstance(model_ref, str) or model_ref not in definitions:
-                raise EvaluationProtocolError(f"Unknown model_ref {model_ref!r}")
-            duplicates = {"predictor", "model", "models", "dp_models", "head"} & prop.keys()
-            if duplicates:
-                raise EvaluationProtocolError(f"model_ref {model_ref!r} cannot repeat model configuration: {sorted(duplicates)}")
-            conflicts = set(prop) & set(definitions[model_ref])
-            if conflicts:
-                raise EvaluationProtocolError(f"model_ref {model_ref!r} repeats model-defined fields: {sorted(conflicts)}")
-            used.add(model_ref)
-            prop = {**definitions[model_ref], **prop}
-        resolved.append(prop)
-    if set(definitions) - used:
-        raise EvaluationProtocolError(f"Unused named model definitions: {sorted(set(definitions) - used)}")
-    return definitions, resolved
+# These adapters consume the whole checkpoint ensemble in one frame-bundle call.
+_ENSEMBLE_PREDICTORS = frozenset({
+    "ooh_frames", "rl_matdesign.predictors.ooh_frames:OOHFramesPredictor",
+})
 
 
 class _Statistics(dict):
@@ -149,29 +110,10 @@ class StructureScorePredictor:
 
         self.cfg = cfg
         self.k: float = float(cfg.get("k", 1.0))
-        self.n_random_configs: int = int(cfg.get("n_random_configs", 1))
         from numbers import Integral
         if seed is not None and (isinstance(seed, bool) or not isinstance(seed, Integral) or seed < 0):
             raise ValueError("Evaluation seed must be a nonnegative integer")
         self._seed = int(seed) if seed is not None else secrets.randbits(64)
-
-        # Optional inner optimization over a shared operating condition (e.g.
-        # temperature). For each candidate we score every property at each sweep
-        # value and keep the single value maximizing the combined reward. The
-        # value is substituted into each property's fparam `null` placeholder(s).
-        sweep = cfg.get("sweep")
-        self.sweep: Optional[Dict[str, Any]] = None
-        if sweep is not None:
-            values = sweep.get("values")
-            if not values:
-                raise ValueError(
-                    "sweep needs a non-empty 'values' list (e.g. temperatures to "
-                    "try for each composition)."
-                )
-            self.sweep = {
-                "name": str(sweep.get("name", "sweep")),
-                "values": [float(v) for v in values],
-            }
 
         raw_props = cfg.get("properties")
         if not raw_props:
@@ -181,15 +123,26 @@ class StructureScorePredictor:
                 "direction: max|min, ...}."
             )
 
-        model_definitions, resolved_props = normalize_model_references(cfg)
+        retired = {"model", "models", "model_ref", "dp_models", "predictor",
+                   "objective", "uncertainty", "output_index"} & cfg.keys()
+        if retired:
+            raise EvaluationProtocolError(
+                f"Top-level model settings {sorted(retired)} are unsupported; declare predictors in properties")
+        if not isinstance(raw_props, list) or any(not isinstance(prop, dict) for prop in raw_props):
+            raise EvaluationProtocolError("properties must be a list of mappings")
         shared_instances = {}
         self._model_declarations = {}
         self.properties: List[Dict[str, Any]] = []
         self._source_builders: Dict[str, Any] = {}
         seen: set[str] = set()
-        for i, p in enumerate(resolved_props):
-            model_ref = p.get("model_ref")
-            model_definition = model_definitions.get(model_ref)
+        for i, p in enumerate(raw_props):
+            if "weight" in p:
+                raise EvaluationProtocolError(
+                    f"properties[{i}].weight was removed; put coefficients in reward terms")
+            retired = {"model_ref", "model", "dp_models"} & p.keys()
+            if retired:
+                raise EvaluationProtocolError(
+                    f"properties[{i}] uses retired settings {sorted(retired)}; use inline predictor and models")
             name = str(p.get("name", f"prop{i}"))
             if name in seen:
                 raise ValueError(
@@ -198,20 +151,38 @@ class StructureScorePredictor:
                 )
             seen.add(name)
 
-            physical_cfg = dict(model_definition if model_definition is not None else p)
-            for field_name in ("name", "model_ref", "direction", "target_value", "target_tolerance",
-                               "weight", "scale", "objective", "source", "transform", "uncertainty",
-                               "output", "unit", "representation"):
-                physical_cfg.pop(field_name, None)
-            self._model_declarations[model_ref if model_ref is not None else name] = physical_cfg
             predictor_name = str(p.get("predictor", "")).strip()
             if not predictor_name:
                 raise ValueError(
                     f"properties[{i}] ({name!r}) needs a 'predictor' — one of "
-                    "'dp_energy', 'dp_property', 'dp_classification', a registry leaf (e.g. 'rf_magpie', "
-                    "'ooh'), or an FQN 'pkg.mod:Class'."
+                    "'dp_energy', 'dp_property', 'dp_classification', a registry leaf "
+                    "(e.g. 'rf_magpie', 'ooh_frames'), or an FQN 'pkg.mod:Class'."
                 )
             is_dp_backend = predictor_name in ("dp_energy", "dp_property", "dp_classification")
+            physical_cfg = dict(p)
+            for field_name in ("name", "direction", "target_value", "target_tolerance",
+                               "scale", "objective", "transform", "uncertainty",
+                               "output", "unit", "representation", "fparam", "aparam"):
+                physical_cfg.pop(field_name, None)
+            if is_dp_backend:
+                for field_name in ("output_index", "output_aggregator", "energy_per_atom"):
+                    physical_cfg.pop(field_name, None)
+            import hashlib
+            model_key = hashlib.sha256(repr(self._key(physical_cfg)).encode()).hexdigest()
+            self._model_declarations[model_key] = physical_cfg
+            model_spec = p.get("models")
+            if "models" in p and (
+                not isinstance(model_spec, list) or not model_spec
+                or any(not isinstance(path, str) or not path for path in model_spec)
+            ):
+                raise EvaluationProtocolError(f"properties[{i}].models must be a nonempty list of paths")
+            if (predictor_name in {"rf_magpie", "mgtransformer", "lookup"} | _ENSEMBLE_PREDICTORS
+                    and model_spec is None):
+                raise EvaluationProtocolError(
+                    f"properties[{i}] ({name!r}) with predictor={predictor_name!r} needs models: a nonempty list of paths")
+            if model_spec is not None and len(model_spec) != len(set(model_spec)):
+                raise EvaluationProtocolError(
+                    f"Property {name!r} repeats a checkpoint; duplicated models do not form an ensemble")
 
             # direction is REQUIRED — the sign (lower vs higher is better) must be
             # explicit, never implied.
@@ -238,8 +209,8 @@ class StructureScorePredictor:
                         f"properties[{i}] ({name!r}) has direction: target but no "
                         "'target_value' -- the value to hit, in the property's real "
                         "units (e.g. target_value: 1.34 for a 1.34 eV bandgap). Note "
-                        "this is NOT the leaf's own 'target'/'model' key, which "
-                        "selects the checkpoint."
+                        "this is NOT a checkpoint selection; 'models' "
+                        "selects checkpoints."
                     )
                 try:
                     target_value = float(p["target_value"])
@@ -275,18 +246,9 @@ class StructureScorePredictor:
                     f"{list(_OBJECTIVES)}."
                 )
 
-            # `null` entries in fparam mark the slot filled by the sweep value.
             fparam = p.get("fparam")
-            sweep_slots = (
-                [j for j, x in enumerate(fparam) if x is None]
-                if isinstance(fparam, (list, tuple)) else []
-            )
-            if sweep_slots and self.sweep is None:
-                raise ValueError(
-                    f"properties[{i}] ({name!r}) has a null placeholder in fparam "
-                    f"but no top-level 'sweep' is configured. Add a 'sweep' block "
-                    "(e.g. {name: temperature, values: [...]}) or fill the fparam."
-                )
+            if isinstance(fparam, (list, tuple)) and any(value is None for value in fparam):
+                raise ValueError(f"Property {name!r} fparam requires explicit operating-condition values")
 
             transform = str(p.get("transform", "none")).lower()
             if transform not in _TRANSFORMS:
@@ -306,7 +268,7 @@ class StructureScorePredictor:
                 raise EvaluationProtocolError(str(exc)) from exc
 
             if is_dp_backend:
-                models = p.get("models") or p.get("dp_models")
+                models = model_spec
                 if not models:
                     raise ValueError(
                         f"properties[{i}] ({name!r}) with predictor={predictor_name!r} "
@@ -343,42 +305,28 @@ class StructureScorePredictor:
                 instance = None
                 is_structure = True
             else:
-                # Registry leaf or FQN. `model:` may be ONE path or a LIST of paths;
-                # each path becomes its own leaf instance, because a leaf represents
-                # exactly one model. That is what makes "one model -> std == 0" fall
-                # out of the arithmetic instead of needing a flag (see _score).
                 from ..registry import resolve_predictor
 
                 models = None
-                model_spec = p.get("model", p.get("models"))
-                if isinstance(model_spec, (list, tuple)):
-                    model_paths = [str(m) for m in model_spec]
-                    if not model_paths:
-                        raise ValueError(
-                            f"properties[{i}] ({name!r}) has an empty 'model' list."
-                        )
-                elif model_spec is None:
-                    model_paths = [None]          # leaf needs no model path
-                else:
-                    model_paths = [str(model_spec)]
-
-                instance = shared_instances.get(model_ref) if model_ref is not None else None
+                # OOH evaluates the ensemble against one padded frame bundle.
+                # Other leaves own a single checkpoint; the engine folds members.
+                owns_ensemble = predictor_name in _ENSEMBLE_PREDICTORS
+                model_paths = [None] if owns_ensemble else list(model_spec or [None])
+                instance = shared_instances.get(model_key)
                 if instance is None:
                     instance = []
                     for j, path in enumerate(model_paths):
-                        leaf_cfg = dict(model_definition if model_definition is not None else p)
-                        if path is not None:
-                            leaf_cfg["model"] = path
-                        # Model-reference identity is independent of property declaration order.
-                        import hashlib
-                        namespace = self._key({"reference": model_ref, "definition": physical_cfg})
+                        leaf_cfg = dict(physical_cfg)
+                        if not owns_ensemble:
+                            leaf_cfg.pop("models", None)
+                            if path is not None:
+                                leaf_cfg["model"] = path
                         child_seed = int.from_bytes(hashlib.sha256(
-                            repr(("model-init-v1", self._seed, namespace, j)).encode()).digest()[:4], "big")
+                            repr(("model-init-v2", self._seed, model_key, j)).encode()).digest()[:4], "big")
                         from ..utils.seeding import isolated_rng
                         with isolated_rng(child_seed):
                             instance.append(self._own(resolve_predictor(predictor_name, leaf_cfg, seed=child_seed)))
-                    if model_ref is not None:
-                        shared_instances[model_ref] = instance
+                    shared_instances[model_key] = instance
 
                 # A leaf that can score structures is a structure objective (gets the
                 # built cells); otherwise it is a composition objective (gets the
@@ -388,13 +336,9 @@ class StructureScorePredictor:
                                    ("score_structures", "predict_structures", "predict_structure_outputs"))
                 backend = "structure_fqn" if is_structure else "composition"
 
-            declared_paths = list(models) if models else model_paths
-            if len(declared_paths) != len(set(declared_paths)):
-                raise EvaluationProtocolError(f"Property {name!r} repeats a checkpoint; duplicated models do not form an ensemble")
             self.properties.append({
                 "name": name,
-                "model_ref": model_ref,
-                "model_key": model_ref if model_ref is not None else name,
+                "model_key": model_key,
                 "output": p.get("output"),
                 "unit": p.get("unit"),
                 "unit_declared": "unit" in p,
@@ -414,17 +358,17 @@ class StructureScorePredictor:
                 "output_aggregator": str(p.get("output_aggregator", "index")),
                 "energy_per_atom": bool(p.get("energy_per_atom", True)),
                 "fparam": fparam,
-                "sweep_slots": sweep_slots,
                 "aparam": p.get("aparam"),
                 "direction": None if is_target else _DIRECTION_ALIASES[direction],
                 "target": target_spec,
-                "weight": float(p.get("weight", 1.0)),
                 "scale": scale,
                 "objective": objective,
                 "transform": transform,
-                "n_random_configs": int(p.get("n_random_configs", self.n_random_configs)),
             })
 
+        from collections import Counter
+        model_uses = Counter(prop["model_key"] for prop in self.properties)
+        self._shared_models = {key for key, uses in model_uses.items() if uses > 1}
         self._output_memo = {}
         self._metadata_memo = {}
         self._active_leaf_metadata = {}
@@ -433,7 +377,7 @@ class StructureScorePredictor:
         from ..rewards import RewardCombiner
 
         self._reward_combiner = RewardCombiner(
-            cfg.get("reward"), {p["name"]: p["weight"] for p in self.properties}
+            cfg.get("reward"), [p["name"] for p in self.properties]
         )
 
         # Any structure predictor present? Only then do we need a builder / base
@@ -441,8 +385,8 @@ class StructureScorePredictor:
         # nothing.
         self._has_structure = any(p["backend"] != "composition" for p in self.properties)
 
-        from ..structure_sources import normalize_structure_sources
-        self.source_plan = normalize_structure_sources(
+        from ..structure_sources import resolve_structure_plan
+        self.source_plan = resolve_structure_plan(
             cfg, needs_structure=[p["name"] for p in self.properties if p["backend"] != "composition"],
         )
         from ..structure_sources import resolve_source_assets
@@ -461,7 +405,7 @@ class StructureScorePredictor:
                     stat = Path(path).stat()
                     self._source_asset_snapshots[path] = (stat.st_dev, stat.st_ino, stat.st_size,
                                                          stat.st_mtime_ns, stat.st_ctime_ns)
-        self.source_plan = replace(self.source_plan, sources=tuple(resolved_sources))
+        self.source_plan = replace(self.source_plan, structure=resolved_sources[0] if resolved_sources else None)
         self._property_sources = self.source_plan.property_sources
         for spec in self.source_plan.sources:
             source_cfg = spec.effective_config
@@ -474,7 +418,6 @@ class StructureScorePredictor:
             self._source_builders[spec.source_id] = self._own(builder)
         self._calc_cache: Dict[str, Any] = {}     # name -> ase calculators (energy backend)
         self._prop_cache: Dict[str, Tuple[List[Any], Dict[str, int]]] = {}  # name -> property models
-        self._geo_calcs: Dict[str, Any] = {}
         self._parallel_models_ready = False
         # Persistent per-composition stats cache (LRU). Keyed by the canonical
         # candidate key, it makes each unique composition build+relax+score
@@ -507,7 +450,7 @@ class StructureScorePredictor:
     def _reward_details(
         self, stats: Dict[str, Tuple[float, float]], *, raw: bool = False,
     ) -> Dict[str, Any]:
-        """Use one reward rule for training, generation, sweeps and diagnostics."""
+        """Use one reward rule for training, generation and diagnostics."""
         # Classifier gates use a fixed one-std margin across model means.
         # Keep this independent of objective direction/scale/k and of `raw`,
         # so training, CSV diagnostics and raw_combine agree on feasibility.
@@ -519,11 +462,16 @@ class StructureScorePredictor:
             )
             for p in self.properties
         }
+        # Gate-only and diagnostic properties do not contribute an adjusted
+        # objective. Their physical outputs remain available above and in reports.
+        objective_names = set(self._reward_combiner.objective_terms)
+        for _, terms in self._reward_combiner.alternatives:
+            objective_names.update(terms)
         values = {
             p["name"]: self._property_value(
                 p, stats[p["name"]][0], 0.0 if raw else stats[p["name"]][1]
             ) / p["scale"]
-            for p in self.properties
+            for p in self.properties if p["name"] in objective_names
         }
         return self._reward_combiner.evaluate(gate_values, values)
 
@@ -535,7 +483,7 @@ class StructureScorePredictor:
         return self._reward_details(self._raw_stats(candidate))
 
     def _property_value(self, prop: Dict[str, Any], mean: float, std: float) -> float:
-        """Signed 'higher is better' value for ONE objective, before weight/scale.
+        """Signed 'higher is better' value before scaling and reward composition.
 
         max/min: the existing signed objective, unchanged. target: the deadbanded
         distance to ``target_value``, negated so closer is better, then pushed
@@ -596,7 +544,7 @@ class StructureScorePredictor:
         if record is None:
             raise KeyError("Completed prediction missing from the current evaluation cache")
         # stats keeps the selected uncertainty and its paired ScientificOutputs;
-        # metadata belongs to this exact (possibly sweep-winning) evaluation.
+        # metadata belongs to this exact (completed) evaluation.
         row = objective_record(self.raw_combine(record.stats), record.stats,
                                self._reward_details(record.stats))
         row.update(metadata_record(record.metadata))
@@ -807,9 +755,8 @@ class StructureScorePredictor:
         """Frozen declarations and the resolved seed for evaluation provenance."""
         from ..structure_sources import SOURCE_SEED_VERSION
         return {"eval_seed": self._seed, "seed_version": SOURCE_SEED_VERSION,
-                "sources": [spec.to_schema() for spec in self.source_plan.sources],
-                "property_sources": self.source_plan.property_sources,
-                "migration_notes": list(self.source_plan.migration_notes),
+                "structure": self.source_plan.structure.to_schema() if self.source_plan.structure else None,
+                "properties": list(self.source_plan.property_names),
                 "asset_resolution": deepcopy(self._source_asset_references),
                 "asset_coverage": "declared known fields; external builder fields may require an adapter"}
 
@@ -820,7 +767,7 @@ class StructureScorePredictor:
         for model_id, definition in self._model_declarations.items():
             references = []
             predictor = str(definition.get("predictor", ""))
-            for field_name in ("model", "models", "dp_models"):
+            for field_name in ("models",):
                 declared = definition.get(field_name)
                 paths = declared if isinstance(declared, (list, tuple)) else [declared]
                 for item in paths:
@@ -828,7 +775,8 @@ class StructureScorePredictor:
                         continue
                     path = Path(item).expanduser()
                     reference = {"field": field_name, "declared": item}
-                    if predictor.startswith("dp_") or path.is_absolute() or predictor in ("rf_magpie", "lookup"):
+                    if (predictor.startswith("dp_") or path.is_absolute()
+                            or predictor in {"rf_magpie", "lookup"} | _ENSEMBLE_PREDICTORS):
                         path = path.resolve()
                         reference["path"] = str(path)
                         if path.is_file():
@@ -935,50 +883,14 @@ class StructureScorePredictor:
         return fn(candidate) if callable(fn) else None
 
     def score_breakdown(self, candidate: Any) -> Dict[str, Any]:
-        """Diagnostic: per-sweep-value property stats + combined reward.
-
-        Builds (and relaxes) the structure **once**, then scores every property
-        at each sweep value (or just once if no sweep). Returns::
-
-            {"rows": [{"value": v, "stats": {name: (mean, std)}, "reward": r}, ...],
-             "best": {"value": v*, "stats": {...}, "reward": r*},
-             "structures": {prop_name: [relaxed Atoms, ...]}}
-
-        ``value`` is ``None`` when no sweep is configured. ``structures`` are the
-        exact (relaxed) cells that were scored, so a caller can save/inspect them
-        without re-building or re-relaxing. Used by ``scripts/evaluate_lips.py``.
-        """
+        """Return explicit property statistics and reward for one built ensemble."""
         self._validate_source_assets()
         prop_structures = self._materialize_structures(candidate)
         diagnostics = deepcopy(self._materialization_diagnostics[0])
-        values = self.sweep["values"] if self.sweep is not None else [None]
-        rows: List[Dict[str, Any]] = []
-        self._evaluation_candidate = self._canonical_candidate(candidate)
-        self._output_memo = {}
-        self._metadata_memo = {}
-        for v in values:
-            self._active_outputs = {}
-            self._active_leaf_metadata = {}
-            if v is None:                       # no sweep — score each property once
-                stats = {
-                    p["name"]: self._score(p, prop_structures[p["name"]])
-                    for p in self.properties
-                }
-            else:
-                stats = {
-                    p["name"]: self._score(
-                        p, prop_structures[p["name"]], fparam=self._fparam_at(p, v)
-                    )
-                    for p in self.properties
-                }
-            stats = _Statistics(stats, outputs=self._active_outputs.copy())
-            details = self._reward_details(stats)
-            rows.append({
-                "value": v, "stats": stats, "reward": details["reward"],
-                "reward_details": details, "outputs": self._active_outputs.copy(),
-            })
-        best = max(rows, key=lambda r: r["reward"])
-        return {"rows": rows, "best": best, "structures": prop_structures, "sources": diagnostics}
+        record = self._evaluate_inputs(prop_structures, candidate, diagnostics)
+        details = self._reward_details(record.stats)
+        return {"stats": record.stats, "reward": details["reward"], "reward_details": details,
+                "outputs": record.outputs, "structures": prop_structures, "sources": diagnostics}
 
     def raw_combine(self, stats: Dict[str, Tuple[float, float]]) -> float:
         """Apply the configured reward rule without objective std penalties.
@@ -1016,10 +928,6 @@ class StructureScorePredictor:
         target.setdefault("sources", {})[source_id] = deepcopy(record)
         self._materialization_diagnostics[index][source_id] = deepcopy(self._last_build_diagnostics)
 
-    def _geo_opt_enabled(self, source_id):
-        go = self.source_plan.source(source_id).geo_opt
-        return bool(go) and bool(go.get("enabled", True))
-
     @staticmethod
     def _canonical_candidate(candidate):
         """Give builders a detached mapping in identity order; retain positions."""
@@ -1035,16 +943,12 @@ class StructureScorePredictor:
 
     def _stage_summary(self, source_id, builder, capture, elapsed, attempted, succeeded):
         from ..utils.stage_timing import summarize_stage_times
-        cfg = self.source_plan.source(source_id).effective_config
         supported = getattr(builder, "timing_stages", ()) or ()
         supported = {supported} if isinstance(supported, str) else set(supported)
-        geo_opt_enabled = self._geo_opt_enabled(source_id)
-        if geo_opt_enabled and not getattr(builder, "handles_geo_opt", False):
-            supported.add("opt")
         return summarize_stage_times(
             capture, elapsed,
-            md_expected=bool(cfg.get("md") or getattr(builder, "md", None)),
-            opt_expected=bool(geo_opt_enabled or cfg.get("opt") or getattr(builder, "opt", None)),
+            md_expected=bool(getattr(builder, "md", None)),
+            opt_expected=bool(getattr(builder, "opt", None)),
             supported_stages=supported, config_attempted=attempted, config_succeeded=succeeded)
 
     @staticmethod
@@ -1060,7 +964,6 @@ class StructureScorePredictor:
         candidate = self._canonical_candidate(candidate)
         self._last_build_timing = {}
         self._last_build_diagnostics = {}
-        self._last_relaxation_failures = []
         self._last_surviving_samples = []
         native_records = None
         succeeded = 0
@@ -1101,27 +1004,7 @@ class StructureScorePredictor:
                         source_id, builder, capture, time.perf_counter() - started, attempted, succeeded)
 
     def _usable_structures(self, source_id: str, structures: Any) -> List[Any]:
-        from ..utils.structure import strict_relaxation_errors
-        builder = self._source_builders[source_id]
         structures = list(structures)
-        self._last_relaxation_failures = []
-        self._last_surviving_samples = []
-        if self._geo_opt_enabled(source_id) and not getattr(builder, "handles_geo_opt", False):
-            successful = []
-            for index, atoms in enumerate(structures):
-                try:
-                    with strict_relaxation_errors():
-                        successful.append(self._relax(atoms, source_id=source_id))
-                except EvaluationProtocolError:
-                    raise
-                except Exception as exc:
-                    record = deepcopy(getattr(atoms, "info", {}).get("_rl_matdesign_sample",
-                                      {"source_id": source_id, "returned_index": index}))
-                    record.update(status="relaxation_failed", error=f"{type(exc).__name__}: {exc}")
-                    self._last_relaxation_failures.append(record)
-                    print(f"[structure_score] source {source_id!r} config {index + 1}/{len(structures)} "
-                          f"relaxation failed, skipping: {type(exc).__name__}: {exc}")
-            structures = successful
         self._last_surviving_samples = [deepcopy(getattr(atoms, "info", {}).get("_rl_matdesign_sample",
                                        {"source_id": source_id, "returned_index": index}))
                                        for index, atoms in enumerate(structures)]
@@ -1191,7 +1074,6 @@ class StructureScorePredictor:
                 built = [exc] * len(active)
             records = getattr(builder, "last_build_timings", [])
             for offset, (i, structures) in enumerate(zip(active, built)):
-                self._last_relaxation_failures = []
                 self._last_surviving_samples = []
                 record = (dict(records[offset]) if len(records) == len(active)
                           else self._unknown_build_timing())
@@ -1258,7 +1140,6 @@ class StructureScorePredictor:
         records = batches[offset] if explicit else (native_records or [])
         return {"sample_identity": "explicit_plan" if explicit else "native_ensemble",
                 "samples": deepcopy(records),
-                "parent_relaxation_failures": deepcopy(self._last_relaxation_failures),
                 "surviving_samples": deepcopy(self._last_surviving_samples)}
 
     def _raw_stats(self, candidate: Any) -> Dict[str, Tuple[float, float]]:
@@ -1296,24 +1177,12 @@ class StructureScorePredictor:
         self._output_memo = {}
         self._metadata_memo = {}
         self._evaluation_candidate = self._canonical_candidate(candidate)
-        best_record = None
-        best_reward = None
-        values = self.sweep["values"] if self.sweep is not None else [None]
-        for value in values:
-            self._active_outputs = {}
-            self._active_leaf_metadata = {}
-            stats = _Statistics({p["name"]: (self._score(p, prop_structures[p["name"]])
-                if value is None else self._score(p, prop_structures[p["name"]], fparam=self._fparam_at(p, value)))
-                for p in self.properties}, outputs=self._active_outputs.copy())
-            reward = self._combine(stats)
-            if best_reward is None or reward > best_reward:
-                best_reward = reward
-                if self.sweep is not None:
-                    stats[self.sweep["name"]] = (float(value), None)
-                best_record = _EvaluationRecord(stats, self._collect_candidate_metadata(candidate),
-                                                deepcopy(source_diagnostics or {}),
-                                                self._active_outputs.copy())
-        return best_record
+        self._active_outputs = {}
+        self._active_leaf_metadata = {}
+        stats = _Statistics({p["name"]: self._score(p, prop_structures[p["name"]])
+                             for p in self.properties}, outputs=self._active_outputs.copy())
+        return _EvaluationRecord(stats, self._collect_candidate_metadata(candidate),
+                                 deepcopy(source_diagnostics or {}), self._active_outputs.copy())
 
     def _cache_evaluation(self, key: tuple, record: _EvaluationRecord) -> None:
         self._stats_cache[key] = record
@@ -1322,20 +1191,10 @@ class StructureScorePredictor:
             while len(self._stats_cache) > cap:
                 self._stats_cache.popitem(last=False)   # evict least-recently used
 
-    @staticmethod
-    def _fparam_at(prop: Dict[str, Any], value: float) -> Any:
-        """Return *prop*'s fparam with its ``null`` slots filled by *value*."""
-        if not prop["sweep_slots"]:
-            return prop["fparam"]      # T-independent property (or no fparam)
-        out = list(prop["fparam"])
-        for j in prop["sweep_slots"]:
-            out[j] = value
-        return out
-
     def _score(
-        self, prop: Dict[str, Any], structures: Any, *, fparam: Any = None,
+        self, prop: Dict[str, Any], structures: Any,
     ) -> Tuple[float, Optional[float]]:
-        output, default_uncertainty = self._score_output(prop, structures, fparam=fparam)
+        output, default_uncertainty = self._score_output(prop, structures)
         self._active_outputs[prop["name"]] = output
         kind = prop["uncertainty"] or default_uncertainty
         return output.mean, getattr(output, kind)
@@ -1391,56 +1250,61 @@ class StructureScorePredictor:
         except (ValueError, TypeError, IndexError, OverflowError) as exc:
             raise EvaluationProtocolError(f"Invalid scientific output: {exc}") from exc
 
-    def _score_output(self, prop, payload, *, fparam=None):
+    def _score_output(self, prop, payload):
         if prop["backend"] in ("composition", "structure_fqn"):
-            output, default = self._score_leaf_output(prop, payload, fparam=fparam)
+            output, default = self._score_leaf_output(prop, payload)
         else:
-            output = self._score_dp_output(prop, payload, fparam=fparam)
+            output = self._score_dp_output(prop, payload)
             default = "model_spread"
         return self._scientific_contract(self._transform_output, prop, output), default
 
-    def _score_dp_output(self, prop, structures, *, fparam=None):
-        if prop["backend"] == "energy":
-            from ..utils.dp_eval import eval_energy_ase
-            calculators = self._get_calculators(prop)
-            self._count_dp_work(prop, structures)
-            values = eval_energy_ase(structures, calculators,
-                                     energy_per_atom=prop["energy_per_atom"])
-        elif prop["backend"] == "property" and prop["model_ref"] is not None:
-            from ..utils.dp_eval import eval_property_outputs, pick_scalar
-            frame = fparam if fparam is not None else prop["fparam"]
-            key = ("dp_outputs", prop["model_key"], self._property_sources.get(prop["name"]),
-                   self._key({"fparam": frame, "aparam": prop["aparam"]}))
-            if key not in self._output_memo:
-                models, elem_to_type = self._get_prop_models(prop)
-                self._count_dp_work(prop, structures)
-                self._output_memo[key] = eval_property_outputs(
-                    structures, models, elem_to_type, fparam=frame, aparam=prop["aparam"])
-            raw = self._output_memo[key]
-            values = [[self._scientific_contract(pick_scalar, vector, output_index=prop["output_index"],
-                       output_aggregator=prop["output_aggregator"]) for vector in row] for row in raw]
+    def _score_dp_output(self, prop, structures):
+        if any("_rl_matdesign_frames" in getattr(atoms, "info", {}) for atoms in structures):
+            raise EvaluationProtocolError("A frame bundle requires a frame-aware predictor such as ooh_frames")
+        memo_key = ("dp_selected", prop["model_key"], self._property_sources.get(prop["name"]),
+                    self._key({key: prop[key] for key in ("fparam", "aparam", "output_index",
+                                                         "output_aggregator", "energy_per_atom")}))
+        if prop["model_key"] in self._shared_models and memo_key in self._output_memo:
+            values = self._output_memo[memo_key]
         else:
-            from ..utils.dp_eval import eval_classification_ensemble, eval_property_ensemble
-            models, elem_to_type = self._get_prop_models(prop)
-            evaluate = (eval_classification_ensemble if prop["backend"] == "classification"
-                        else eval_property_ensemble)
-            self._count_dp_work(prop, structures)
-            values = evaluate(structures, models, elem_to_type,
-                              output_index=prop["output_index"],
-                              output_aggregator=prop["output_aggregator"],
-                              fparam=fparam if fparam is not None else prop["fparam"], aparam=prop["aparam"])
+            if prop["backend"] == "energy":
+                from ..utils.dp_eval import eval_energy_ase
+                calculators = self._get_calculators(prop)
+                self._count_dp_work(prop, structures)
+                values = eval_energy_ase(structures, calculators,
+                                         energy_per_atom=prop["energy_per_atom"])
+            elif prop["backend"] == "property" and prop["model_key"] in self._shared_models:
+                from ..utils.dp_eval import eval_property_outputs, pick_scalar
+                frame = prop["fparam"]
+                key = ("dp_outputs", prop["model_key"], self._property_sources.get(prop["name"]),
+                       self._key({"fparam": frame, "aparam": prop["aparam"]}))
+                if key not in self._output_memo:
+                    models, elem_to_type = self._get_prop_models(prop)
+                    self._count_dp_work(prop, structures)
+                    self._output_memo[key] = eval_property_outputs(
+                        structures, models, elem_to_type, fparam=frame, aparam=prop["aparam"])
+                raw = self._output_memo[key]
+                values = [[self._scientific_contract(pick_scalar, vector, output_index=prop["output_index"],
+                           output_aggregator=prop["output_aggregator"]) for vector in row] for row in raw]
+            else:
+                from ..utils.dp_eval import eval_classification_ensemble, eval_property_ensemble
+                models, elem_to_type = self._get_prop_models(prop)
+                evaluate = (eval_classification_ensemble if prop["backend"] == "classification"
+                            else eval_property_ensemble)
+                self._count_dp_work(prop, structures)
+                values = evaluate(structures, models, elem_to_type,
+                                  output_index=prop["output_index"],
+                                  output_aggregator=prop["output_aggregator"],
+                                  fparam=prop["fparam"], aparam=prop["aparam"])
         array = self._scientific_contract(np.asarray, values, dtype=float)
         expected = (len(prop["models"]), len(structures))
         if array.shape != expected:
             raise EvaluationProtocolError(f"Expected complete model/configuration matrix {expected}, got {array.shape}")
+        self._output_memo[memo_key] = array
         ids = self._configuration_ids(prop, structures)
         return self._scientific_contract(aggregate_samples, self._raw_schema(prop), [
             self._scientific_contract(ModelSamples, f"{prop['model_key']}:{index}:{model}", ids, tuple(array[index]))
             for index, model in enumerate(prop["models"])])
-
-    def _score_leaves(self, prop, payload):
-        """Compatibility helper; all leaves use the same sample-aware output path."""
-        return self._score(prop, payload)
 
     def _call_leaf(self, method, payload, prop, index, conditions):
         from ..utils.seeding import isolated_rng, candidate_seed
@@ -1449,7 +1313,7 @@ class StructureScorePredictor:
         source = ({"id": source_id, "protocol": self.source_plan.source(source_id).protocol_fingerprint}
                   if source_id is not None else None)
         definition = self._model_declarations[prop["model_key"]]
-        namespace = {"version": 1, "candidate": candidate, "reference": prop["model_ref"],
+        namespace = {"version": 2, "candidate": candidate, "model_key": prop["model_key"],
                      "model": definition, "member": index, "source": source, "conditions": conditions}
         with isolated_rng(candidate_seed(self._seed, namespace)):
             result = method(payload, **conditions)
@@ -1461,13 +1325,25 @@ class StructureScorePredictor:
             self._active_leaf_metadata[(prop["name"], index)] = deepcopy(metadata)
             return result
 
-    def _score_leaf_output(self, prop, payload, *, fparam=None):
+    def _cached_leaf_call(self, method, payload, prop, index):
+        """Reuse a scalar leaf result and its metadata within one evaluation."""
+        if prop["model_key"] not in self._shared_models:
+            return self._call_leaf(method, payload, prop, index, {})
+        key = ("leaf_scalar", id(prop["instance"][index]),
+               self._property_sources.get(prop["name"]))
+        if key not in self._output_memo:
+            self._output_memo[key] = deepcopy(self._call_leaf(method, payload, prop, index, {}))
+            self._metadata_memo[key] = deepcopy(self._active_leaf_metadata[(prop["name"], index)])
+        self._active_leaf_metadata[(prop["name"], index)] = deepcopy(self._metadata_memo[key])
+        return deepcopy(self._output_memo[key])
+
+    def _score_leaf_output(self, prop, payload):
         from collections.abc import Mapping
         is_structure = prop["backend"] == "structure_fqn"
         ids = self._configuration_ids(prop, payload)
         sampled, folded, named = [], [], []
         conditions = {key: value for key, value in
-                      (("fparam", fparam if fparam is not None else prop["fparam"]),
+                      (("fparam", prop["fparam"]),
                        ("aparam", prop["aparam"])) if value is not None}
         for index, leaf in enumerate(prop["instance"]):
             native_outputs = getattr(leaf, "predict_structure_outputs" if is_structure else "predict_outputs", None)
@@ -1514,14 +1390,14 @@ class StructureScorePredictor:
             score = getattr(leaf, "score_structures" if is_structure else "score", None)
             model_id = f"{prop['model_key']}:{index}"
             if callable(score):
-                result = self._call_leaf(score, detached, prop, index, {})
+                result = self._cached_leaf_call(score, detached, prop, index)
                 values = tuple(result) if is_structure else (result,)
                 sampled.append(self._scientific_contract(ModelSamples, model_id, ids, values))
             else:
                 predict = getattr(leaf, "predict_structures" if is_structure else "predict", None)
                 if not callable(predict):
                     raise EvaluationProtocolError("Leaf must implement a named-output, score, or predict interface")
-                result = self._call_leaf(predict, detached, prop, index, {})
+                result = self._cached_leaf_call(predict, detached, prop, index)
                 if not isinstance(result, (tuple, list)) or len(result) != 2:
                     raise EvaluationProtocolError("Legacy predict must return (mean, native_uncertainty)")
                 mean, uncertainty = result
@@ -1606,21 +1482,6 @@ class StructureScorePredictor:
                 self._close_new_resources(owned_start)
                 raise
         return self._prop_cache[name]
-
-    def _relax(self, atoms: Any, *, source_id: str) -> Any:
-        from ..utils.structure import relax_structure
-        go = self.source_plan.source(source_id).geo_opt
-        if source_id not in self._geo_calcs:
-            from deepmd.calculator import DP as DPCalculator
-            head = go.get("head")
-            model = go.get("model", "models/DPA-3.1-3M.pt")
-            self._geo_calcs[source_id] = self._own(
-                DPCalculator(model=model, **({"head": head} if head else {})))
-        return relax_structure(
-            atoms, calc=self._geo_calcs[source_id],
-            fmax=float(go.get("fmax", 0.001)), steps=int(go.get("steps", 1000)),
-            relax_cell=bool(go.get("relax_cell", True)),
-        )
 
     @staticmethod
 

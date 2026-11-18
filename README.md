@@ -149,7 +149,7 @@ See [experiment archiving and reproduction](docs/reproducibility.md) and
 
 ---
 
-## REINFORCE (default for OOH)
+## REINFORCE
 
 ```bash
 python scripts/run_experiment.py \
@@ -160,7 +160,8 @@ python scripts/run_experiment.py \
     --save-checkpoint-freq 50
 ```
 
-Key YAML fields (edit `configs/ooh.yaml`):
+The retained OOH scenario defaults to DQN Monte Carlo. The command above
+explicitly selects REINFORCE. Example policy-gradient settings for that override:
 
 ```yaml
 pg_warmup_eps: 1000          # random episodes to fit the StandardScaler
@@ -212,6 +213,7 @@ python scripts/run_experiment.py \
 Key YAML fields:
 
 ```yaml
+dqn_target_mode: mc          # full-episode return targets; bootstrap also supported
 dqn_warmup_eps: 500           # warmup episodes to populate the initial buffer
 dqn_num_train_eps: 20000      # total online training episodes
 dqn_buffer_size: 50000        # replay buffer capacity (FIFO)
@@ -327,7 +329,7 @@ under built-in short names (Tier 3).
 
 For any system whose reward is "substitute composition onto a base POSCAR,
 evaluate with one or more DeepMD models, aggregate to a scalar", use
-a named `structure_sources` entry with `builder: substitute` and a property whose
+a single `structure` pipeline and a property whose
 `predictor` is `dp_energy`, `dp_property`, or `dp_classification`. The list
 automatically selects the reward engine. Composition-only predictors can use
 the same engine without a builder; see `configs/oxides_sinter_calcine.yaml` for
@@ -339,27 +341,31 @@ groups:
   - name: alloy
     kind: composition
     species_set: [Ni, Fe]
-    fraction_set: {min: 0.00, max: 1.00, step: 0.25}
-    n_components: 2
+    amount_set: {min: 0.00, max: 1.00, step: 0.25}
+    n_steps: 2
+    total: 1
     element_bounds:
       Ni: [0.25, 0.75]
       Fe: [0.25, 0.75]
 
 # Predictor
-structure_sources:
-  bulk:
-    builder: substitute                         # fixed-lattice element swap
-    base_poscar: /path/to/template.POSCAR         # placeholder X on sub sites
-    site_symbol: X
-k: 1.0
+structure:
+  builder: pipeline
+  base_poscar: /path/to/template.POSCAR
+  steps:
+    - type: substitute
+      a_site_symbol: X
+      a_dopant_group: alloy
 properties:
   - name: energy
-    source: bulk
     predictor: dp_energy                        # DP potential energy
     models: [/path/to/member1.pt, /path/to/member2.pt]
     direction: min                              # lower energy = better
     objective: mean_minus_kstd                   # reward = -mean - k*model_spread
     uncertainty: model_spread                    # requires at least two models
+reward:
+  type: weighted_sum
+k: 1.0
 
 # Method + hyperparameters
 method: a2c
@@ -377,10 +383,18 @@ python scripts/run_experiment.py \
 
 **Zero Python required.**
 
+The current public design has two group kinds: chemical `composition` amounts
+and `categorical` assignments. See [the group and pipeline guide](docs/design_groups.md)
+for all parameters, descriptor layouts, parent/novel peptides, and the migrated
+scenario configs. Removed domain and builder parameters are rejected; changed
+state/action schemas require new training checkpoints.
+
 ### Combining properties and synthesizability
 
-The default reward remains the weighted sum of the configured properties.
-Set top-level `reward.type: gated` to optimize an objective only after all
+A single-property weighted sum uses coefficient 1 by default. With multiple
+properties, declare every objective coefficient in `reward.objective.terms`;
+property `weight` is removed and rejected. Set `reward.type: gated` to optimize
+an objective only after all
 requirements pass. Both the objective and each gate can be weighted sums of
 any named properties, including composition-only predictors; this is shared
 across material systems.
@@ -389,10 +403,9 @@ This fragment assumes that the environment and structure builder have already
 been configured, and that you supply the two model files:
 
 ```yaml
-# Set n_random_configs: 10 inside the declared bulk source.
+# Set n_random_configs: 10 inside the structure block.
 properties:
   - name: delta
-    source: bulk
     predictor: dp_property
     models: [models/delta.pt]
     output_index: 0
@@ -400,7 +413,6 @@ properties:
     objective: mean
     scale: 1.0                       # delta stays in its original units
   - name: synthesizability_probability
-    source: bulk
     predictor: dp_classification
     models: [models/synthesizability.pt]
     head: synthesizability
@@ -423,6 +435,13 @@ reward:
   failure:
     reward: -10.0
 ```
+
+The gate's `name: synthesis` is a user-chosen label for diagnostics such as
+`gate_synthesis_value`. Its `score` combines raw property statistics; a term of
+1 leaves the selected statistic unchanged. The gate threshold and the optimized
+objective are separate: the classifier checks feasibility and the delta property
+supplies the passing reward. In `configs/perovskite.yaml`, three delta terms each
+have coefficient 0.33333, and the classifier is absent from the objective terms.
 
 The example accepts both nearly pure and pure structures. Use `output_index: 2`
 to select only pure, or `output_index: 1` for a binary model trained with labels
@@ -454,33 +473,42 @@ To guarantee that every passing candidate outranks every failing candidate,
 choose it below the lowest possible feasible objective; a fixed value cannot
 guarantee this when the objective has no known lower bound.
 
-Omit `reward` or use `reward: {type: weighted_sum}` to keep the existing weighted
-sum. No automatic property normalization is added. Start a new run or recompute
+For a single property, `reward: {type: weighted_sum}` needs no objective terms.
+For multiple properties, weighted sums and gated rewards require explicit
+`reward.objective.terms`; omitted properties do not contribute to the objective.
+Gate coefficients live only in `gates[].score.terms`, and maximum-alternative
+coefficients in `alternatives[].terms`. No automatic property normalization is added. Start a new run or recompute
 saved rewards after changing the reward definition; old replay-buffer targets
-still encode the old reward. See the [YAML reference](docs/yaml_config_reference.md#reward-weighted-sum-or-gated)
+still encode the old reward. See the [YAML reference](docs/yaml_config_reference.md#properties-models-and-reward)
 for multiple gates, multi-property gate scores, and diagnostics.
+
+ActMOF's single property `q` uses a maximizing mean objective and `scale: 100000`.
+Its `reward: {type: weighted_sum}` therefore gives `reward = q / 100000`; repeating
+a coefficient of 1 in a separate terms block is unnecessary.
 
 ### Parallel structure preparation on multiple GPUs
 
-Add `structure_parallel` to a named source to prepare its configurations
+Add `structure_parallel` inside `structure` to prepare its configurations
 concurrently. Each persistent worker executes one explicit sample and completes
-its source-owned relaxation before returning it. Built-in `substitute` supports
+its configured operations before returning it. The built-in `pipeline` supports
 this protocol, including multiple templates. An external builder must implement
 `build_sample(candidate, *, sample)` returning one ASE `Atoms`; merely having
 `build(..., n_configs=1)` is insufficient. Missing capability is a configuration
 error before scientific jobs run. An MD builder must expose the same explicit
-sample protocol before its MD-plus-optimization path can run in workers. Keep
-`geo_opt: null` within that source if the builder already performs optimization.
+sample protocol before its MD-plus-optimization path can run in workers. Add a
+`geo_opt` pipeline step only when relaxation is required.
 
 ```yaml
-structure_sources:
-  bulk:
-    builder: substitute
-    base_poscar: my.POSCAR
-    site_symbol: X
-    n_random_configs: 4
-    structure_parallel: {}  # automatic GPUs; one task per GPU
-# Each structure property refers to source: bulk.
+structure:
+  builder: pipeline
+  base_poscar: my.POSCAR
+  n_random_configs: 4
+  structure_parallel: {}  # automatic GPUs; one task per GPU
+  steps:
+    - type: substitute
+      a_site_symbol: X
+      a_dopant_group: alloy
+# All structure properties share these configurations.
 ```
 
 On eight selected GPUs, the example collects two formulas with four configurations
@@ -502,9 +530,9 @@ processing its learning updates, which changes its sampling trajectory. An expli
 `candidate_batch_size: 1` restores single-formula collection. PG waves
 stay within the existing learning batch. Cache hits reuse results and can leave
 some GPUs idle; property inference and learning remain in the parent process.
-Older `workers_per_device: auto` is accepted as `1` with a deprecation warning;
-remove the now-unused `min_speedup` and `min_successful_configs`. A legacy success
-threshold above one is ignored with a warning. Two workers per GPU are no longer supported.
+The retired `workers_per_device`, `min_speedup`, and `min_successful_configs`
+options are rejected. Each GPU runs one worker, and every nonempty successful
+ensemble is accepted.
 
 By default `auto` includes GPU 0, which the parent also uses for prediction and
 RL. To give workers the available GPUs without that contention, run the parent
@@ -520,26 +548,22 @@ CPU property prediction may cost more time, so measure it before choosing this
 allocation. Alternatively, add `reserve_devices: [0]` to the block to leave visible
 GPU 0 for the parent and automatically use the remaining GPUs. Parent DeepMD
 scoring models are loaded before the first build. Their resident memory, external
-GPU load and additional source-specific worker pools still affect available
-memory.
+GPU load still affects available memory.
 
 Manual `devices: [1, 2]` is also supported. Indices are relative to the inherited
 `CUDA_VISIBLE_DEVICES`: with `CUDA_VISIBLE_DEVICES=2,4,7`, this selects physical GPUs
 4 and 7. Each worker sees its assigned GPU as local device 0. Keep LAMMPS's
 single-GPU arguments, such as `-k on g 1`; do not override `CUDA_VISIBLE_DEVICES`,
-`LOCAL_RANK`, or `DEVICE` through `md.env`. Start one experiment process; this
+`LOCAL_RANK`, or `DEVICE` through an MD step’s `env` settings. Start one experiment process; this
 feature does not need `torchrun` or distributed RL training.
 
 Property scoring and reward calculation wait for the completed structures and
-use the same model-by-configuration statistics. Properties with the same
-`source` reference reuse one prepared ensemble; distinct source IDs create
-independent ensembles. `share_structure` is a legacy migration input, not the
-recommended interface: old `true` can normalize to source `default`; old `false`
-requires explicit source definitions. Omitting `structure_parallel` uses serial
-execution. Source/sample seeds do not depend on candidate order, batch partition
+use the same model-by-configuration statistics. All structure properties reuse
+one prepared ensemble. Omitting `structure_parallel` uses serial execution.
+Sample seeds do not depend on candidate order, batch partition
 or worker count; GPU arithmetic can still vary across hardware/backends. GPU execution requires the appropriate CUDA-enabled
 DeepMD/LAMMPS installation; speedup depends on MD/optimization cost, CPU resources,
-and the work that remains serial. See the [YAML reference](docs/yaml_config_reference.md#structure_parallel-gpu-workers-and-automatic-formula-batches)
+and the work that remains serial. See the [YAML reference](docs/structure_source_migration.md)
 for failure handling, supported builders, and reproducibility.
 
 ### Tier 2 — YAML + a custom scientific predictor
@@ -547,7 +571,7 @@ for failure handling, supported builders, and reproducibility.
 A custom adapter returns physical predictions; the property engine applies
 reward signs, weights and penalties. Use `predict_outputs(candidate)` for a
 composition model, or `predict_structure_outputs(structures)` for structures
-prepared by a named source. This illustrative adapter exposes one checkpoint;
+prepared by the shared structure pipeline. This illustrative adapter exposes one checkpoint;
 its `_bulk_modulus` method must implement the actual physics and return GPa:
 
 ```python
@@ -560,7 +584,10 @@ class ElasticConstantPredictor:
 
     def __init__(self, cfg, *, seed=None):
         from deepmd.calculator import DP
-        self.calc = DP(model=cfg["model"])
+        models = cfg["models"]
+        if len(models) != 1:
+            raise ValueError("This example adapter accepts one checkpoint")
+        self.calc = DP(model=models[0])
 
     def predict_structure_outputs(self, structures):
         # Source metadata identifies the same retained configurations in every model.
@@ -575,37 +602,35 @@ class ElasticConstantPredictor:
         raise NotImplementedError("Implement the scientific calculation in GPa")
 ```
 
-Declare the source and model once, then select its output:
+Declare the structure and each property with its model files:
 
 ```yaml
-structure_sources:
-  bulk:
-    builder: substitute
-    base_poscar: my.POSCAR
-    site_symbol: X
-    n_random_configs: 5
-models:
-  elastic:
-    predictor: "my_pkg.elastic_predictor:ElasticConstantPredictor"
-    model: my.pt
+structure:
+  builder: pipeline
+  base_poscar: my.POSCAR
+  n_random_configs: 5
+  steps:
+    - type: substitute
+      a_site_symbol: X
+      a_dopant_group: alloy
 properties:
   - name: stiffness
-    model_ref: elastic
-    source: bulk
+    predictor: "my_pkg.elastic_predictor:ElasticConstantPredictor"
+    models: [my.pt]
     output: bulk_modulus
     direction: max
     objective: mean
 ```
 
-Properties referencing the same model, source and operating conditions share one
+Properties with identical model declarations and operating conditions share one
 named-output inference. A singleton model has `model_spread=None`; configuration
 spread remains separate. An explicit uncertainty penalty requires an available
 statistic selected by `uncertainty`. Nonlinear inverse transforms act on retained
 raw samples before statistics, never on an already folded mean/std pair.
 
 Install your package or set `PYTHONPATH` so the FQN can be imported. Constructor
-options belong to the model definition; output/reward/source settings belong to
-the property. Existing inline properties remain supported. Legacy `score*` and
+options and output/reward settings belong to the property. Inline properties
+are the only supported predictor configuration format. Legacy `score*` and
 `predict*` interfaces have narrower compatibility rules; see the
 [scientific output migration](docs/scientific_output_migration.md). Old adapters
 that returned already-negated or penalized rewards must expose scientific values
@@ -614,56 +639,55 @@ before being used as properties.
 ### Tier 3 — specialized (OOH-like)
 
 For complex domain physics (e.g. OOH slab and adsorbate construction before
-the trained property prediction) or constraints that exceed the declarative `phase_pattern`
-grammar (e.g. cross-element inequalities like `Fe ≤ max(Ni, Co)`), keep the
-logic in a dedicated class:
+the trained property prediction) or scientific constraints (e.g. cross-element
+inequalities like `Fe ≤ max(Ni, Co)`), keep the logic in a dedicated class:
 
 - **Predictor**: write `src/rl_matdesign/predictors/<name>.py` and register
   `_make_<name>` in `src/rl_matdesign/registry.py:PREDICTORS`.
 - **Constraint**: write `src/rl_matdesign/constraints/<name>.py` subclassing
   `ConstraintFilter`, register in `CONSTRAINTS`.
 
-Use `predictor: <name>` in YAML. This is what the bundled `ooh` predictor
-and `ooh_phase` constraint do.
+Use `properties[].predictor: <name>` for the predictor and a group filter entry
+for constraints. OOH combines the `ooh_frames` predictor with `ooh_phase` and
+the structure pipeline's substitution/adsorbate operations.
 
 ### Plug-in surface reference
 
-**Built-in predictor short names** — use as `properties[].predictor`;
-registry leaves also support a flat `predictor: <name>`:
+**Built-in predictor short names** — use as `properties[].predictor`:
 
 | Name | What it does |
 |---|---|
-| `structure_score` | Reward engine selected automatically by a non-empty `properties:` list; optional shared build/relax, then weighted-sum or gated reward |
 | `dp_energy` / `dp_property` / `dp_classification` | DeepMD energy, regression, or class probabilities; use within `properties[].predictor` |
-| `rf_magpie` | RandomForest on Magpie features (no DeepMD); select the target with `model` |
-| `ooh` | OOH slab/adsorbate sampling and the trained DeepMD property; units require the model provenance |
+| `rf_magpie` | RandomForest on Magpie features (no DeepMD); supply its checkpoint in `models: [path]` |
+| `ooh_frames` | Trained DeepMD property on frames built by the shared structure pipeline; units require model provenance |
 | `dummy` | Random-noise predictor for smoke testing |
 
 **Built-in constraint filters** — `filters: [{type: <name>, ...}]`:
 
 | Name | What it does |
 |---|---|
-| `phase_pattern` | Declarative YAML rule set (required / forbidden / sum / ratio) |
 | `ooh_phase` | OOH 5-phase rules (Ni / Co / NiFe / CoFe / NiFeCo) |
 | `smact_charge` | SMACT-style charge-neutrality for ionic compositions |
-| `last_step_element` | Forces a named element at the final step (oxide-style) |
+| `pauling_en` | Charge neutrality with Pauling electronegativity screening |
+
+Every entry in a group’s `filters` list must pass. The list is applied directly
+in declaration order during warmup, training and generation. Omit the list or use
+`filters: []` to skip optional scientific filtering; no separate enable flag is needed.
 
 **FQN form** for both predictors and constraints:
-`predictor: "pkg.module:ClassName"` — no repo edit needed.
+`properties[].predictor: "pkg.module:ClassName"` — no repo edit needed.
+Constraint classes use the group filter's `type` field.
 
-### Per-element fraction bounds and complete assignments
+### Final chemical bounds and action budgets
 
-`element_bounds: {El: [min_frac, max_frac]}` intersects each species' exact menu
-with a closed physical interval. Positive lower bounds imply required species.
-Use `n_components` to choose a subset size, or assign the full declared list
-when every label is a design variable. No Ti-specific last action is needed.
-
-The deprecated `episode_style: fixed_order_amount` spelling means assign every
-species once, in a freely chosen order. It no longer fixes the action order or
-makes the final species a special remainder variable. One complete label/value
-assignment consumes a transition; the feasible-action mask enforces the total.
-Integer oxides retain accumulation and their explicit one-positive-O-token rule;
-see [domain migration](docs/design_domain_migration.md).
+`element_bounds: {Fe: [0.2, 0.6]}` limits the final accumulated amount of Fe.
+`amount_set` specifies individual increments, so several allowed increments can
+reach that interval. Positive lower bounds require presence; `[0, 0]` excludes
+final presence. Use `n_steps` for the exact action budget, `total: 1` when the
+amounts must sum to one, and `unique: true` when each species may be chosen only
+once. Integer counts use the same composition kind without a required total.
+For oxides, `element_bounds: {O: [1, 9]}` requires oxygen at any action position.
+See the [design guide](docs/design_groups.md) for compound choices and examples.
 
 ### Flag-naming convention
 

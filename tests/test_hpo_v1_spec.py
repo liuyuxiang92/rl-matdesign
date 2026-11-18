@@ -19,10 +19,11 @@ def write_plan(tmp_path, extra=None, base=None):
 
 
 def test_defaults_are_complete_and_paths_use_scenario_directory(tmp_path):
-    path = write_plan(tmp_path, base={"properties": [{"name": "temperature", "unit": "K", "model": "assets/net.pt"}]})
+    path = write_plan(tmp_path, base={"properties": [{"name": "temperature", "unit": "K", "models": ["assets/net.pt", "assets/net2.pt"]}]})
     plan = load_plan(path)
     assert plan["base_config"] == str(tmp_path / "scenario.yaml")
-    assert plan["base_config_data"]["properties"][0]["model"] == str(tmp_path / "assets/net.pt")
+    assert plan["base_config_data"]["properties"][0]["models"] == [
+        str(tmp_path / "assets/net.pt"), str(tmp_path / "assets/net2.pt")]
     assert len(plan["search_space"]) == 5
     assert plan["budget"]["train"]["min_fraction"] < plan["budget"]["train"]["initial_fraction"]
     assert phase_efficiency(plan, "generation")["max_attempts_per_unique"] == 1.5

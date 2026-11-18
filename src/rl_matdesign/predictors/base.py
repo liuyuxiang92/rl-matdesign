@@ -5,7 +5,7 @@ this interface via structural subtyping.  No inheritance required.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Protocol, Tuple, runtime_checkable
+from typing import Any, Dict, List, Protocol, Tuple, runtime_checkable
 
 
 @runtime_checkable
@@ -19,9 +19,10 @@ class PropertyPredictor(Protocol):
     Parameters
     ----------
     composition:
-        Dict mapping element symbol → fractional occupancy, e.g.
-        ``{"Co": 0.20, "Cr": 0.20, "Fe": 0.20, "Mn": 0.20, "Ni": 0.20}``.
-        Fractions must sum to 1.0 (guaranteed by :class:`CompositionEnv`).
+        Structured candidate mapping. Chemical groups contain raw species
+        amounts; categorical groups contain target-to-value assignments.
+        Example: {"cations": {"Fe": 0.2, "Ni": 0.8}}. A total is enforced
+        only when explicitly configured in the chemical group.
 
     Returns
     -------
@@ -42,11 +43,11 @@ class PropertyPredictor(Protocol):
         The hook is optional and is not part of structural protocol checks.
     """
 
-    def predict(self, composition: Dict[str, float]) -> Tuple[float, float | None]:
+    def predict(self, composition: Dict[str, Any]) -> Tuple[float, float | None]:
         ...
 
     def batch_predict(
-        self, compositions: List[Dict[str, float]]
+        self, compositions: List[Dict[str, Any]]
     ) -> List[Tuple[float, float | None]]:
         """Batch variant.  Default loops over ``predict``; override for speed."""
         return [self.predict(c) for c in compositions]

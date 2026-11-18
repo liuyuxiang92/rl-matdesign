@@ -1,63 +1,47 @@
-"""ConstraintFilter base class for pluggable composition constraints.
+"""Shared contract for optional scientific action filters.
 
-The :class:`CompositionEnv` accepts an optional ``phase_filter`` argument.
-Any object that implements ``filter_actions()`` can serve as a filter.
-The base class here is a no-op pass-through; subclass it to add constraints.
-
-Two built-in subclasses are provided:
-- :class:`~rl_matdesign.constraints.smact_filter.SMACTChargeFilter`
-  for ionic/oxide systems requiring charge neutrality.
-
-For OOH catalyst phase constraints see the ``main`` branch
-(``src/abcde_ooh/constraints/``).
+Groups store filter instances in a list. Applying that list retains only actions
+accepted by every filter, after intrinsic group feasibility has been checked.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+def apply_filters(filters, *, actions, **context):
+    """Intersect action filters, rejecting malformed or expanding plugin results."""
+    current = list(actions)
+    for index, filter_ in enumerate(filters):
+        if not current:
+            return []
+        # Keep an independent snapshot: plugins may prune their input in place.
+        available = set(current)
+        result = filter_.filter_actions(actions=list(current), **context)
+        prefix = f"Constraint filter {index} ({type(filter_).__name__})"
+        if not isinstance(result, (list, tuple)):
+            raise ValueError(f"{prefix} must return a list or tuple of actions.")
+        try:
+            selected = set(result)
+        except TypeError as exc:
+            raise ValueError(f"{prefix} returned an invalid action encoding.") from exc
+        if not selected.issubset(available):
+            raise ValueError(f"{prefix} may only remove actions (subset required).")
+        if len(selected) != len(result):
+            raise ValueError(f"{prefix} must not duplicate actions.")
+        current = list(result)
+    return current
 
 
 class ConstraintFilter:
-    """Pass-through constraint filter (no constraints applied).
+    """Pass-through base for custom filters implementing ``filter_actions``.
 
-    Override ``filter_actions`` to implement domain-specific rules.
-    The interface mirrors the existing ``phase_filter`` contract in
-    :class:`~rl_matdesign.env.CompositionEnv` so existing phase-filter
-    implementations work without modification.
+    Chemical groups supply raw ``chemical_amounts``, integer lattice metadata,
+    remaining steps, species and action values. ``prior_groups`` contains already
+    completed groups. Categorical groups instead supply ``current_fields`` and
+    ``code_to_value`` so plugins can interpret the selected field's value without
+    treating assignments as elemental amounts. Context is copied by the group;
+    filters must return a subset of their input actions, including an empty list
+    when no valid continuation exists. Accept extra keyword arguments to ignore
+    context that a particular scientific check does not need.
     """
 
-    def filter_actions(
-        self,
-        *,
-        actions: List[Tuple[Tuple[float, ...], Tuple[float, ...]]],
-        units_map: Dict[str, int],
-        steps_left: int,
-        allowed_units: Sequence[int],
-        possible_sums_by_k: List[Any],
-        species_set: List[str],
-        fraction_set: List[str],
-        prior_groups: Optional[List[Dict[str, Any]]] = None,
-        code_to_value: Optional[Dict[str, Any]] = None,
-        **_: Any,
-    ) -> List[Tuple[Tuple[float, ...], Tuple[float, ...]]]:
-        """Return the subset of *actions* consistent with this constraint.
-
-        The default implementation returns *actions* unchanged.
-
-        ``prior_groups`` carries the already-completed group compositions (in
-        group order) when this filter runs inside a :class:`MultiGroupEnv`, so a
-        later sublattice can depend on an earlier pick (e.g. the S-site O range
-        bounded by the P-site metal). It is ``None`` for single-group
-        (:class:`CompositionEnv`) runs. Filters that ignore cross-group coupling
-        can simply not read it.
-
-        ``code_to_value`` is set only by :class:`~rl_matdesign.env_multigroup.
-        CategoricalGroup`: it maps this step's ``comp_oh`` code to the actual
-        picked value (e.g. an element symbol), because a categorical slot's
-        ``elem_oh`` one-hot encodes the *slot name*, not the chemistry — a
-        filter that needs the real value (e.g. a charge-neutrality check) must
-        decode through this map rather than ``allowed_units``/``units_map``,
-        which are empty (``[]`` / ``{}``) for categorical groups. ``None`` for
-        composition-style (fraction/amount) groups. The trailing ``**_`` keeps
-        subclasses forward compatible with future context kwargs.
-        """
+    def filter_actions(self, *, actions, **context):
         return actions

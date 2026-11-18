@@ -182,7 +182,6 @@ PARAMETERS: dict[str, Parameter] = {
     "hpo_phase": Parameter(str, "train", "HPO job phase.", choices=("train", "generation")),
     "hpo_target_unique": Parameter(int, None, "HPO target successfully evaluated distinct candidates.", minimum=1, nullable=True),
     "hpo_ratio_limit": Parameter(float, 1.5, "Strict HPO attempts/unique upper bound.", minimum=1, exclusive_minimum=True),
-    "constrain_training": Parameter(bool, True, "Apply configured constraints during training."),
     "train_count_duplicates": Parameter(bool, True, "Count repeated terminal candidates toward training budgets."),
     "train_budget": Parameter(int, None, "Total paid training candidates; derives algorithm episode limits when set.", minimum=1, nullable=True),
     "train_max_duplicate_attempts": Parameter(int, 1000, "Maximum consecutive duplicates in a unique-candidate budget.", minimum=1),
@@ -220,21 +219,28 @@ PARAMETERS: dict[str, Parameter] = {
     "k": Parameter(float, 1.0, "Default uncertainty coefficient passed to property evaluation.", minimum=0),
 }
 
-# Ownership declarations, NOT complete nested schemas. These are existing flat
-# options consumed by the named owners. The next schema layers can migrate them
-# beside the owning implementation without changing the core training contract.
+# Nested structure and group implementations own their scientific options.
 DELEGATED_KEYS = {
-    "environment": frozenset({"groups", "anion_formula", "episode_style", "generated_columns"}),
-    "structure_sources": frozenset({"structure_sources"}),
-    "model_resources": frozenset({"models"}),
-    "reward": frozenset({"predictor", "properties", "reward", "sweep", "share_structure", "n_random_configs", "predict_cache_size", "geo_opt", "structure_parallel"}),
-    "builders": frozenset({"builder", "base_poscar", "poscar", "poscar_template", "site_symbol", "site_map", "valences", "halide_total", "host", "eligible_region", "eligible_region_fallback", "formula_units", "p_site_group", "s_site_group", "p_site_per_fu", "s_site_per_fu", "li_per_fu", "o_element", "cl_element", "a_site_symbol", "b_site_symbol", "a_dopant_group", "b_dopant_group", "a_defect_group", "interstitial_min_dist", "interstitial_max_attempts"}),
-    "constraints": frozenset({"filters", "constraint_filter", "scaffold_poscar", "scaffold_site_symbol", "scaffold_formula", "smact_anions", "smact_anion", "smact_anion_charge", "smact_anion_stoich", "required_elements", "nonzero_ratio_at_last", "reserve_for_last", "phase_patterns", "target_phases"}),
-    "ooh_predictor": frozenset({"dp_models", "objective", "ads_height", "ads_dz", "adsorbates", "geo_opt_model", "uncertainty", "output_index"}),
-    "flat_model_predictors": frozenset({"model", "mgt_repo", "mgt_python", "config", "device", "cutoff", "max_neighbors", "atom_features", "triplet_endpoint", "triplet_pad_mode"}),
+    "environment": frozenset({"groups", "generated_columns"}),
+    "structure": frozenset({"structure"}),
+    "reward": frozenset({"properties", "reward", "predict_cache_size"}),
 }
+_PROPERTY_OWNED_KEYS = frozenset({
+    "predictor", "models", "model", "model_ref", "dp_models", "objective",
+    "uncertainty", "output_index", "mgt_repo", "mgt_python", "config", "device",
+    "cutoff", "max_neighbors", "atom_features", "triplet_endpoint", "triplet_pad_mode",
+})
+# Rejection only: retired keys cannot be mistaken for custom predictor options.
+_RETIRED_KEYS = frozenset({
+    "anion_formula", "episode_style", "structure_sources", "sweep", "share_structure",
+    "builder", "base_poscar", "poscar", "poscar_template", "site_symbol", "site_map",
+    "filters", "constraint_filter", "scaffold_formula", "scaffold_poscar", "scaffold_site_symbol",
+    "smact_anions", "smact_anion", "smact_anion_charge", "smact_anion_stoich",
+    "required_elements", "nonzero_ratio_at_last", "reserve_for_last", "phase_patterns", "target_phases",
+    "n_random_configs", "geo_opt", "geo_opt_model", "structure_parallel", "ads_height", "ads_dz", "adsorbates",
+    "application", "applications", "md", "opt", "constrain_training",
+})
 _DELEGATED_NAMES = frozenset().union(*DELEGATED_KEYS.values())
-_RESERVED_PREFIXES = ("dqn_", "pg_", "train_", "gen_", "eval_")
 
 
 def _generation_selection(raw: Mapping, source: str = "yaml") -> tuple[str, str]:
@@ -302,19 +308,6 @@ def with_generation_selection(raw: Mapping, parameter: str) -> dict:
     return cfg
 
 
-def _has_flat_extension(cfg: Mapping) -> bool:
-    # A property-level FQN receives that property's mapping, not the entire run;
-    # it therefore does not excuse unknown keys at the experiment top level.
-    for key in ("predictor", "builder"):
-        if isinstance(cfg.get(key), str) and ":" in cfg[key]:
-            return True
-    for item in cfg.get("filters") or []:
-        kind = item if isinstance(item, str) else item.get("type") if isinstance(item, Mapping) else None
-        if isinstance(kind, str) and ":" in kind:
-            return True
-    return False
-
-
 def validate_config(raw: Mapping) -> None:
     """Validate core values and ownership without materializing any defaults.
 
@@ -326,30 +319,67 @@ def validate_config(raw: Mapping) -> None:
     for key, value in cfg.items():
         if key in PARAMETERS:
             PARAMETERS[key].normalize(key, value)
-    for key in ("groups", "properties", "filters"):
+    retired = set(cfg) & (_RETIRED_KEYS | _PROPERTY_OWNED_KEYS)
+    if retired:
+        raise ConfigError(f"Removed top-level parameters: {sorted(retired)}; use groups, structure and properties")
+    for key in ("groups", "properties"):
         if key in cfg:
             if not isinstance(cfg[key], list):
                 raise ConfigError(f"{key} must be a list")
             for index, item in enumerate(cfg[key]):
-                if not isinstance(item, Mapping) and not (key == "filters" and isinstance(item, str)):
-                    raise ConfigError(f"{key}[{index}] must be a mapping" + (" or filter name" if key == "filters" else ""))
-    if "structure_sources" in cfg:
-        # This owner is deliberately lightweight: checking its declaration does
-        # not import a builder, resolve files, infer predictor capabilities or
-        # materialize source defaults into the authored run configuration.
-        from .structure_sources import StructureSourceSpec
-        sources = _mapping(cfg["structure_sources"], "structure_sources")
-        for name, definition in sources.items():
+                if not isinstance(item, Mapping):
+                    raise ConfigError(f"{key}[{index}] must be a mapping")
+    if "properties" in cfg and not cfg["properties"]:
+        raise ConfigError("properties must be a non-empty list")
+    names = set()
+    for index, group in enumerate(cfg.get("groups", [])):
+        name = group.get("name")
+        if not isinstance(name, str) or not name.strip() or name in names:
+            raise ConfigError(f"groups[{index}].name must be a unique nonempty string")
+        names.add(name)
+        kind = group.get("kind", "composition")
+        common = {"name", "kind", "n_steps", "filters"}
+        fields = {
+            "composition": common | {"species_set", "amount_set", "total", "unique", "element_bounds"},
+            "categorical": common | {"choices", "labels", "values"},
+        }
+        if kind not in fields:
+            raise ConfigError("Groups use only composition and categorical kinds")
+        unknown = set(group) - fields[kind]
+        if unknown:
+            raise ConfigError(f"Group {name!r} has unused or removed parameters: {sorted(unknown)}")
+        if kind == "composition" and not {"species_set", "amount_set", "n_steps"}.issubset(group):
+            raise ConfigError(f"Composition group {name!r} needs species_set, amount_set and n_steps")
+        if kind == "categorical" and ("choices" in group) == ("labels" in group or "values" in group):
+            raise ConfigError(f"Categorical group {name!r} needs choices or labels/values")
+        if kind == "categorical" and "choices" not in group and not {"labels", "values", "n_steps"}.issubset(group):
+            raise ConfigError(f"Categorical group {name!r} needs labels, values and n_steps")
+    if "structure" in cfg:
+        structure = _mapping(cfg["structure"], "structure")
+        if not isinstance(structure.get("builder"), str) or not structure["builder"].strip():
+            raise ConfigError("structure.builder must name a builder")
+        if structure["builder"] == "pipeline":
+            from .predictors.builders.pipeline import validate_pipeline_config
             try:
-                StructureSourceSpec(name, definition)
+                validate_pipeline_config(structure)
             except (TypeError, ValueError) as exc:
-                raise ConfigError(f"structure_sources[{name!r}]: {exc}") from exc
+                raise ConfigError(f"structure: {exc}") from exc
+        elif structure["builder"] != "peptide" and ":" not in structure["builder"]:
+            raise ConfigError("structure.builder must be pipeline, peptide, or a custom class FQN")
     for index, prop in enumerate(cfg.get("properties", [])):
-        if "source" in prop:
-            name = prop["source"]
-            if not isinstance(name, str) or not name.strip() or name != name.strip():
-                raise ConfigError(f"properties[{index}].source must be a nonempty source name without surrounding whitespace")
-        for field_name in ("model_ref", "output", "unit"):
+        if "weight" in prop:
+            raise ConfigError(f"properties[{index}].weight was removed; put coefficients in reward terms")
+        misplaced = set(prop) & (_RETIRED_KEYS | {"source", "model", "dp_models", "model_ref"})
+        if misplaced:
+            raise ConfigError(f"properties[{index}] has removed or structure-owned parameters: {sorted(misplaced)}")
+        if prop.get("predictor") in {"ooh", "structure_score"}:
+            raise ConfigError(f"properties[{index}].predictor must name a leaf predictor; use ooh_frames for OOH")
+        if "models" in prop:
+            models = prop["models"]
+            if (not isinstance(models, list) or not models
+                    or any(not isinstance(path, str) or not path.strip() for path in models)):
+                raise ConfigError(f"properties[{index}].models must be a non-empty list of model paths")
+        for field_name in ("output", "unit"):
             if field_name not in prop or field_name == "unit" and prop[field_name] is None:
                 continue
             value = prop[field_name]
@@ -363,33 +393,22 @@ def validate_config(raw: Mapping) -> None:
         }.items():
             if field_name in prop and prop[field_name] not in options:
                 raise ConfigError(f"properties[{index}].{field_name} must be one of {options}")
-    if isinstance(cfg.get("models"), Mapping) or any("model_ref" in prop for prop in cfg.get("properties", [])):
-        from .predictors.structure_score import normalize_model_references
+    if cfg.get("properties"):
+        from .rewards import RewardCombiner
         try:
-            normalize_model_references(cfg)
+            RewardCombiner(cfg.get("reward"), [prop.get("name", f"prop{i}")
+                                               for i, prop in enumerate(cfg["properties"])])
         except (TypeError, ValueError) as exc:
-            raise ConfigError(f"Named model definitions: {exc}") from exc
-    elif "models" in cfg:
-        # A list retains its existing flat-adapter meaning. It does not become
-        # a named resource table or excuse an invalid model_ref.
-        if not isinstance(cfg["models"], list) or cfg.get("properties"):
-            raise ConfigError("models must be a named mapping; legacy lists belong only to flat predictors")
-    if "constraint_filter" in cfg and cfg["constraint_filter"] is not None:
-        raise ConfigError("constraint_filter no longer selects a filter; use filters: [{type: ...}].")
-    flat_extension = _has_flat_extension(cfg)
+            raise ConfigError(str(exc)) from exc
     known = set(PARAMETERS) | set(_DELEGATED_NAMES) | {_GENERATION_METADATA}
     for key in cfg:
         if key in known:
-            continue
-        core_typo = get_close_matches(key, sorted(PARAMETERS), n=1, cutoff=0.85)
-        if flat_extension and not key.startswith(_RESERVED_PREFIXES) and not core_typo:
             continue
         suggestions = get_close_matches(key, sorted(known | set(ALIASES)), n=1, cutoff=0.65)
         hint = f" Did you mean {suggestions[0]!r}?" if suggestions else ""
         raise ConfigError(
             f"Unknown experiment key {key!r}.{hint} "
-            "Property-specific options belong inside properties entries; "
-            "a flat custom predictor/builder may own additional top-level options."
+            "Property-specific options belong inside properties entries."
         )
 
 

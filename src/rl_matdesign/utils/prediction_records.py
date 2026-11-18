@@ -36,6 +36,11 @@ def objective_record(raw_mean, stats, details) -> dict:
             row[f"{prefix}_value"] = float(gate["score"])
             row[f"{prefix}_passed"] = bool(gate["passed"])
             row[f"{prefix}_violation"] = float(gate["violation"])
+    if details and details.get("type") == "max":
+        row["reward_objective"] = float(details["objective"])
+        row["selected_alternative"] = details["selected_alternative"]
+        for alternative in details["alternatives"]:
+            row[f"alternative_{alternative['name']}_score"] = float(alternative["score"])
     return row
 
 

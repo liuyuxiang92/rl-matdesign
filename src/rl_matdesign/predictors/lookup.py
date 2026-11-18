@@ -1,7 +1,7 @@
 """Exact property lookup on a dense, named Cartesian grid.
 
-Use ``predictor: rl_matdesign.predictors.lookup:LookupPredictor`` with a
-``model`` path to an NPZ archive containing:
+Use ``predictor: lookup`` with ``models: [table.npz]`` inside a property.
+The engine passes one scalar ``model`` path to this leaf. The NPZ archive contains:
 
 * ``field_names``: a nonempty, unique, one-dimensional Unicode string array;
 * ``axis_0``, ..., ``axis_n-1``: nonempty, unique one-dimensional numeric or

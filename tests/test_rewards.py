@@ -21,25 +21,36 @@ def _gated():
     }
 
 
-WEIGHTS = {"performance": 9.0, "pure": 7.0, "nearly": 3.0, "cost": 1.0}
+PROPERTIES = ["performance", "pure", "nearly", "cost"]
 
 
-def test_omitted_reward_preserves_signed_legacy_weighted_sum():
-    for cfg in (None, {}, {"type": "weighted_sum"}):
-        result = RewardCombiner(cfg, {"a": 2, "b": -3, "c": 0}).evaluate(
-            {}, {"a": -5.0, "b": 4.0, "c": 999.0},
-        )
-        assert result == {"reward": -22.0, "objective": -22.0,
-                          "type": "weighted_sum", "gate_passed": True, "gates": []}
+@pytest.mark.parametrize("cfg", [None, {}, {"type": "weighted_sum"}])
+def test_single_property_defaults_to_unit_coefficient(cfg):
+    result = RewardCombiner(cfg, ["a"]).evaluate({}, {"a": -5.0})
+    assert result == {"reward": -5.0, "objective": -5.0,
+                      "type": "weighted_sum", "gate_passed": True, "gates": []}
 
 
-def test_explicit_objective_replaces_not_multiplies_property_weights():
-    combiner = RewardCombiner({"objective": {"terms": {"performance": 2}}}, WEIGHTS)
+def test_reward_terms_are_the_only_coefficients():
+    combiner = RewardCombiner({"objective": {"terms": {"a": 2, "b": -3, "c": 0}}},
+                              ["a", "b", "c"])
+    assert combiner.evaluate({}, {"a": -5.0, "b": 4.0, "c": 999.0})["reward"] == -22.0
+
+
+def test_unreferenced_properties_do_not_contribute_to_objective():
+    combiner = RewardCombiner({"objective": {"terms": {"performance": 2}}}, PROPERTIES)
     assert combiner.evaluate({}, {"performance": 6})["reward"] == 12.0
 
 
+@pytest.mark.parametrize("cfg", [None, {}, {"type": "weighted_sum"},
+                                 {key: value for key, value in _gated().items() if key != "objective"}])
+def test_multiple_properties_require_explicit_objective(cfg):
+    with pytest.raises(ValueError, match="Multiple properties require explicit reward.objective.terms"):
+        RewardCombiner(cfg, PROPERTIES)
+
+
 def test_gates_use_raw_means_and_objective_uses_adjusted_values():
-    result = RewardCombiner(_gated(), WEIGHTS).evaluate(
+    result = RewardCombiner(_gated(), PROPERTIES).evaluate(
         {"pure": .7, "nearly": .4, "cost": 3, "performance": 1000},
         {"performance": 6, "pure": -100, "nearly": -100, "cost": -300},
     )
@@ -50,7 +61,7 @@ def test_gates_use_raw_means_and_objective_uses_adjusted_values():
 
 
 def test_all_gates_required_and_violations_add_in_raw_units():
-    combiner = RewardCombiner(_gated(), WEIGHTS)
+    combiner = RewardCombiner(_gated(), PROPERTIES)
     result = combiner.evaluate({"pure": .4, "nearly": .4, "cost": 7}, {"performance": 1e6})
     assert result["objective"] == 2e6  # no hidden normalization or clipping
     assert result["gate_passed"] is False
@@ -61,7 +72,7 @@ def test_all_gates_required_and_violations_add_in_raw_units():
 
 @pytest.mark.parametrize("cost", [0.0, 5.0])
 def test_equality_at_either_bound_passes(cost):
-    result = RewardCombiner(_gated(), WEIGHTS).evaluate(
+    result = RewardCombiner(_gated(), PROPERTIES).evaluate(
         {"pure": .8, "nearly": 0, "cost": cost}, {"performance": 1000},
     )
     assert result["gate_passed"]
@@ -71,17 +82,17 @@ def test_equality_at_either_bound_passes(cost):
 def test_zero_penalty_still_enforces_gate_and_preserves_explicit_failure_reward():
     cfg = _gated()
     cfg["gates"][0]["penalty_weight"] = 0
-    result = RewardCombiner(cfg, WEIGHTS).evaluate(
+    result = RewardCombiner(cfg, PROPERTIES).evaluate(
         {"pure": .1, "nearly": 0, "cost": 1}, {"performance": 2},
     )
     assert result["gate_passed"] is False
     assert result["reward"] == -4
 
 
-def test_gated_default_objective_keeps_existing_weights_and_does_not_force_positive_reward():
+def test_gated_objective_does_not_force_positive_reward():
     cfg = _gated()
-    del cfg["objective"]
-    result = RewardCombiner(cfg, WEIGHTS).evaluate(
+    cfg["objective"]["terms"] = {"performance": 9}
+    result = RewardCombiner(cfg, PROPERTIES).evaluate(
         {"pure": 1, "nearly": 0, "cost": 1},
         {"performance": -100, "pure": 0, "nearly": 0, "cost": 0},
     )
@@ -93,7 +104,7 @@ def test_omitted_penalty_defaults_to_one_and_inputs_and_outputs_are_not_shared()
     cfg = _gated()
     del cfg["gates"][0]["penalty_weight"]
     original = deepcopy(cfg)
-    combiner = RewardCombiner(cfg, WEIGHTS)
+    combiner = RewardCombiner(cfg, PROPERTIES)
     cfg["gates"][0]["score"]["terms"]["pure"] = 900
     first = combiner.evaluate({"pure": .5, "nearly": 0, "cost": 1}, {"performance": 2})
     first["gates"][0]["score"] = -1
@@ -122,7 +133,7 @@ def test_omitted_penalty_defaults_to_one_and_inputs_and_outputs_are_not_shared()
 ])
 def test_bad_reward_configuration_rejected(cfg, match):
     with pytest.raises(ValueError, match=match):
-        RewardCombiner(cfg, {"a": 1})
+        RewardCombiner(cfg, ["a"])
 
 
 @pytest.mark.parametrize("change,match", [
@@ -142,7 +153,7 @@ def test_bad_gate_fields_rejected(change, match):
     cfg = _gated()
     cfg["gates"][0].update(change)
     with pytest.raises(ValueError, match=match):
-        RewardCombiner(cfg, WEIGHTS)
+        RewardCombiner(cfg, PROPERTIES)
 
 
 @pytest.mark.parametrize("missing,match", [("score", "score is required"), ("min", "at least one bound")])
@@ -150,14 +161,14 @@ def test_missing_gate_fields_rejected(missing, match):
     cfg = _gated()
     del cfg["gates"][0][missing]
     with pytest.raises(ValueError, match=match):
-        RewardCombiner(cfg, WEIGHTS)
+        RewardCombiner(cfg, PROPERTIES)
 
 
 def test_duplicate_gate_names_rejected():
     cfg = _gated()
     cfg["gates"][1]["name"] = "quality"
     with pytest.raises(ValueError, match="duplicates gate"):
-        RewardCombiner(cfg, WEIGHTS)
+        RewardCombiner(cfg, PROPERTIES)
 
 
 @pytest.mark.parametrize("failure,match", [(None, "failure must be a mapping"), ({}, "failure.reward is required"),
@@ -166,14 +177,17 @@ def test_explicit_finite_failure_reward_required(failure, match):
     cfg = _gated()
     cfg["failure"] = failure
     with pytest.raises(ValueError, match=match):
-        RewardCombiner(cfg, WEIGHTS)
+        RewardCombiner(cfg, PROPERTIES)
 
 
-@pytest.mark.parametrize("weights,match", [({}, "at least one property"), ({"": 1}, "non-empty strings"),
-                                         ({1: 1}, "non-empty strings"), ({"a": math.inf}, "finite")])
-def test_bad_property_declarations_rejected(weights, match):
+@pytest.mark.parametrize("names,match", [
+    ([], "at least one property"), ([""], "non-empty strings"), ([1], "non-empty strings"),
+    (["a", "a"], "duplicates"), ("a", "sequence of names"),
+    ({"a": 2}, "coefficients belong in reward terms"), (None, "sequence of names"),
+])
+def test_bad_property_declarations_rejected(names, match):
     with pytest.raises(ValueError, match=match):
-        RewardCombiner(None, weights)
+        RewardCombiner(None, names)
 
 
 @pytest.mark.parametrize("raw,adjusted,match", [
@@ -185,9 +199,9 @@ def test_bad_property_declarations_rejected(weights, match):
 ])
 def test_invalid_runtime_values_fail_with_useful_errors(raw, adjusted, match):
     with pytest.raises(ValueError, match=match):
-        RewardCombiner(_gated(), WEIGHTS).evaluate(raw, adjusted)
+        RewardCombiner(_gated(), PROPERTIES).evaluate(raw, adjusted)
 
 
 def test_extra_runtime_metadata_is_ignored():
-    result = RewardCombiner(None, {"a": 2}).evaluate({"temperature": 900}, {"a": 3, "temperature": 900})
+    result = RewardCombiner({"objective": {"terms": {"a": 2}}}, ["a"]).evaluate({"temperature": 900}, {"a": 3, "temperature": 900})
     assert result["reward"] == 6

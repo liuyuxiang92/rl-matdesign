@@ -136,7 +136,7 @@ def test_real_worker_signal_finishes_unit_then_resume_matches_control(tmp_path, 
     config = _config()
     config["groups"][0].update(
         species_set=["Ni", "Fe", "Co", "Cr", "Mn", "Cu", "Zn", "Ti"],
-        fraction_set=[f"{value / 10:.1f}" for value in range(1, 9)], n_components=3)
+        amount_set=[f"{value / 10:.1f}" for value in range(1, 9)], n_steps=3)
     config.update(method=method, dqn_target_mode=target, dqn_warmup_eps=2,
                   dqn_batch_size=2, dqn_eps_min=1., pg_warmup_eps=2, pg_batch_eps=batch,
                   train_count_duplicates=False, train_budget=12,
@@ -224,7 +224,6 @@ def test_serial_coordinator_interrupt_after_last_sample_can_finalize_without_reb
     from rl_matdesign.hpo.restart import inspect_restart
 
     scenario = _config()
-    scenario.pop("predictor")
     scenario.update(properties=[{"name": "energy", "predictor": "dummy", "direction": "min"}],
                     pg_warmup_eps=2, dqn_warmup_eps=1, pg_batch_eps=4)
     (tmp_path / "scenario.yaml").write_text(yaml.safe_dump(scenario))

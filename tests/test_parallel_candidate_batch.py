@@ -181,7 +181,6 @@ def test_batch_configuration_count_remains_strict(pool_factory, value):
         pool.recommended_candidate_batch_size(value)
 
 
-def test_legacy_success_minimum_does_not_reject_small_ensembles(pool_factory):
-    with pytest.warns(DeprecationWarning, match="min_successful_configs"):
-        pool, _ = pool_factory(parallel_extra={"min_successful_configs": 5})
+def test_batch_accepts_single_configuration_for_each_candidate(pool_factory):
+    pool, _ = pool_factory()
     assert [len(atoms) for atoms in pool.build_many([{}, {}, {}], n_configs=1)] == [1, 1, 1]

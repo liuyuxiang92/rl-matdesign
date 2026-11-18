@@ -29,13 +29,13 @@ def test_manifest_append_only_exact_command_and_seed_state(tmp_path, repo, monke
     model = tmp_path / "model.pt"
     model.write_bytes(b"weights")
     config = tmp_path / "input.yaml"
-    config.write_text("models: [model.pt]\n")
+    config.write_text("properties:\n  - name: energy\n    predictor: dp_energy\n    models: [model.pt]\n")
     (repo / "code.py").write_text("answer = 2\n")
     state = random.getstate()
-    first = write_run_manifest(tmp_path / "run", {"models": ["model.pt"]},
+    first = write_run_manifest(tmp_path / "run", {"properties": [{"name": "energy", "predictor": "dp_energy", "models": ["model.pt"]}]},
                                argv=["rl-matdesign", "--config", "input.yaml"],
                                config_path=config, seeds={"train": 8}, phase="train",
-                               config_sources={"models": "yaml"}, runtime_args={"method": "a2c"},
+                               config_sources={"properties": "yaml"}, runtime_args={"method": "a2c"},
                                repo_dir=repo)
     initial = first.read_bytes()
     second = write_run_manifest(tmp_path / "run", {}, phase="generate", repo_dir=repo)
@@ -53,8 +53,8 @@ def test_manifest_append_only_exact_command_and_seed_state(tmp_path, repo, monke
 
 
 def test_reference_paths_use_runtime_cwd_and_do_not_guess(tmp_path):
-    refs = referenced_files({"properties": [{"models": ["a.pt", "b.pt"]}],
-                             "out": "/some/output", "predictor": "module:Predictor"}, base_dir=tmp_path)
+    refs = referenced_files({"properties": [{"name": "energy", "predictor": "dp_energy", "models": ["a.pt", "b.pt"]}],
+                             "out": "/some/output"}, base_dir=tmp_path)
     assert [r["path"] for r in refs] == [str(tmp_path / "a.pt"), str(tmp_path / "b.pt")]
 
 
@@ -64,7 +64,7 @@ def test_bundle_preserves_outputs_and_detects_tamper(tmp_path, repo):
     (run / "generated.csv").write_text("formula,reward\nNi,1\n")
     model = tmp_path / "model.pt"
     model.write_bytes(b"weights")
-    manifest = write_run_manifest(run, {"models": [str(model)]}, repo_dir=repo)
+    manifest = write_run_manifest(run, {"properties": [{"name": "energy", "predictor": "dp_energy", "models": [str(model)]}]}, repo_dir=repo)
     (run / "pip-freeze.txt").write_text("example==1.0\n")
     bundle = create_bundle(tmp_path / "archive", [run], repo_dir=repo)
     result = verify_bundle(bundle)
@@ -171,7 +171,7 @@ def test_manifest_environment_whitelist_and_hash_dedup(tmp_path, repo, monkeypat
         calls.append(Path(path))
         return original_hash(path)
     monkeypatch.setattr(provenance, "sha256_file", count_hash)
-    manifest = write_run_manifest(tmp_path / "run", {"models": ["model.pt", "model.pt"]},
+    manifest = write_run_manifest(tmp_path / "run", {"properties": [{"name": "energy", "predictor": "dp_energy", "models": ["model.pt", "model.pt"]}]},
                                   input_files=[model], repo_dir=repo)
     data = json.loads(manifest.read_text())
     assert calls.count(model) == 1
@@ -221,8 +221,8 @@ def test_mgtransformer_assets_resolve_under_repo_not_cwd(tmp_path, repo, monkeyp
 def test_rf_path_stays_cwd_and_unknown_plugin_is_not_guessed(tmp_path, repo, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "model.pt").write_bytes(b"cwd decoy")
-    config = {"properties": [{"predictor": "rf_magpie", "model": "model.pt"},
-                             {"predictor": "external.plugin:Predictor", "model": "model.pt"}]}
+    config = {"properties": [{"predictor": "rf_magpie", "models": ["model.pt"]},
+                             {"predictor": "external.plugin:Predictor", "models": ["model.pt"]}]}
     refs = referenced_files(config)
     assert refs[0]["path"] == str(tmp_path / "model.pt")
     assert refs[1]["path"] is None
@@ -235,25 +235,25 @@ def test_rf_path_stays_cwd_and_unknown_plugin_is_not_guessed(tmp_path, repo, mon
     assert any("Unresolved asset path" in p for p in verify_bundle(bundle)["problems"])
 
 
-def test_named_source_templates_relaxation_and_property_models_are_archived(tmp_path, repo, monkeypatch):
+def test_pipeline_templates_relaxation_and_property_models_are_archived(tmp_path, repo, monkeypatch):
     monkeypatch.chdir(tmp_path)
     paths = [tmp_path / name for name in ("phase_a.POSCAR", "phase_b.POSCAR", "relax.pt", "energy.pt")]
     for index, path in enumerate(paths):
         path.write_bytes(f"asset-{index}".encode())
     config = {
-        "structure_sources": {"bulk": {
-            "builder": "substitute",
+        "structure": {
+            "builder": "pipeline",
             "base_poscar": [{"path": "phase_a.POSCAR", "n_configs": 3},
-                            {"poscar": "phase_b.POSCAR", "n_configs": 2}],
-            "geo_opt": {"model": "relax.pt"},
-        }},
-        "properties": [{"name": "energy", "predictor": "dp_energy", "source": "bulk", "model": "energy.pt"}],
+                            {"path": "phase_b.POSCAR", "n_configs": 2}],
+            "steps": [{"type": "geo_opt", "model": "relax.pt"}],
+        },
+        "properties": [{"name": "energy", "predictor": "dp_energy", "models": ["energy.pt"]}],
     }
     refs = referenced_files(config)
     assert [row["path"] for row in refs] == [str(path) for path in paths]
     assert [row["field"] for row in refs[:3]] == [
-        "structure_sources.bulk.base_poscar[0].path", "structure_sources.bulk.base_poscar[1].poscar",
-        "structure_sources.bulk.geo_opt.model[0]",
+        "structure.base_poscar[0].path", "structure.base_poscar[1].path",
+        "structure.steps[0].model[0]",
     ]
     path = write_run_manifest(tmp_path / "run", config, repo_dir=repo)
     manifest = json.loads(path.read_text())
@@ -267,16 +267,21 @@ def test_named_source_templates_relaxation_and_property_models_are_archived(tmp_
     assert {record["sha256"] for record in records} >= {sha256_file(path) for path in paths}
 
 
-def test_external_source_builder_relative_paths_remain_unresolved_but_geo_opt_is_owned(tmp_path, repo, monkeypatch):
+def test_external_builder_relative_paths_remain_unresolved_and_absolute_assets_are_recorded(tmp_path, repo, monkeypatch):
     monkeypatch.chdir(tmp_path)
     for name in ("template", "builder.pt", "relax.pt"):
         (tmp_path / name).write_bytes(name.encode())
-    config = {"structure_sources": {"bulk": {"builder": "external:Builder", "base_poscar": "template",
-                                              "md": {"model": "builder.pt"}, "geo_opt": {"model": "relax.pt"}}}}
+    config = {"structure": {
+        "builder": "external:Builder", "base_poscar": "template",
+        "engine": {"model": "builder.pt"},
+        "relaxation": {"model": str(tmp_path / "relax.pt")},
+    }}
     refs = {row["field"]: row for row in referenced_files(config)}
-    for field in ["structure_sources.bulk.base_poscar[0]", "structure_sources.bulk.md.model[0]"]:
+    for field in ["structure.base_poscar[0]", "structure.engine.model[0]"]:
         assert refs[field]["path"] is None and refs[field]["status"] == "unresolved_path"
-    assert refs["structure_sources.bulk.geo_opt.model[0]"]["path"] == str(tmp_path / "relax.pt")
+    absolute = refs["structure.relaxation.model[0]"]
+    assert absolute["path"] == str(tmp_path / "relax.pt")
+    assert absolute["path_resolution"] == "declared_absolute_path"
     path = write_run_manifest(tmp_path / "run", config, repo_dir=repo)
     manifest = json.loads(path.read_text())
     assert len(manifest["missing_inputs"]) == 2
@@ -284,35 +289,73 @@ def test_external_source_builder_relative_paths_remain_unresolved_but_geo_opt_is
     assert next(row for row in manifest["input_files"] if row["path"] == str(tmp_path / "relax.pt"))["status"] == "present"
 
 
-def test_named_source_default_relaxation_model_and_missing_template_are_explicit(tmp_path, repo, monkeypatch):
+def test_pipeline_explicit_relaxation_model_and_missing_template_are_recorded(tmp_path, repo, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "models").mkdir()
-    default_model = tmp_path / "models" / "DPA-3.1-3M.pt"
-    default_model.write_bytes(b"default relaxation model")
-    config = {"structure_sources": {"bulk": {"base_poscar": "missing.POSCAR", "geo_opt": {"enabled": True}}}}
+    model = tmp_path / "models" / "DPA-3.1-3M.pt"
+    model.write_bytes(b"explicit relaxation model")
+    config = {"structure": {"builder": "pipeline", "base_poscar": "missing.POSCAR",
+                            "steps": [{"type": "geo_opt", "model": "models/DPA-3.1-3M.pt"}]}}
     refs = referenced_files(config)
     assert refs[0]["status"] == "missing_or_not_file"
-    assert refs[1]["field"] == "structure_sources.bulk.geo_opt.model[default]"
-    assert refs[1]["path"] == str(default_model)
+    assert refs[1]["field"] == "structure.steps[0].model[0]"
+    assert refs[1]["path"] == str(model)
     path = write_run_manifest(tmp_path / "run", config, repo_dir=repo)
     manifest = json.loads(path.read_text())
-    assert [row["field"] for row in manifest["missing_inputs"]] == ["structure_sources.bulk.base_poscar[0]"]
+    assert [row["field"] for row in manifest["missing_inputs"]] == ["structure.base_poscar[0]"]
 
 
-def test_named_sources_preserve_distinct_identity_for_shared_file_and_do_not_rehash_in_manifest(tmp_path, repo, monkeypatch):
+def test_shared_structure_and_property_asset_keeps_roles_without_manifest_rehash(tmp_path, repo, monkeypatch):
     import rl_matdesign.utils.provenance as provenance
     monkeypatch.chdir(tmp_path)
-    template = tmp_path / "POSCAR"
+    template, model = tmp_path / "POSCAR", tmp_path / "model.pt"
     template.write_bytes(b"template")
+    model.write_bytes(b"shared model")
     calls = []
     original_hash = provenance.sha256_file
     def counted_hash(path):
         calls.append(Path(path))
         return original_hash(path)
     monkeypatch.setattr(provenance, "sha256_file", counted_hash)
-    cfg = {"structure_sources": {name: {"base_poscar": "POSCAR"} for name in ["first", "second"]}}
+    cfg = {
+        "structure": {"builder": "pipeline", "base_poscar": "POSCAR",
+                      "steps": [{"type": "geo_opt", "model": "model.pt"}]},
+        "properties": [{"name": name, "predictor": "dp_energy", "models": ["model.pt"]}
+                       for name in ["energy", "uncertainty"]],
+    }
     path = write_run_manifest(tmp_path / "run", cfg, repo_dir=repo)
     rows = json.loads(path.read_text())["input_files"]
-    assert [row["source"] for row in rows] == ["first", "second"]
-    assert calls.count(template) == 2  # Each source resolver once; no second manifest pass.
-    assert rows[0]["sha256"] == rows[1]["sha256"]
+    assert [row["field"] for row in rows] == [
+        "structure.base_poscar[0]", "structure.steps[0].model[0]",
+        "properties[0].models", "properties[1].models",
+    ]
+    assert [row["source"] for row in rows[:2]] == ["structure", "structure"]
+    assert calls.count(template) == calls.count(model) == 1
+    assert rows[1]["sha256"] == rows[2]["sha256"] == rows[3]["sha256"]
+
+
+def test_singular_pipeline_archives_nested_models_with_runtime_paths(tmp_path, repo, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    names = ["POSCAR", "md.pb", "relax.pt", "ooh.pt"]
+    for name in names:
+        (tmp_path / name).write_bytes(name.encode())
+    config = {
+        "structure": {"builder": "pipeline", "base_poscar": "POSCAR", "steps": [
+            {"type": "md_average", "model": "md.pb"},
+            {"type": "geo_opt", "model": "relax.pt"},
+        ]},
+        "properties": [{"name": "overpotential", "predictor": "ooh_frames", "models": ["ooh.pt"]}],
+    }
+    manifest = write_run_manifest(tmp_path / "run", config, repo_dir=repo)
+    data = json.loads(manifest.read_text())
+    assert not data["missing_inputs"]
+    rows = data["input_files"]
+    assert [row["field"] for row in rows] == [
+        "structure.base_poscar[0]", "structure.steps[0].model[0]",
+        "structure.steps[1].model[0]", "properties[0].models",
+    ]
+    assert [row["path"] for row in rows] == [str(tmp_path / name) for name in names]
+    assert [row["sha256"] for row in rows] == [sha256_file(tmp_path / name) for name in names]
+    (tmp_path / "run" / "pip-freeze.txt").write_text("example==1.0\n")
+    bundle = create_bundle(tmp_path / "archive", [tmp_path / "run"], repo_dir=repo)
+    assert verify_bundle(bundle)["complete"]

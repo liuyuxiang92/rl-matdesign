@@ -1,42 +1,57 @@
 # Constraint filter contract
 
 Every filter returns a subset of the actions it receives. An empty list means
-that this partial candidate has no legal continuation. It must remain empty;
-restoring the input would admit a candidate already rejected by a scientific
-constraint. Rollout code handles this condition as an infeasible episode and
-uses bounded retries. An incomplete candidate must not be sent to the oracle.
+that this partial candidate has no legal continuation. It remains empty;
+restoring rejected actions would admit a candidate excluded by a scientific
+constraint. Rollout code handles infeasible episodes with bounded retries.
+Incomplete candidates must not reach the oracle.
 
-`ChainConstraintFilter` checks each child against that child's immediate input.
-It rejects newly introduced actions, actions removed by an earlier child,
-duplicate actions, and malformed return types with `ValueError`. These are
-plug-in programming errors, not infeasible episodes to retry. Children may prune
-their own list in place; the caller's original action list is protected.
+A group's `filters` list applies every scientific check in declaration order:
 
-This change affects the legacy last-step element rule, SMACT charge and Pauling
-filters (both composition and categorical paths), and SSE metal/oxide form
-selection. The last-step rule tests numeric zero, so `0`, `0.00`, and `-0e0`
-have the same meaning. It uses `code_to_value` when provided. Numeric nonzero
-values retain their meaning; this filter does not introduce a positive lower
-bound. The generic domain defines nonnegative amounts separately.
+```yaml
+filters:
+  - type: smact_charge
+  - type: pauling_en
+```
 
-The change does not replace the charge check's existing policy for unknown
-chemistry. `constraints/charge.py` is unchanged:
+Actions must pass both checks. `apply_filters` checks each result against that
+filter's input and rejects newly introduced or duplicate actions and malformed
+results with `ValueError`. These are plugin programming errors, not scientific
+infeasibility. A filter may prune its own list in place without modifying the
+caller's list. The registered built-ins are `smact_charge`, `pauling_en`, and
+`ooh_phase`; custom classes use `type: package.module:ClassName`.
+
+Intrinsic chemical amount feasibility runs independently of optional filters.
+It enforces exact menus, action budgets, optional total, uniqueness and final
+raw-amount bounds. Oxygen presence is a final bound and has no reserved last
+position. LiPS's one-positive-precursor-form-per-metal rule comes from its
+structure plan and remains active whether optional scientific filters are present
+or absent.
+Neither a last-step element filter nor a categorical oxygen-form choice is part
+of the current interface.
+
+SMACT charge and Pauling filters receive raw accumulated chemical amounts and
+explicit completed-group/scaffold context. Categorical fields are generic
+assignments and do not implicitly become elemental counts. Structure operations
+resolve compound bases and signed edits rather than asking filters to infer them.
+
+The charge screen retains its existing unknown-chemistry policy:
 
 - Missing oxidation-state data remains permissive.
-- Missing electronegativity data skips the Pauling check; charge balance is
-  still required when oxidation states are known.
-- Exceeding the oxidation-state combination cap emits its existing warning and
-  remains permissive.
+- Missing electronegativity data skips the Pauling check; known-state charge
+  balance is still required.
+- Exceeding the oxidation-state combination cap warns and remains permissive.
 - A Pauling backend exception falls back to charge-neutrality acceptance.
-- The existing `allow_alloys` option and scaffold/amount assembly are unchanged.
+- `allow_alloys` controls its documented alloy exception.
 
-A successful screen therefore means "not rejected under the configured data
-policy", not a proof that every physical validity condition has been verified.
-Known-invalid results now remain rejected even when every action fails.
+A successful screen means the configured data policy did not reject the design;
+it is not proof of every physical validity condition. Known-invalid results
+remain rejected when every action fails. The OOH phase filter also returns an
+empty action set for infeasible states. Its scientific phase rules remain
+independently tested.
 
-OOH phase and generic phase-pattern filters already return empty lists for
-infeasible states. Their criteria, primary-phase intervals and required elements
-are unchanged; the chain now preserves these rejections. Regression coverage
-includes valid OOH rollouts for all six target phase settings, explicit
-phase-pattern rejection, zero spellings, chain subset enforcement, SSE sorted
-dopant pairing, and the unchanged unknown-data behavior above.
+The filter list is the sole switch: configured filters apply during warmup,
+training, generation and baseline searches. Omit `filters` or use `filters: []`
+to run without optional scientific filters. Intrinsic group feasibility and
+reward gates still apply. Configured charge/Pauling checks additionally screen
+completed generated formulas. There is no separate training enable/disable flag.

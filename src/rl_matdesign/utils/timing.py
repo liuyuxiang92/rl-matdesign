@@ -49,11 +49,10 @@ class PredictorTimer:
     """Counting/timing proxy around a ``PropertyPredictor``.
 
     Wraps ``predict`` / ``predict_raw`` / ``batch_predict`` and delegates every
-    other attribute to the wrapped predictor.  Delegation is load-bearing:
-    ``run_experiment`` reads ``predictor._cache`` for DQN checkpointing and
-    ``training.generate_candidates`` probes ``predict_raw`` /
-    ``per_objective_stats`` / ``check_phase``.  ``__getattr__`` hands back the
-    inner objects, so those paths keep working untouched.
+    other attribute to the wrapped predictor. Generation probes ``predict_raw`` /
+    ``per_objective_stats`` / ``check_phase`` through this proxy. Shared training
+    and generation snapshots retain the inner predictor's result caches alongside
+    this wrapper's cost ledger; live models and calculators are never serialized.
 
     ``n_unique`` is counted against this wrapper's own key set rather than the
     predictor's internal cache, so it is meaningful even for predictors that

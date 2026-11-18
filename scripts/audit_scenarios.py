@@ -2,7 +2,7 @@
 """Audit authored scenario/HPO contracts without importing scientific models.
 
 Optional domain checks construct the configured filters and initial legal-action
-mask. They do not certify terminal feasibility, external sequence constraints,
+mask. They do not certify terminal feasibility, plugin-owned peptide constraints,
 model capabilities, assets, scientific units or numerical predictions.
 """
 from __future__ import annotations
@@ -18,11 +18,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from rl_matdesign.config_schema import load_yaml_config, normalize_aliases, validate_config
 from rl_matdesign.configuration import build_env, load_config
 from rl_matdesign.hpo.search_space import validate_search_space
-from rl_matdesign.predictors.structure_score import normalize_model_references
-from rl_matdesign.structure_sources import normalize_structure_sources
+from rl_matdesign.structure_sources import resolve_structure_plan
 
 _STRUCTURE = {'dp_energy', 'dp_property', 'dp_classification', 'mgtransformer',
-              'rl_matdesign.predictors.mgtransformer:MGTransformerPredictor'}
+              'rl_matdesign.predictors.mgtransformer:MGTransformerPredictor', 'ooh_frames'}
 _COMPOSITION = {'rf_magpie', 'lookup', 'glassnet', 'dummy'}
 
 
@@ -64,17 +63,17 @@ def audit_file(path: Path, root: Path, *, domains=False):
         return row
     cfg = load_config(str(path))
     row['kind'] = 'scenario'
-    _, props = normalize_model_references(cfg)
+    props = cfg['properties']
     external = [p for p in props if p['predictor'] not in _STRUCTURE | _COMPOSITION]
-    needs_structure = [p['name'] for p in props if p['predictor'] in _STRUCTURE or 'source' in p]
-    plan = normalize_structure_sources(cfg, needs_structure=needs_structure)
-    row['source_ids'] = [s.source_id for s in plan.sources]
-    row['property_sources'] = plan.property_sources
+    needs_structure = [p['name'] for p in props if p['predictor'] in _STRUCTURE]
+    plan = resolve_structure_plan(cfg, needs_structure=needs_structure)
+    row['structure'] = None if plan.structure is None else plan.structure.builder
+    row['structure_properties'] = list(plan.property_names)
     row['outputs'] = []
     for p in props:
         uncertainty = p.get('uncertainty')
         objective = p.get('objective', 'mean')
-        paths = p.get('models', p.get('model', p.get('dp_models')))
+        paths = p.get('models', [])
         count = len(paths) if isinstance(paths, (list, tuple)) else 1
         if objective != 'mean' and uncertainty == 'model_spread' and count < 2:
             raise ValueError(f"{p['name']} requests unavailable singleton model_spread")
@@ -82,9 +81,9 @@ def audit_file(path: Path, root: Path, *, domains=False):
         if p.get('unit') is None:
             row['limitations'].append(f"{p['name']}: physical unit unverified; YAML acceptance is not model provenance.")
     if external:
-        row['limitations'].append('External plugin capabilities and predictor-supplied sequence constraints require installed-plugin validation.')
-    if cfg.get('predictor') == 'ooh':
-        row['limitations'].append('OOH preset source/output contract needs its actual template and models for inference validation.')
+        row['limitations'].append('External plugin capabilities and predictor-supplied peptide constraints require installed-plugin validation.')
+    if any(p['predictor'] == 'ooh_frames' for p in props):
+        row['limitations'].append('OOH frame/output contract needs its actual template and models for inference validation.')
     if domains:
         env, _, _ = build_env(cfg, _NoOracle())
         env.initialize()
@@ -106,19 +105,22 @@ def audit_inventory(root, paths, *, domains=False):
             entries.append(audit_file(root / rel, root, domains=domains))
         except Exception as exc:
             entries.append({'path': str(rel), 'status': 'failed', 'error': f'{type(exc).__name__}: {exc}'})
-    return {'schema_version': 1, 'scope': 'Executable config/source/HPO audit; not scientific model validation.',
+    return {'schema_version': 1, 'scope': 'Executable config/structure/HPO audit; not scientific model validation.',
             'configuration_count': len(entries), 'failed': sum(e['status']=='failed' for e in entries), 'entries': entries}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument('--inventory', type=Path, required=True,
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument('--inventory', type=Path,
                         help='Local JSON inventory with entries containing relative config paths')
+    inputs.add_argument('--config', type=Path, action='append', help='Scenario or HPO YAML; repeatable')
     parser.add_argument('--domains', action='store_true')
     parser.add_argument('--output', type=Path)
     args = parser.parse_args(argv)
-    paths = [row['path'] for row in json.loads(args.inventory.read_text())['entries']]
+    paths = ([row['path'] for row in json.loads(args.inventory.read_text())['entries']]
+             if args.inventory else [str(path.resolve().relative_to(args.root.resolve())) for path in args.config])
     report = audit_inventory(args.root, paths, domains=args.domains)
     text = json.dumps(report, indent=2) + '\n'
     if args.output: args.output.write_text(text)

@@ -57,6 +57,9 @@ def test_interrupted_runner_matches_uninterrupted_training(tmp_path, method, tar
     assert _scientific_rows(full / 'generated.csv') == _scientific_rows(resumed / 'generated.csv')
     left = torch.load(full / 'checkpoint.pt', weights_only=False)
     right = torch.load(resumed / 'checkpoint.pt', weights_only=False)
+    assert left['predictor_caches']['_stats_cache']
+    assert right['predictor_caches']['_stats_cache']
+    assert set(left['predictor_caches']['_stats_cache']) == set(right['predictor_caches']['_stats_cache'])
     assert left['training_budget_state'] == right['training_budget_state']
     assert left['predictor_ledger']['phase_costs'] == right['predictor_ledger']['phase_costs']
     assert torch.equal(left['rng_state']['torch_cpu'], right['rng_state']['torch_cpu'])

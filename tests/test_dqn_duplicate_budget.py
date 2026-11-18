@@ -8,14 +8,14 @@ import numpy as np
 import pytest
 import torch
 
-from rl_matdesign.env import EpisodeStep
+from rl_matdesign.domain_runtime import EpisodeStep
 from rl_matdesign.training import CandidateEvaluationFailed, train_dqn_online
 
 
 class ScriptedEnv:
     """Choose prescribed terminal candidates while retaining two-step RL paths."""
 
-    n_components = 2
+    max_steps = 2
 
     def __init__(self, candidates):
         self.candidates = iter(candidates)
@@ -53,7 +53,7 @@ class ScriptedEnv:
         self.counter += 1
 
     def terminal_comp_key(self):
-        assert self.counter == self.n_components
+        assert self.counter == self.max_steps
         return (("group", ((self.candidate, 1),)),)
 
 
@@ -61,7 +61,7 @@ def run(env, tmp_path, **overrides):
     kwargs = dict(
         env=env,
         elem_feats_scaled=np.array([[0.1, 0.2]]),
-        fraction_set=["0.5"],
+        action_values=["0.5"],
         device=torch.device("cpu"),
         hidden_dim=4,
         n_warmup_eps=2,

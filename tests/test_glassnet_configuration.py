@@ -26,27 +26,30 @@ def test_glassnet_registry_owns_only_input_basis_and_cache_batch_settings():
 def toy_domain(denominator):
     # The full three-coordinate simplex is an arithmetic fixture, not a
     # calibrated or recommended glass-design domain.
-    return {"groups": [{"name": "mixture", "kind": "composition",
-        "species_set": ["SiO2", "Na2O", "CaO"], "n_components": 3,
-        "fraction_set": [str(index / denominator) for index in range(denominator + 1)],
+    return {"properties": [{"name": "score", "predictor": "dummy", "direction": "max", "objective": "mean"}],
+        "groups": [{"name": "mixture", "kind": "composition",
+        "species_set": ["SiO2", "Na2O", "CaO"], "n_steps": 3, "total": 1, "unique": True,
+        "amount_set": [str(index / denominator) for index in range(denominator + 1)],
     }]}
 
 
 @pytest.mark.parametrize("denominator", [2, 4, 8])
 def test_toy_oxide_simplex_count_matches_enumeration_and_closed_form(denominator):
     env, kind, _ = build_env(toy_domain(denominator), object())
-    assert kind == "fraction" and env.n_components == 3
-    menus = env._species_allowed_units
-    exhaustive = sum(sum(values) == env._total_units for values in product(*menus.values()))
-    assert count_compositions(menus, env._total_units, slots=3) == exhaustive == comb(denominator + 2, 2)
+    assert kind == "multi_group" and env.max_steps == 3
+    env = env._inners[0]
+    menus = dict(zip(env.species_set, env._menus))
+    exhaustive = sum(sum(values) == env._target for values in product(*menus.values()))
+    assert count_compositions(menus, env._target, slots=3) == exhaustive == comb(denominator + 2, 2)
 
 
 def test_toy_oxide_refinement_preserves_coarser_points():
     menus = []
     for denominator in [2, 4, 8]:
         env, _, _ = build_env(toy_domain(denominator), object())
-        menus.append({label: {Fraction(amount, env._total_units) for amount in values}
-                      for label, values in env._species_allowed_units.items()})
+        inner = env._inners[0]
+        menus.append({label: {amount * inner._quantum for amount in values}
+                      for label, values in zip(inner.species_set, inner._menus)})
     for label in menus[0]:
         assert menus[0][label] < menus[1][label] < menus[2][label]
 
@@ -82,10 +85,9 @@ def test_shared_glass_model_evaluates_once_with_synthetic_physical_gate(monkeypa
 
     monkeypatch.setitem(PREDICTORS, "glassnet", factory)
     cfg = {
-        "models": {"toy": {"predictor": "glassnet", "oxide_basis": ["SiO2", "Na2O", "CaO"]}},
         "properties": [
-            {"name": "toy_temperature", "model_ref": "toy", "output": "Tg", "objective": "mean", "direction": "max"},
-            {"name": "toy_density", "model_ref": "toy", "output": "Density", "objective": "mean", "direction": "max"},
+            {"name": "toy_temperature", "predictor": "glassnet", "oxide_basis": ["SiO2", "Na2O", "CaO"], "output": "Tg", "objective": "mean", "direction": "max"},
+            {"name": "toy_density", "predictor": "glassnet", "oxide_basis": ["SiO2", "Na2O", "CaO"], "output": "Density", "objective": "mean", "direction": "max"},
         ],
         "reward": {"type": "gated", "gates": [{"name": "toy_gate",
             "score": {"terms": {"toy_temperature": 1}}, "min": 25}],

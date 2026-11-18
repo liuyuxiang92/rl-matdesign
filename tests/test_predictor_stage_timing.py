@@ -9,7 +9,7 @@ from rl_matdesign.utils import stage_timing
 from rl_matdesign.utils.stage_timing import (
     capture_stage_times, summarize_stage_times, timed_stage,
 )
-from tests.test_cross_formula_predictor import enable_source_geo_opt, _candidate, _predictor
+from tests.test_cross_formula_predictor import _candidate, _predictor
 
 
 class Clock:
@@ -59,7 +59,6 @@ class TimedSerialBuilder:
 
 class TimedBatchBuilder(TimedSerialBuilder):
     parallel_execution = True
-    handles_geo_opt = True
 
     def build_many_seeded(self, candidates, *, n_configs, source_spec, eval_seed):
         import numpy as np
@@ -84,56 +83,46 @@ class TimedBatchBuilder(TimedSerialBuilder):
         return results
 
 
-def _timed_predictor(clock, *, shared=True, batch=False, failures=None):
-    predictor = _predictor(share_structure=shared)
+def _timed_predictor(clock, *, batch=False, failures=None):
+    predictor = _predictor()
     factory = TimedBatchBuilder if batch else TimedSerialBuilder
-    if shared:
-        predictor._source_builders["default"] = factory(clock, failures=failures)
-    else:
-        predictor._source_builders = {
-            prop["name"]: factory(clock, failures=failures if index == 0 else None)
-            for index, prop in enumerate(predictor.properties)
-        }
-    predictor._parallel_models_ready = True  # No DeepMD imports in fake scoring.
-
+    predictor._source_builders["structure"] = factory(clock, failures=failures)
+    predictor._parallel_models_ready = True
     def score(prop, structures):
         clock.advance(7 if prop["name"] == "benefit" else 5)
         return 1.0, 0.0
-
     predictor._score = score
     return predictor
 
 
-@pytest.mark.parametrize("shared", [True, False])
-def test_scalar_build_stages_and_properties_have_exact_nonoverlapping_times(clock, shared):
-    predictor = _timed_predictor(clock, shared=shared)
+
+
+def test_scalar_build_stages_and_properties_have_exact_nonoverlapping_times(clock):
+    predictor = _timed_predictor(clock, )
     predictor.predict(_candidate(.2))
     row = predictor.last_evaluation_timings[0]
-    multiplier = 1 if shared else 2
-    assert row["md_task_s"] == 4 * multiplier
-    assert row["opt_task_s"] == 6 * multiplier
-    assert row["structure_other_task_s"] == 2 * multiplier
+    assert row["md_task_s"] == 4
+    assert row["opt_task_s"] == 6
+    assert row["structure_other_task_s"] == 2
     assert row["property_s"] == 12
-    assert row["config_succeeded"] == 2 * multiplier
+    assert row["config_succeeded"] == 2
     assert row["config_attempted"] is None
     assert not row["cache_hit"]
 
 
-@pytest.mark.parametrize("shared", [True, False])
 @pytest.mark.parametrize("batch", [True, False])
-def test_batch_records_align_with_candidates_and_coalesced_duplicates_cost_zero(clock, shared, batch):
-    predictor = _timed_predictor(clock, shared=shared, batch=batch)
+def test_batch_records_align_with_candidates_and_coalesced_duplicates_cost_zero(clock, batch):
+    predictor = _timed_predictor(clock, batch=batch)
     first, second = _candidate(.1), _candidate(.2)
     predictor.batch_predict([first, second, first.copy()])
     first_row, second_row, duplicate = predictor.last_evaluation_timings
     for row in (first_row, second_row):
-        multiplier = 1 if shared else 2
-        assert row["md_task_s"] == 4 * multiplier
-        assert row["opt_task_s"] == 6 * multiplier
-        assert row["structure_other_task_s"] == 2 * multiplier
+        assert row["md_task_s"] == 4
+        assert row["opt_task_s"] == 6
+        assert row["structure_other_task_s"] == 2
         assert row["property_s"] == 12
-        assert row["config_succeeded"] == 2 * multiplier
-        assert row["config_attempted"] == (2 * multiplier if batch else None)
+        assert row["config_succeeded"] == 2
+        assert row["config_attempted"] == (2 if batch else None)
     assert duplicate["cache_hit"] is True
     assert duplicate["md_task_s"] == duplicate["opt_task_s"] == duplicate["property_s"] == 0
     assert duplicate["config_attempted"] == duplicate["config_succeeded"] == 0
@@ -188,42 +177,50 @@ def test_property_failure_retains_build_and_elapsed_inference_time(clock):
     assert not predictor._stats_cache
 
 
-def test_multiple_optimization_passes_do_not_invent_extra_configuration_attempts(clock):
+def test_multiple_builder_optimization_passes_do_not_invent_extra_configuration_attempts(clock):
     predictor = _timed_predictor(clock)
-    enable_source_geo_opt(predictor)
-    def relax(atoms, *, source_id):
-        with timed_stage("opt"):
-            clock.advance(11)
+    builder = predictor._source_builders['structure']
+    original = builder.build
+    def build(*args, **kwargs):
+        atoms = original(*args, **kwargs)
+        for cell in atoms:
+            with timed_stage('opt'):
+                clock.advance(11)
         return atoms
-    predictor._relax = relax
+    builder.build = build
     predictor.predict(_candidate(.1))
     row = predictor.last_evaluation_timings[0]
-    assert row["opt_task_s"] == 6 + 22
-    assert row["config_succeeded"] == 2
-    assert row["config_attempted"] is None
+    assert row['opt_task_s'] == 6 + 22
+    assert row['config_succeeded'] == 2 and row['config_attempted'] is None
 
 
-@pytest.mark.parametrize("survivors", [0, 1])
-def test_parent_relaxation_after_batch_counts_failed_opt_time_and_actual_survivors(clock, survivors):
+
+
+@pytest.mark.parametrize('survivors', [0, 1])
+def test_builder_batch_counts_failed_opt_time_and_actual_survivors(clock, survivors):
     predictor = _timed_predictor(clock, batch=True)
-    enable_source_geo_opt(predictor)
-    predictor._source_builders["default"].handles_geo_opt = False
-    def relax(atoms, *, source_id):
-        with timed_stage("opt"):
-            clock.advance(11)
-            if atoms.index >= survivors:
-                raise RuntimeError("unconverged")
+    builder = predictor._source_builders['structure']
+    def build(candidate, *, n_configs, rng):
+        atoms=[]
+        for index in range(n_configs):
+            with timed_stage('md'):
+                clock.advance(2)
+            with timed_stage('opt'):
+                clock.advance(14)
+            clock.advance(1)
+            if index < survivors:
+                atoms.append(SimpleNamespace(candidate=candidate,index=index))
         return atoms
-    predictor._relax = relax
+    builder.build=build
     result = predictor.batch_predict([_candidate(.1)], return_exceptions=True)
     row = predictor.last_evaluation_timings[0]
     assert isinstance(result[0], Exception) == (survivors == 0)
-    assert row["md_task_s"] == 4
-    assert row["opt_task_s"] == 6 + 22
-    assert row["structure_other_task_s"] == 2
-    assert row["config_attempted"] == 2
-    assert row["config_succeeded"] == survivors
-    assert row["property_s"] == (12 if survivors else 0)
+    assert row['md_task_s'] == 4 and row['opt_task_s'] == 28
+    assert row['structure_other_task_s'] == 2 and row['config_attempted'] == 2
+    assert row['config_succeeded'] == survivors
+    assert row['property_s'] == (12 if survivors else 0)
+
+
 
 
 def test_pool_timeout_sidechannel_stays_aligned_around_cache_hits_and_duplicates(clock):
@@ -232,7 +229,6 @@ def test_pool_timeout_sidechannel_stays_aligned_around_cache_hits_and_duplicates
     predictor.predict(cached)
     class TimeoutBuilder:
         parallel_execution = True
-        handles_geo_opt = True
         def build_many_seeded(self, candidates, **kwargs):
             assert candidates == [first, second]
             self.last_build_timings = [
@@ -243,7 +239,7 @@ def test_pool_timeout_sidechannel_stays_aligned_around_cache_hits_and_duplicates
             ]
             clock.advance(100)
             raise TimeoutError("worker timed out")
-    predictor._source_builders["default"] = TimeoutBuilder()
+    predictor._source_builders["structure"] = TimeoutBuilder()
     result = predictor.batch_predict([cached, first, second, first.copy()], return_exceptions=True)
     assert all(isinstance(item, TimeoutError) for item in result[1:])
     cache, finished, unfinished, duplicate = predictor.last_evaluation_timings
@@ -259,18 +255,17 @@ def test_pool_timeout_sidechannel_stays_aligned_around_cache_hits_and_duplicates
     assert all(row["property_s"] == 0 for row in predictor.last_evaluation_timings)
 
 
-def test_separate_property_groups_keep_alignment_when_first_group_skips_a_formula(clock):
-    predictor = _timed_predictor(clock, shared=False, batch=True, failures={.1: "md"})
+def test_failed_batch_candidate_keeps_neighbor_timing_aligned(clock):
+    predictor = _timed_predictor(clock, batch=True, failures={.1: 'md'})
     bad, good = _candidate(.1), _candidate(.2)
     result = predictor.batch_predict([bad, good], return_exceptions=True)
     assert isinstance(result[0], RuntimeError)
     bad_row, good_row = predictor.last_evaluation_timings
-    assert bad_row["md_task_s"] == 2
-    assert bad_row["opt_task_s"] == bad_row["property_s"] == 0
-    assert good_row["md_task_s"] == 8
-    assert good_row["opt_task_s"] == 12
-    assert good_row["property_s"] == 12
-    assert predictor._source_builders["cost"].calls == [good]
+    assert bad_row['md_task_s'] == 2 and bad_row['opt_task_s'] == bad_row['property_s'] == 0
+    assert good_row['md_task_s'] == 4 and good_row['opt_task_s'] == 6 and good_row['property_s'] == 12
+    assert predictor._source_builders['structure'].calls == [bad, good]
+
+
 
 
 def test_uninstrumented_serial_physics_reports_unknown_stage_costs(clock):
@@ -281,7 +276,7 @@ def test_uninstrumented_serial_physics_reports_unknown_stage_costs(clock):
         def build(self, candidate, *, n_configs, rng):
             clock.advance(27)
             return [SimpleNamespace(candidate=candidate) for _ in range(n_configs)]
-    predictor._source_builders["default"] = OldBuilder()
+    predictor._source_builders["structure"] = OldBuilder()
     predictor.predict(_candidate(.1))
     row = predictor.last_evaluation_timings[0]
     assert row["md_task_s"] is None

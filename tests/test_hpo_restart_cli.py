@@ -90,7 +90,7 @@ def test_modified_or_missing_model_asset_is_rejected(existing, tmp_path, remove)
     plan = deepcopy(original)
     asset = tmp_path / "predictor-weights.pt"
     asset.write_bytes(b"original model asset")
-    plan["base_config_data"]["dp_model"] = str(asset)
+    plan["base_config_data"]["properties"][0]["models"] = [str(asset)]
     campaign = Campaign(plan, tmp_path / "asset-campaign")
     before = (campaign.out / "manifest.json").read_bytes()
     if remove:

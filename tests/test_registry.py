@@ -6,14 +6,14 @@ import pytest
 
 def test_builtin_predictor_names_present():
     from rl_matdesign.registry import PREDICTORS
-    expected = {"rf_magpie", "ooh", "dummy"}
+    expected = {"rf_magpie", "ooh_frames", "dummy"}
     assert expected.issubset(set(PREDICTORS))
 
 
 def test_builtin_constraint_names_present():
     from rl_matdesign.registry import CONSTRAINTS
-    expected = {"phase_pattern", "ooh_phase", "smact_charge", "last_step_element"}
-    assert expected.issubset(set(CONSTRAINTS))
+    expected = {"ooh_phase", "smact_charge", "pauling_en"}
+    assert set(CONSTRAINTS) == expected
 
 
 def test_resolve_dummy_predictor_runs():
@@ -77,7 +77,7 @@ def test_resolve_unknown_constraint_lists_builtins():
     from rl_matdesign.registry import resolve_constraint
     with pytest.raises(ValueError) as info:
         resolve_constraint("not_a_real_constraint", {})
-    assert "phase_pattern" in str(info.value)
+    assert "ooh_phase" in str(info.value) and "smact_charge" in str(info.value)
 
 
 def test_mgtransformer_is_registered_under_a_short_name():
@@ -97,3 +97,26 @@ def test_mgtransformer_resolves_and_reports_the_missing_model_key():
     with pytest.raises(ValueError) as info:
         resolve_predictor("mgtransformer", {"mgt_repo": ".", "mgt_python": "python"})
     assert "model" in str(info.value)
+
+
+@pytest.mark.parametrize("kind", ["last_step_element", "sse_doping", "phase_pattern", "chain"])
+def test_removed_constraints_are_not_registered(kind):
+    from rl_matdesign.registry import resolve_constraint
+    with pytest.raises(ValueError, match="Unknown filter"):
+        resolve_constraint(kind, {})
+
+
+@pytest.mark.parametrize("kind", ["ooh", "structure_score"])
+def test_removed_predictor_shortcuts_are_not_registered(kind):
+    from rl_matdesign.registry import resolve_predictor
+    with pytest.raises(ValueError, match="Unknown predictor"):
+        resolve_predictor(kind, {})
+
+
+@pytest.mark.parametrize("cfg", [{}, {"properties": []}, {"predictor": "dummy"},
+    {"predictor": "ooh", "dp_models": ["weights.pt"]},
+    {"models": {"g": {"predictor": "glassnet"}}, "properties": [{"model_ref": "g"}]}])
+def test_reward_requires_explicit_inline_properties(cfg):
+    from rl_matdesign.registry import build_reward
+    with pytest.raises(ValueError, match="properties"):
+        build_reward(cfg)

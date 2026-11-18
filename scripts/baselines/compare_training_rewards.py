@@ -76,7 +76,7 @@ def _split_run(spec: str) -> Tuple[str, str]:
 
 
 def _discount_correction(run_dir: str) -> Tuple[float, str]:
-    """``gamma ** (n_components - 1)`` for a legacy PG log, from run_config.json.
+    """``gamma ** (episode_steps - 1)`` for a legacy PG log, from run_config.json.
 
     PG logs the *discounted* return G_0 while DQN logs the undiscounted terminal
     reward, both under the column name ``return``. For a terminal-only reward (all
@@ -90,14 +90,14 @@ def _discount_correction(run_dir: str) -> Tuple[float, str]:
         with open(cfg_path) as f:
             cfg = json.load(f)
         gamma = float(cfg.get("gamma", 1.0))
-        n = int(cfg.get("n_components", 1))
+        n = sum(int(group.get("n_steps", len(group.get("choices", [])))) for group in cfg.get("groups", []))
     except (ValueError, TypeError, json.JSONDecodeError):
         return 1.0, "unreadable run_config.json — left as discounted return"
     if gamma >= 1.0 or n <= 1:
         return 1.0, ""
     factor = gamma ** (n - 1)
     return factor, (f"un-discounted by gamma^{n - 1} = {factor:.4f} "
-                    f"(gamma={gamma}, n_components={n})")
+                    f"(gamma={gamma}, episode_steps={n})")
 
 
 def _load_training_rewards(path: str) -> Dict[str, object]:

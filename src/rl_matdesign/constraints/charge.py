@@ -209,7 +209,7 @@ def template_scaffold(poscar_path: str, site_symbol: str) -> Tuple[Dict[str, flo
     count, and the number of ``site_symbol`` placeholder atoms (the working sites
     the RL agent fills) is returned so callers can normalize the fixed part to a
     per-working-formula-unit basis. Reuses ASE just like
-    :func:`rl_matdesign.utils.structure.substitute_sites`.
+    :func:`rl_matdesign.predictors.builders.pipeline.PipelineBuilder`.
     """
     from ase.io import read as ase_read
 

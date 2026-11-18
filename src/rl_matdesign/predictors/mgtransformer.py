@@ -12,9 +12,9 @@ that repo's ``graph_builder.py`` / ``predict.py`` / ``serve.py`` for what's
 actually being called.
 
 Fully config-driven, no perovskite/formation-energy assumption anywhere in this
-file: point ``model`` at any finetuned checkpoint under
+file: list finetuned checkpoints in ``properties[].models`` under
 ``mgt_repo/ckpt/finetuned/`` (bandgap, bulk modulus, ehull, ...) to reuse this
-class for a completely different ``structure_score`` scenario. It opts into the
+class for a completely different property scenario. It opts into the
 **structure** objective protocol (see ``structure_score.py``'s predictor
 contract) by exposing ``score_structures`` — a property that depends on 3D
 geometry, not just stoichiometry, needs the built/relaxed cells, not the raw
@@ -22,12 +22,16 @@ candidate composition.
 
 **One instance is one model.** ``score_structures`` returns one value per
 structure and does no folding of its own; the engine averages the structures
-axis and takes mean/std across models. To use an ensemble, give ``model:`` a
-LIST of paths in the ``properties[]`` entry — the engine then builds one instance
-(one ``serve.py`` process) per path. With a single path ``std`` is exactly 0.
+axis and measures spread across independent models. Set ``models:`` to a list
+of paths in the ``properties[]`` entry; the engine builds one instance
+(one ``serve.py`` process) per path. A single checkpoint cannot establish model
+spread, which is reported as unavailable.
 
-Config keys
------------
+Internal leaf constructor keys
+------------------------------
+The property engine converts the public ``models`` list to one scalar ``model``
+for each leaf instance. All other options below belong in the property entry.
+
     mgt_repo (required):
         Path to the ``MGTransformer`` checkout.
     mgt_python (required):

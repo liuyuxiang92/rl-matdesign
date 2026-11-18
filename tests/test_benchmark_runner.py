@@ -20,8 +20,8 @@ def module(relative):
 @pytest.fixture
 def tiny_config(tmp_path):
     cfg = {"groups": [{"name": "alloy", "kind": "composition", "species_set": ["Fe", "Ni"],
-                        "fraction_set": ["0", "0.25", "0.5", "0.75", "1"], "n_components": 2}],
-           "predictor": "dummy", "dqn_warmup_eps": 1, "dqn_batch_size": 1,
+                        "amount_set": [0, .25, .5, .75, 1], "n_steps": 2, "total": 1, "unique": True}],
+           "properties": [{"name": "score", "predictor": "dummy", "direction": "max", "objective": "mean"}], "dqn_warmup_eps": 1, "dqn_batch_size": 1,
            "dqn_grad_steps_per_ep": 1, "pg_warmup_eps": 2, "pg_batch_eps": 2,
            "train_max_duplicate_attempts": 50, "eval_seed": 19,
            "num_gen_eps": 0}
@@ -108,7 +108,7 @@ def test_random_partial_or_fatal_runs_report_and_fail(tiny_config, tmp_path, mon
         def close(self): closed.append(True)
     monkeypatch.setattr(random_run, 'build_predictor', lambda *a, **kw: Oracle())
     monkeypatch.setattr(random_run, 'sampler_from_env', lambda env: SimpleNamespace(
-        size=2, total_units=1, sample=lambda rng: {'Fe': 1}))
+        size=2, amount_quantum=1., sample=lambda rng: {'Fe': 1}))
     out = tmp_path / failure
     error = EvaluationProtocolError if failure == 'protocol' else SystemExit
     with pytest.raises(error):

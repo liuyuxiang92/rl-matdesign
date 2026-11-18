@@ -29,7 +29,7 @@ class Builder(BaseBuilder):
 
 
 def _timed_pool(pool_factory, tmp_path, **kwargs):
-    pool, root = pool_factory(cfg_extra={"md": {"model": "fake"}, "opt": {"model": "fake"}}, **kwargs)
+    pool, root = pool_factory(**kwargs)
     (tmp_path / "fake_modules" / "timed_builder.py").write_text(_TIMED_BUILDER)
     pool.kind = "timed_builder:Builder"
     return pool, root
@@ -58,8 +58,17 @@ def test_measured_stage_times_and_failures_are_returned_in_formula_order(pool_fa
     assert all(item["timing"] is not None for item in pool.last_build_job_timings)
 
 
-def test_uninstrumented_external_md_is_unknown_not_builder_time(pool_factory):
-    pool, _ = pool_factory(cfg_extra={"md": {"model": "old_plugin"}, "opt": {"model": "old_plugin"}})
+def test_uninstrumented_external_md_is_unknown_not_builder_time(pool_factory, tmp_path):
+    pool, _ = pool_factory()
+    (tmp_path / "fake_modules" / "untimed_builder.py").write_text(
+        "from parallel_test_builder import Builder as BaseBuilder\n"
+        "class Builder(BaseBuilder):\n"
+        "    md = {'model': 'external_md'}\n"
+        "    opt = {'model': 'external_opt'}\n"
+    )
+    # External builders declare their executed stages through runtime attributes;
+    # top-level config keys do not enable framework MD or optimization stages.
+    pool.kind = "untimed_builder:Builder"
     pool.build({}, n_configs=1)
     timing = pool.last_build_timings[0]
     assert timing["md_task_s"] is None
@@ -69,7 +78,7 @@ def test_uninstrumented_external_md_is_unknown_not_builder_time(pool_factory):
 
 
 def test_shared_optimizer_failure_keeps_observed_duration_in_worker_reply(pool_factory):
-    pool, _ = pool_factory(cfg_extra={"opt": {"model": "fake"}})
+    pool, _ = pool_factory()
     with pytest.raises(RuntimeError, match="CUDA out of memory"):
         pool.build({"mode": "internal_relax_oom"}, n_configs=1)
     timing = pool.last_build_timings[0]

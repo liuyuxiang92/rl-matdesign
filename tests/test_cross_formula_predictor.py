@@ -40,15 +40,16 @@ class RecordingBuilder:
 
 def _config(**overrides):
     cfg = {
-        "base_poscar": "not-read-by-fake-builder",
-        "n_random_configs": 2,
+        "structure": {"builder": "pipeline", "base_poscar": "not-read-by-fake-builder", "n_random_configs": 2,
+                      "steps": [{"type": "substitute", "a_site_symbol": "Fe", "a_dopant_group": "alloy"}]},
         "k": 1.0,
         "properties": [
             {"name": "benefit", "predictor": "dp_property", "models": ["unused"],
-             "direction": "max", "weight": 2.0, "objective": "mean_minus_kstd"},
+             "direction": "max", "objective": "mean_minus_kstd"},
             {"name": "cost", "predictor": "dp_property", "models": ["unused"],
              "direction": "min", "scale": 5.0, "objective": "mean"},
         ],
+        "reward": {"objective": {"terms": {"benefit": 2.0, "cost": 1.0}}},
     }
     cfg.update(overrides)
     return cfg
@@ -56,15 +57,8 @@ def _config(**overrides):
 
 def _predictor(**overrides):
     cfg = _config(**overrides)
-    if cfg.get("share_structure") is False:
-        cfg = independent_source_config(cfg)
     predictor = StructureScorePredictor(cfg, seed=17)
-    builder = RecordingBuilder()
-    if len(predictor.source_plan.sources) == 1:
-        predictor._source_builders["default"] = builder
-    else:
-        predictor._source_builders = {prop["name"]: RecordingBuilder()
-                               for prop in predictor.properties}
+    predictor._source_builders["structure"] = RecordingBuilder()
     predictor._score = lambda prop, structures: (
         float(structures[0].candidate["Fe"]) * (10 if prop["name"] == "benefit" else 5),
         0.5 if prop["name"] == "benefit" else 0.0,
@@ -78,7 +72,7 @@ def _candidate(value):
 
 def test_batch_coalesces_duplicates_and_cache_hits_preserving_input_order():
     predictor = _predictor()
-    builder = predictor._source_builders["default"]
+    builder = predictor._source_builders["structure"]
     first, second, cached = map(_candidate, [0.1, 0.2, 0.3])
     cached_result = predictor.predict(cached)
     results = predictor.batch_predict([second, cached, first, second.copy()])
@@ -101,41 +95,32 @@ def test_shared_batch_builds_once_and_passes_same_structures_to_each_property():
     predictor._score = score
     candidates = [_candidate(0.1), _candidate(0.2)]
     predictor.batch_predict(candidates)
-    assert predictor._source_builders["default"].waves == [candidates]
+    assert predictor._source_builders["structure"].waves == [candidates]
     assert [name for name, _ in seen] == ["benefit", "cost", "benefit", "cost"]
     assert seen[0][1] is seen[1][1]
     assert seen[2][1] is seen[3][1]
     assert seen[0][1] is not seen[2][1]
 
 
-def test_independent_properties_batch_build_with_their_own_config_counts():
-    cfg = _config(share_structure=False)
+def test_properties_cannot_override_the_shared_sample_count():
+    cfg = _config()
     cfg["properties"][0]["n_random_configs"] = 3
-    predictor = _predictor(**cfg)
-    candidates = [_candidate(0.1), _candidate(0.2)]
-    results = predictor.batch_predict(candidates)
-    assert results == pytest.approx([(0.9, None), (2.8, None)])
-    for name, count in [("benefit", 3), ("cost", 2)]:
-        assert predictor._source_builders[name].waves == [candidates]
-        assert predictor._source_builders[name].calls == [(c, count) for c in candidates]
+    with pytest.raises(ValueError, match="structure-owned"):
+        StructureScorePredictor(cfg, seed=17)
 
 
-@pytest.mark.parametrize("shared", [True, False])
-def test_failed_formula_does_not_discard_neighbors_or_enter_cache(shared):
-    predictor = _predictor(share_structure=shared)
+def test_failed_formula_does_not_discard_neighbors_or_enter_cache():
+    predictor = _predictor()
     bad, good = _candidate(0.1), _candidate(0.2)
-    builder = predictor._source_builders["default"] if shared else predictor._source_builders["benefit"]
+    builder = predictor._source_builders["structure"]
     builder.failures.add(0.1)
     results = predictor.batch_predict([bad, good, bad.copy()], return_exceptions=True)
-
     assert isinstance(results[0], RuntimeError)
     assert results[0] is results[2]
     assert results[1] == pytest.approx((2.8, None))
     assert predictor._key(bad) not in predictor._stats_cache
     assert predictor._key(bad) not in predictor._batch_stats
     assert predictor._key(good) in predictor._stats_cache
-    if not shared:
-        assert predictor._source_builders["cost"].waves == [[good]]
     builder.failures.clear()
     assert predictor.batch_predict([bad, good]) == pytest.approx([(0.9, None), (2.8, None)])
     assert builder.waves == [[bad, good], [bad]]
@@ -144,7 +129,7 @@ def test_failed_formula_does_not_discard_neighbors_or_enter_cache(shared):
 def test_scalar_builder_fallback_also_isolates_formula_errors():
     predictor = _predictor()
     builder = RecordingBuilder(failures={0.1})
-    predictor._source_builders["default"] = SimpleNamespace(build=builder.build)
+    predictor._source_builders["structure"] = SimpleNamespace(build=builder.build)
     bad, good = _candidate(0.1), _candidate(0.2)
     results = predictor.batch_predict([bad, good], return_exceptions=True)
     assert isinstance(results[0], RuntimeError)
@@ -170,7 +155,7 @@ def test_scoring_failure_does_not_cache_partial_property_results():
     assert predictor._key(bad) not in predictor._batch_stats
     predictor._score = original_score
     assert predictor.batch_predict([bad])[0] == pytest.approx((0.9, None))
-    assert predictor._source_builders["default"].waves == [[bad, good], [bad]]
+    assert predictor._source_builders["structure"].waves == [[bad, good], [bad]]
 
 
 def test_nonfinite_reward_is_rejected_without_caching_its_statistics():
@@ -191,11 +176,11 @@ def test_nonfinite_reward_is_rejected_without_caching_its_statistics():
 def test_default_error_mode_raises_but_keeps_successful_neighbor_result():
     predictor = _predictor()
     bad, good = _candidate(0.1), _candidate(0.2)
-    predictor._source_builders["default"].failures.add(0.1)
+    predictor._source_builders["structure"].failures.add(0.1)
     with pytest.raises(RuntimeError, match="build failed"):
         predictor.batch_predict([bad, good])
     assert predictor.predict(good) == pytest.approx((2.8, None))
-    assert len(predictor._source_builders["default"].calls) == 2
+    assert len(predictor._source_builders["structure"].calls) == 2
 
 
 def test_batch_diagnostics_do_not_rebuild_when_wave_exceeds_lru_capacity():
@@ -210,49 +195,43 @@ def test_batch_diagnostics_do_not_rebuild_when_wave_exceeds_lru_capacity():
         assert predictor.reward_details(candidate)["reward"] == pytest.approx(result[0])
     # The next wave can also reuse the previous wave's evicted diagnostics.
     assert predictor.batch_predict(candidates[::-1]) == results[::-1]
-    assert len(predictor._source_builders["default"].calls) == 3
+    assert len(predictor._source_builders["structure"].calls) == 3
 
 
-def test_batch_preserves_gated_sweep_choice_for_each_formula():
-    cfg = _config(sweep={"name": "temperature", "values": [300, 500]})
-    cfg["reward"] = {
-        "type": "gated",
-        "gates": [{"name": "safe", "score": {"terms": {"cost": 1.0}}, "max": 0.5}],
-        "objective": {"terms": {"benefit": 1.0}},
-        "failure": {"reward": -10.0},
-    }
-    for prop in cfg["properties"]:
-        prop.update(fparam=[None], objective="mean")
+def test_batch_preserves_explicit_condition_outputs_and_reward_choice():
+    cfg = _config()
+    cfg["properties"] = [
+        {"name": f"{name}_T{temperature}", "predictor": "dp_property", "models": ["unused"],
+         "direction": "max", "objective": "mean", "fparam": [temperature]}
+        for temperature in (300, 500) for name in ("benefit", "cost")]
+    cfg["reward"] = {"type": "max", "alternatives": [
+        {"name": f"T{temperature}", "terms": {f"benefit_T{temperature}": 1., f"cost_T{temperature}": -1.}}
+        for temperature in (300, 500)]}
     predictor = _predictor(**cfg)
     calls = []
-
-    def score(prop, structures, *, fparam=None):
+    def score(prop, structures):
         fraction = structures[0].candidate["Fe"]
-        temperature = fparam[0]
+        temperature = prop["fparam"][0]
         calls.append((fraction, prop["name"], temperature))
-        if prop["name"] == "benefit":
+        if prop["name"].startswith("benefit"):
             return float(temperature) * fraction, 0.0
-        return (0.9 if fraction == 0.1 and temperature == 500 else 0.2), 0.0
-
+        return (200. if fraction == 0.1 and temperature == 500 else 0.), 0.0
     predictor._score = score
     first, second = _candidate(0.1), _candidate(0.2)
     assert predictor.batch_predict([first, second]) == [(30.0, None), (100.0, None)]
-    assert predictor.per_objective_stats(first)["temperature"] == (300.0, None)
-    assert predictor.per_objective_stats(second)["temperature"] == (500.0, None)
-    assert predictor.reward_details(first)["gate_passed"] is True
+    assert len(predictor.per_objective_stats(first)) == 4
+    assert len(predictor.per_objective_stats(second)) == 4
+    assert predictor.reward_details(first)["selected_alternative"] == "T300"
+    assert predictor.reward_details(second)["selected_alternative"] == "T500"
     assert len(calls) == 8
-    assert len(predictor._source_builders["default"].calls) == 2
+    assert len(predictor._source_builders["structure"].calls) == 2
 
 
-def test_recommended_wave_size_delegates_to_structure_builders():
+def test_recommended_wave_size_delegates_to_structure_builder():
     predictor = _predictor()
     assert predictor.evaluation_batch_size() == 1
-    predictor._source_builders["default"].batch_size = 4
+    predictor._source_builders["structure"].batch_size = 4
     assert predictor.evaluation_batch_size() == 4
-    independent = _predictor(share_structure=False)
-    independent._source_builders["benefit"].batch_size = 2
-    independent._source_builders["cost"].batch_size = 3
-    assert independent.evaluation_batch_size() == 3
 
 
 def test_empty_predictor_batch_keeps_previous_wave_diagnostics():
@@ -261,8 +240,8 @@ def test_empty_predictor_batch_keeps_previous_wave_diagnostics():
     predictor.batch_predict(candidates)
     assert predictor.batch_predict([]) == []
     predictor.per_objective_stats(candidates[0])
-    assert predictor._source_builders["default"].waves == [candidates]
-    assert len(predictor._source_builders["default"].calls) == 2
+    assert predictor._source_builders["structure"].waves == [candidates]
+    assert len(predictor._source_builders["structure"].calls) == 2
 
 
 def test_empty_timer_batch_does_not_call_predictor_or_clock(monkeypatch):
@@ -379,29 +358,3 @@ def test_timer_default_mode_preserves_legacy_batch_api(monkeypatch):
     assert timer.batch_predict(candidates) == [(1.0, 0.0), (1.0, 0.0)]
     assert calls == [candidates]
     assert (timer.n_calls, timer.n_unique, timer.t_predict_s) == (2, 2, 4.0)
-
-
-def independent_source_config(cfg):
-    """Explicit independent-source fixture; production does not infer this choice."""
-    from copy import deepcopy
-    cfg = deepcopy(cfg)
-    source_keys = ("builder", "base_poscar", "site_symbol", "n_random_configs", "geo_opt", "structure_parallel")
-    common = {key: cfg.pop(key) for key in source_keys if key in cfg}
-    cfg.pop("share_structure", None)
-    cfg["structure_sources"] = {}
-    for prop in cfg["properties"]:
-        source_id = prop["name"]
-        source = {**common, **{key: prop.pop(key) for key in source_keys if key in prop}}
-        cfg["structure_sources"][source_id] = source
-        prop["source"] = source_id
-    return cfg
-
-
-def enable_source_geo_opt(predictor):
-    """Configure relaxation before any evaluation in a fake-source fixture."""
-    from dataclasses import replace
-    from rl_matdesign.structure_sources import StructureSourceSpec
-    predictor.source_plan = replace(predictor.source_plan, sources=tuple(
-        StructureSourceSpec(spec.source_id, {**spec.effective_config, "geo_opt": {"enabled": True}})
-        for spec in predictor.source_plan.sources
-    ))

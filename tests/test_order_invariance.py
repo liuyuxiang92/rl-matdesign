@@ -7,7 +7,7 @@ the featurizer or predictor wiring can't silently break it.
 
 Three layers are covered separately so a regression points at the right place:
 - ``featurize_formula`` is order-invariant on the input formula string.
-- ``CompositionEnv`` / ``IntegerRatioEnv`` produce identical per-step features
+- Unified chemical amount groups produce identical per-step features
   at any step index where the *partial multisets* match between two episodes.
 - The predictor contract (``predict(composition) -> (mean, std)``) treats the
   input dict as an unordered mapping.
@@ -83,7 +83,7 @@ def test_featurize_formula_is_order_invariant_integer(perm_strings):
 
 
 # ============================================================================
-# CompositionEnv layer
+# Normalized chemical amounts
 # ============================================================================
 
 def _oh(idx: int, n: int) -> Tuple[float, ...]:
@@ -95,12 +95,12 @@ def _oh(idx: int, n: int) -> Tuple[float, ...]:
 def _walk(env, action_seq: Sequence[Tuple[str, str]]) -> None:
     """Roll *env* through a sequence of (element, fraction-string) pairs."""
     env.initialize()
-    species_set = env.species_set
-    fraction_set = env.fraction_set
-    for elem, frac_str in action_seq:
-        elem_oh = _oh(species_set.index(elem), len(species_set))
-        comp_oh = _oh(fraction_set.index(frac_str), len(fraction_set))
-        env.step((elem_oh, comp_oh))
+    inner = env._active()
+    for elem, amount in action_seq:
+        code = next(code for code in inner.action_values if float(code) == float(amount))
+        action = (_oh(inner.species_set.index(elem), len(inner.species_set)),
+                  _oh(inner.action_values.index(code), len(inner.action_values)))
+        env.step(env._to_union(action, inner))
 
 
 def _multiset(prefix: Sequence[Tuple[str, str]]) -> Tuple[Tuple[str, str], ...]:
@@ -110,19 +110,14 @@ def _multiset(prefix: Sequence[Tuple[str, str]]) -> Tuple[Tuple[str, str], ...]:
 
 @pytest.fixture
 def composition_env_factory():
-    """Build a CompositionEnv with a deterministic reward."""
-    from rl_matdesign.env import CompositionEnv
-
+    """Build a normalized chemical group with a deterministic mapping reward."""
+    from rl_matdesign.env_multigroup import MultiGroupEnv
     def _build(reward_fn=None):
-        return CompositionEnv(
-            species_set=["Fe", "Co", "Ni", "Mn", "Cr"],
-            fraction_set=["0.05", "0.10", "0.15", "0.20", "0.25",
-                          "0.30", "0.35", "0.40"],
-            anion_formula="",
-            n_components=5,
-            reward_fn=reward_fn or (lambda _f: 1.0),
-        )
-
+        return MultiGroupEnv(groups=[{"name": "chemistry", "kind": "composition",
+            "species_set": ["Fe", "Co", "Ni", "Mn", "Cr"],
+            "amount_set": [.05, .1, .15, .2, .25, .3, .35, .4],
+            "n_steps": 5, "total": 1, "unique": True}],
+            reward_fn=lambda payload: (reward_fn or (lambda _c: 1.0))(payload["chemistry"]))
     return _build
 
 
@@ -207,31 +202,21 @@ def test_composition_env_features_first_step_always_equal(composition_env_factor
 
 
 # ============================================================================
-# IntegerRatioEnv layer
+# Unnormalized chemical amounts
 # ============================================================================
 
 def _walk_int(env, action_seq: Sequence[Tuple[str, str]]) -> None:
-    env.initialize()
-    species_set = env.species_set
-    ratio_set = env.ratio_set
-    for elem, digit_str in action_seq:
-        elem_oh = _oh(species_set.index(elem), len(species_set))
-        comp_oh = _oh(ratio_set.index(digit_str), len(ratio_set))
-        env.step((elem_oh, comp_oh))
+    _walk(env, action_seq)
 
 
 @pytest.fixture
 def integer_env_factory():
-    from rl_matdesign.env_integer import IntegerRatioEnv
-
+    from rl_matdesign.env_multigroup import MultiGroupEnv
     def _build(reward_fn=None):
-        return IntegerRatioEnv(
-            species_set=["Fe", "Co", "Ni", "Mn", "Cr"],
-            ratio_set=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
-            n_components=5,
-            reward_fn=reward_fn or (lambda _f: 1.0),
-        )
-
+        return MultiGroupEnv(groups=[{"name": "chemistry", "kind": "composition",
+            "species_set": ["Fe", "Co", "Ni", "Mn", "Cr"],
+            "amount_set": list(range(10)), "n_steps": 5}],
+            reward_fn=lambda payload: (reward_fn or (lambda _c: 1.0))(payload["chemistry"]))
     return _build
 
 
@@ -269,7 +254,7 @@ def test_integer_env_features_match_when_partial_multisets_match(
                 env_a.path[k].state_material_features,
                 env_b.path[k].state_material_features,
                 err_msg=(
-                    f"IntegerRatioEnv step {k}: partial multisets equal "
+                    f"Integer amount step {k}: partial multisets equal "
                     f"({prefix_a}) but features differ"
                 ),
             )

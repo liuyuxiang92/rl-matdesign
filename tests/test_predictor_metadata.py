@@ -54,6 +54,26 @@ class SampledMetadataPredictor(InProcessMetadataPredictor):
         return self._evaluate(candidate)[0]
 
 
+class ConditionMetadataPredictor:
+    """A shared model whose evaluated condition must stay paired with its output."""
+    from rl_matdesign.predictors.outputs import OutputSchema
+    output_schema = {"activity": OutputSchema("activity", "mol")}
+
+    def __init__(self, cfg, *, seed=None):
+        self.calls = []
+        self.last_metadata = {}
+
+    def predict_outputs(self, candidate, *, fparam):
+        from rl_matdesign.predictors.outputs import ScientificOutput
+        temperature = fparam[0]
+        self.calls.append(temperature)
+        self.last_metadata = {"temperature": temperature, "candidate": deepcopy(candidate)}
+        return {"activity": ScientificOutput(self.output_schema["activity"], -abs(temperature - 300))}
+
+    def candidate_metadata(self, candidate):
+        return deepcopy(self.last_metadata)
+
+
 @pytest.fixture
 def composite():
     from rl_matdesign.predictors.structure_score import StructureScorePredictor
@@ -62,12 +82,13 @@ def composite():
         properties = [{
             "name": "response", "direction": "max", "objective": "mean",
             "predictor": ("tests.test_predictor_metadata:SampledMetadataPredictor"
-                          if isinstance(spec.get("model"), list)
+                          if isinstance(spec.get("models"), list)
                           else "tests.test_predictor_metadata:InProcessMetadataPredictor"),
             **spec,
         } for spec in (property_specs or ({},))]
         return StructureScorePredictor({
             "properties": properties, "predict_cache_size": predict_cache_size,
+            "reward": {"objective": {"terms": {prop["name"]: 1 for prop in properties}}},
         })
 
     return make
@@ -89,11 +110,11 @@ def test_composite_forwards_single_leaf_metadata_and_reuses_prediction(composite
 
 @pytest.mark.parametrize("property_specs,expected_sizes", [
     (({"name": "binding"}, {"name": "stability"}), {"binding": 1, "stability": 1}),
-    (({"name": "binding", "model": ["first", "second"]},),
+    (({"name": "binding", "models": ["first", "second"]},),
      {"binding": 2}),
-    (({"name": "binding", "model": ["first", "second"]}, {"name": "stability"}),
+    (({"name": "binding", "models": ["first", "second"]}, {"name": "stability"}),
      {"binding": 2, "stability": 1}),
-    (({"name": "binding", "model": ["first", "second"]}, {"name": "binding[0]"}),
+    (({"name": "binding", "models": ["first", "second"]}, {"name": "binding[0]"}),
      {"binding": 2, "binding[0]": 1}),
 ])
 def test_composite_namespaces_multiple_objectives_and_models(
@@ -136,7 +157,7 @@ def test_composite_keeps_matching_metadata_when_leaf_cache_evicts_and_evicts_tog
 
 @pytest.mark.parametrize("property_specs", [
     ({},),
-    ({"name": "binding", "model": ["first", "second"]}, {"name": "stability"}),
+    ({"name": "binding", "models": ["first", "second"]}, {"name": "stability"}),
 ])
 def test_composite_metadata_defensive_copy_on_capture_and_return(
     composite, monkeypatch, property_specs,
@@ -201,33 +222,38 @@ def test_failed_metadata_is_not_cached_and_good_batch_neighbors_survive(composit
     assert predictor.candidate_metadata(bad)["raw_mean"] == 3
 
 
-def test_sweep_record_keeps_metadata_from_selected_trial(monkeypatch):
+def test_explicit_condition_record_keeps_metadata_for_every_alternative(monkeypatch):
     from rl_matdesign.predictors.structure_score import StructureScorePredictor
 
     predictor = StructureScorePredictor({
-        "sweep": {"name": "temperature", "values": [200, 300, 400]},
-        "properties": [{"name": "activity", "direction": "max", "objective": "mean",
-                        "predictor": "tests.test_predictor_metadata:InProcessMetadataPredictor",
-                        "fparam": [None]}],
+        "properties": [{"name": f"activity_T{temperature}", "predictor": f"{__name__}:ConditionMetadataPredictor",
+                        "direction": "max", "objective": "mean", "output": "activity",
+                        "fparam": [temperature]} for temperature in (200, 300, 400)],
+        "reward": {"type": "max", "alternatives": [
+            {"name": f"T{temperature}", "terms": {f"activity_T{temperature}": 1}}
+            for temperature in (200, 300, 400)]},
     })
-    current = {}
-
-    def score(prop, payload, *, fparam=None):
-        current["temperature"] = fparam[0]
-        return -abs(fparam[0] - 300), 0.
-
-    monkeypatch.setattr(predictor, "_score", score)
-    leaf = predictor.properties[0]["instance"][0]
-    monkeypatch.setattr(leaf, "candidate_metadata", lambda _: current)
     candidate = {"peptide": ["A"]}
-    assert predictor.predict(candidate) == (0., None)
-    assert current["temperature"] == 400
-    assert predictor.per_objective_stats(candidate)["temperature"] == (300., None)
-    assert predictor.candidate_metadata(candidate) == {"temperature": 300}
+    prediction = predictor.predict(candidate)
+    assert prediction == (0., None)
+    leaf = predictor.properties[0]["instance"][0]
+    assert all(prop["instance"][0] is leaf for prop in predictor.properties)
+    assert leaf.last_metadata["temperature"] == 400
+    assert leaf.calls == [200, 300, 400]
+    monkeypatch.setattr(leaf, "predict_outputs", lambda *args, **kwargs: pytest.fail("condition reevaluated"))
+    metadata = predictor.candidate_metadata(candidate)
+    assert predictor.per_objective_stats(candidate) == {
+        "activity_T200": (-100., None), "activity_T300": (0., None), "activity_T400": (-100., None)}
+    assert metadata == {f"activity_T{temperature}": [{"temperature": temperature, "candidate": candidate}]
+                        for temperature in (200, 300, 400)}
+    row = predictor.prediction_record(candidate, prediction)
+    assert row["selected_alternative"] == "T300"
+    assert json.loads(row["metadata_json"]) == metadata
+    assert leaf.calls == [200, 300, 400]
 
 
 def test_sequence_constraints_apply_all_leaves_and_copy_plugin_data(composite, monkeypatch):
-    predictor = composite({"name": "a", "model": ["one", "two"]}, {"name": "b"})
+    predictor = composite({"name": "a", "models": ["one", "two"]}, {"name": "b"})
     bounds = [{"tokens": ["C"], "min": 2, "max": 2}]
     calls = []
 

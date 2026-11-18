@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 from abcde_ooh.constraints.primary_phase import check_primary_phase
-from rl_matdesign.env import CompositionEnv
+from rl_matdesign.amounts import ChemicalAmountsGroup
 from rl_matdesign.registry import build_constraints
 
 
@@ -12,15 +12,15 @@ FRACTIONS = [f"{i / 20:.2f}" for i in range(1, 17)]
 
 
 def make_env(phase="any"):
-    env = CompositionEnv(
+    env = ChemicalAmountsGroup(
         species_set=SPECIES,
-        fraction_set=FRACTIONS,
-        n_components=5,
+        amount_set=FRACTIONS, total=1, unique=True,
+        n_steps=5,
         state_featurizer=lambda _: np.zeros(1),
     )
     config = {"type": "ooh_phase", "target_phases": [phase]}
-    env.phase_filter = build_constraints({"filters": [config]}, env=env)
-    return env, env.phase_filter.children[0]
+    env.filters = build_constraints({"filters": [config]}, env=env)
+    return env, env.filters[0]
 
 
 @pytest.mark.parametrize("phase,composition", [

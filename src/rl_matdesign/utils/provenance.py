@@ -35,9 +35,9 @@ ENVIRONMENT_RECORD_NAMES = frozenset({
 # Only fields whose contract denotes a file. Plugins with other fields must pass
 # input_files / --asset explicitly. Never infer paths from arbitrary strings.
 FILE_KEYS = frozenset({
-    "model", "models", "dp_model", "dp_models", "model_file", "model_files",
+    "model", "models", "model_file", "model_files",
     "model_path", "checkpoint", "checkpoint_path", "weights", "base_poscar",
-    "poscar", "poscar_template", "scaffold_poscar", "geo_opt_model",
+    "scaffold_poscar",
     "train_csv", "data_csv", "dataset_path", "feature_schema", "scaler_path",
     "load_qnet", "load_scaler", "load_policy", "load_value", "config_file",
 })
@@ -143,7 +143,7 @@ def referenced_files(config: Mapping[str, Any], *, base_dir: str | Path | None =
     """
     base = Path.cwd() if base_dir is None else Path(base_dir).absolute()
     found: list[dict[str, Any]] = []
-    known_predictors = {None, "structure_score", "rf_magpie", "ooh", "dummy",
+    known_predictors = {None, "structure_score", "rf_magpie", "ooh_frames", "dummy", "glassnet",
                         "dp_energy", "dp_property", "dp_classification"}
     mgt_predictors = {"mgtransformer", "rl_matdesign.predictors.mgtransformer:MGTransformerPredictor"}
 
@@ -151,8 +151,7 @@ def referenced_files(config: Mapping[str, Any], *, base_dir: str | Path | None =
               owner_config: Mapping[str, Any] | None = None) -> None:
         if isinstance(value, Mapping):
             if not location and isinstance(value.get("properties"), list) and value["properties"]:
-                # build_reward routes a nonempty properties list to the shared
-                # engine even if a legacy top-level predictor name is present.
+                # Every property is evaluated through the shared engine.
                 owner = "structure_score"
                 owner_config = value
             elif "predictor" in value:
@@ -160,28 +159,23 @@ def referenced_files(config: Mapping[str, Any], *, base_dir: str | Path | None =
                 owner_config = value
             for key, child in value.items():
                 label = f"{location}.{key}" if location else str(key)
-                if not location and key == "structure_sources":
-                    from ..structure_sources import StructureSourceSpec, resolve_source_assets
-                    if not isinstance(child, Mapping):
-                        raise ValueError("structure_sources must be a mapping of named definitions")
-                    for source_id, definition in child.items():
-                        source = StructureSourceSpec(source_id, definition)
-                        _, references = resolve_source_assets(source, base_dir=base)
-                        for reference in references:
-                            record = {**reference,
-                                      "field": f"{label}.{source_id}.{reference['field']}",
-                                      "source": source_id, "builder": source.builder,
-                                      "source_asset_resolution": reference["status"]}
-                            if reference["path"] is None:
-                                record["status"] = "unresolved_path"
-                            else:
-                                record["status"] = {"resolved": "present", "missing": "missing_or_not_file",
-                                                    "unresolved": "unreadable"}[reference["status"]]
-                                record["path_resolution"] = ("declared_absolute_path"
-                                    if Path(reference["declared"]).is_absolute() else "runtime_cwd")
-                            found.append(record)
-                    # The general walker must not reinterpret an external
-                    # builder's unresolved paths or duplicate nested templates.
+                if not location and key == "structure" and not (
+                        isinstance(child, Mapping) and child.get("builder") == "peptide"):
+                    from ..structure_sources import StructureSpec, resolve_source_assets
+                    structure = StructureSpec(child)
+                    _, references = resolve_source_assets(structure, base_dir=base)
+                    for reference in references:
+                        record = {**reference, "field": f"{label}.{reference['field']}",
+                                  "source": "structure", "builder": structure.builder,
+                                  "source_asset_resolution": reference["status"]}
+                        if reference["path"] is None:
+                            record["status"] = "unresolved_path"
+                        else:
+                            record["status"] = {"resolved": "present", "missing": "missing_or_not_file",
+                                                "unresolved": "unreadable"}[reference["status"]]
+                            record["path_resolution"] = ("declared_absolute_path"
+                                if Path(reference["declared"]).is_absolute() else "runtime_cwd")
+                        found.append(record)
                     continue
                 is_mgt_file = owner in mgt_predictors and key in {"model", "models", "config"}
                 if key in FILE_KEYS or is_mgt_file:

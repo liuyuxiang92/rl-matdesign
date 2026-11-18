@@ -8,7 +8,7 @@ import hpo
 
 def test_hpo_overrides_keep_shared_defaults_derived_at_execution():
     config = hpo._build_trial_yaml(
-        base_cfg={"predictor": "dummy", "gamma": .9, "dqn_num_train_eps": 100},
+        base_cfg={"properties": [{"name": "score", "predictor": "dummy", "direction": "max", "objective": "mean"}], "gamma": .9, "dqn_num_train_eps": 100},
         fixed_overrides={"gamma": .8}, sampled={"dqn_lr": .002},
         budget_scaling={"dqn_num_train_eps": .5}, method="dqn",
     )
@@ -20,14 +20,14 @@ def test_hpo_overrides_keep_shared_defaults_derived_at_execution():
 
 def test_hpo_rejects_unknown_core_parameters():
     with pytest.raises(ValueError, match="dqn_lrr"):
-        hpo._build_trial_yaml(base_cfg={"predictor": "dummy"},
+        hpo._build_trial_yaml(base_cfg={"properties": [{"name": "score", "predictor": "dummy", "direction": "max", "objective": "mean"}]},
                               fixed_overrides={}, sampled={"dqn_lrr": .002},
                               budget_scaling={}, method="dqn")
 
 
 def test_hpo_scales_omitted_defaults_without_freezing_other_defaults():
     config = hpo._build_trial_yaml(
-        base_cfg={"predictor": "dummy"}, fixed_overrides={}, sampled={},
+        base_cfg={"properties": [{"name": "score", "predictor": "dummy", "direction": "max", "objective": "mean"}]}, fixed_overrides={}, sampled={},
         budget_scaling={"dqn_num_train_eps": .25, "dqn_warmup_eps": .25}, method="dqn",
     )
     assert config["dqn_num_train_eps"] == 5000
@@ -107,7 +107,7 @@ def test_stage_two_replays_fraction_before_integer_validation(tmp_path, monkeypa
     monkeypatch.setattr(hpo, "_run_one_seed", run)
     result = hpo._run_stage2(
         out_root=str(tmp_path), stage1_study=study,
-        base_cfg={"predictor": "dummy", "dqn_num_train_eps": 100},
+        base_cfg={"properties": [{"name": "score", "predictor": "dummy", "direction": "max", "objective": "mean"}], "dqn_num_train_eps": 100},
         hpo_cfg={"method": "dqn", "fixed_overrides": {}, "metric": {"k": 1},
                  "stage2": {"n_top_to_confirm": 1, "seeds_per_trial": 1},
                  "search_space": {"dqn_eps_anneal_eps": {

@@ -10,14 +10,14 @@ trajectory through ``env.allowed_actions()`` / ``env.step()``.
 
 Candidate representation
 ------------------------
-A candidate is a list of ``n_components`` integer *choices*, one per env step.
+A candidate is a list of ``max_steps`` integer *choices*, one per env step.
 At step ``k`` the env exposes a (constraint-filtered, feasibility-guaranteed) list
 of allowed actions ``L_k``; choice ``c_k`` selects ``L_k[c_k % len(L_k)]``.  This
 is uniform across env types:
 
-* oxides (:class:`IntegerRatioEnv`): each action is (element, integer-digit);
+* oxides (:class:`ChemicalAmountsGroup`): each action is (element, integer-digit);
   repeats are allowed and merged, O is forced into the last slot by the filter.
-* OOH (:class:`CompositionEnv`): each action is (distinct element, fraction) and
+* OOH (:class:`ChemicalAmountsGroup`): each action is (distinct element, fraction) and
   the env prunes amounts so the fractions can still sum to ``total_units``.
 
 Because every selected action comes from ``allowed_actions()``, every decoded
@@ -72,13 +72,11 @@ def make_predictor_and_env(cfg: dict, seed: Optional[int] = None):
     # Neutralise scoring during replay; speed up replay by skipping featurization.
     env.reward_fn = lambda *_args, **_kw: 0.0
     env.state_featurizer = lambda _s: _ZERO_FEATS
-    # Baselines always search the constrained space (generation semantics).
-    env.constraints_enabled = True
     return predictor, env, env_type
 
 
 def n_steps(env) -> int:
-    return int(env.n_components)
+    return int(env.max_steps)
 
 
 def action_upper_bound(env) -> int:
@@ -87,7 +85,7 @@ def action_upper_bound(env) -> int:
     Used as the fixed integer range for BO's per-step choice variables; the
     decoder folds the suggested value into the live allowed set via modulo.
     """
-    return max(1, len(env.species_set) * len(env.fraction_set))
+    return max(1, len(env.species_set) * len(env.action_values))
 
 
 # ---------------------------------------------------------------------------

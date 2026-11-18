@@ -10,38 +10,33 @@ through `predict_outputs(candidate)` as immutable `ScientificOutput` records.
 
 ## Model reuse
 
-Existing inline properties remain supported. A model used for several quantities
-can instead be declared once:
+Every property declares its own predictor and optional `models` checkpoint list.
+The engine reuses identical model declarations without a public registry:
 
 ```yaml
-models:
-  glass:
-    predictor: glassnet
 properties:
   - name: expansion
-    model_ref: glass
+    predictor: glassnet
     output: CTEbelowTg
     direction: min
   - name: transition_temperature
-    model_ref: glass
+    predictor: glassnet
     output: Tg
     direction: max
 ```
 
-This is the engine syntax; an actual adapter's supported output catalog and model
-assets must be checked before running. A `model_ref` creates one instance per
-checkpoint member through the existing registry. One `predict_outputs` call serves
-all properties that use that instance with the same candidate, structure source
-and operating conditions. Different explicit sources remain independent even when
-their definitions are equal. DeepMD property models reuse their complete raw output
-matrix before individual `output_index`/`output_aggregator` selections.
+The adapter's output catalog and model assets still need validation before a
+scientific run. Identical predictor construction settings share model instances.
+One `predict_outputs` call serves properties using the same candidate, shared
+structure ensemble and operating conditions. Different conditions retain their
+distinct inference. DeepMD property models reuse their complete raw output matrix
+before individual `output_index`/`output_aggregator` selections.
 
-Definitions own model arguments; references own reward/output selection and source
-use. A reference cannot also declare `predictor`, `model`, `models`, `dp_models` or
-`head`, or repeat any field already owned by its definition. Unknown references,
-unused definitions, duplicate checkpoints within an ensemble, and reward settings
-inside model definitions are rejected. Distinct named model IDs are not silently
-merged based on equal dictionaries.
+There is one supported YAML shape: `properties[].predictor` and, when explicit
+checkpoint paths are needed, `properties[].models`. Top-level `predictor`,
+top-level `models`, `model_ref`, and property `model`/`dp_models` aliases are rejected.
+Duplicate checkpoints within an ensemble are also rejected. Output selection and
+reward parameters do not create redundant copies of the underlying model.
 
 Adapters should implement `predict_outputs(candidate)` (or
 `predict_structure_outputs(structures)` for engine-built structures), returning
@@ -94,9 +89,26 @@ explicit. `mean_minus_kstd` and `mean_plus_kstd` require an available selected
 uncertainty. Select one with `uncertainty: model_spread`, `config_spread`,
 `native_uncertainty` or `pooled_spread`. With no selection, the legacy self-folding
 interface uses native uncertainty; other protocols default to model spread.
-An unavailable statistic with an explicit penalty is an `EvaluationProtocolError`,
+For a property participating in the reward objective, an unavailable statistic
+with an explicit penalty is an `EvaluationProtocolError`,
 including a single-model point predictor with no model-spread estimate. The engine
 does not quietly fabricate zero, change the uncertainty type, or disable a penalty.
+
+Reward coefficients belong exclusively to `reward.objective.terms`,
+`reward.gates[].score.terms`, or `reward.alternatives[].terms`. Property `weight`
+is rejected. A single-property weighted sum defaults to coefficient 1; multiple
+properties require explicit objective terms. Properties absent from those terms
+remain available as scientific outputs and gate inputs, without applying adjusted
+objective arithmetic to them. Objective terms consume direction/uncertainty/scale
+adjusted values; gate terms consume raw gate statistics.
+
+For ActMOF, the only property is `q`, with a maximizing mean objective and scale
+100000. The concise `reward: {type: weighted_sum}` produces `q / 100000`.
+In the supplied perovskite configuration, `name: synthesis` labels diagnostics,
+not a model or application class. Its `score.terms: {pure_probability: 1.0}`
+passes the classifier's raw gate statistic to the `min: 0.8` test. The three delta
+coefficients remain `0.33333` only in the objective terms; the classifier has no
+coefficient in that objective.
 
 Classification gates preserve their existing mean-minus-model-spread rule with
 multiple models. With one model, the gate uses its mean and the saved model spread
@@ -107,8 +119,9 @@ and target-distance objectives otherwise retain their semantics.
 ## Evaluation records and accounting
 
 One successful record contains named scientific outputs, compatibility statistics,
-leaf metadata and source diagnostics. A sweep retains all of these from its winning
-condition. Metadata is captured immediately after the corresponding inference;
+leaf metadata and structure diagnostics. Explicit properties at different
+conditions retain all outputs, including those outside the selected reward
+alternative. Metadata is captured immediately after the corresponding inference;
 reusing the same model for another condition does not replace an earlier result's
 metadata. `cached_outputs(candidate)` returns an existing record or `None`, without
 causing inference. Batch records remain readable after persistent LRU eviction.

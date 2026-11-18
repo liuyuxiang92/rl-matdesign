@@ -94,7 +94,7 @@ def main(argv=None):
                     if method.startswith('dqn'):
                         command += ['--dqn-target-mode', method.removeprefix('dqn-')]
                 rows.append({'config': str(Path(config).resolve()), 'domain_size': domain.size,
-                             'horizon': env.n_components, 'initial_action_count': len(env.allowed_actions()),
+                             'horizon': env.max_steps, 'initial_action_count': len(env.allowed_actions()),
                              'seed': seed, 'method': method, 'budget': args.budget,
                              'command': command, 'output': str(directory)})
     for trial, content in configurations.items():

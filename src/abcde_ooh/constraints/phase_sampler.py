@@ -1,6 +1,6 @@
 """Forward feasibility pruning for phase-constrained action spaces.
 
-PhaseActionFilter wraps around ABCDEOOHEnv.allowed_actions() and removes
+PhaseActionFilter wraps around ChemicalAmountsGroup.allowed_actions() and removes
 any action whose partial-composition cannot be completed into a valid
 terminal composition of the requested phase(s). This guarantees 100% pass
 rate without post-generation filtering.
@@ -30,7 +30,7 @@ class PhaseActionFilter:
         target_phase: Union[str, Sequence[str]],
         allowed_units: List[int],
         possible_sums_by_k: List[set],
-        total_units: int = 20,
+        amount_scale: int = 20,
     ) -> None:
         if isinstance(target_phase, str):
             phases: List[str] = [target_phase]
@@ -50,17 +50,17 @@ class PhaseActionFilter:
         self._allowed_units: List[int] = list(allowed_units)
         self._allowed_units_set: Set[int] = set(allowed_units)
         self._possible_sums_by_k = possible_sums_by_k
-        self._total_units = total_units
+        self._amount_scale = amount_scale
 
         # Phase thresholds are defined as *fractions* and derived from
-        # total_units so the chemistry is identical at any grid resolution.
-        #   - dopant budget: total non-primary units strictly < 0.25*total_units
-        #     → max allowed = ceil(0.25*total_units) - 1
+        # amount_scale so the chemistry is identical at any grid resolution.
+        #   - dopant budget: total non-primary units strictly < 0.25*amount_scale
+        #     → max allowed = ceil(0.25*amount_scale) - 1
         #     (total=20 → 4, total=100 → 24; both mean "< 0.25")
-        #   - primary group must be ≥ 0.75*total_units
+        #   - primary group must be ≥ 0.75*amount_scale
         #     (total=20 → 15, total=100 → 75)
-        self._max_dopant_units: int = math.ceil(0.25 * total_units) - 1
-        self._primary_min_units: int = round(0.75 * total_units)
+        self._max_dopant_units: int = math.ceil(0.25 * amount_scale) - 1
+        self._primary_min_units: int = round(0.75 * amount_scale)
 
         # Pre-compute valid terminal (primary, dopant) unit allocations
         pmin = self._primary_min_units
@@ -84,9 +84,9 @@ class PhaseActionFilter:
         pairs: List[Tuple[int, int]] = []
         for p1 in self._allowed_units:
             for p2 in self._allowed_units:
-                if p1 + p2 > self._total_units:
+                if p1 + p2 > self._amount_scale:
                     continue
-                dopant_total = self._total_units - p1 - p2
+                dopant_total = self._amount_scale - p1 - p2
                 if dopant_total > self._max_dopant_units:
                     continue
                 if dopant_total < 0:
@@ -105,9 +105,9 @@ class PhaseActionFilter:
             for p2 in self._allowed_units:
                 for p3 in self._allowed_units:
                     total_primary = p1 + p2 + p3
-                    if total_primary > self._total_units:
+                    if total_primary > self._amount_scale:
                         continue
-                    dopant_total = self._total_units - total_primary
+                    dopant_total = self._amount_scale - total_primary
                     if dopant_total > self._max_dopant_units:
                         continue
                     if dopant_total < 0:
@@ -131,7 +131,8 @@ class PhaseActionFilter:
         allowed_units: List[int],
         possible_sums_by_k: List[set],
         species_set: List[str],
-        fraction_set: List[str],
+        action_values: List[str],
+        **_,
     ) -> List[Tuple]:
         """Return subset of *actions* that can lead to a valid terminal phase."""
         from abcde_ooh.encoding import decode_one_hot
@@ -140,13 +141,13 @@ class PhaseActionFilter:
         for action in actions:
             elem_oh, comp_oh = action
             elem = decode_one_hot(elem_oh, species_set)
-            comp_str = decode_one_hot(comp_oh, fraction_set)
-            cand_units = int(round(float(comp_str) * self._total_units))
+            comp_str = decode_one_hot(comp_oh, action_values)
+            cand_units = int(round(float(comp_str) * self._amount_scale))
 
             # Build hypothetical units_map after this action
             new_map = dict(units_map)
             new_map[elem] = cand_units
-            budget_after = self._total_units - sum(new_map.values())
+            budget_after = self._amount_scale - sum(new_map.values())
 
             if self._is_feasible(new_map, steps_left, budget_after):
                 filtered.append(action)
@@ -198,7 +199,7 @@ class PhaseActionFilter:
         """Can the partial composition be completed into a valid single-primary phase?
 
         Rule: primary ≥ _primary_min_units (≥0.75), all others are dopants
-        (≤ _max_dopant_units, i.e. < 0.25 total). Thresholds scale with total_units.
+        (≤ _max_dopant_units, i.e. < 0.25 total). Thresholds scale with amount_scale.
         """
         primary_units = units_map.get(primary, 0)
         other_units = sum(v for k, v in units_map.items() if k != primary)

@@ -1,0 +1,269 @@
+checkpoint_version: 3.0.0
+created_at: '2026-11-18T06:40:52.189902+00:00'
+branch: codex/unified-material-groups
+worktree: /Users/liuyuxiang/.codex/worktrees/unified-material-groups/rl-matdesign
+baseline: b947208aa196eb08500722f95005e333b4a8051e
+phase:
+  current: complete
+  completed:
+  - unified_groups_cleanup
+  - inline_properties_schema
+  - scenario_inventory_25
+  - scenario_audit
+  - training_cache_resume_fix
+  - ooh_constructor_boundaries
+  - final_full_suite
+  - final_installed_wheel
+  - reflection
+  - reward_only_coefficients
+  - consumer_weight_removal
+  - reward_only_configs_29
+  - reward_only_final_validation
+  - plain_filter_lists
+  - unused_phase_pattern_removal
+  - training_filter_warmup_fix
+  - filter_cleanup_validation
+  - filter_presence_only
+  - redundant_parallel_options_removed
+  - lips_pipeline_override_removed
+  - filter_presence_validation
+  - local_code_commit
+  next: []
+state:
+  parameters:
+  - name: chemical_group
+    value: composition with amount_set, n_steps, optional total, unique and element_bounds
+    source: user discussion and implementation request
+    confidence: high
+  - name: ooh_hea_cardinality
+    value: five distinct positive species
+    source: explicit user clarification
+    confidence: high
+  - name: parent_peptide_thiols
+    value: fixed original positions 2 and 11
+    source: explicit user clarification
+    confidence: high
+  - name: novel_peptide_thiols
+    value: any two of eleven valid positions
+    source: explicit user clarification
+    confidence: high
+  - name: lips_temperatures
+    value:
+    - 460
+    - 470
+    - 480
+    - 490
+    source: user discussion
+    confidence: high
+  - name: retired_compatibility
+    value: remove retired parameter readers, aliases, domains and superseded builders
+    source: 'explicit user confirmation: Remove retired compatibility code'
+    confidence: high
+  - name: single_property_format
+    value: Only explicit properties; optional properties[].models lists. No top-level predictor/model/models or
+      property model_ref/model/dp_models.
+    source: Explicit user request 2026-11-18
+    confidence: high
+  - name: reward_coefficient_ownership
+    value: Only reward terms; reject removed properties[].weight. Single-property implicit1; multi-property explicit
+      objective terms or max alternatives.
+    source: Explicit user clarification 2026-11-18
+    confidence: high
+  - name: local_scenario_yaml_submission
+    value: Update actual configs/ files in codex/unified-material-groups; do not stage or include scenario YAML
+      changes in remote submissions. Existing tracked/ignored status retained.
+    source: Explicit user instruction to update repo YAML even though configs will not be uploaded to remote
+    confidence: high
+  - name: optional_filter_configuration
+    value: 'groups[].filters is the sole switch: listed filters always apply; absent or empty skips optional filters
+      in every phase. constrain_training and constraints_enabled are removed.'
+    source: Latest explicit user removal request 2026-11-18; verified across DQN, REINFORCE and A2C
+    confidence: high
+  experiments:
+  - name: scenario_audit
+    status: completed
+    result: All 36 local full configs pass executable configuration, initial domain and structure/HPO metadata audit;
+      not scientific asset validation.
+    results_path: /tmp/rlmat-full-current-scenario-audit.json
+  - name: initial_cleanup_full_suite
+    status: failed
+    result: 2496 passed, 28 failed, 3 skipped.
+    reason: Remaining tests depended on retired structure registries, sweep/outer-geo-opt settings, old OOH wrapper
+      and sampler attribute names.
+    resolution: Migrated preserved scientific/worker/provenance coverage to current interfaces; all affected files
+      pass.
+    results_path: /tmp/rlmat-cleanup-full.xml
+  - name: migrated_failure_regressions
+    status: completed
+    result: 119 passed across HPO domain counting, benchmark, cross-formula workers, structure outputs/provenance,
+      convergence/timing and prediction metadata/records.
+  - name: owned_domain_regressions
+    status: completed
+    result: 336 passed, 2 optional RF asset skips; arithmetic coverage includes 50 independent exhaustive domains.
+  - name: installed_wheel
+    status: completed
+    result: 'Final-source offline build/install outside checkout: 14 current imports, 13 retired-module absence
+      checks, group rollouts, singular pipeline and installed Ni1Fe1 total2 phase regression passed. All 94 packaging
+      source hashes unchanged.'
+    results_path: /private/tmp/rlmat-wheel-check-j_dkoo0c/verification-report.json
+  - name: final_full_suite
+    status: completed
+    results_path: /tmp/rlmat-cleanup-final.xml
+    command: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src pytest -p no:cacheprovider -o addopts='-ra' -q --junitxml=/tmp/rlmat-cleanup-final.xml
+    result: 2523 passed, 3 external-asset skips, 76 existing warnings in 592.78 seconds; followed by the isolated
+      phase-filter correction and its affected tests.
+  - name: final_phase_filter_regression
+    status: completed
+    result: 268 passed in 7.43 seconds after applying the final phase-filter correction; no later production changes.
+    results_path: /tmp/rlmat-cleanup-phase-final.xml
+    command: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src pytest -p no:cacheprovider -o addopts='-ra' -q tests/test_phase_pattern.py
+      tests/test_constraint_contracts.py tests/test_chemical_amounts.py tests/test_env_bounds.py tests/test_ooh_phase_sampler.py
+      tests/test_chain.py tests/test_config_schema.py tests/test_public_amount_configs.py
+  - name: standard_properties_initial_full_suite
+    status: failed
+    results_path: /tmp/rlmat-standard-properties-full.xml
+    log: /tmp/rlmat-standard-properties-full.log
+    known_findings:
+    - DQN training snapshots only _cache; must persist engine _stats_cache/_batch_stats too to preserve ledger known_cache_hits
+      on resume.
+    - Remaining old CSV/model fixtures and oxide count9 must migrate.
+    - OOH canonical FQN must own models ensemble and assets; partial model loading must clean up completed members.
+    result: 2578 passed, 20 failed, 3 skipped in600.28seconds.
+    reason: Four cache-resume ledger regressions plus retired-format, scenario-count and CSV fixture expectations.
+    resolution: Shared training/generation result-cache snapshots and migrated fixtures; final full suite passes.
+  - name: standard_25_scenario_audit
+    status: completed
+    results_path: /tmp/rlmat-standard-25-scenario-audit.json
+    result: 25 full configs; zero schema/domain audit failures. No scientific inference.
+  - name: standard_properties_final_full_suite
+    status: completed
+    result: 2606 passed, 3 unavailable external-asset skips, 76 existing warnings in730.76seconds. A subsequent
+      timing.py docstring-only correction describes the new cache ownership; no executable behavior changed.
+    results_path: /tmp/rlmat-standard-properties-final.xml
+    log: /tmp/rlmat-standard-properties-final.log
+  - name: standard_properties_final_wheel
+    status: completed
+    result: Final source after docstring correction:94 packaging hashes unchanged;14 imports,13 retired modules
+      absent;actual dummy rollout/reuse and14 strict-format rejection checks pass.
+    results_path: /private/tmp/rlmat-standard-wheel-sk_2z20h/verification-report.json
+  - name: standard_properties_final_static
+    status: completed
+    result: git diff --check clean;119 source/script Python files parse.25-file review ZIP byte-identical to configs.
+  - name: reward_only_core
+    status: completed
+    result: '218 tests passed in3.34seconds: reward arithmetic, engine, schema, and gate-only uncertainty behavior.'
+    results_path: /tmp/rlmat-reward-only-core.xml
+  - name: reward_only_consumers
+    status: completed
+    result: 433 focused tests passed, including HPO/benchmark consumers, property sharing and parallel scoring.
+  - name: reward_only_config_audit
+    status: completed
+    result: 29 scenario/smoke/HPO configs pass schema and domain checks; all13 property weights removed with prior
+      coefficients retained only in reward.25-file review ZIP and combined YAML refreshed. No scientific inference.
+    results_path: /tmp/rlmat-reward-only-config-audit.json
+  - name: reward_only_full_suite
+    status: completed
+    result: Full run:2630passed,5failed,3external-asset skips,76existing warnings in603.66seconds. All5failures
+      came from one metadata fixture missing explicit multi-property reward. Fixture corrected; all15metadata tests
+      then pass in2.49seconds. Combined unique coverage:2635passed,3skipped. No production source changed after
+      full run.
+    resolution: Added explicit equal coefficients only to tests/test_predictor_metadata.py fixture; all scientific
+      assertions retained.
+    results_path: /tmp/rlmat-reward-only-final-verification.json
+    full_suite: /tmp/rlmat-reward-only-full.xml
+    corrective_run: /tmp/rlmat-reward-only-metadata-final.xml
+  - name: reward_only_installed_wheel
+    status: completed
+    result: Offline wheel passes16retired-format schema/runtime rejections including propertyweight, explicit reward
+      arithmetic, shared model reuse and current/retired imports. All94packaging source hashes still match final
+      source.
+    results_path: /private/tmp/rlmat-reward-only-wheel-wil90d44/verification-report.json
+  - name: in_repository_yaml_verification
+    status: completed
+    result: 29 local application/support YAMLs validate with new schema;25 application files exactly match verified
+      bundle (5tracked,6ignored,14untracked); no staged config changes.
+    results_path: /private/tmp/rlmat-repository-config-verification.json
+  - name: filter_cleanup_final
+    status: completed
+    result: 500 unique tests passed (196 filter/domain/phase-toggle, 281 integration/counting/resume, 23 cross-formula
+      training); 29 config/domain audits passed; 117 source/script files parse; fresh wheel excludes chain and phase_pattern.
+      No scientific production inference.
+    results_path: /tmp/rlmat-filter-cleanup-verification.json
+  - name: filter_presence_focused_initial
+    status: failed
+    result: 271 passed, 1 subprocess import failure
+    reason: Fresh-Python schema probe lacked explicit PYTHONPATH and selected unrelated installed package.
+    resolution: Repeated full focused suite with PYTHONPATH set to the intended worktree src; all272passed with
+      no source changes.
+  - name: filter_presence_final
+    status: completed
+    result: 543 unique tests passed:272presence/schema,127parallel,11LiPS,133integration/resume/HPO. All29config/domain
+      audits pass.25filebundle matchescurrentYAML;freshinstalledwheel probe passes and all90sourcefiles match finalworktree.
+    results_path: /tmp/rlmat-filter-presence-verification.json
+  decisions:
+  - decision: Remove backward compatibility for retired group parameters and superseded domain/builder implementations.
+    rationale: User explicitly confirmed removal; one current API avoids maintaining parallel paths. Descriptor
+      contract v4 and old configs require migration/fresh training or archived runtime.
+  - decision: Preserve original POSCAR blocks and pass structures through generic pipeline operations.
+    rationale: Repeated Fe blocks remain distinguishable without public site maps or application classes.
+  - decision: Retain LiPS best shared temperature objective with eight explicit properties and two shared models.
+    rationale: Removes sweep syntax while preserving the existing scientific objective.
+  - decision: Keep existing proprietary config ignore rules and original dirty checkout untouched.
+    rationale: Implementation is isolated and privacy declarations remain in force.
+  - decision: Reward terms exclusively own coefficients; propertyweight readers, fallback/storage, and downstream
+      inference removed. Only rejection guards remain.
+    rationale: Explicit user request for one unambiguous format; singleproperty implicit1 remains concise, multi-property
+      objective terms avoid unintentionally rewarding diagnostic or gate-only outputs.
+  - decision: Delete unused phase_pattern and explicit chain implementations; apply plain filter lists with shared
+      strict subset validation.
+    rationale: No current scenario uses the removed types; implicit AND expresses required behavior without wrapper
+      configuration or classes.
+  - decision: Make declared filters and structure steps authoritative; remove phase-specific filter toggles and
+      LiPS no-geo-opt override; delete fixed/ignored parallel settings.
+    rationale: Explicit user wants one enable condition without redundant parameters. Audit retained choices that
+      change physics, policy, accounting or artifact retention.
+blockers: []
+limitations:
+- Real DeepMD, GP, GlassPy and LAMMPS production assets are not all available locally; no numerical production parity
+  claim.
+- Perovskite MD model placeholders must be replaced by compatible frozen models before simulation.
+- Code is committed locally; all configs/ changes remain uncommitted by user request. No merge or push requested
+  or performed.
+artifacts:
+- path: docs/design_groups.md
+  role: implemented schema, descriptor and pipeline guide
+- path: configs
+  role: 25 complete application scenarios plus smoke/HPO support configs; preexisting private ignores retained
+- path: tests/test_unified_groups_training_smoke.py
+  role: actual new-domain training and generation verification
+- path: /tmp/rl-matdesign-standard-scenario-configs-20261118/application_scenarios.zip
+  role: 25 exact migrated YAMLs, including local private scenarios
+resume_instructions:
+- 'Latest user request handled: local code commit on codex/unified-material-groups, followed by DQN parameter reference.
+  Use git log -1 for final amended commit identity. All configs/ changes are excluded and remain local. No merge
+  or push authorized. Earlier uncommitted-state notes below are historical.'
+- 'Latest task complete: configured filter lists always apply; no constrain_training/constraints_enabled. Removed
+  three obsolete parallel options and evaluate_lips --no-geo-opt. /tmp/rlmat-filter-presence-verification.json records543unique
+  passing tests,29config/domain audits and installed-wheel parity. ThreeoxideYAMLs and25filelocalbundle updated;
+  keep configs local-only. No commit/push requested or performed.'
+- 'Earlier filter-list cleanup validated: /tmp/rlmat-filter-cleanup-verification.json records 500 unique passing
+  tests, 29 config/domain audits and fresh-wheel deletion checks. Use filters lists in Python and YAML; phase_filter,
+  chain and phase_pattern implementations are removed. That phase-specific switch was subsequently removed; see
+  the newest presence-only contract. Config YAML content unchanged this turn; keep local-only submission restriction.'
+- Task complete on codex/unified-material-groups in /Users/liuyuxiang/.codex/worktrees/unified-material-groups/rl-matdesign;
+  all work remains uncommitted.
+- Review25fullconfigs in /private/tmp/rl-matdesign-standard-scenario-configs-20261118/application_scenarios.zip
+  or all_application_scenarios.yaml. Preserve locally private configs and original dirty checkout.
+- Current execution supports only inline properties with predictor and optional models lists. OOH is29species,DQNMC;
+  perovskite matches attached MD/opt/reward and two sample count; three default oxide objectives retained.
+- No scientific production inference was run. Missing pinned GlassPy and two RF assets explain three skips; perovskite
+  binary checkpoint path remains a placeholder.
+- Do not change historical sealed runtime hashes/fixtures or resume old checkpoints under this semantic refactor.
+  No commit/merge/push requested.
+- Reward-only cleanup complete. Final evidence /tmp/rlmat-reward-only-final-verification.json combines full suite
+  and fixture-only metadata rerun;2635passed,3asset skips. That source snapshot matched its wheel; see later filter-cleanup
+  validation for the latest source.
+- Keep the25 application configs updated in this worktree configs/ directory, including locally ignored scenarios.
+  User requests local-only YAML changes; exclude them from any future commit/push unless explicitly overridden.
+  Do not copy into the unrelated old-code original checkout automatically.
+updated_at: '2026-11-18T08:23:23.086235+00:00'

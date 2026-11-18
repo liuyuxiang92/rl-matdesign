@@ -293,3 +293,114 @@
     src/rl_matdesign/utils/candidate_records.py, src/rl_matdesign/utils/timing.py,
     src/rl_matdesign/utils/stage_timing.py]
   tags: [performance, checkpoint-storage, paid-accounting]
+
+- id: pitfall-zero-chemical-actions-001
+  date: '2026-11-18'
+  expires: '2027-02-18'
+  title: Zero selections consume actions but are absent from chemical candidate identity
+  wrong: Retaining zero-valued species in terminal payloads while omitting them in domain keys.
+  right: Keep zero selections in pick counts, consumed labels and step budgets; omit zero
+    amounts from terminal chemical payloads before nested predictor caching and canonicalization.
+    In mixed or external payloads, strip zeros only from pipeline-owned chemical groups;
+    categorical zero and false values retain typed identity. Sort species for largest-
+    remainder allocation so amount ties do not depend on dictionary insertion order.
+  impact: Equivalent physical recipes otherwise disagree between domain deduplication and predictor caches.
+  files: [src/rl_matdesign/amounts.py, src/rl_matdesign/configuration.py,
+    tests/test_chemical_amounts.py, tests/test_public_amount_configs.py]
+  tags: [chemical-amounts, candidate-identity, caching]
+
+- id: pitfall-compound-amount-basis-001
+  date: '2026-11-18'
+  expires: '2027-02-18'
+  title: Formula-unit amounts and substitution cation fractions expand differently
+  wrong: Expanding every compound label with the same stoichiometric multiplier.
+  right: Default chemical mixtures to formula-unit amounts. Bind cation_fraction expansion
+    from the substitution operation to its group descriptor and builder; Ni2O3 at 0.04
+    means Ni0.04O0.06 for LiPS, but Ni0.08O0.12 in a formula-unit mixture.
+  impact: A chemically valid descriptor can still represent the wrong physical recipe.
+  files: [src/rl_matdesign/design_domains.py, src/rl_matdesign/predictors/builders/pipeline.py,
+    tests/test_public_amount_configs.py]
+  tags: [descriptors, compound-stoichiometry, sse]
+
+- id: pitfall-historical-fixtures-001
+  date: '2026-11-18'
+  expires: '2027-02-18'
+  title: Sealed historical runtime tests must own their historical fixtures
+  wrong: Importing mutable current-schema test helpers into tests that execute archived source.
+  right: Keep historical YAML fixtures local to the archived runtime test. Current schema
+    rejection may precede source rejection, but both restart modes must preserve campaign
+    bytes and modification times and must not create an upgrade receipt. Never refresh
+    sealed release hashes to accommodate a semantic refactor.
+  impact: An unrelated fixture migration can make historical-runtime tests fail before
+    reaching the intended immutable-source and paid-accounting checks.
+  files: [tests/test_dqn_performance_resume.py, src/rl_matdesign/utils/source_compatibility.py]
+  tags: [test-fixtures, provenance, source-contracts]
+
+- id: pitfall-phase-filter-amount-scale-001
+  date: '2026-11-18'
+  expires: '2027-02-18'
+  title: Phase masks must normalize actual accumulated amounts, not infer a unit total
+  wrong: Reconstructing earlier fractions from (1 - final_action_amount) silently
+    assumes total1 and rejects valid integer recipes such as Ni1Fe1 with total2.
+  right: Use chemical_amounts and action_amounts supplied by the domain, accumulate
+    the hypothetical final action, and normalize once for fractional phase rules.
+    Verify proportional totals, repeated selections, both action orders and zero
+    additions. Reject empty, negative or nonfinite physical compositions.
+  impact: Valid integer or scaled compositions can have no permitted last action
+    despite satisfying the phase rule; the removed fractional-domain assumption survives
+    even after all old parameter names are deleted.
+  files: [src/rl_matdesign/constraints/phase_pattern.py, tests/test_phase_pattern.py]
+  tags: [chemical-amounts, constraints, normalization]
+
+- id: pitfall-predictor-result-checkpoints-001
+  date: '2026-11-18'
+  expires: '2027-02-18'
+  title: Training checkpoints must persist the shared property engine result caches
+  wrong: Saving only a leaf predictor's _cache while routing every scenario through StructureScorePredictor.
+  right: >-
+    Use the same result-only snapshot/restore helper for training and generation,
+    persisting _cache, _stats_cache, _batch_stats, supported custom state and the paid
+    evaluation ledger. Never serialize live model instances, calculators or workers.
+    Restore RNG after setup and validate exact ledger/cost equality as well as weights
+    across uninterrupted and resumed DQN MC, DQN bootstrap and policy-gradient runs.
+  impact: >-
+    Training weights can still match while resumed runs lose known cache hits and
+    repeat expensive evaluations. Weakening resume assertions would hide the regression.
+  files: [src/rl_matdesign/utils/generation_resume.py, src/rl_matdesign/experiment.py,
+    src/rl_matdesign/training.py, tests/test_exact_resume.py, tests/test_hpo_checkpoint_retention.py]
+  tags: [checkpointing, paid-accounting, property-cache]
+
+- id: pitfall-unreferenced-reward-objectives-001
+  date: '2026-11-18'
+  expires: '2027-02-18'
+  title: Do not evaluate optimization objectives for gate-only or diagnostic properties
+  wrong: Computing direction, uncertainty objective and scale for every property before
+    selecting explicit reward terms can fail on unavailable uncertainty for an unused objective.
+  right: Select property names from objective terms or max alternatives before computing
+    adjusted values. Retain all physical statistics for gates and scientific reports.
+    Verify all three reward modes and a gate-only property with unavailable model spread.
+  impact: A valid physical gate or unrelated objective was blocked by uncertainty that
+    the reward never used, despite correct term selection in RewardCombiner.
+  files: [src/rl_matdesign/predictors/structure_score.py, tests/test_structure_score.py]
+  tags: [reward-ownership, uncertainty, feasibility-gates]
+
+- id: pitfall-training-filter-warmup-001
+  date: '2026-11-18'
+  expires: '2027-02-18'
+  title: Scientific filtering must follow one declaration across all execution phases
+  wrong: >-
+    A separate phase-specific filter toggle previously left REINFORCE/A2C scaler
+    warmup filtered even when training filtering was disabled. Moving the toggle
+    earlier fixed that bug but retained two configuration authorities.
+  right: >-
+    The user subsequently removed constrain_training and constraints_enabled.
+    Always apply the configured filter list in warmup, training and generation;
+    an absent or empty list skips optional filtering. Test all three algorithms
+    with configured, absent and empty lists. Intrinsic group bounds and reward
+    gates apply independently. Do not restore the superseded toggle implementation.
+  impact: >-
+    Multiple enable paths can give warmup a different scientific domain from
+    training or silently bypass a filter explicitly requested by the configuration.
+  files: [src/rl_matdesign/amounts.py, src/rl_matdesign/categorical.py,
+    tests/test_training_filters.py, docs/constraint_filter_contract.md]
+  tags: [training-phases, constraints, configuration-ownership]

@@ -55,7 +55,7 @@ def science_protocol(cfg):
     # Match execution_contract's ownership boundary rather than maintaining a
     # second whitelist of potentially arbitrary plugin scientific options.
     selected = {key: value for key, value in cfg.items()
-                if key not in PARAMETERS or key in {"eval_seed", "k", "constrain_training"}}
+                if key not in PARAMETERS or key in {"eval_seed", "k"}}
     for key in ("generated_columns", "predict_cache_size", "config_file", "config_schema_version"):
         selected.pop(key, None)
     return hashlib.sha256(json.dumps(selected, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -90,25 +90,25 @@ def outputs_and_feasibility(cfg, row):
     try:
         outputs = {name: ScientificOutput.from_dict(value)
                    for name, value in (row.get("outputs") or {}).items()}
-        raw, weights, physical = {}, {}, {}
+        raw, physical = {}, {}
         for prop in properties:
+            if "weight" in prop:
+                raise ValueError("Property weight is unsupported; coefficients belong in reward terms")
             name = prop["name"]
             output = outputs[name]
             if output.schema.name != name:
                 raise ValueError(f"Output name mismatch for {name}")
-            definition = cfg.get("models", {}).get(prop.get("model_ref"), {}) if isinstance(cfg.get("models"), dict) else {}
-            predictor = prop.get("predictor", definition.get("predictor"))
+            predictor = prop["predictor"]
             # Mirrors StructureScore's fixed classification gate margin.
             raw[name] = output.mean - ((output.model_spread or 0.0) if predictor == "dp_classification" else 0.0)
-            weights[name] = prop.get("weight", 1.0)
             selector = prop.get("output")
             if (selector in PHYSICAL_OUTPUTS and output.schema.representation == "physical"
                     and output.schema.unit == PHYSICAL_OUTPUTS[selector]):
                 if selector in physical:
                     raise ValueError(f"Ambiguous multiple properties select {selector}")
                 physical[selector] = output.mean
-        combiner = RewardCombiner(cfg.get("reward"), weights)
-        passed = combiner.evaluate(raw, {name: 0.0 for name in weights})["gate_passed"]
+        combiner = RewardCombiner(cfg.get("reward"), list(raw))
+        passed = combiner.evaluate(raw, {name: 0.0 for name in raw})["gate_passed"]
         return passed, physical, None
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
         return None, {}, str(exc)

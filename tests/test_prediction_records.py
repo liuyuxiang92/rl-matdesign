@@ -4,12 +4,13 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 
+import numpy as np
 import pytest
 
 from rl_matdesign.predictors.outputs import ModelSamples, OutputSchema, aggregate_samples
 from rl_matdesign.predictors.structure_score import StructureScorePredictor
 from rl_matdesign.utils.prediction_records import prediction_record
-from tests.test_ooh_scientific_outputs import COMP, oracle_factory, slab_poscar
+from tests.ooh_fixtures import COMP, leaf as ooh_leaf, oracle_factory, slab_poscar
 from tests.test_reward_integration import _cfg
 
 
@@ -99,21 +100,31 @@ def test_batch_records_use_paired_outputs_metadata_after_lru_eviction(monkeypatc
     assert len(leaf.calls) == 3
 
 
-def test_sweep_snapshot_uses_winning_condition_metadata_and_missing_uncertainty(monkeypatch):
-    predictor = _named_predictor(
-        sweep={"name": "condition", "values": [1, 2, 3]},
-        property_settings={"fparam": [None]},
-    )
+def test_explicit_conditions_snapshot_keeps_all_paired_metadata_and_selected_alternative(monkeypatch):
+    predictor = StructureScorePredictor({
+        "properties": [{"name": f"delta_c{condition}", "predictor": f"{__name__}:NamedLeaf",
+            "output": "activity", "direction": "max", "objective": "mean", "fparam": [condition]}
+            for condition in (1, 2, 3)],
+        "reward": {"type": "max", "alternatives": [
+            {"name": f"condition{condition}", "terms": {f"delta_c{condition}": 1}}
+            for condition in (1, 2, 3)]},
+    }, seed=3)
     candidate = {"value": 0}
     prediction = predictor.predict(candidate)
     leaf = predictor.properties[0]["instance"][0]
+    assert all(prop["instance"][0] is leaf for prop in predictor.properties)
     assert leaf.last_metadata["condition"] == 3
     _deny_inference(monkeypatch, predictor)
     row = prediction_record(predictor, candidate, prediction)
-    assert row["obj_delta_mean"] == 5
-    assert row["obj_condition_mean"] == 2
-    assert row["obj_condition_std"] is None
-    assert row["meta_condition"] == 2
+    assert row["reward"] == row["dp_mean"] == 5
+    assert row["selected_alternative"] == "condition2"
+    metadata = json.loads(row["metadata_json"])
+    for condition, value in ((1, 4), (2, 5), (3, 4)):
+        assert row[f"obj_delta_c{condition}_mean"] == value
+        assert row[f"obj_delta_c{condition}_std"] is None
+        assert row[f"alternative_condition{condition}_score"] == value
+        assert metadata[f"delta_c{condition}"][0]["condition"] == condition
+        assert metadata[f"delta_c{condition}"][0]["candidate"] == candidate
     assert len(leaf.calls) == 3
 
 
@@ -131,9 +142,9 @@ def test_gated_record_keeps_physical_delta_when_reward_and_raw_composite_are_pen
 
 
 @pytest.mark.parametrize("matrix,uncertainty,expected", [
-    (((2.,),), "models", None),
-    (((1., 3.),), "configs", 1.),
-    (((1.,), (3.,)), "models", 1.),
+    (((2.,),), "model_spread", None),
+    (((1., 3.),), "config_spread", 1.),
+    (((1.,), (3.,)), "model_spread", 1.),
 ])
 def test_ooh_scientific_cache_preserves_positive_raw_value_and_nullable_spread(
     oracle_factory, monkeypatch, matrix, uncertainty, expected,
@@ -142,16 +153,19 @@ def test_ooh_scientific_cache_preserves_positive_raw_value_and_nullable_spread(
     assert predictor.cached_outputs(COMP) is None
     assert calls["evals"] == 0
     prediction = predictor.predict(COMP)
-    before = dict(calls)
-    monkeypatch.setattr(predictor, "predict_outputs", lambda _: pytest.fail("OOH reevaluated"))
-    monkeypatch.setattr(predictor, "predict_raw", lambda _: pytest.fail("OOH raw reevaluated"))
-    monkeypatch.setattr(predictor, "check_phase", lambda _: (True, "NiFe"))
+    from rl_matdesign.predictors.ooh_frames import OOHFramesPredictor
+    assert isinstance(ooh_leaf(predictor), OOHFramesPredictor)
+    before = deepcopy(calls)
+    before_timing = deepcopy(predictor.last_evaluation_timings)
+    _deny_inference(monkeypatch, predictor)
     row = prediction_record(predictor, COMP, prediction, k=2)
-    assert row["reward"] == -2 and row["dp_mean"] == 2
-    assert row["dp_std"] == expected
-    assert row["dp_mean_minus_std"] == (None if expected is None else 2 - 2 * expected)
-    assert row["metadata_json"] == "{}" and row["primary_label"] == "NiFe"
-    assert calls == before
+    assert row["reward"] == row["dp_mean"] == -2
+    assert row["obj_overpotential_mean"] == 2
+    assert row["obj_overpotential_std"] == expected
+    assert "dp_std" not in row and "dp_mean_minus_std" not in row
+    assert row["metadata_json"] == "{}" and "primary_label" not in row
+    assert predictor.last_evaluation_timings == before_timing
+    np.testing.assert_equal(calls, before)
 
 
 def test_missing_cached_record_is_explicit_and_does_not_infer():

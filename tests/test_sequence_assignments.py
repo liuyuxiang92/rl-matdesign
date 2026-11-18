@@ -1,299 +1,135 @@
-"""Standalone Stage 2B contract: complete position/value assignments.
-
-The finite-domain oracle below enumerates candidates independently of the
-environment's feasibility solver, including every reachable partial assignment.
-"""
+"""Ordered peptide identity is assembled from categorical assignment stages."""
 from copy import deepcopy
-from itertools import combinations, product
-import json
+from itertools import combinations, product, permutations
 
 import numpy as np
 import pytest
 
-from rl_matdesign.action_encoding import ActionEncoding, ValueEncoding
-from rl_matdesign.sequence import SequenceGroup
+from rl_matdesign.categorical import CategoricalGroup
+from rl_matdesign.env_multigroup import MultiGroupEnv
+from rl_matdesign.peptide_design import compile_groups
 
 
-STOP = ("stop", None)
+def config(parent=None, budget=2):
+    structure = {"builder": "peptide", "parent": parent, "require_change": ["peptide"]} if parent else {"builder": "peptide", "length": 3}
+    ordinary = {"name": "peptide", "kind": "categorical", "labels": [1, 2, 3],
+                "values": ["A", "B", "__STOP__", "1"], "n_steps": budget}
+    groups = [{"name": "n_terminal", "kind": "categorical", "choices": [{"name": "treatment", "values": ["H", "Ac"]}]}, ordinary]
+    if parent is None:
+        groups.append({"name": "remaining", "kind": "categorical", "labels": {"unassigned_from": "peptide"}, "values": ["C"], "n_steps": 3-budget})
+    return {"structure": structure, "groups": groups}
 
 
-def action(group, position, token):
-    if position == "stop":
-        label = group.encoding.labels.index_of(("control", "stop"))
-        value = group.encoding.values.index_of("stop", namespace=(group.name, "control"))
-    else:
-        label = group.encoding.labels.index_of(("position", position))
-        value = group.encoding.values.index_of(token, namespace=(group.name, "monomer"))
-    return group.encoding.encode(label, value)
+def env_for(cfg):
+    groups, adapter = compile_groups(cfg)
+    return MultiGroupEnv(groups=groups, candidate_adapter=adapter)
 
 
-def decoded_actions(group):
-    result = set()
-    for labels, values in group.allowed_actions():
-        label = group.encoding.labels.labels[int(np.argmax(labels))]
-        value = group.value_specs[int(np.argmax(values))].value
-        result.add(STOP if label == ("control", "stop") else (label[1], value))
-    return result
+def action(group, label, value):
+    li = group.species_set.index(label)
+    code = next(code for candidate, code in group._slot_codes[li] if candidate == value)
+    return (tuple(np.eye(len(group.species_set))[li]), tuple(np.eye(len(group.action_values))[group.action_values.index(code)]))
 
 
-def finite_candidates(spec):
-    """Brute-force complete molecular candidates, not action trajectories."""
-    parent = tuple(spec["parent"]) if "parent" in spec else None
-    length = len(parent) if parent else spec["length"]
-    choices = [list(dict.fromkeys(spec["tokens"] + ([parent[p]] if parent else [])))
-               for p in range(length)]
-    candidates = set()
-    for candidate in product(*choices):
-        if parent and not 1 <= sum(a != b for a, b in zip(candidate, parent)) <= spec["num_mutations"]:
-            continue
-        if not spec.get("allow_repeats", True) and len(set(candidate)) != length:
-            continue
-        if any(not bound.get("min", 0) <= sum(token in bound["tokens"] for token in candidate)
-               <= bound.get("max", length) for bound in spec.get("count_constraints", [])):
-            continue
-        candidates.add(candidate)
-    return candidates
+def choose(env, label, value):
+    inner = env._active()
+    env.step(env._to_union(action(inner, label, value), inner))
 
 
-ORACLE_CASES = [
-    {"tokens": ["A", "B", "C"], "length": 3},
-    {"tokens": ["A", "B", "C"], "length": 3, "allow_repeats": False},
-    {"tokens": ["A", "B", "C"], "length": 3,
-     "count_constraints": [{"tokens": ["A", "B"], "min": 2, "max": 2},
-                           {"tokens": ["B", "C"], "min": 2, "max": 3}]},
-    {"tokens": ["A", "B", "C", "D"], "length": 3, "allow_repeats": False,
-     "count_constraints": [{"tokens": ["A", "B"], "min": 1, "max": 2},
-                           {"tokens": ["B", "C"], "min": 2, "max": 2}]},
-    {"tokens": ["A", "B", "C"], "parent": ["A", "A", "B"], "num_mutations": 1},
-    {"tokens": ["A", "B", "C"], "parent": ["A", "B", "C"], "num_mutations": 2},
-    {"tokens": ["A", "B", "C"], "parent": ["A", "B", "C"], "num_mutations": 3,
-     "allow_repeats": False},
-    {"tokens": ["A", "B", "C"], "parent": ["A", "A", "B"], "num_mutations": 2,
-     "allow_repeats": False},
-    {"tokens": ["A", "B", "C"], "parent": ["A", "B", "C"], "num_mutations": 2,
-     "count_constraints": [{"tokens": ["A"], "min": 1, "max": 1},
-                           {"tokens": ["B", "C"], "min": 2, "max": 2}]},
-    {"tokens": ["A", "B", "C"], "parent": ["X", "A", "A"], "num_mutations": 2,
-     "allow_repeats": False,
-     "count_constraints": [{"tokens": ["X", "A"], "min": 1, "max": 2},
-                           {"tokens": ["A", "B"], "min": 1, "max": 2}]},
-    {"tokens": ["A", "B"], "parent": ["X", "X", "A", "B"], "num_mutations": 3,
-     "count_constraints": [{"tokens": ["X"], "min": 1, "max": 1}]},
-    {"tokens": ["A", "B", "C", "D"], "parent": ["A", "A", "A", "B"], "num_mutations": 3,
-     "allow_repeats": False,
-     "count_constraints": [{"tokens": ["A", "C"], "min": 2, "max": 2}]},
-]
+def test_exact_edit_budget_has_no_early_stop_and_reserved_looking_ids_are_values():
+    env = env_for(config(["A", "B", "A"]))
+    choose(env, "treatment", "H")
+    choose(env, 1, "__STOP__")
+    assert not env.is_terminal
+    choose(env, 2, "1")
+    assert env.is_terminal and env.counter == env.max_steps == 3
+    assert env.terminal_cation_fractions()["peptide"] == ["__STOP__", "1", "A"]
 
 
-@pytest.mark.parametrize("spec", ORACLE_CASES)
-def test_all_reachable_partial_action_masks_match_independent_finite_oracle(spec):
-    candidates = finite_candidates(spec)
-    assert candidates
-    parent = tuple(spec["parent"]) if "parent" in spec else None
-    length = len(parent) if parent else spec["length"]
-    budget = spec["num_mutations"] if parent else length
-    partials = {()}
-    for candidate in candidates:
-        edits = tuple((p, token) for p, token in enumerate(candidate)
-                      if not parent or token != parent[p])
-        for count in range(len(edits) + 1):
-            partials.update(combinations(edits, count))
-    terminal_candidates = set()
-    for fixed in sorted(partials):
-        group = SequenceGroup(spec)
-        # The same canonical state is reachable through reverse position order.
-        for position, token in reversed(fixed):
-            group.step(action(group, position + 1, token))
-        assert group.is_terminal == (len(fixed) == budget)
-        if group.is_terminal:
-            assert group.allowed_actions() == []
-            terminal_candidates.add(group.terminal_comp_key())
-            continue
-        fixed_map = dict(fixed)
-        compatible = [candidate for candidate in candidates
-                      if all(candidate[p] == token for p, token in fixed)]
-        expected = {(p + 1, token) for candidate in compatible for p, token in enumerate(candidate)
-                    if p not in fixed_map and (not parent or token != parent[p])}
-        current = tuple(fixed_map.get(p, parent[p] if parent else None) for p in range(length))
-        if parent and fixed and current in candidates:
-            expected.add(STOP)
-        assert decoded_actions(group) == expected, (spec, fixed)
-        if STOP in expected:
-            group.step(action(group, *STOP))
-            terminal_candidates.add(group.terminal_comp_key())
-            assert group.is_terminal and group.counter <= budget
-    assert terminal_candidates == candidates
+def test_parent_and_novel_share_label_value_actions_but_expose_initial_state():
+    parent = env_for(config(["A", "B", "A"]))
+    novel = env_for(config())
+    assert parent.candidate_adapter._sequence(parent._raw_group_payload(), complete=False) == ["A", "B", "A"]
+    assert novel.candidate_adapter._sequence(novel._raw_group_payload(), complete=False) == [None]*3
+    assert parent.candidate_adapter.state_feature_schema()["initial_sequence"] == ["A", "B", "A"]
+    for env in (parent, novel):
+        choose(env, "treatment", "H")
+        choose(env, 1, "B")
+        assert env._inners[1].assigned_labels == {1}
 
 
-def test_assignment_execution_order_has_identical_state_mask_and_candidate():
-    spec = {"name": "peptide", "tokens": ["A", "B", "C"], "length": 3}
-    first, second = SequenceGroup(spec), SequenceGroup(spec)
-    for position, token in [(1, "A"), (3, "C")]:
-        first.step(action(first, position, token))
-    for position, token in [(3, "C"), (1, "A")]:
-        second.step(action(second, position, token))
-    np.testing.assert_array_equal(first.current_state_features(), second.current_state_features())
-    assert first.allowed_actions() == second.allowed_actions()
-    first.step(action(first, 2, "B"))
-    second.step(action(second, 2, "B"))
-    assert first.terminal_comp_key() == second.terminal_comp_key() == ("A", "B", "C")
-    reverse = SequenceGroup(spec)
-    for position, token in [(3, "A"), (1, "C"), (2, "B")]:
-        reverse.step(action(reverse, position, token))
-    assert reverse.terminal_comp_key() == ("C", "B", "A")
-    assert reverse.terminal_comp_key() != first.terminal_comp_key()
-
-
-def test_parent_blank_same_complete_pair_contract_and_distinct_initial_states():
-    blank = SequenceGroup({"tokens": ["A", "B"], "length": 2})
-    parent = SequenceGroup({"tokens": ["A", "B"], "parent": ["A", "B"], "num_mutations": 2})
-    blank.step(action(blank, 2, "A"))
-    parent.step(action(parent, 2, "A"))
-    assert blank.cation_fractions() == [None, "A"]
-    assert parent.cation_fractions() == ["A", "A"]
-    assert blank.counter == parent.counter == 1
-    assert STOP not in decoded_actions(blank)
-    assert STOP in decoded_actions(parent)
-    assert parent.max_steps == parent.n_components == 2
-
-
-def test_parent_can_stop_after_one_edit_without_padding_to_maximum():
-    group = SequenceGroup({"tokens": ["A", "B", "C"], "parent": ["A", "B", "C"], "num_mutations": 3})
-    assert STOP not in decoded_actions(group)
-    group.step(action(group, 3, "A"))
-    before = group.current_state_features()
-    group.step(action(group, *STOP))
-    assert group.counter == 2 < group.max_steps
-    assert group.is_terminal and group._is_terminal() and group.is_done
-    assert group.terminal_comp_key() == ("A", "B", "A")
-    assert group.allowed_actions() == []
-    np.testing.assert_array_equal(group.current_state_features()[:-1], before[:-1])
-    assert before[-1] == 0 and group.current_state_features()[-1] == 1
-    with pytest.raises(RuntimeError, match="after termination"):
-        group.step(action(group, 1, "C"))
-
-
-def test_budget_one_auto_terminates_without_stop_step():
-    group = SequenceGroup({"tokens": ["A", "B"], "parent": ["A", "B"], "num_mutations": 1})
-    group.step(action(group, 1, "B"))
-    assert group.counter == group.max_steps == 1
-    assert group.is_terminal
-
-
-def test_intrinsic_constraints_allow_repairable_intermediate_duplicates():
-    group = SequenceGroup({"tokens": ["A", "B", "C"], "parent": ["A", "B", "C"],
-                           "num_mutations": 2, "allow_repeats": False})
-    group.constraints_enabled = False  # A training filter toggle cannot bypass molecular validity.
-    group.step(action(group, 1, "B"))
-    assert group.cation_fractions() == ["B", "B", "C"]
-    assert decoded_actions(group) == {(2, "A")}
-    group.step(action(group, 2, "A"))
-    assert group.terminal_comp_key() == ("B", "A", "C")
-
-
-def test_parent_only_ids_are_retained_and_counted_but_never_new_choices():
-    group = SequenceGroup({"tokens": ["01", "1"], "parent": ["cap-X", "01", "1"],
-                           "num_mutations": 2,
-                           "count_constraints": [{"tokens": ["cap-X"], "min": 1, "max": 1}]})
-    assert (1, "01") not in decoded_actions(group)
-    assert not any(token == "cap-X" for _, token in decoded_actions(group))
-    group.step(action(group, 2, "1"))
-    group.step(action(group, *STOP))
-    assert group.terminal_comp_key() == ("cap-X", "1", "1")
-    assert group.state_feature_schema()["tokens"] == ["01", "1", "cap-X"]
-
-
-def test_exact_monomer_ids_do_not_collide_with_stop_or_numeric_spellings():
-    tokens = ["01", "1", "1.0", "stop", '["control","stop"]', " cap-A "]
-    group = SequenceGroup({"tokens": tokens, "parent": ["01", "1"], "num_mutations": 2})
-    assert len(group.fraction_set) == len(set(group.fraction_set)) == len(tokens) + 1
-    assert all(spec.kind == "categorical" for spec in group.value_specs)
-    np.testing.assert_array_equal(ValueEncoding.from_specs(group.value_specs).features, np.eye(len(tokens) + 1))
-    group.step(action(group, 2, " cap-A "))
-    group.step(action(group, *STOP))
-    assert group.terminal_comp_key() == ("01", " cap-A ")
-
-
-@pytest.mark.parametrize("wrong_action", [
-    ((0, 0, 0), (1, 0, 0)), ((1, 1, 0), (1, 0, 0)),
-    ((.9, .1, 0), (1, 0, 0)), ((1, 0), (1, 0, 0)),
-    ((1, 0, 0), (float("nan"), 0, 0)), ((1, 0, 0), (0, 0, 1)),
-    ((0, 0, 1), (1, 0, 0)), ((0, 0, 1), (0, 0, 1)), None,
-])
-def test_invalid_actions_do_not_mutate_state(wrong_action):
-    group = SequenceGroup({"tokens": ["A", "B"], "parent": ["A", "B"], "num_mutations": 2})
-    before = group.current_state_features()
+def test_noop_and_repeat_edit_fail_atomically_and_initialize_restores_parent():
+    env = env_for(config(["A", "B", "A"]))
+    choose(env, "treatment", "H")
+    original = env.current_state_features().copy()
     with pytest.raises(ValueError):
-        group.step(wrong_action)
-    np.testing.assert_array_equal(group.current_state_features(), before)
-    assert group.counter == 0
-
-
-def test_noop_or_repeat_edit_is_rejected_and_initialization_restores_parent():
-    group = SequenceGroup({"tokens": ["A", "B", "C"], "parent": ["A", "B"], "num_mutations": 2})
-    with pytest.raises(ValueError, match="not allowed"):
-        group.step(action(group, 1, "A"))
-    group.step(action(group, 1, "C"))
-    before = group.current_state_features()
-    with pytest.raises(ValueError, match="not allowed"):
-        group.step(action(group, 1, "B"))
-    np.testing.assert_array_equal(group.current_state_features(), before)
-    assert group.counter == 1
-    group.initialize()
-    assert group.cation_fractions() == ["A", "B"]
-    assert group.counter == 0 and not group.is_terminal
-    with pytest.raises(RuntimeError, match="completed sequence"):
-        group.terminal_comp_key()
-
-
-@pytest.mark.parametrize("spec", [
-    {"tokens": ["A"], "length": 2, "allow_repeats": False},
-    {"tokens": ["A"], "parent": ["A"], "num_mutations": 1},
-    {"tokens": ["A", "B"], "parent": ["A", "A", "A"], "num_mutations": 1,
-     "allow_repeats": False},
-    {"tokens": ["A", "B"], "length": 2,
-     "count_constraints": [{"tokens": ["A"], "min": 2}, {"tokens": ["B"], "min": 1}]},
-])
-def test_infeasible_candidate_domains_fail_during_construction(spec):
-    assert finite_candidates(spec) == set()
-    with pytest.raises(ValueError, match="no complete candidate"):
-        SequenceGroup(spec)
-
-
-@pytest.mark.parametrize("changes", [
-    {"tokens": [1, "A"]}, {"tokens": ["A", "A"]}, {"tokens": []}, {"tokens": {"csv": "a.csv"}},
-    {"length": True}, {"length": 1.5}, {"length": 0}, {"allow_repeats": "false"},
-    {"parent": ["A"]}, {"num_mutations": 1},
-    {"parent": ["A", "B"], "num_mutations": False},
-    {"parent": ["A", "B"], "num_mutations": 3},
-    {"count_constraints": [{"tokens": ["unknown"]}]},
-    {"count_constraints": [{"tokens": ["A"], "max": True}]},
-    {"count_constraints": [{"tokens": ["A"], "min": 2, "max": 1}]},
-    {"count_constraints": [{"tokens": ["A"], "max": 3}]},
-    {"count_constraints": [{"where": {"cap": True}}]},
-    {"filters": ["anything"]},
-])
-def test_invalid_specs_fail_without_silent_coercion(changes):
+        choose(env, 1, "A")
+    np.testing.assert_array_equal(env.current_state_features(), original)
+    choose(env, 1, "B")
+    after = env.current_state_features().copy()
     with pytest.raises(ValueError):
-        SequenceGroup({"tokens": ["A", "B"], "length": 2, **changes})
+        choose(env, 1, "A")
+    np.testing.assert_array_equal(env.current_state_features(), after)
+    env.initialize()
+    assert env.candidate_adapter._sequence(env._raw_group_payload(), complete=True) == ["A", "B", "A"]
 
 
-def test_schema_records_action_semantics_budget_and_exact_vocabulary():
-    spec = {"name": "chain", "tokens": ["A", "B", "C"], "parent": ["A", "B", "C"], "num_mutations": 2}
-    group = SequenceGroup(spec)
-    schema = group.design_schema()
-    assert schema["version"] == 2 and schema["action_protocol"] == "position_value_assignment"
-    assert schema["max_steps"] == 2
-    restored = ActionEncoding.from_schema(json.loads(json.dumps(schema["actions"])))
-    assert restored.to_schema() == group.encoding.to_schema()
-    assert sum(np.prod(block["shape"]) for block in schema["state"]["blocks"]) == len(group.current_state_features())
-    for change in ({"tokens": ["B", "A", "C"]}, {"parent": ["B", "A", "C"]},
-                   {"num_mutations": 3}, {"allow_repeats": False},
-                   {"count_constraints": [{"tokens": ["A"], "max": 1}]}):
-        assert SequenceGroup({**spec, **change}).design_schema() != schema
-    detached = deepcopy(schema)
-    schema["initial"][0] = "changed"
-    schema["state"]["tokens"].clear()
-    assert group.design_schema() == detached
-    group.cation_fractions()[0] = "changed"
-    assert group.cation_fractions() == ["A", "B", "C"]
+@pytest.mark.parametrize("vector", [(0, 0, 0), (1, 1, 0), (.5, .5, 0), (float("nan"), 0, 1), (1, 0), (2, 0, 0)])
+def test_invalid_target_encoding_does_not_mutate_ordered_state(vector):
+    env = env_for(config(["A", "B", "A"]))
+    inner = env._inners[1]
+    before = inner.current_state_features().copy()
+    valid = action(inner, 1, "B")
+    with pytest.raises(ValueError, match="one-hot"):
+        inner.step((vector, valid[1]))
+    np.testing.assert_array_equal(inner.current_state_features(), before)
+    assert inner.counter == 0
+
+
+def test_parent_only_identity_is_retained_at_its_original_target_only():
+    cfg = config(["parent-only", "A", "B"])
+    cfg["structure"]["require_change"] = []
+    env = env_for(cfg)
+    inner = env._inners[1]
+    assert "parent-only" in dict(inner.slots)[1]
+    assert all("parent-only" not in values for position, values in inner.slots if position != 1)
+
+
+@pytest.mark.parametrize("parent", [None, ["A", "B", "A"]])
+def test_plugin_count_range_matches_independent_enumeration(parent):
+    cfg = config(parent)
+    cfg["groups"][1].pop("labels")
+    cfg["groups"][1].pop("values")
+    cfg["groups"][1]["choices"] = [{"name": 1, "values": ["A", "B"]},
+                                      {"name": 2, "values": ["A", "C"]},
+                                      {"name": 3, "values": ["B", "C"]}]
+    _, adapter = compile_groups(cfg)
+    counts = []
+    menus = {1: ["A", "B"], 2: ["A", "C"], 3: ["B", "C"]}
+    for selected in combinations(range(1,4), 2):
+        for values in product(*(menus[position] for position in selected)):
+            if parent and any(value == parent[position-1] for position, value in zip(selected,values)):
+                continue
+            candidate = list(parent) if parent else ["C"]*3
+            for position, value in zip(selected, values):
+                candidate[position-1] = value
+            counts.append(sum(token in {"A", "C"} for token in candidate))
+    assert adapter._count_range({"A", "C"}) == (min(counts), max(counts))
+
+
+def test_assignment_order_commutes_while_position_order_changes_identity():
+    keys, states = [], []
+    for edits in permutations([(1,"B"), (3,"1")]):
+        env = env_for(config(["A", "B", "A"]))
+        choose(env, "treatment", "H")
+        for target, value in edits:
+            choose(env, target, value)
+        keys.append(env.terminal_comp_key())
+        states.append(env.current_state_features())
+    assert keys[0] == keys[1]
+    np.testing.assert_array_equal(states[0], states[1])
+    swapped = env_for(config(["A", "B", "A"]))
+    choose(swapped, "treatment", "H")
+    choose(swapped, 1, "1")
+    choose(swapped, 3, "B")
+    assert swapped.terminal_comp_key() != keys[0]

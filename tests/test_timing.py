@@ -4,7 +4,7 @@ Two layers:
 
 * Unit tests for :class:`PredictorTimer` — the counting is what the whole
   method comparison rests on, and the attribute delegation is load-bearing
-  (``run_experiment`` reads ``predictor._cache``, ``generate_candidates`` probes
+  (result snapshots retain the leaf caches and generation probes
   ``predict_raw``), so both are pinned here.
 * End-to-end smoke via subprocess on ``configs/test_dummy.yaml`` for all three
   comparison arms (DQN bootstrap, DQN mc, A2C), asserting that ``timing.json``
@@ -157,10 +157,10 @@ def test_snapshot_has_exactly_the_training_log_columns():
 # Delegation — required by run_experiment / generate_candidates
 # ---------------------------------------------------------------------------
 
-def test_delegates_cache_attribute_for_dqn_checkpointing():
+def test_delegates_leaf_cache_attribute():
     inner = _Rich()
     t = PredictorTimer(inner)
-    # run_experiment.py does exactly this, then mutates the result in place.
+    # The transparent proxy must expose optional leaf attributes unchanged.
     cache = getattr(t, "_cache", None)
     assert cache is inner._cache
     cache["added"] = (2.0, 0.0)
@@ -252,7 +252,8 @@ def test_run_writes_timing_json(tmp_path, method, target_mode):
     assert pred["n_calls"] > 0
     assert pred["n_unique"] <= pred["n_calls"]
     assert pred["n_repeated_requests"] == pred["n_calls"] - pred["n_unique"]
-    assert pred["cache_hit_rate"] is None  # Dummy has no cache telemetry.
+    assert pred["cache_status_known_requests"] == pred["n_calls"]
+    assert pred["cache_hit_rate"] == pytest.approx(pred["n_cache_hits"] / pred["n_calls"])
     assert pred["t_predict_s"] >= 0.0
     # The predictor is part of the run, so it cannot have taken longer than it.
     assert pred["t_predict_s"] <= timing["total_s"]
@@ -287,11 +288,12 @@ def test_training_log_carries_cumulative_cost_columns(tmp_path, method, phase):
     assert all(u <= c for u, c in zip(uniq, calls))
 
 
-def test_generated_csv_schema_is_untouched(tmp_path):
-    # Generation cost lives in timing.json; generated.csv must keep the schema
-    # compare_methods.py / plot_figures.py already read.
+def test_generated_csv_separates_named_properties_from_timing(tmp_path):
+    # Generation cost lives in timing.json; scientific property columns remain
+    # separate from cumulative timing telemetry.
     out = _run(tmp_path, "a2c", None)
     with (out / "generated.csv").open() as f:
         cols = set(csv.DictReader(f).fieldnames or [])
-    assert {"formula", "reward", "dp_mean", "dp_std"} <= cols
+    assert {"formula", "reward", "dp_mean", "obj_quality_mean", "obj_quality_std"} <= cols
+    assert "dp_std" not in cols
     assert not (_TIMING_COLS & cols)

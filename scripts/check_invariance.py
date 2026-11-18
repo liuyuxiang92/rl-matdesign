@@ -82,14 +82,14 @@ def _sample_random_multiset(
     env.initialize()
     sequence: List[Tuple[str, str]] = []
     species_set = env.species_set
-    fraction_set = env.fraction_set
-    while env.counter < env.n_components:
+    action_values = env.action_values
+    while env.counter < env.max_steps:
         actions = env.allowed_actions()
         if not actions:
             return []
         elem_oh, comp_oh = rng.choice(actions)
         elem = species_set[int(np.argmax(elem_oh))]
-        frac = fraction_set[int(np.argmax(comp_oh))]
+        frac = action_values[int(np.argmax(comp_oh))]
         env.step((elem_oh, comp_oh))
         sequence.append((elem, frac))
     return sequence
@@ -97,77 +97,55 @@ def _sample_random_multiset(
 
 def _enumerate_orderings(
     sequence: Sequence[Tuple[str, str]],
-    pinned_last: bool,
     num_perms: int,
     rng: random.Random,
 ) -> List[List[Tuple[str, str]]]:
     """Sample *num_perms* orderings of *sequence* (always including the original)."""
-    if pinned_last:
-        free, last = list(sequence[:-1]), sequence[-1]
-    else:
-        free, last = list(sequence), None
-
-    perms = list(itertools.permutations(range(len(free))))
-    rng.shuffle(perms)
-    chosen = perms[: max(1, min(num_perms, len(perms)))]
-
-    out: List[List[Tuple[str, str]]] = []
-    for idx_seq in chosen:
-        ordering = [free[i] for i in idx_seq]
-        if last is not None:
-            ordering.append(last)
-        out.append(ordering)
-    return out
+    original = tuple(sequence)
+    chosen = {original}
+    attempts = 0
+    while len(chosen) < num_perms and attempts < max(20, num_perms * 20):
+        shuffled = list(sequence)
+        rng.shuffle(shuffled)
+        chosen.add(tuple(shuffled))
+        attempts += 1
+    return [list(original)] + [list(order) for order in sorted(chosen - {original})]
 
 
 # ---------------------------------------------------------------------------
 # Probe per layer
 # ---------------------------------------------------------------------------
 
-def _probe_featurizer(
-    orderings: List[List[Tuple[str, str]]],
-    env_type: str,
-) -> Tuple[float, float]:
-    """Featurize the terminal formula of each ordering, return max delta."""
-    from rl_matdesign.featurization import featurize_formula
+def _replay(ordering, env_factory):
+    env = env_factory()
+    env.initialize()
+    for label, value in ordering:
+        action = (tuple(float(item == label) for item in env.species_set),
+                  tuple(float(item == value) for item in env.action_values))
+        if action not in env.allowed_actions():
+            return None
+        env.step(action)
+    return env
 
-    feats = []
+
+def _probe_featurizer(orderings, env_factory):
+    """Compare complete descriptor/assignment states for valid action orders."""
+    states = []
     for ordering in orderings:
-        if env_type == "integer_ratio":
-            formula = "".join(f"{el}{frac}" for el, frac in ordering)
-        else:
-            formula = "".join(f"{el}{frac}" for el, frac in ordering)
-        feats.append(featurize_formula(formula))
-    return _max_delta(feats)
+        env = _replay(ordering, env_factory)
+        if env is not None:
+            states.append(env.current_state_features())
+    return _max_delta(states)
 
 
-def _probe_predictor(
-    orderings: List[List[Tuple[str, str]]],
-    predictor,
-    env_type: str,
-) -> Tuple[float, float]:
-    """Run predictor on each ordering's terminal composition (mean + std)."""
-    from pymatgen.core.composition import Composition
-
-    means, stds = [], []
+def _probe_predictor(orderings, predictor, env_factory):
+    """Score identical structured candidates through the production payload path."""
+    values = []
     for ordering in orderings:
-        formula = "".join(f"{el}{frac}" for el, frac in ordering)
-        try:
-            comp_obj = Composition(formula).fractional_composition
-            comp = {str(el): float(comp_obj[el]) for el in comp_obj}
-        except Exception:
-            comp = {}
-        try:
-            m, s = predictor.predict(comp)
-        except Exception as e:
-            print(f"[WARN] predictor.predict({formula!r}) raised {type(e).__name__}: {e}")
-            continue
-        means.append(float(m))
-        stds.append(float(s))
-
-    abs_m, rel_m = _max_delta_scalar(means)
-    abs_s, rel_s = _max_delta_scalar(stds)
-    return max(abs_m, abs_s), max(rel_m, rel_s)
+        env = _replay(ordering, env_factory)
+        if env is not None:
+            values.append(np.asarray(predictor.predict(env.terminal_cation_fractions())))
+    return _max_delta(values)
 
 
 def _probe_qnet(
@@ -176,7 +154,7 @@ def _probe_qnet(
     qnet,
     scaler,
     elem_feats_scaled: np.ndarray,
-    fraction_set: List[str],
+    action_values: List[str],
     device,
 ) -> Tuple[float, float]:
     """Compare Q(s, a) across orderings only where state AND action match.
@@ -197,7 +175,8 @@ def _probe_qnet(
     # Canonical action used for all queries (need not be "allowed" — we just
     # want a fixed query vector).
     canonical_elem_idx = 0  # first element in species_set
-    canonical_frac = float(fraction_set[0])
+    from rl_matdesign.action_features import value_alphabet
+    canonical_value = value_alphabet(env_factory()).features[0]
 
     for k in range(N):
         # Group orderings by their prefix multiset at step k.
@@ -221,16 +200,16 @@ def _probe_qnet(
                         for j in range(len(species_set))
                     )
                     comp_oh = tuple(
-                        1.0 if j == fraction_set.index(frac) else 0.0
-                        for j in range(len(fraction_set))
+                        1.0 if j == action_values.index(frac) else 0.0
+                        for j in range(len(action_values))
                     )
                     try:
                         env.step((elem_oh, comp_oh))
                     except Exception:
                         break
-                s_mat = env.state_featurizer(env.state)
+                s_mat = env.current_state_features()
                 s_mat_sc = scaler.transform(s_mat.reshape(1, -1))[0]
-                s_step = np.zeros(env.n_components, dtype=float)
+                s_step = np.zeros(env.max_steps, dtype=float)
                 s_step[k] = 1.0
                 a_elem = elem_feats_scaled[canonical_elem_idx]
                 with torch.no_grad():
@@ -238,7 +217,7 @@ def _probe_qnet(
                         torch.tensor(s_mat_sc.reshape(1, -1), dtype=torch.float32, device=device),
                         torch.tensor(s_step.reshape(1, -1),  dtype=torch.float32, device=device),
                         torch.tensor(a_elem.reshape(1, -1),  dtype=torch.float32, device=device),
-                        torch.tensor([[canonical_frac]],     dtype=torch.float32, device=device),
+                        torch.tensor(canonical_value.reshape(1, -1),     dtype=torch.float32, device=device),
                     )
                 qs.append(float(q.item()))
             if len(qs) >= 2:
@@ -286,7 +265,7 @@ def main() -> None:
     from rl_matdesign.config_schema import resolve_config
     from rl_matdesign.utils.model_contract import load_artifact, validate_scaler
     from rl_matdesign.action_features import value_alphabet
-    from rl_matdesign.training import _precompute_elem_features, _detect_last_position_pin
+    from rl_matdesign.training import _precompute_elem_features
 
     cfg = resolve_config(load_config(args.config)).config
     rng = random.Random(args.seed)
@@ -298,7 +277,6 @@ def main() -> None:
         return env
 
     probe_env, env_type, _ = build_env(cfg, predictor)
-    pinned_last = _detect_last_position_pin(probe_env) is not None
 
     # Sample multisets
     multisets: List[List[Tuple[str, str]]] = []
@@ -332,7 +310,7 @@ def main() -> None:
             state_dim = int(getattr(scaler, "n_features_in_", scaler.mean_.shape[0]))
             qnet = QRegressor(
                 state_dim=state_dim,
-                step_dim=probe_env.n_components,
+                step_dim=probe_env.max_steps,
                 elem_dim=int(elem_feats_scaled.shape[1]),
                 frac_dim=value_alphabet(probe_env).feature_dim,
                 hidden_dim=int(cfg["dqn_hidden_dim"]),
@@ -346,18 +324,18 @@ def main() -> None:
     qnet_max_abs, qnet_max_rel = 0.0, 0.0
 
     for seq in multisets:
-        orderings = _enumerate_orderings(seq, pinned_last, args.num_perms, rng)
+        orderings = _enumerate_orderings(seq, args.num_perms, rng)
 
-        a, r = _probe_featurizer(orderings, env_type)
+        a, r = _probe_featurizer(orderings, _build_env)
         feat_max_abs = max(feat_max_abs, a); feat_max_rel = max(feat_max_rel, r)
 
-        a, r = _probe_predictor(orderings, predictor, env_type)
+        a, r = _probe_predictor(orderings, predictor, _build_env)
         pred_max_abs = max(pred_max_abs, a); pred_max_rel = max(pred_max_rel, r)
 
         if qnet is not None:
             a, r = _probe_qnet(
                 orderings, _build_env, qnet, scaler,
-                elem_feats_scaled, list(probe_env.fraction_set), device,
+                elem_feats_scaled, list(probe_env.action_values), device,
             )
             qnet_max_abs = max(qnet_max_abs, a); qnet_max_rel = max(qnet_max_rel, r)
 

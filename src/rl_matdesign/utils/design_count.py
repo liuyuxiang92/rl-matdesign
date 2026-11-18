@@ -251,15 +251,32 @@ class UniformCompositionSampler:
 
 
 def sampler_from_env(env) -> UniformCompositionSampler:
-    """Exact uniform sampler for a single unfiltered fraction domain.
+    """Count a single finite, distinct-species amount domain exactly.
 
-    General chemical filters need their own counted-domain implementation;
-    silently calling a random-action rollout would not be uniform on materials.
+    Additive repeated-selection domains and external filters require a different
+    counting algorithm; reject them instead of claiming a biased uniform sample.
+    Returned samples are integer lattice amounts; multiply by amount_quantum.
     """
-    schema = env.state_feature_schema()
-    if schema.get("kind") != "fractional_composition":
-        raise ValueError("Exact composition counting requires one fraction-composition group")
-    if getattr(env, "phase_filter", None) is not None:
+    from ..amounts import ChemicalAmountsGroup
+    if hasattr(env, "_inners"):
+        from ..configuration import _SingleChemicalCandidate
+        adapter = getattr(env, "candidate_adapter", None)
+        preserves_amounts = adapter is None or (
+            isinstance(adapter, _SingleChemicalCandidate) and not adapter.empirical)
+        if len(env._inners) != 1 or not preserves_amounts:
+            raise ValueError("Exact counting requires one chemical amount group preserving raw amount identity")
+        env = env._inners[0]
+    if not isinstance(env, ChemicalAmountsGroup) or not env.unique:
+        raise ValueError("Exact counting requires a chemical amount group with unique: true")
+    if env.filters or env.candidate_validator is not None:
         raise ValueError("Exact counting/sampling does not include plugin filters; use an explicitly counted domain")
-    return UniformCompositionSampler(schema["species_allowed_units"], schema["total_units"],
-                                     required=schema["mandatory_species"], slots=schema["n_components"])
+    if env._target is None or any(value < 0 for menu in env._menus for value in menu):
+        raise ValueError("Exact counting requires nonnegative amounts and a fixed total")
+    menus, required = {}, []
+    for label, menu, (low, high) in zip(env.species_set, env._menus, env._bounds):
+        menus[label] = [value for value in menu if low <= value <= high]
+        if not low <= 0 <= high:
+            required.append(label)
+    sampler = UniformCompositionSampler(menus, env._target, required=required, slots=env.n_steps)
+    sampler.amount_quantum = env._quantum
+    return sampler

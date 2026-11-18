@@ -30,10 +30,11 @@ def _write_model(tmp_path, *, filename="table.npz", remove=(), **updates):
 def _engine(*paths, objective="mean", uncertainty=None, **settings):
     return build_predictor({
         "properties": [
-            {"name": f"p{i}", "predictor": FQN, "model": str(path), "direction": "max",
+            {"name": f"p{i}", "predictor": FQN, "models": [str(path)], "direction": "max",
              "objective": objective, "uncertainty": uncertainty}
             for i, path in enumerate(paths)
         ],
+        "reward": {"objective": {"terms": {f"p{i}": 1 for i in range(len(paths))}}},
         **settings,
     }, seed=42)
 
@@ -66,7 +67,7 @@ def test_self_folded_lookup_ensemble_requires_raw_samples_without_discarding_nat
     second = _write_model(tmp_path, filename="second.npz", mean=np.full((2, 3), 5.), std=1.5)
     predictor = build_predictor({"properties": [{
         "name": "response", "predictor": FQN,
-        "model": [str(first), str(second)], "direction": "max", "objective": "mean",
+        "models": [str(first), str(second)], "direction": "max", "objective": "mean",
     }]})
     # Means plus native std do not define aligned underlying model/configuration
     # samples. Combining them must not silently drop std or relabel it model spread.

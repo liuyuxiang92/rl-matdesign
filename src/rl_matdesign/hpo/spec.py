@@ -213,7 +213,7 @@ def _search_settings(raw, generation=False):
 
 _PATH_KEYS = {"model", "checkpoint", "model_path", "weights", "weights_path", "scaler", "scaler_path", "model_dir", "cache_dir",
               "base_poscar", "poscar", "poscar_template", "scaffold_poscar", "mgt_repo", "mgt_python", "config", "geo_opt_model", "path"}
-_PATH_LIST_KEYS = {"dp_models", "model_paths", "checkpoint_paths"}
+_PATH_LIST_KEYS = {"models", "model_paths", "checkpoint_paths"}
 
 
 def _resolve_asset_paths(value, base_dir, key=None):

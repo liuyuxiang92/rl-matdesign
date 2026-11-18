@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from rl_matdesign import training
+from rl_matdesign.action_features import value_alphabet
 from rl_matdesign.configuration import _TerminalReward
 from rl_matdesign.predictors.outputs import OutputSchema, ScientificOutput
 from rl_matdesign.utils.episode_batch import CandidateEvaluationFailed, EpisodeBatchEvaluator
@@ -49,7 +50,9 @@ def test_cli_exports_exactly_the_budgeted_training_episodes(tmp_path, method, co
     for row, log in zip(samples, expected):
         assert float(row["reward"]) == pytest.approx(float(log["terminal_reward"]))
         assert float(row["dp_mean"]) == pytest.approx(float(row["reward"]))
-        assert float(row["dp_std"]) >= 0.0
+        assert float(row["obj_score_mean"]) == pytest.approx(float(row["reward"]))
+        assert float(row["obj_score_std"]) >= 0.0
+        assert "dp_std" not in row
     if method == "dqn":
         assert [row["phase"] for row in samples] == ["dqn_warmup"] + ["dqn_train"] * (budget - 1)
     else:
@@ -60,19 +63,19 @@ def test_cli_exports_exactly_the_budgeted_training_episodes(tmp_path, method, co
         assert len({row["formula"] for row in samples}) < len(samples)
 
 
-@pytest.mark.parametrize("domain", ["categorical", "multigroup", "sequence", "typed_fields"])
+@pytest.mark.parametrize("domain", ["categorical", "multigroup", "positions", "typed_fields"])
 def test_cli_material_export_preserves_structured_candidates(tmp_path, domain):
     cfg = _config(count_duplicates=True, categorical=True)
     if domain == "multigroup":
         cfg["groups"].insert(0, {
             "name": "metal", "kind": "composition", "species_set": ["Fe", "Ni"],
-            "fraction_set": ["1.0"], "n_components": 1,
+            "amount_set": [1], "n_steps": 1, "total": 1,
         })
-    elif domain == "sequence":
-        cfg["groups"] = [{"name": "chain", "kind": "sequence", "tokens": ["01", "1", "C"],
-                          "length": 2}]
+    elif domain == "positions":
+        cfg["groups"] = [{"name": "chain", "kind": "categorical", "labels": [1, 2],
+                          "values": ["01", "1", "C"], "n_steps": 2}]
     elif domain == "typed_fields":
-        cfg["groups"] = [{"name": "settings", "kind": "categorical", "choices": [
+        cfg["groups"] = [{"name": "settings", "kind": "categorical", "n_steps": 2, "choices": [
             {"name": "level", "values": [1, 2]},
             {"name": "switch", "values": [False, "off"]},
         ]}]
@@ -86,9 +89,9 @@ def test_cli_material_export_preserves_structured_candidates(tmp_path, domain):
     for row in samples:
         candidate = json.loads(row["candidate_json"])
         assert json.loads(row["metadata_json"]) == {}
-        if domain == "sequence":
-            assert len(candidate["chain"]) == 2
-            assert set(candidate["chain"]) <= {"01", "1", "C"}
+        if domain == "positions":
+            assert set(candidate["chain"]) == {"1", "2"}
+            assert set(candidate["chain"].values()) <= {"01", "1", "C"}
         elif domain == "typed_fields":
             assert type(candidate["settings"]["level"]) is int
             switch = candidate["settings"]["switch"]
@@ -118,7 +121,8 @@ def test_only_generate_preserves_samples_and_uses_the_same_property_columns(tmp_
         fields = set(reader.fieldnames)
         generated_rows = list(reader)
     assert len(generated_rows) == 1
-    assert {"formula", "reward", "dp_mean", "dp_std", "dp_mean_minus_std"} <= fields
+    assert {"formula", "reward", "dp_mean", "obj_score_mean", "obj_score_std"} <= fields
+    assert not {"dp_std", "dp_mean_minus_std"} & fields
     assert fields <= set(_samples(out)[0])
 
 
@@ -177,7 +181,7 @@ def test_scalar_snapshots_reuse_each_actual_stochastic_prediction():
 def test_raw_predictor_without_a_record_hook_is_not_evaluated_again():
     predictor = ChangingPredictor()
     predictor.predict_raw = lambda _: pytest.fail("sample export must not predict again")
-    adapter = _TerminalReward(predictor, "multi_group")
+    adapter = _TerminalReward(predictor)
     adapter.capture_prediction_records = True
     assert adapter({"A": 1.0}) == 1.25
     assert len(predictor.calls) == 1
@@ -313,18 +317,18 @@ def test_pg_samples_are_durable_before_the_partial_batch_update(monkeypatch, tmp
 
 
 def test_dqn_permutation_replay_does_not_export_synthetic_samples(tmp_path):
-    from rl_matdesign.env import CompositionEnv
+    from rl_matdesign.env_multigroup import MultiGroupEnv
 
     predictor = ChangingPredictor()
-    env = CompositionEnv(
-        species_set=["Fe", "Ni", "Co"], fraction_set=["0.25", "0.50"],
-        n_components=3, total_units=4,
+    env = MultiGroupEnv(
+        groups=[{"name": "metal", "kind": "composition", "species_set": ["Fe", "Ni", "Co"],
+                 "amount_set": [.25, .5], "n_steps": 3, "total": 1, "unique": True}],
         state_featurizer=lambda _: np.array([0.0, 1.0]),
-        reward_fn=_TerminalReward(predictor, "fraction"),
+        reward_fn=_TerminalReward(predictor),
     )
     writer = TrainingSampleWriter(tmp_path / "training_samples.csv")
     _, _, logs = run_dqn(
-        env, tmp_path, elem_feats_scaled=np.eye(3), fraction_set=env.fraction_set,
+        env, tmp_path, elem_feats_scaled=env.action_features(), action_values=value_alphabet(env),
         n_warmup_eps=2, dqn_num_train_eps=1, augment_permutations=2,
         checkpoint_cfg={"path": str(tmp_path / "checkpoint.pt"), "freq": 1},
         training_samples=writer,
@@ -333,7 +337,7 @@ def test_dqn_permutation_replay_does_not_export_synthetic_samples(tmp_path):
     assert len(samples) == len(predictor.calls) == len(logs) == 3
     assert [float(row["reward"]) for row in samples] == [1.25, 2.25, 3.25]
     assert [int(row["training_budget_used"]) for row in samples] == [1, 2, 3]
-    assert len(saved(tmp_path)["buffer"]) > 3 * env.n_components
+    assert len(saved(tmp_path)["buffer"]) > 3 * env.max_steps
 
 
 class ScientificMetadataPredictor:
@@ -360,12 +364,10 @@ def test_scientific_training_and_generation_export_matching_gated_properties(tmp
     # structure builder or scientific library inference is needed.
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [str(_REPO), os.environ.get("PYTHONPATH")])) )
     cfg = _config(count_duplicates=True)
-    cfg.pop("predictor")
     cfg.update(
-        models={"test": {"predictor": "tests.test_training_samples_integration:ScientificMetadataPredictor"}},
         properties=[
-            {"name": "delta", "model_ref": "test", "output": "delta", "direction": "max", "objective": "mean"},
-            {"name": "synthesis_probability", "model_ref": "test", "output": "probability", "direction": "max", "objective": "mean"},
+            {"name": "delta", "predictor": "tests.test_training_samples_integration:ScientificMetadataPredictor", "output": "delta", "direction": "max", "objective": "mean"},
+            {"name": "synthesis_probability", "predictor": "tests.test_training_samples_integration:ScientificMetadataPredictor", "output": "probability", "direction": "max", "objective": "mean"},
         ],
         reward={"type": "gated", "gates": [{"name": "synthesis", "score": {
             "type": "weighted_sum", "terms": {"synthesis_probability": 1.0}}, "min": .8}],

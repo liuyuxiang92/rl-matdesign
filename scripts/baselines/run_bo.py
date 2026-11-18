@@ -71,7 +71,7 @@ def main() -> None:
     n = C.n_steps(env)
     ub = C.action_upper_bound(env)
     budget = args.budget or C.default_budget(cfg)
-    print(f"[BO] env_type={env_type}, n_components={n}, action_ub={ub}, "
+    print(f"[BO] env_type={env_type}, max_steps={n}, action_ub={ub}, "
           f"budget(valid trials)={budget}, startup={args.n_startup_trials}")
 
     cache: dict = {}

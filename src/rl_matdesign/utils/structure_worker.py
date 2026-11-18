@@ -32,9 +32,6 @@ def main(fd: int) -> None:
 
             cfg = setup["cfg"]
             builder = resolve_builder(setup["kind"], cfg, seed=setup["seed"])
-            geo_opt = cfg.get("geo_opt") or {}
-            geo_enabled = bool(geo_opt) and bool(geo_opt.get("enabled", True))
-            geo_calc = None
             connection.send({"ok": True,
                              "sample_protocol": callable(getattr(builder, "build_sample", None))})
         except Exception:
@@ -82,21 +79,9 @@ def main(fd: int) -> None:
                             "structure_parallel requires a builder returning exactly one "
                             f"structure for n_configs=1; got {len(atoms_list)}. "
                             "Expanded ensembles require an explicit template/sample protocol "
-                            "(supported by the built-in substitute builder), or the native serial path."
+                            "(supported by the built-in pipeline builder), or the native serial path."
                         )
                     atoms = atoms_list[0]
-                    if geo_enabled:
-                        from rl_matdesign.utils.structure import relax_structure
-                        if geo_calc is None:
-                            from deepmd.calculator import DP
-                            head = geo_opt.get("head")
-                            geo_calc = DP(model=geo_opt.get("model", "models/DPA-3.1-3M.pt"),
-                                          **({"head": head} if head else {}))
-                        atoms = relax_structure(
-                            atoms, calc=geo_calc, fmax=float(geo_opt.get("fmax", 0.001)),
-                            steps=int(geo_opt.get("steps", 1000)),
-                            relax_cell=bool(geo_opt.get("relax_cell", True)),
-                        )
                     if sample is not None:
                         attach_sample_identity(atoms, sample)
                 # ASE copy drops the calculator. Do not serialize a live DeepMD
@@ -111,12 +96,10 @@ def main(fd: int) -> None:
             if stage_times is not None:
                 supported = getattr(builder, "timing_stages", ()) or ()
                 supported = [supported] if isinstance(supported, str) else list(supported)
-                if geo_enabled:
-                    supported.append("opt")
                 reply["timing"] = summarize_stage_times(
                     stage_times, time.perf_counter() - started,
-                    md_expected=bool(cfg.get("md") or getattr(builder, "md", None)),
-                    opt_expected=bool(geo_enabled or cfg.get("opt") or getattr(builder, "opt", None)),
+                    md_expected=bool(getattr(builder, "md", None)),
+                    opt_expected=bool(getattr(builder, "opt", None)),
                     supported_stages=supported,
                     config_succeeded=int(reply["ok"]),
                 )

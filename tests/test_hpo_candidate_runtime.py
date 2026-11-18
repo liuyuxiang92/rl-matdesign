@@ -111,7 +111,7 @@ def test_generation_starts_fresh_and_keeps_failed_scientific_gates(tmp_path, mon
     monkeypatch.setattr(training, "_rollout_policy_episode", lambda **kw: training._rollout_random_episode(kw["env"]))
     qnet = torch.nn.Linear(1, 1)
     rows = training.generate_candidates(env=env, predictor=pred, scaler=None,
-        device=torch.device("cpu"), elem_feats_scaled=np.zeros((1, 1)), fraction_set=["1"],
+        device=torch.device("cpu"), elem_feats_scaled=np.zeros((1, 1)), action_values=["1"],
         qnet=qnet, n_exploit=3, gen_temperature=.1)
     env.hpo_recorder.close()
     assert len(rows) == 3
@@ -244,7 +244,7 @@ def test_generation_resume_preserves_candidates_cost_rng_and_predictor(tmp_path,
             stack.callback(env.hpo_recorder.close)
             training.generate_candidates(env=env, predictor=predictor, scaler=None,
                 device=torch.device("cpu"), elem_feats_scaled=np.zeros((1, 1)),
-                fraction_set=["1"], qnet=qnet, n_exploit=3, gen_temperature=.1)
+                action_values=["1"], qnet=qnet, n_exploit=3, gen_temperature=.1)
     state = torch.load(tmp_path / "generation_checkpoint.pt", weights_only=False)
     assert state["hpo_state"]["budget"]["attempts_started"] == batch_size
     restore_rng_state(state["rng_state"])
@@ -259,7 +259,7 @@ def test_generation_resume_preserves_candidates_cost_rng_and_predictor(tmp_path,
     monkeypatch.setattr(training, "_save_checkpoint", original_save)
     rows = training.generate_candidates(env=resumed_env, predictor=resumed_predictor, scaler=None,
         device=torch.device("cpu"), elem_feats_scaled=np.zeros((1, 1)),
-        fraction_set=["1"], qnet=qnet, n_exploit=3, gen_temperature=.1)
+        action_values=["1"], qnet=qnet, n_exploit=3, gen_temperature=.1)
     resumed_env.hpo_recorder.close()
     assert draws[batch_size] == expected_next_draw
     assert [row["formula"] for row in rows] == ["A1", "B1", "C1"]

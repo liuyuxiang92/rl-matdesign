@@ -18,11 +18,10 @@ spec.loader.exec_module(summary)
 def configuration():
     return {"groups": [{"name": "glass", "kind": "composition", "species_set": ["SiO2", "B2O3"]}],
             "train_count_duplicates": False, "eval_seed": 11,
-            "models": {"glass": {"predictor": "glassnet"}},
             "properties": [
-                {"name": "forming", "model_ref": "glass", "output": "T3"},
-                {"name": "expansion", "model_ref": "glass", "output": "CTEbelowTg"},
-                {"name": "transition", "model_ref": "glass", "output": "Tg"}],
+                {"name": "forming", "predictor": "glassnet", "output": "T3"},
+                {"name": "expansion", "predictor": "glassnet", "output": "CTEbelowTg"},
+                {"name": "transition", "predictor": "glassnet", "output": "Tg"}],
             "reward": {"type": "gated", "objective": {"terms": {"forming": 1}},
                        "gates": [{"name": "cte", "score": {"terms": {"expansion": 1}}, "max": 5e-6},
                                  {"name": "tg", "score": {"terms": {"transition": 1}}, "min": 773}],
@@ -130,6 +129,18 @@ def test_classifier_gate_uses_model_spread_not_native_uncertainty():
     output = ScientificOutput(OutputSchema("p", "1"), .6, model_spread=.2, native_uncertainty=.01)
     feasible, _, _ = summary.outputs_and_feasibility(cfg, {"outputs": {"p": output.to_dict()}})
     assert feasible is False
+
+
+@pytest.mark.parametrize("edit", [
+    lambda cfg: cfg["properties"][0].update(weight=1),
+    lambda cfg: cfg["reward"].pop("objective"),
+])
+def test_retired_or_ambiguous_reward_protocol_has_unknown_feasibility(edit):
+    cfg = configuration()
+    edit(cfg)
+    feasible, physical, issue = summary.outputs_and_feasibility(cfg, observation())
+    assert feasible is None and physical == {}
+    assert issue and ("weight" in issue or "reward.objective" in issue)
 
 
 def test_optimizer_counts_use_update_rows_only_and_missing_counts_stay_unknown(tmp_path):

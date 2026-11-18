@@ -1,235 +1,95 @@
+#!/usr/bin/env python3
+"""Evaluate elemental amount recipes using a complete current scenario YAML.
+
+Example: --config configs/ooh.yaml --formula Ni0.70Fe0.15Ce0.05Er0.05Tm0.05. Formula amounts are
+exact design-group amounts, without a scaffold suffix. Templates, adsorbates,
+simulation, models and uncertainty are taken from the scenario configuration.
+For compound precursor choices use evaluate_lips.py or the full named candidate
+interface rather than trying to infer recipes from an elemental formula.
+"""
 from __future__ import annotations
 
 import argparse
 import csv
 import os
+from pathlib import Path
 import re
 import sys
-from typing import Dict, Iterable, List, Tuple
+
+_ROOT=Path(__file__).resolve().parents[1]
+for _sub in ('src','scripts'):
+    sys.path.insert(0,str(_ROOT/_sub))
+for _key in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS'):
+    os.environ.setdefault(_key,'1')
 
 
-def parse_cation_fractions(formula: str, *, anion_formula: str) -> Dict[str, float]:
-    """Parse a terminal formula like 'Ni0.70Fe0.15...O2H1' into {el: frac}.
-
-    Notes:
-    - This intentionally does NOT use pymatgen to avoid extra dependencies and warnings.
-    - It assumes the formula uses explicit decimal fractions for each cation.
-    """
-
-    if anion_formula and formula.endswith(anion_formula):
-        core = formula[: -len(anion_formula)]
-    else:
-        core = formula
-
-    parts = re.findall(r"([A-Z][a-z]?)([0-9]*\.?[0-9]+)", core)
-    if not parts:
-        raise ValueError(f"Could not parse any (element,fraction) pairs from: {formula}")
-
-    comp: Dict[str, float] = {}
-    for el, frac_str in parts:
-        comp[el] = comp.get(el, 0.0) + float(frac_str)
-
-    return comp
+def formula_candidate(formula, group):
+    from pymatgen.core import Composition
+    from rl_matdesign.amounts import ChemicalAmountsGroup
+    if any(re.fullmatch(r'[A-Z][a-z]?', label) is None for label in group['species_set']):
+        raise ValueError('Elemental formula input cannot preserve compound precursor identity')
+    composition=Composition(formula).get_el_amt_dict()
+    unknown=set(composition)-set(group['species_set'])
+    if unknown:
+        raise ValueError(f'Formula contains choices outside the design group: {sorted(unknown)}; omit scaffold atoms')
+    exact={}
+    for label in group['species_set']:
+        value=float(composition.get(label,0))
+        lower,upper=group.get('element_bounds',{}).get(label,(-float('inf'),float('inf')))
+        if not lower <= value <= upper:
+            raise ValueError(f'{label}: final amount violates element_bounds')
+        exact[label]=[value,value]
+    ChemicalAmountsGroup({**group,'element_bounds':exact},state_featurizer=lambda _: [0.])
+    return {group['name']:{label:float(value) for label,value in composition.items() if value}}
 
 
-def iter_formulas(args: argparse.Namespace) -> Iterable[str]:
-    for f in args.formula:
-        if f.strip():
-            yield f.strip()
-
+def iter_formulas(args):
+    yield from (formula.strip() for formula in args.formula if formula.strip())
     if args.formulas_file:
-        with open(args.formulas_file, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                # allow either "formula" alone, or "formula\tvalue" style
+        for line in args.formulas_file.read_text().splitlines():
+            line=line.strip()
+            if line and not line.startswith('#'):
                 yield line.split()[0]
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Evaluate DeepMD dp_mean/dp_std/objective for one or more terminal formulas. "
-            "Useful to check whether the DP model can reproduce low experimental candidates."
-        )
-    )
-    parser.add_argument(
-        "--formula",
-        action="append",
-        default=[],
-        help="Terminal formula like 'Ni0.70Fe0.15Ce0.05Er0.05Tm0.05O2H1'. Repeatable.",
-    )
-    parser.add_argument(
-        "--formulas-file",
-        type=str,
-        default=None,
-        help="Text file with one formula per line (optionally followed by whitespace + value).",
-    )
-    parser.add_argument("--anion-formula", type=str, default="O2H1")
-
-    parser.add_argument(
-        "--dp-model",
-        action="append",
-        default=None,
-        help=(
-            "Path to a DeepMD .pt checkpoint. Repeat for ensemble. "
-            "Defaults to model_1.ckpt.pt … model_5.ckpt.pt if not specified."
-        ),
-    )
-    parser.add_argument("--dp-poscar", type=str, default="POSCAR")
-    parser.add_argument("--dp-n-random-configs", type=int, default=10)
-    parser.add_argument("--dp-ads-height", type=float, default=1.9)
-    parser.add_argument("--dp-ads-dz", type=float, default=1.0)
-    parser.add_argument(
-        "--dp-uncertainty",
-        type=str,
-        default="models",
-        choices=["models", "configs", "total"],
-    )
-    parser.add_argument(
-        "--dp-objective",
-        type=str,
-        default="mean_minus_kstd",
-        choices=["mean", "mean_minus_kstd", "mean_plus_kstd", "exp_scaled"],
-    )
-    parser.add_argument("--dp-k", type=float, default=1.0)
-    parser.add_argument("--dp-exp-ref", type=float, default=230.0,
-        help="Reference overpotential (mV) for exp_scaled objective. Default: 230.")
-    parser.add_argument("--dp-exp-scale", type=float, default=10.0,
-        help="Scale factor in denominator for exp_scaled objective. Default: 10.")
-
-    parser.add_argument(
-        "--dp-debug-dir",
-        type=str,
-        default=None,
-        help="If set, dump the exact POSCAR frames used for DP evaluation into this directory.",
-    )
-
-    parser.add_argument(
-        "--geo-opt",
-        action="store_true",
-        help="Geometry-optimize each structure (LBFGS, fmax=0.001, max 1000 steps) before DP property evaluation.",
-    )
-    parser.add_argument(
-        "--geo-opt-model",
-        type=str,
-        default="./DPA-3.1-3M_1.pt",
-        help="Path to DP model .pt for geometry optimization (default: ./DPA-3.1-3M_1.pt).",
-    )
-
-    parser.add_argument(
-        "--adsorbates",
-        nargs="*",
-        default=None,
-        metavar="NAME",
-        help="Which intermediates to place on each doped slab (O, OH, OOH). "
-             "Pass the flag with NO names (--adsorbates) to evaluate the bare "
-             "parent slab. Omit the flag entirely for the default O OH OOH.",
-    )
-    parser.add_argument(
-        "--output-index",
-        type=int,
-        default=0,
-        help="Which scalar to read from the flattened model output (default 0). "
-             "The batch is frame-major, so with several adsorbates index 0 is the "
-             "first one in --adsorbates order.",
-    )
-
-    parser.add_argument("--out-csv", type=str, default=None)
-
-    args = parser.parse_args()
-
-    if args.dp_model is None:
-        args.dp_model = [
-            "model_1.ckpt.pt",
-            "model_2.ckpt.pt",
-            "model_3.ckpt.pt",
-            "model_4.ckpt.pt",
-            "model_5.ckpt.pt",
-        ]
-
-    from abcde_ooh.dp_predictor import (
-        ADSORBATE_MODES,
-        DPConfig,
-        DeepMDOverpotentialPredictor,
-        normalize_adsorbates,
-        objective_from_mean_std,
-    )
-
-    # argparse gives None when the flag is absent and [] when it is passed bare,
-    # so "--adsorbates" with no names means the clean slab while omitting it keeps
-    # the historical three.
-    adsorbates = (
-        ADSORBATE_MODES if args.adsorbates is None
-        else normalize_adsorbates(args.adsorbates)
-    )
-
-    cfg = DPConfig(
-        base_poscar=args.dp_poscar,
-        model_files=tuple(args.dp_model),
-        n_random_configs=args.dp_n_random_configs,
-        ads_height=args.dp_ads_height,
-        ads_dz=args.dp_ads_dz,
-        seed=0,
-        geo_opt=args.geo_opt,
-        geo_opt_model=args.geo_opt_model,
-        output_index=args.output_index,
-        adsorbates=adsorbates,
-    )
-    predictor = DeepMDOverpotentialPredictor(cfg)
-
-    rows: List[dict] = []
-
-    skipped: List[Tuple[str, str]] = []
-
-    for formula in iter_formulas(args):
-        try:
-            comp = parse_cation_fractions(formula, anion_formula=args.anion_formula)
-            mean, std = predictor.predict_overpotential(
-                comp,
-                uncertainty=args.dp_uncertainty,
-                debug_dir=args.dp_debug_dir,
-            )
-            obj = objective_from_mean_std(
-                float(mean), float(std),
-                mode=args.dp_objective, k=args.dp_k,
-                exp_ref=args.dp_exp_ref, exp_scale=args.dp_exp_scale,
-            )
-            reward = -float(obj)
-
-            rows.append(
-                {
-                    "formula": formula,
-                    "dp_mean": float(mean),
-                    "dp_std": float(std),
-                    "dp_objective": float(obj),
-                    "reward": float(reward),
-                }
-            )
-        except Exception as exc:
-            skipped.append((formula, str(exc)))
-            print(f"[WARN] Skipping {formula}: {exc}", flush=True)
-
-    if args.out_csv:
-        with open(args.out_csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["formula", "dp_mean", "dp_std", "dp_objective", "reward"])
-            w.writeheader()
-            w.writerows(rows)
-        print(f"Wrote {len(rows)} rows -> {args.out_csv}")
-    else:
-        w = csv.DictWriter(
-            sys.stdout,
-            fieldnames=["formula", "dp_mean", "dp_std", "dp_objective", "reward"],
-        )
-        w.writeheader()
-        w.writerows(rows)
-
-    if skipped:
-        print(f"\n[WARN] {len(skipped)} formula(s) skipped due to errors:")
-        for formula, reason in skipped:
-            print(f"  {formula}: {reason}")
+def main(argv=None):
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config',required=True)
+    parser.add_argument('--formula',action='append',default=[])
+    parser.add_argument('--formulas-file',type=Path)
+    parser.add_argument('--seed',type=int,default=0)
+    parser.add_argument('--out-csv',type=Path)
+    args=parser.parse_args(argv)
+    from rl_matdesign.configuration import load_config
+    from rl_matdesign.registry import build_reward
+    cfg=load_config(args.config)
+    groups=cfg['groups']
+    if len(groups)!=1 or groups[0].get('kind')!='composition' or not cfg.get('structure'):
+        parser.error('Formula evaluation requires one composition group and an explicit structure pipeline')
+    try:
+        items=[(formula,formula_candidate(formula,groups[0])) for formula in iter_formulas(args)]
+        if not items: raise ValueError('Supply --formula or --formulas-file')
+    except (ValueError,TypeError) as exc:
+        parser.error(str(exc))
+    predictor=build_reward(cfg,seed=args.seed)
+    from evaluate_lips import evaluate_one
+    rows=[]
+    try:
+        for formula,candidate in items:
+            result=evaluate_one(predictor,candidate)
+            row={'candidate_formula':formula,'structure_formula':result['formula'],'reward':result['reward'],'dp_mean':result['dp_mean']}
+            for name,(mean,std) in result['stats'].items():
+                row[f'{name}_mean']=mean; row[f'{name}_std']=std
+            rows.append(row)
+            print(row)
+        if args.out_csv:
+            with args.out_csv.open('w',newline='',encoding='utf-8') as stream:
+                writer=csv.DictWriter(stream,fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
+    finally:
+        close=getattr(predictor,'close',None)
+        if callable(close): close()
+    return 0
 
 
-if __name__ == "__main__":
-    main()
+if __name__=='__main__':
+    raise SystemExit(main())

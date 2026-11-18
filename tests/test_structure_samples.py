@@ -3,14 +3,14 @@ from copy import deepcopy
 
 import pytest
 
-from rl_matdesign.structure_sources import StructureSourceSpec
+from rl_matdesign.structure_sources import StructureSpec
 from rl_matdesign.utils.structure_samples import (
     SAMPLE_INFO_KEY, attach_sample_identity, canonical_sample_candidate, sample_plan,
 )
 
 
 def test_sample_plan_retains_template_counts_and_uses_source_seed_protocol():
-    source = StructureSourceSpec('bulk', {'builder': 'substitute', 'base_poscar': ['a', 'b']})
+    source = StructureSpec({'builder': 'external:Templates', 'base_poscar': ['a', 'b']})
     templates = [{'path': 'a', 'site_symbol': 'X', 'n_configs': 2},
                  {'path': 'b', 'site_symbol': 'Fe'}]
     candidate = {'Ni': .6, 'Fe': .4}
@@ -28,7 +28,7 @@ def test_sample_plan_retains_template_counts_and_uses_source_seed_protocol():
 
 def test_sample_metadata_is_defensive_and_does_not_overwrite_builder_information():
     from ase import Atoms
-    source = StructureSourceSpec('bulk', {'builder': 'native'})
+    source = StructureSpec({'builder': 'native'})
     sample = sample_plan({'Fe': 1}, n_configs=1, source_spec=source, eval_seed=1)[0]
     atoms = Atoms('H')
     atoms.info['builder'] = 'kept'
@@ -41,7 +41,7 @@ def test_sample_metadata_is_defensive_and_does_not_overwrite_builder_information
         attach_sample_identity(atoms, other)
     assert atoms.info == snapshot
     atoms.info[SAMPLE_INFO_KEY]['source_id'] = 'changed'
-    assert sample.record()['source_id'] == 'bulk'
+    assert sample.record()['source_id'] == 'structure'
 
 
 def test_canonical_candidate_sorts_mappings_without_erasing_typed_fields_or_sequence_order():
@@ -55,7 +55,7 @@ def test_canonical_candidate_sorts_mappings_without_erasing_typed_fields_or_sequ
 
 @pytest.mark.parametrize('count', [0, -1, True, 1.5, '2'])
 def test_sample_counts_are_not_silently_coerced(count):
-    source = StructureSourceSpec('bulk', {'builder': 'native'})
+    source = StructureSpec({'builder': 'native'})
     with pytest.raises(ValueError, match='positive integer'):
         sample_plan({}, n_configs=count, source_spec=source, eval_seed=1)
     with pytest.raises(ValueError, match='positive integer'):
@@ -72,7 +72,7 @@ class _ExplicitSampleBuilder:
 
 def test_generic_explicit_protocol_serial_batches_share_candidate_stable_plan():
     from rl_matdesign.utils.structure_samples import execute_many_seeded_samples, execute_seeded_samples
-    source = StructureSourceSpec('bulk', {'builder': 'external:Explicit'})
+    source = StructureSpec({'builder': 'external:Explicit'})
     kwargs = dict(n_configs=3, source_spec=source, eval_seed=13)
     builder = _ExplicitSampleBuilder()
     a, b = {'Ni': .5, 'Co': .5}, {'Ni': .25, 'Co': .75}
@@ -91,7 +91,7 @@ def test_missing_sample_capability_fails_before_native_build():
     class Native:
         def build(self, candidate, **kwargs):
             pytest.fail('Opaque native ensemble must not be called by explicit protocol')
-    source = StructureSourceSpec('bulk', {'builder': 'external:Native'})
+    source = StructureSpec({'builder': 'external:Native'})
     with pytest.raises(EvaluationProtocolError, match='explicit build_sample') as exc:
         execute_many_seeded_samples(Native(), [{}, {}], n_configs=2, source_spec=source, eval_seed=1)
     assert isinstance(exc.value, SamplingProtocolError)
@@ -104,7 +104,7 @@ def test_candidate_plan_failure_is_aligned_and_does_not_discard_neighbors():
             if candidate.get('fail'):
                 raise ValueError('invalid candidate plan')
             return sample_plan(candidate, **kwargs)
-    source = StructureSourceSpec('bulk', {'builder': 'external:Planner'})
+    source = StructureSpec({'builder': 'external:Planner'})
     builder = Planner()
     result = execute_many_seeded_samples(builder, [{'id': 'a'}, {'fail': True}, {'id': 'c'}],
                                          n_configs=2, source_spec=source, eval_seed=1)
@@ -121,7 +121,7 @@ def test_candidate_plan_failure_is_aligned_and_does_not_discard_neighbors():
 def test_custom_plan_must_honor_explicit_source_and_sample_identity(corruption):
     from dataclasses import replace
     from rl_matdesign.utils.structure_samples import resolve_sample_plan
-    source = StructureSourceSpec('bulk', {'builder': 'external:Planner'})
+    source = StructureSpec({'builder': 'external:Planner'})
     class Planner(_ExplicitSampleBuilder):
         def sample_plan(self, candidate, **kwargs):
             plan = sample_plan(candidate, **kwargs)
@@ -141,7 +141,7 @@ def test_custom_plan_must_honor_explicit_source_and_sample_identity(corruption):
 
 def test_custom_planner_cannot_mutate_callers_candidate_or_reseed_modified_candidate():
     from rl_matdesign.utils.structure_samples import resolve_sample_plan
-    source = StructureSourceSpec('bulk', {'builder': 'external:Planner'})
+    source = StructureSpec({'builder': 'external:Planner'})
     class Planner(_ExplicitSampleBuilder):
         def sample_plan(self, candidate, **kwargs):
             candidate['nested']['Fe'] = 2
@@ -160,7 +160,7 @@ def test_explicit_sample_requires_single_atoms_and_retains_successful_samples():
             if sample.sample_index == 1:
                 raise RuntimeError('single sample construction failed')
             return result
-    source = StructureSourceSpec('bulk', {'builder': 'external:BrokenSample'})
+    source = StructureSpec({'builder': 'external:BrokenSample'})
     builder = BrokenSample()
     cells = execute_seeded_samples(builder, {'Fe': 1}, n_configs=3, source_spec=source, eval_seed=1)
     assert [cell.info[SAMPLE_INFO_KEY]['sample_index'] for cell in cells] == [0, 2]
@@ -178,7 +178,7 @@ def test_sample_protocol_errors_propagate_without_trying_more_samples():
             self.calls += 1
             raise EvaluationProtocolError('invalid configured oracle')
     builder = InvalidProtocol()
-    source = StructureSourceSpec('bulk', {'builder': 'external:InvalidProtocol'})
+    source = StructureSpec({'builder': 'external:InvalidProtocol'})
     with pytest.raises(EvaluationProtocolError, match='invalid configured oracle'):
         execute_many_seeded_samples(builder, [{}, {}], n_configs=2, source_spec=source, eval_seed=1)
     assert builder.calls == 1

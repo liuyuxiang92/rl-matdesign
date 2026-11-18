@@ -32,10 +32,13 @@ class Builder(Base):
 ''')
     root = tmp_path / "training_workers"
     inner = StructureScorePredictor({
-        "builder": "composition_batch_builder:Builder", "test_root": str(root),
-        "n_random_configs": 2, "predict_cache_size": 1,
-        "structure_parallel": {
-            "devices": "auto", "timeout_s": 20, "startup_timeout_s": 20,
+        "predict_cache_size": 1,
+        "structure": {
+            "builder": "composition_batch_builder:Builder", "test_root": str(root),
+            "n_random_configs": 2,
+            "structure_parallel": {
+                "devices": "auto", "timeout_s": 20, "startup_timeout_s": 20,
+            },
         },
         "properties": [
             {"name": "delta", "predictor": "dp_property", "models": ["unused"],
@@ -66,7 +69,7 @@ class Builder(Base):
     env = ScriptedEnv(["A", "B", "A", "C"], predictor)
     try:
         _, _, rows = training.train_dqn_online(
-            env=env, elem_feats_scaled=np.array([[.1, .2]]), fraction_set=["0.5"],
+            env=env, elem_feats_scaled=np.array([[.1, .2]]), action_values=["0.5"],
             device=torch.device("cpu"), hidden_dim=4, n_warmup_eps=2,
             dqn_num_train_eps=2, batch_size=1, dqn_grad_steps_per_ep=1,
             dqn_target_update_freq=2, dqn_eps_anneal_eps=10,

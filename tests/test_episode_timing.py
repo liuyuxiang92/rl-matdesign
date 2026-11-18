@@ -116,24 +116,25 @@ def test_scalar_retry_logs_failed_work_separately_and_does_not_reuse_stale_timin
     assert recorder.rows[0]["rl_update_s"] == 0
 
 
-def test_adapter_aligns_invalid_payloads_and_copies_timing(clock):
+def test_adapter_aligns_failed_candidates_and_copies_timing(clock):
     predictor = TimedPredictor(clock, 2)
-    reward = configuration._TerminalReward(predictor, "multi_group")
-    reward._candidate = lambda payload: None if payload == "invalid" else payload
-    result = reward.evaluate_many([{"A": 1}, "invalid", {"C": 1}])
-    assert result == [1, configuration._FAILED_CANDIDATE_REWARD, 3]
-    assert reward.last_evaluation_timings[1] == {}
+    reward = configuration._TerminalReward(predictor)
+    result = reward.evaluate_many([{"A": 1}, {"X": 1}, {"C": 1}])
+    assert result[0] == 1 and result[2] == 3
+    assert isinstance(result[1], training.CandidateEvaluationFailed)
+    assert reward.last_evaluation_timings[1]["md_task_s"] == 30
     assert reward.last_evaluation_timings[0]["md_task_s"] == 30
     assert reward.last_evaluation_timings[2]["md_task_s"] == 0
     predictor.last_evaluation_timings[0]["md_task_s"] = 999
     assert reward.last_evaluation_timings[0]["md_task_s"] == 30
-    reward("invalid")
-    assert reward.last_evaluation_timings == [{}]
-    assert reward.last_evaluation_wall_s == 0
+    with pytest.raises(training.CandidateEvaluationFailed):
+        reward({"X": 1})
+    assert reward.last_evaluation_timings[0]["md_task_s"] == 30
+    assert reward.last_evaluation_wall_s == 20
 
 
 def test_legacy_predictor_does_not_fabricate_md_opt_times(clock):
-    reward = configuration._TerminalReward(SimpleNamespace(predict=lambda _: (1, 0)), "multi_group")
+    reward = configuration._TerminalReward(SimpleNamespace(predict=lambda _: (1, 0)))
     assert reward({"A": 1}) == 1
     assert reward.last_evaluation_timings == [{}]
 
@@ -205,7 +206,7 @@ def test_generation_keeps_timing_out_of_candidate_schema(clock, monkeypatch):
     rows = training.generate_candidates(
         env=env, predictor=predictor, qnet=torch.nn.Linear(1, 1),
         scaler=StandardScaler().fit([[0.0, 1.0], [1.0, 1.0]]), device=torch.device("cpu"),
-        elem_feats_scaled=np.array([[0.1, 0.2]]), fraction_set=["0.5"],
+        elem_feats_scaled=np.array([[0.1, 0.2]]), action_values=["0.5"],
         n_exploit=2, n_explore=0, max_attempts=4,
     )
     assert [r["formula"] for r in rows] == ["A1", "B1"]
@@ -240,7 +241,7 @@ def test_pg_failure_guard_flushes_successful_untrained_batch(clock, monkeypatch)
     successful = [row for row in recorder.rows if row["status"] == "ok"]
     assert len(failed) == 11
     assert len(successful) == 1
-    assert successful[0]["formula"] == "Na1.00"
+    assert successful[0]["formula"] == "Na1"
     assert successful[0]["episode"] == 1
     assert successful[0]["rl_update_s"] == 0
     assert successful[0]["eval_wall_share_s"] > 0

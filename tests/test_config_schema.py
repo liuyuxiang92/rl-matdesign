@@ -139,18 +139,17 @@ def test_gamma_fallbacks_apply_after_overrides():
 
 def test_false_zero_and_none_cli_values_have_distinct_meanings():
     result = resolve_config(
-        {"method": "dqn", "constrain_training": True, "train_count_duplicates": True,
+        {"method": "dqn", "train_count_duplicates": True,
          "eval_seed": 9, "gen_epsilon": 0.2},
-        {"method": None, "constrain_training": False, "train_count_duplicates": False,
+        {"method": None, "train_count_duplicates": False,
          "eval_seed": 0, "gen_epsilon": 0},
     )
     assert result.config["method"] == "dqn"
     assert result.sources["method"] == "yaml"
-    assert result.config["constrain_training"] is False
     assert result.config["train_count_duplicates"] is False
     assert result.config["eval_seed"] == 0
     assert result.config["gen_epsilon"] == 0
-    assert result.sources["constrain_training"] == "override"
+    assert result.sources["train_count_duplicates"] == "override"
 
 
 def test_method_override_retains_inactive_algorithm_parameters():
@@ -176,7 +175,7 @@ def test_seed_fallbacks_and_generation_cap_follow_effective_values():
 
 @pytest.mark.parametrize("key,value", [
     ("eval_seed", -1), ("train_seed", 2**32), ("gen_seed", 1.5),
-    ("constrain_training", "false"), ("train_count_duplicates", 1),
+    ("train_count_duplicates", 1),
     ("dqn_batch_size", True), ("dqn_batch_size", 0),
     ("dqn_eps_anneal_eps", 0), ("dqn_lr", 0), ("pg_lr_actor", float("nan")),
     ("pg_lr_critic", float("inf")), ("gamma", 1.1), ("gen_epsilon", -0.1),
@@ -196,7 +195,7 @@ def test_scientific_notation_from_pyyaml_is_normalized():
 
 def test_unknown_core_key_suggests_correct_spelling():
     with pytest.raises(ConfigError, match="Did you mean 'dqn_batch_size'"):
-        resolve_config({"predictor": "dummy", "dqn_batch_szie": 32})
+        resolve_config({"dqn_batch_szie": 32})
 
 
 def test_nested_plugin_settings_are_preserved_without_claiming_validation():
@@ -208,57 +207,52 @@ def test_nested_plugin_settings_are_preserved_without_claiming_validation():
         resolve_config({**raw, "custom_top_level_option": 3})
 
 
-def test_named_structure_sources_have_an_owner_without_materializing_source_defaults():
-    raw = {
-        "structure_sources": {"bulk": {"builder": "external:Builder", "custom_option": [1, 2]}},
-        "properties": [{"name": "energy", "predictor": "external:Predictor", "source": "bulk"}],
-    }
+def test_structure_has_one_owner_without_materializing_defaults():
+    raw = {"structure": {"builder": "external:Builder", "custom_option": [1, 2]},
+           "properties": [{"name": "energy", "predictor": "external:Predictor"}]}
     before = deepcopy(raw)
     result = resolve_config(raw)
-    assert result.config["structure_sources"] == raw["structure_sources"]
-    assert result.sources["structure_sources"] == "yaml"
-    assert "n_random_configs" not in result.config["structure_sources"]["bulk"]
+    assert result.config["structure"] == raw["structure"]
+    assert result.sources["structure"] == "yaml"
+    assert "n_random_configs" not in result.config["structure"]
     assert raw == before
 
 
-@pytest.mark.parametrize("sources", [
-    [], {1: {}}, {"": {}}, {" bulk ": {}}, {"bulk": []},
-    {"bulk": {"n_random_configs": True}}, {"bulk": {"n_random_configs": 0}},
-    {"bulk": {"geo_opt": True}}, {"bulk": {"direction": "max"}},
-])
-def test_malformed_source_definitions_fail_in_lightweight_validation(sources):
-    with pytest.raises(ConfigError, match="structure_sources"):
-        resolve_config({"structure_sources": sources})
+@pytest.mark.parametrize("key,value", [("structure_sources", {}), ("sweep", {}),
+    ("share_structure", True), ("builder", "custom:Builder"), ("filters", ["smact_charge"])])
+def test_removed_parameters_fail_even_with_custom_predictor(key, value):
+    with pytest.raises(ConfigError, match="Removed top-level"):
+        resolve_config({key: value, "predictor": "external:Predictor"})
 
 
-@pytest.mark.parametrize("source", [None, 1, [], "", " bulk "])
-def test_property_source_requires_an_explicit_nonempty_name(source):
-    with pytest.raises(ConfigError, match=r"properties\[0\].source"):
+@pytest.mark.parametrize("source", [None, 1, [], "", "bulk"])
+def test_removed_property_source_rejected(source):
+    with pytest.raises(ConfigError, match="removed or structure-owned"):
         validate_config({"properties": [{"predictor": "external:Predictor", "source": source}]})
 
 
-def test_source_validation_does_not_import_ml_or_structure_backends():
+def test_structure_validation_does_not_import_ml_or_structure_backends():
     import subprocess
     import sys
     result = subprocess.run([sys.executable, "-c", """
 import sys
 from rl_matdesign.config_schema import resolve_config
-resolve_config({'structure_sources': {'bulk': {'builder': 'external:Builder'}},
-                'properties': [{'predictor': 'external:Predictor', 'source': 'bulk'}]})
+resolve_config({'structure': {'builder': 'external:Builder'},
+                'properties': [{'predictor': 'external:Predictor'}]})
 assert not {'torch', 'ase', 'pymatgen', 'deepmd', 'matminer'} & set(sys.modules)
 """], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
 
 
-def test_named_models_resolve_through_one_owner_without_mutating_authored_config():
-    raw = {"models": {"glass": {"predictor": "glassnet"}}, "properties": [
-        {"name": "cte", "model_ref": "glass", "output": "CTEbelowTg", "unit": "K^-1", "representation": "physical", "objective": "mean"},
-        {"name": "tg", "model_ref": "glass", "output": "Tg", "unit": "K"},
-    ]}
+def test_inline_models_preserve_authored_config():
+    raw = {"properties": [
+        {"name": "cte", "predictor": "glassnet", "output": "CTEbelowTg", "unit": "K^-1", "representation": "physical", "objective": "mean"},
+        {"name": "energy", "predictor": "dp_energy", "models": ["weights.pt"], "direction": "min"},
+    ], "reward": {"objective": {"terms": {"energy": 1}}}}
+    before = deepcopy(raw)
     result = resolve_config(raw)
-    assert result.config["models"] == raw["models"]
-    assert result.config["properties"] == raw["properties"]
-    assert result.sources["models"] == "yaml"
+    assert result.config["properties"] == before["properties"]
+    assert raw == before
 
 
 @pytest.mark.parametrize("field,value", [
@@ -271,38 +265,52 @@ def test_property_output_contract_rejects_ambiguous_values(field, value):
         resolve_config({"properties": [{"predictor": "external:Predictor", field: value}]})
 
 
-@pytest.mark.parametrize("definition,prop", [
-    ({"predictor": "glassnet", "direction": "min"}, {"model_ref": "g"}),
-    ({"predictor": "glassnet"}, {"model_ref": "unknown"}),
-    ({"predictor": "glassnet"}, {"model_ref": "g", "predictor": "glassnet"}),
-    ({"predictor": "glassnet", "batch_size": 32}, {"model_ref": "g", "batch_size": 32}),
+@pytest.mark.parametrize("key,value", [
+    ("predictor", "ooh"), ("predictor", "external:Predictor"),
+    ("models", {"g": {"predictor": "glassnet"}}), ("models", ["weights.pt"]),
+    ("model", "weights.pt"), ("dp_models", ["weights.pt"]),
+    ("objective", "mean"), ("uncertainty", "models"),
 ])
-def test_model_definition_conflicts_fail_before_backend_construction(definition, prop):
-    with pytest.raises(ConfigError, match="Named model"):
-        resolve_config({"models": {"g": definition}, "properties": [prop]})
+def test_flat_model_settings_are_rejected(key, value):
+    with pytest.raises(ConfigError, match="Removed top-level"):
+        resolve_config({key: value, "properties": [{"predictor": "dummy"}]})
 
 
-def test_legacy_flat_models_list_is_not_a_named_resource_table():
-    assert resolve_config({"predictor": "external:Predictor", "models": ["weights.pt"]}).config["models"] == ["weights.pt"]
+@pytest.mark.parametrize("key,value", [
+    ("model_ref", "glass"), ("model", "weights.pt"), ("dp_models", ["weights.pt"]),
+])
+def test_retired_property_model_settings_are_rejected(key, value):
+    with pytest.raises(ConfigError, match=key):
+        resolve_config({"properties": [{"predictor": "external:Predictor", key: value}]})
+
+
+@pytest.mark.parametrize("value", [0, 1, None])
+def test_removed_property_weight_is_rejected(value):
+    with pytest.raises(ConfigError, match=r"weight was removed; put coefficients in reward terms"):
+        resolve_config({"properties": [{"name": "p", "predictor": "external:Predictor", "weight": value}],
+                        "reward": {"objective": {"terms": {"p": 1}}}})
+
+
+@pytest.mark.parametrize("reward", [None, {}, {"type": "weighted_sum"}])
+def test_multi_property_reward_must_select_its_terms(reward):
+    cfg = {"properties": [{"name": "performance"}, {"name": "diagnostic"}]}
+    if reward is not None:
+        cfg["reward"] = reward
+    with pytest.raises(ConfigError, match="Multiple properties require explicit reward.objective.terms"):
+        resolve_config(cfg)
+    cfg["reward"] = {"objective": {"terms": {"performance": 1}}}
+    assert resolve_config(cfg).config["reward"] == cfg["reward"]
+
+
+@pytest.mark.parametrize("models", [None, [], "weights.pt", {}, [None], [""], [1]])
+def test_models_require_nonempty_path_lists(models):
     with pytest.raises(ConfigError, match="models"):
-        resolve_config({"models": ["weights.pt"], "properties": [{"predictor": "dp_energy"}]})
+        resolve_config({"properties": [{"predictor": "dp_energy", "models": models}]})
 
 
-@pytest.mark.parametrize("selector", [
-    {"predictor": "custom:Predictor"},
-    {"builder": "custom:Builder"},
-    {"filters": [{"type": "custom:Filter"}]},
-])
-def test_flat_fqn_plugin_owns_its_custom_keys_but_not_core_typos(selector):
-    result = resolve_config({**selector, "custom_option": {"foo": 1}})
-    assert result.config["custom_option"] == {"foo": 1}
-    with pytest.raises(ConfigError, match="dqn_batch_szie"):
-        resolve_config({**selector, "dqn_batch_szie": 32})
-
-
-def test_flat_extension_does_not_hide_a_nonprefixed_core_typo():
+def test_property_fqn_does_not_hide_a_top_level_typo():
     with pytest.raises(ConfigError, match="Did you mean 'method'"):
-        resolve_config({"predictor": "custom:Predictor", "methodd": "dqn"})
+        resolve_config({"properties": [{"predictor": "custom:Predictor"}], "methodd": "dqn"})
 
 
 def test_validate_does_not_materialize_defaults_before_hpo_overrides():
@@ -339,3 +347,20 @@ def test_documented_parameter_table_is_generated_from_definitions():
     path = Path(__file__).resolve().parents[1] / "docs" / "configuration_schema.md"
     content = path.read_text()
     assert content.split("<!-- schema:start -->\n")[1].split("<!-- schema:end -->")[0] == schema_markdown()
+
+
+@pytest.mark.parametrize("value", [True, False])
+@pytest.mark.parametrize("source", ["yaml", "override"])
+def test_removed_training_filter_toggle_is_rejected(value, source):
+    config, overrides = ({"constrain_training": value}, {}) if source == "yaml" else ({}, {"constrain_training": value})
+    with pytest.raises(ConfigError, match="constrain_training"):
+        resolve_config(config, overrides)
+
+
+@pytest.mark.parametrize("flag", ["--constrain-training", "--no-constrain-training"])
+def test_removed_training_filter_cli_flags_are_rejected(flag, capsys):
+    from rl_matdesign.experiment import parse_args
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["--config", "unused.yaml", "--out", "unused-output", flag])
+    assert exc.value.code == 2
+    assert f"unrecognized arguments: {flag}" in capsys.readouterr().err

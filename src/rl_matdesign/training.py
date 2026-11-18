@@ -1,6 +1,6 @@
 """RL training functions for rl_matdesign experiments.
 
-All functions are domain-agnostic: they operate on a :class:`CompositionEnv`
+All functions are domain-agnostic: they operate on a :class:`MultiGroupEnv`
 and a :class:`~rl_matdesign.predictors.base.PropertyPredictor` and contain
 no material-system-specific logic.
 
@@ -38,7 +38,7 @@ import torch
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
-from .env import CompositionEnv
+from .env_multigroup import MultiGroupEnv
 from .action_features import value_features, value_feature_dim
 from .predictors.base import PropertyPredictor
 from .utils.training_budget import TrainingBudget
@@ -46,6 +46,7 @@ from .utils.stage_timing import checkpoint_stage, checkpoint_prepared, record_ch
 from .utils.checkpoint_serialization import save_checkpoint_payload
 from .utils.rollout_errors import InfeasibleEpisode, EvaluationProtocolError
 from .utils.seeding import capture_rng_state, restore_rng_state
+from .utils.generation_resume import predictor_checkpoint_fields
 from .utils.model_contract import bind_scaler, environment_contract, scaler_fingerprint
 from .utils.episode_batch import (
     CandidateEvaluationFailed, EpisodeBatchEvaluator, training_wave_limit,
@@ -256,7 +257,7 @@ def add_episode_to_buffer(
     path: list,
     buffer: collections.deque,
     elem_feats_scaled: np.ndarray,
-    fraction_set: List[str],
+    action_values: List[str],
     gamma: float = 0.9,
 ) -> None:
     """Convert a completed episode path into buffer rows and append.
@@ -281,7 +282,7 @@ def add_episode_to_buffer(
             "s_mat_raw":       np.asarray(step.state_material_features, dtype=float),
             "s_step":          np.asarray(step.state_step_onehot, dtype=float),
             "a_elem_idx":      int(np.argmax(step.action_elem_onehot)),
-            **_action_value_record(step, fraction_set),
+            **_action_value_record(step, action_values),
             "reward":          float(step.reward),
             "s_mat_next_raw":  np.asarray(next_step.state_material_features, dtype=float)
                                if not done else np.zeros(len(step.state_material_features), dtype=float),
@@ -307,34 +308,7 @@ def _row_fingerprint(row: dict) -> tuple:
     )
 
 
-def _detect_last_position_pin(env) -> Optional[set]:
-    """If env.phase_filter pins certain elements at the terminal action,
-    return the set of pinned element symbols. Otherwise return None.
-
-    Walks ``ChainConstraintFilter.children`` so a filter nested inside a
-    chain is detected correctly.
-    """
-    from .constraints.last_step_element import LastStepElementFilter
-
-    if getattr(env, "phase_filter", None) is None:
-        return None
-
-    def _walk(f):
-        if isinstance(f, LastStepElementFilter):
-            if f.reserve_for_last:
-                return set(f.required_elements)
-            return None
-        if hasattr(f, "children"):
-            for child in f.children:
-                pinned = _walk(child)
-                if pinned is not None:
-                    return pinned
-        return None
-
-    return _walk(env.phase_filter)
-
-
-def _path_to_rows(path: list, fraction_set: List[str], gamma: float = 0.9) -> List[dict]:
+def _path_to_rows(path: list, action_values: List[str], gamma: float = 0.9) -> List[dict]:
     """Convert an env.path into row dicts (matching add_episode_to_buffer)."""
     rows: List[dict] = []
     n = len(path)
@@ -351,7 +325,7 @@ def _path_to_rows(path: list, fraction_set: List[str], gamma: float = 0.9) -> Li
             "s_mat_raw":       np.asarray(step.state_material_features, dtype=float),
             "s_step":          np.asarray(step.state_step_onehot, dtype=float),
             "a_elem_idx":      int(np.argmax(step.action_elem_onehot)),
-            **_action_value_record(step, fraction_set),
+            **_action_value_record(step, action_values),
             "reward":          float(step.reward),
             "s_mat_next_raw":  np.asarray(next_step.state_material_features, dtype=float)
                                if not done else np.zeros(len(step.state_material_features), dtype=float),
@@ -367,7 +341,6 @@ def _path_to_rows(path: list, fraction_set: List[str], gamma: float = 0.9) -> Li
 # Module-level guards so the "no alternatives possible" / "non-DQN method"
 # warnings fire only once per training run, not once per episode.
 _AUG_WARNED_NO_ALTS = False
-_AUG_WARNED_FIXED_ORDER = False
 
 
 def _augment_episode_in_buffer(
@@ -375,7 +348,7 @@ def _augment_episode_in_buffer(
     original_path: list,
     buffer: collections.deque,
     elem_feats_scaled: np.ndarray,
-    fraction_set: List[str],
+    action_values: List[str],
     *,
     K: int,
     gamma: float = 0.9,
@@ -394,35 +367,18 @@ def _augment_episode_in_buffer(
     of *this* episode are skipped. Cross-episode coincidences are kept,
     since they are legitimate independent observations.
     """
-    global _AUG_WARNED_NO_ALTS, _AUG_WARNED_FIXED_ORDER
+    global _AUG_WARNED_NO_ALTS
 
     # Always insert the original path first (zero risk when K == 0).
-    add_episode_to_buffer(original_path, buffer, elem_feats_scaled, fraction_set, gamma=gamma)
+    add_episode_to_buffer(original_path, buffer, elem_feats_scaled, action_values, gamma=gamma)
     if K <= 0:
-        return
-
-    # episode_style: 'fixed_order_amount' forces a single ordering — no permutation valid.
-    episode_style = getattr(env, "episode_style", None)
-    if episode_style == "fixed_order_amount":
-        if not _AUG_WARNED_FIXED_ORDER:
-            print(
-                "[WARN] dqn_augment_permutations is a no-op when "
-                "episode_style='fixed_order_amount' (element order is forced).",
-                flush=True,
-            )
-            _AUG_WARNED_FIXED_ORDER = True
         return
 
     N = len(original_path)
     if N < 2:
         return
 
-    # Detect whether a LastStepElementFilter pins the terminal action.
-    pinned_last_elements = _detect_last_position_pin(env)
-    if pinned_last_elements is not None:
-        permutable = list(range(N - 1))   # keep position N-1 fixed
-    else:
-        permutable = list(range(N))
+    permutable = list(range(N))
 
     import math
     import itertools
@@ -482,14 +438,12 @@ def _augment_episode_in_buffer(
     # Stash the original terminal reward and predictor.
     original_R = float(original_path[-1].reward)
     saved_reward_fn = env.reward_fn
+    original_key = env.terminal_comp_key()
 
     try:
         env.reward_fn = lambda _formula: original_R
         for perm in chosen_perms:
-            if pinned_last_elements is not None:
-                permuted_actions = [original_actions[i] for i in perm] + [original_actions[-1]]
-            else:
-                permuted_actions = [original_actions[i] for i in perm]
+            permuted_actions = [original_actions[i] for i in perm]
 
             env.initialize()
             try:
@@ -500,16 +454,21 @@ def _augment_episode_in_buffer(
                 # didn't anticipate): silently skip this augmentation.
                 continue
 
-            if not _env_terminal(env):
+            if not _env_terminal(env) or env.terminal_comp_key() != original_key:
                 continue
-            for row in _path_to_rows(env.path, fraction_set, gamma=gamma):
+            for row in _path_to_rows(env.path, action_values, gamma=gamma):
                 fp = _row_fingerprint(row)
                 if fp in seen_fingerprints:
                     continue
                 seen_fingerprints.add(fp)
                 buffer.append(row)
     finally:
-        env.reward_fn = saved_reward_fn
+        try:
+            env.initialize()
+            for action in original_actions:
+                env.step(action)
+        finally:
+            env.reward_fn = saved_reward_fn
 
 
 def _compute_td_target(
@@ -517,7 +476,7 @@ def _compute_td_target(
     target_net: torch.nn.Module,
     s_mat_scaler: StandardScaler,
     elem_feats_scaled: np.ndarray,
-    fraction_set: List[str],
+    action_values: List[str],
     device: torch.device,
     gamma: float,
     target_cache=None,
@@ -534,7 +493,7 @@ def _compute_td_target(
     n = len(next_idxs)
     ns_mat = s_mat_scaler.transform(row["s_mat_next_raw"].reshape(1, -1))[0]
     a_e = np.asarray([elem_feats_scaled[ei] for ei, _ in next_idxs], dtype=float)
-    a_c = value_features(fraction_set, [fi for _, fi in next_idxs])
+    a_c = value_features(action_values, [fi for _, fi in next_idxs])
     ns_mat_b = np.repeat(ns_mat.reshape(1, -1), n, axis=0)
     ns_step_b = np.repeat(row["s_step_next"].reshape(1, -1), n, axis=0)
     with torch.no_grad():
@@ -556,7 +515,7 @@ def _dqn_gradient_step(
     target_net: torch.nn.Module,
     s_mat_scaler: StandardScaler,
     elem_feats_scaled: np.ndarray,
-    fraction_set: List[str],
+    action_values: List[str],
     optimizer: torch.optim.Optimizer,
     loss_fn: torch.nn.Module,
     device: torch.device,
@@ -577,7 +536,7 @@ def _dqn_gradient_step(
     # --- END mc-target experiment ---
         y = [
             _compute_td_target(r, target_net, s_mat_scaler, elem_feats_scaled,
-                               fraction_set, device, gamma, target_cache=target_cache)
+                               action_values, device, gamma, target_cache=target_cache)
             for r in batch
         ]
     s_mat_b  = torch.tensor(
@@ -611,9 +570,9 @@ def _dqn_gradient_step(
 
 def train_dqn_online(
     *,
-    env: CompositionEnv,
+    env: MultiGroupEnv,
     elem_feats_scaled: np.ndarray,
-    fraction_set: List[str],
+    action_values: List[str],
     device: torch.device,
     hidden_dim: int = 128,
     n_warmup_eps: int = 500,
@@ -796,11 +755,11 @@ def train_dqn_online(
                     training_samples.record(episode, warmup_rows[-1])
             if augment_permutations > 0:
                 _augment_episode_in_buffer(
-                    env, episode.path, buffer, elem_feats_scaled, fraction_set,
+                    env, episode.path, buffer, elem_feats_scaled, action_values,
                     K=augment_permutations, gamma=gamma,
                 )
             else:
-                add_episode_to_buffer(episode.path, buffer, elem_feats_scaled, fraction_set, gamma=gamma)
+                add_episode_to_buffer(episode.path, buffer, elem_feats_scaled, action_values, gamma=gamma)
             pbar.update(int(counted))
         pbar.close()
         # Unlike PG warmup (which neutralises reward_fn), DQN warmup pays a real
@@ -817,12 +776,12 @@ def train_dqn_online(
             joblib.dump(scaler, checkpoint_cfg["scaler_path"])
         state_dim = int(s_mat_all.shape[1])
         elem_dim  = int(elem_feats_scaled.shape[1])
-        step_dim  = env.n_components
+        step_dim  = env.max_steps
         print(f"[INFO] s_mat scaler fitted on {len(s_mat_all)} warmup rows.")
 
         qnet = QRegressor(
             state_dim=state_dim, step_dim=step_dim,
-            elem_dim=elem_dim, frac_dim=value_feature_dim(fraction_set), hidden_dim=hidden_dim,
+            elem_dim=elem_dim, frac_dim=value_feature_dim(action_values), hidden_dim=hidden_dim,
         ).to(device)
         target_net = copy.deepcopy(qnet)
         target_net.eval()
@@ -834,11 +793,9 @@ def train_dqn_online(
 
     ckpt_path: Optional[str] = None
     ckpt_freq: int = 0
-    dp_cache_ref: Optional[dict] = None
     if checkpoint_cfg:
         ckpt_path    = checkpoint_cfg.get("path")
         ckpt_freq    = int(checkpoint_cfg.get("freq", 0))
-        dp_cache_ref = checkpoint_cfg.get("dp_cache")
     if resume_state and resume_state.get("rng_state") is not None:
         restore_rng_state(resume_state["rng_state"])
 
@@ -873,7 +830,7 @@ def train_dqn_online(
             _allowed = _legal_actions(env)
             _s_mat_sc = scaler.transform(
                 env.current_state_features().reshape(1, -1))[0]
-            _s_step = np.zeros(env.n_components, dtype=float)
+            _s_step = np.zeros(env.max_steps, dtype=float)
             _s_step[env.counter] = 1.0
             if float(np.random.rand()) < eps:
                 _a = random.choice(_allowed)
@@ -883,7 +840,7 @@ def train_dqn_online(
                     s_material=_s_mat_sc, s_step=_s_step,
                     allowed_actions=_allowed,
                     elem_feats_scaled=elem_feats_scaled,
-                    fraction_set=fraction_set,
+                    action_values=action_values,
                 )
             env.step(_a)
 
@@ -920,11 +877,11 @@ def train_dqn_online(
         episode_reward = float(episode.path[-1].reward)
         if augment_permutations > 0:
             _augment_episode_in_buffer(
-                env, episode.path, buffer, elem_feats_scaled, fraction_set,
+                env, episode.path, buffer, elem_feats_scaled, action_values,
                 K=augment_permutations, gamma=gamma,
             )
         else:
-            add_episode_to_buffer(episode.path, buffer, elem_feats_scaled, fraction_set, gamma=gamma)
+            add_episode_to_buffer(episode.path, buffer, elem_feats_scaled, action_values, gamma=gamma)
 
         # 2. Gradient steps.
         mean_loss = float("nan")
@@ -936,7 +893,7 @@ def train_dqn_online(
                 _batch = random.sample(buf_list, batch_size)
                 losses.append(_dqn_gradient_step(
                     qnet, _batch, target_net, scaler,
-                    elem_feats_scaled, fraction_set, optimizer, loss_fn, device, gamma,
+                    elem_feats_scaled, action_values, optimizer, loss_fn, device, gamma,
                     target_mode=dqn_target_mode,
                     target_cache=target_cache,
                 ))
@@ -1004,7 +961,7 @@ def train_dqn_online(
                     "type": "dqn",
                     "scaler_fingerprint": scaler_fingerprint(scaler),
                     "execution_contract": (checkpoint_cfg or {}).get("execution_contract"),
-                    "predictor_ledger": timer.state_dict() if callable(getattr(timer, "state_dict", None)) else None,
+                    **predictor_checkpoint_fields(timer),
                     "environment_contract": environment_contract(env),
                     "episodes_completed": completed,
                     "training_episodes_completed": train_attempts,
@@ -1018,7 +975,6 @@ def train_dqn_online(
                     "buffer": list(buffer),
                     "dqn_buffer_size": dqn_buffer_size,
                     "eps": eps,
-                    "dp_cache": dict(dp_cache_ref) if dp_cache_ref is not None else {},
                 }, numbered_path=_numbered)
             tqdm.write(f"[INFO] DQN checkpoint saved at episode {train_attempts} "
                        f"(budget {completed}/{dqn_num_train_eps}) → {_numbered or ckpt_path}")
@@ -1040,7 +996,7 @@ def choose_action(
     s_step: np.ndarray,
     allowed_actions: Sequence[Tuple[Tuple[float, ...], Tuple[float, ...]]],
     elem_feats_scaled: np.ndarray,
-    fraction_set: List[str],
+    action_values: List[str],
     gen_epsilon: float = 0.0,
     gen_top_frac: float = 0.0,
     gen_temperature: float = 0.0,
@@ -1069,7 +1025,7 @@ def choose_action(
     a_elem = np.asarray(
         [elem_feats_scaled[int(np.argmax(a[0]))] for a in allowed_actions], dtype=float
     )
-    a_comp = value_features(fraction_set, [int(np.argmax(a[1])) for a in allowed_actions])
+    a_comp = value_features(action_values, [int(np.argmax(a[1])) for a in allowed_actions])
     s_mat_b  = np.repeat(s_material.reshape(1, -1), n, axis=0)
     s_step_b = np.repeat(s_step.reshape(1, -1), n, axis=0)
 
@@ -1105,7 +1061,7 @@ def _legal_actions(env):
     if not actions:
         raise InfeasibleEpisode(
             f"{type(env).__name__}: no legal continuation at step "
-            f"{env.counter}/{env.n_components}; check domain and active constraints"
+            f"{env.counter}/{env.max_steps}; check domain and active constraints"
         )
     return actions
 
@@ -1115,12 +1071,12 @@ def _env_terminal(env) -> bool:
         marker = getattr(env, name, None)
         if marker is not None:
             return bool(marker() if callable(marker) else marker)
-    return int(env.counter) >= int(env.n_components)
+    return int(env.counter) >= int(env.max_steps)
 
 
 def _episode_steps(env):
     """Allow STOP before the maximum horizon without inventing extra steps."""
-    for index in range(env.n_components):
+    for index in range(env.max_steps):
         if _env_terminal(env):
             return
         yield index
@@ -1128,7 +1084,7 @@ def _episode_steps(env):
         raise RuntimeError("Environment did not terminate within its declared maximum steps")
 
 
-def _rollout_random_episode(env: CompositionEnv) -> None:
+def _rollout_random_episode(env: MultiGroupEnv) -> None:
     """Roll out one episode with uniformly random action selection."""
     env.initialize()
     for _ in _episode_steps(env):
@@ -1139,12 +1095,12 @@ def _rollout_random_episode(env: CompositionEnv) -> None:
 
 def _rollout_policy_episode(
     *,
-    env: CompositionEnv,
+    env: MultiGroupEnv,
     qnet: torch.nn.Module,
     scaler: StandardScaler,
     device: torch.device,
     elem_feats_scaled: np.ndarray,
-    fraction_set: List[str],
+    action_values: List[str],
     gen_epsilon: float = 0.0,
     gen_top_frac: float = 0.0,
     gen_temperature: float = 1.0,
@@ -1154,15 +1110,15 @@ def _rollout_policy_episode(
     for _ in _episode_steps(env):
         allowed = _legal_actions(env)
         s_mat = scaler.transform(env.current_state_features().reshape(1, -1))[0]
-        s_step = np.zeros(env.n_components, dtype=float)
-        if env.counter < env.n_components:
+        s_step = np.zeros(env.max_steps, dtype=float)
+        if env.counter < env.max_steps:
             s_step[env.counter] = 1.0
         a = choose_action(
             model=qnet, device=device,
             s_material=s_mat, s_step=s_step,
             allowed_actions=allowed,
             elem_feats_scaled=elem_feats_scaled,
-            fraction_set=fraction_set,
+            action_values=action_values,
             gen_epsilon=gen_epsilon,
             gen_top_frac=gen_top_frac,
             gen_temperature=gen_temperature,
@@ -1170,7 +1126,7 @@ def _rollout_policy_episode(
         env.step(a)
 
 
-def _fit_scaler_from_warmup(env: CompositionEnv, n_warmup_eps: int) -> StandardScaler:
+def _fit_scaler_from_warmup(env: MultiGroupEnv, n_warmup_eps: int) -> StandardScaler:
     """Fit a StandardScaler on material features from random warmup episodes.
 
     The reward function is temporarily replaced with a no-op so warmup does not
@@ -1212,11 +1168,11 @@ def _fit_scaler_from_warmup(env: CompositionEnv, n_warmup_eps: int) -> StandardS
 
 def _rollout_pg_episode(
     *,
-    env: CompositionEnv,
+    env: MultiGroupEnv,
     policy: torch.nn.Module,
     scaler: StandardScaler,
     elem_feats_scaled: np.ndarray,
-    fraction_set: List[str],
+    action_values: List[str],
     device: torch.device,
 ) -> None:
     """Roll out one episode with pure softmax sampling (on-policy, no pg_epsilon)."""
@@ -1224,14 +1180,14 @@ def _rollout_pg_episode(
     for _ in _episode_steps(env):
         allowed = _legal_actions(env)
         s_mat = scaler.transform(env.current_state_features().reshape(1, -1))[0]
-        s_step = np.zeros(env.n_components, dtype=float)
-        if env.counter < env.n_components:
+        s_step = np.zeros(env.max_steps, dtype=float)
+        if env.counter < env.max_steps:
             s_step[env.counter] = 1.0
         n = len(allowed)
         a_elem_batch = np.asarray(
             [elem_feats_scaled[int(np.argmax(a[0]))] for a in allowed], dtype=float
         )
-        a_comp_batch = value_features(fraction_set, [int(np.argmax(a[1])) for a in allowed])
+        a_comp_batch = value_features(action_values, [int(np.argmax(a[1])) for a in allowed])
         s_mat_batch  = np.repeat(s_mat.reshape(1, -1), n, axis=0)
         s_step_batch = np.repeat(s_step.reshape(1, -1), n, axis=0)
         with torch.no_grad():
@@ -1282,7 +1238,7 @@ def _episode_pg_terms(
     value_net: Optional[torch.nn.Module],
     scaler: "StandardScaler",
     elem_feats_scaled: np.ndarray,
-    fraction_set: List[str],
+    action_values: List[str],
     device: "torch.device",
 ) -> tuple:
     """Build per-step policy-gradient *components* for one episode.
@@ -1316,7 +1272,7 @@ def _episode_pg_terms(
         a_elem_batch = np.asarray(
             [elem_feats_scaled[int(np.argmax(a[0]))] for a in allowed], dtype=float
         )
-        a_comp_batch = value_features(fraction_set, [int(np.argmax(a[1])) for a in allowed])
+        a_comp_batch = value_features(action_values, [int(np.argmax(a[1])) for a in allowed])
         s_mat_batch  = np.repeat(s_mat.reshape(1, -1), n, axis=0)
         s_step_batch = np.repeat(s_step.reshape(1, -1), n, axis=0)
 
@@ -1370,10 +1326,10 @@ def train_pg(
     *,
     policy: torch.nn.Module,
     value_net: Optional[torch.nn.Module],
-    env: CompositionEnv,
+    env: MultiGroupEnv,
     scaler: "StandardScaler",
     elem_feats_scaled: np.ndarray,
-    fraction_set: List[str],
+    action_values: List[str],
     device: "torch.device",
     num_iters: int,
     batch_eps: int,
@@ -1579,7 +1535,7 @@ def train_pg(
                 episode = evaluator.next(
                     lambda: _rollout_pg_episode(
                         env=env, policy=policy, scaler=scaler,
-                        elem_feats_scaled=elem_feats_scaled, fraction_set=fraction_set,
+                        elem_feats_scaled=elem_feats_scaled, action_values=action_values,
                         device=device,
                     ),
                     limit=wave_limit,
@@ -1675,7 +1631,7 @@ def train_pg(
                 value_net=value_net,
                 scaler=scaler,
                 elem_feats_scaled=elem_feats_scaled,
-                fraction_set=fraction_set,
+                action_values=action_values,
                 device=device,
             )
             all_logp.extend(lp)
@@ -1810,7 +1766,7 @@ def train_pg(
                     "type": "pg",
                     "scaler_fingerprint": scaler_fingerprint(scaler),
                     "execution_contract": (checkpoint_cfg or {}).get("execution_contract"),
-                    "predictor_ledger": timer.state_dict() if callable(getattr(timer, "state_dict", None)) else None,
+                    **predictor_checkpoint_fields(timer),
                     "budget_target": budget_target,
                     "environment_contract": environment_contract(env),
                     "rl_method": rl_method,
@@ -1846,11 +1802,11 @@ def train_pg(
 
 def _pg_single_episode_generate(
     *,
-    env: CompositionEnv,
+    env: MultiGroupEnv,
     policy: torch.nn.Module,
     scaler: StandardScaler,
     elem_feats_scaled: np.ndarray,
-    fraction_set: List[str],
+    action_values: List[str],
     device: torch.device,
     gen_epsilon: float = 0.0,
     gen_top_frac: float = 0.0,
@@ -1865,15 +1821,15 @@ def _pg_single_episode_generate(
     for _ in _episode_steps(env):
         allowed = _legal_actions(env)
         s_mat = scaler.transform(env.current_state_features().reshape(1, -1))[0]
-        s_step = np.zeros(env.n_components, dtype=float)
-        if env.counter < env.n_components:
+        s_step = np.zeros(env.max_steps, dtype=float)
+        if env.counter < env.max_steps:
             s_step[env.counter] = 1.0
 
         n = len(allowed)
         a_elem_batch = np.asarray(
             [elem_feats_scaled[int(np.argmax(a[0]))] for a in allowed], dtype=float
         )
-        a_comp_batch = value_features(fraction_set, [int(np.argmax(a[1])) for a in allowed])
+        a_comp_batch = value_features(action_values, [int(np.argmax(a[1])) for a in allowed])
         s_mat_batch  = np.repeat(s_mat.reshape(1, -1), n, axis=0)
         s_step_batch = np.repeat(s_step.reshape(1, -1), n, axis=0)
 
@@ -1904,12 +1860,12 @@ def _pg_single_episode_generate(
 
 def generate_candidates(
     *,
-    env: CompositionEnv,
+    env: MultiGroupEnv,
     predictor: PropertyPredictor,
     scaler: StandardScaler,
     device: torch.device,
     elem_feats_scaled: np.ndarray,
-    fraction_set: List[str],
+    action_values: List[str],
     policy: Optional[torch.nn.Module] = None,
     qnet: Optional[torch.nn.Module] = None,
     n_exploit: int = 200,
@@ -1964,14 +1920,14 @@ def generate_candidates(
         if use_pg:
             _pg_single_episode_generate(
                 env=env, policy=policy, scaler=scaler,
-                elem_feats_scaled=elem_feats_scaled, fraction_set=fraction_set,
+                elem_feats_scaled=elem_feats_scaled, action_values=action_values,
                 device=device, gen_epsilon=gen_epsilon,
                 gen_top_frac=gen_top_frac, gen_temperature=gen_temperature,
             )
         else:
             _rollout_policy_episode(
                 env=env, qnet=qnet, scaler=scaler, device=device,
-                elem_feats_scaled=elem_feats_scaled, fraction_set=fraction_set,
+                elem_feats_scaled=elem_feats_scaled, action_values=action_values,
                 gen_epsilon=gen_epsilon, gen_top_frac=gen_top_frac,
                 gen_temperature=gen_temperature,
             )

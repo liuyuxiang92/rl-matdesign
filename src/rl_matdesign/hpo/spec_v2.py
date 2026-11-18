@@ -35,7 +35,6 @@ def infer_objective(base: Mapping, threshold: float) -> dict:
     if not isinstance(props, list) or not props:
         raise ConfigError("HPO requires named properties in base_config to infer its physical objective")
     named = {}
-    weights = {}
     for index, prop in enumerate(props):
         if not isinstance(prop, Mapping):
             raise ConfigError(f"base_config.properties[{index}] must be a mapping")
@@ -43,9 +42,8 @@ def infer_objective(base: Mapping, threshold: float) -> dict:
         if not isinstance(name, str) or not name.strip() or name != name.strip() or name in named:
             raise ConfigError("base_config.properties must have distinct explicit nonempty names")
         named[name] = prop
-        weights[name] = _number(prop.get("weight", 1.0), f"properties[{index}].weight")
     try:
-        combiner = RewardCombiner(base.get("reward"), weights)
+        combiner = RewardCombiner(base.get("reward"), list(named))
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"Cannot infer HPO objective from base_config: {exc}") from exc
     active = [(name, coefficient) for name, coefficient in combiner.objective_terms.items() if coefficient != 0]

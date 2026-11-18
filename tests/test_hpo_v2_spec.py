@@ -75,7 +75,7 @@ def test_property_direction_aliases_and_negative_threshold(tmp_path, direction, 
 
 def test_reward_objective_selects_named_property_and_ignores_gate_properties(tmp_path):
     scene = {
-        'properties': [{'name': 'working_temperature', 'direction': 'min', 'output': 'T3', 'weight': 0},
+        'properties': [{'name': 'working_temperature', 'direction': 'min', 'output': 'T3'},
                        {'name': 'transition_temperature', 'direction': 'max', 'output': 'Tg'},
                        {'name': 'expansion', 'direction': 'min', 'output': 'CTE'}],
         'reward': {'type': 'gated', 'objective': {'terms': {'working_temperature': 2, 'expansion': 0}},
@@ -88,23 +88,35 @@ def test_reward_objective_selects_named_property_and_ignores_gate_properties(tmp
     assert plan['base_config_data']['reward']['gates'] == scene['reward']['gates']
 
 
-def test_legacy_property_weights_can_select_single_target(tmp_path):
+def test_reward_terms_select_one_physical_target_among_diagnostic_properties(tmp_path):
     plan = load_plan(write_plan(tmp_path, scene={'properties': [
-        {'name': 'energy', 'direction': 'min', 'weight': 1},
-        {'name': 'density', 'direction': 'max', 'weight': 0},
-    ]}))
+        {'name': 'energy', 'direction': 'min'},
+        {'name': 'density', 'direction': 'max'},
+    ], 'reward': {'objective': {'terms': {'energy': 2, 'density': 0}}}}))
     assert plan['objective']['field'] == 'energy'
 
 
+@pytest.mark.parametrize('weight', [0, 1, -1])
+def test_retired_property_weight_is_rejected_even_with_explicit_reward(tmp_path, weight):
+    scene = {'properties': [{'name': 'energy', 'direction': 'min', 'weight': weight}],
+             'reward': {'objective': {'terms': {'energy': 1}}}}
+    with pytest.raises(ConfigError, match='weight'):
+        load_plan(write_plan(tmp_path, scene=scene))
+
+
 @pytest.mark.parametrize('scene,match', [
-    ({'predictor': 'dummy'}, 'named properties'),
-    ({'properties': [{'name': 'a', 'direction': 'min'}, {'name': 'b', 'direction': 'max'}]}, 'exactly one'),
-    ({'properties': [{'name': 'a', 'direction': 'min', 'weight': 0}]}, 'exactly one'),
+    ({}, 'named properties'),
+    ({'properties': [{'name': 'a', 'direction': 'min'}, {'name': 'b', 'direction': 'max'}]}, 'explicit reward.objective'),
+    ({'properties': [{'name': 'a', 'direction': 'min'}, {'name': 'b', 'direction': 'max'}],
+      'reward': {'objective': {'terms': {'a': 1, 'b': 1}}}}, 'exactly one'),
+    ({'properties': [{'name': 'a', 'direction': 'min'}],
+      'reward': {'objective': {'terms': {'a': 0}}}}, 'exactly one'),
     ({'properties': [{'name': 'a', 'direction': 'target'}]}, 'direction target'),
     ({'properties': [{'name': 'a'}]}, 'direction min or max'),
-    ({'properties': [{'name': 'a', 'direction': 'min'}, {'name': 'a', 'direction': 'max'}]}, 'distinct'),
+    ({'properties': [{'name': 'a', 'direction': 'min'}, {'name': 'a', 'direction': 'max'}]}, 'duplicates'),
     ({'properties': [{'name': 'a', 'direction': 'min', 'scale': -1}]}, 'contradicts'),
-    ({'properties': [{'name': 'a', 'direction': 'min', 'weight': -1}]}, 'contradicts'),
+    ({'properties': [{'name': 'a', 'direction': 'min'}],
+      'reward': {'objective': {'terms': {'a': -1}}}}, 'contradicts'),
     ({'properties': [{'name': 'a', 'direction': 'min', 'scale': 0}]}, 'contradicts'),
     ({'properties': [{'name': 'a', 'direction': 'min'}],
       'reward': {'objective': {'terms': {'T3': 1}}}}, 'unknown property'),

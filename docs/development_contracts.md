@@ -3,23 +3,26 @@
 The 0.2 refactor borrows configuration ownership, explicit plugin contracts and
 automated checks from the DeepMD ecosystem; it does not copy its architecture or
 claim compatibility with all of its models. Keep application-specific scientific
-arguments in their adapter or source. Training code must not branch on a material
+arguments in their adapter or structure operation. Training code must not branch on a material
 name. A new model adapter is appropriate when its API, preprocessing or physical
 meaning differs; it should not require a new training interface.
 
 ## Extension path
 
 1. Describe the labelled design variables and completion constraints in `groups`.
-   A composition assignment and a peptide `(position, monomer)` assignment each
-   consume one transition. Integer-token domains retain accumulation semantics.
+   Adding a chemical amount and assigning a peptide `(position, monomer)` each
+   consume one transition. Chemical additions may repeat a label unless `unique`
+   is enabled; categorical assignments select each target at most once.
 2. Use a registry name or `package.module:Class` for a model. Prefer named
    `ScientificOutput` values with units, representation and actual uncertainty.
    Preserve raw model/configuration samples when a nonlinear inverse is needed.
-3. Declare a structure source only if the model needs structures. Properties with
-   one source share its sampled/relaxed ensemble. A parallel builder implements
+3. Declare one `structure` when a model needs structures. All structure properties
+   share its sampled ensemble and optional pipeline operations. A parallel builder implements
    explicit `build_sample`; an opaque native ensemble cannot be split safely.
-4. Separate scientific output from reward direction, scaling, weights and gates.
-   Use `model_ref` when one model serves multiple outputs.
+4. Separate scientific output from reward direction, scaling and gates. Objective
+   and gate coefficients belong only to reward terms; do not add property weights.
+   Repeat inline property model settings for multiple outputs; identical model
+   declarations are reused automatically.
 5. Test the domain, candidate identity, units, failure behavior and RNG isolation.
    Test doubles establish interface behavior; an opt-in real-model reference
    verifies scientific integration. Label missing assets and GPU checks honestly.
@@ -96,7 +99,7 @@ and this invocation's prediction time.
 Use `scripts/benchmark.py` to write a plan before `--run`. Every arm starts in a
 fresh process, with an empty result cache. The random baseline samples uniformly
 over unique composition maps using completion counts, not random action paths.
-Its exact counter covers one fraction group with sum/bounds/menu constraints;
+Its exact counter covers one composition group with total/bounds/menu constraints;
 arbitrary chemical filters require an explicit counted-domain implementation.
 
 The current A2C uses the existing Monte Carlo return target and value baseline;

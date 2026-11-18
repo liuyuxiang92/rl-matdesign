@@ -1,4 +1,8 @@
-"""Real old-source HPO jobs resume exactly through the audited performance release.
+"""Real old-source HPO jobs obey the sealed performance-release boundary.
+
+An actually approved runtime must resume exactly. A later semantic runtime must
+reject both check-only and restart without touching the historical campaign.
+Current-runtime restart equivalence is covered by test_hpo_cooperative_restart.
 
 Set RLMAT_PERFORMANCE_LEGACY_SRC to an immutable baseline ``src`` directory when
 testing a source export without Git history. Normal checkouts materialize the
@@ -20,10 +24,8 @@ import pytest
 import torch
 import yaml
 
-from rl_matdesign.hpo.algorithm_profiles import initial_parameters
 from rl_matdesign.utils import source_compatibility as compatibility
 from tests.test_hpo_checkpoint_retention import _assert_nested_equal
-from tests.test_hpo_cooperative_restart import _plan
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -117,22 +119,49 @@ def _snapshot(directory):
         for path in directory.rglob("*") if path.is_file()}
 
 
-@pytest.mark.parametrize("method", ["dqn-mc", "dqn-bootstrap"])
-def test_legacy_hpo_check_only_and_restart_preserve_learning_exactly(tmp_path, legacy_source, method):
-    plan, _ = _plan(tmp_path, method)
-    parameters = initial_parameters(plan)
-    parameters["dqn_batch_size"] = 8
+def _write_historical_inputs(path, method):
+    """Frozen input syntax for the archived baseline, never today's loader."""
+    scenario = {
+        "method": "dqn",
+        "properties": [{"name": "energy", "predictor": "dummy", "direction": "min", "objective": "mean"}],
+        "groups": [{"name": "metal", "kind": "composition",
+                    "species_set": ["Ni", "Fe", "Co", "Cr", "Mn", "Cu", "Zn", "Ti"],
+                    "fraction_set": [f"{i / 10:.1f}" for i in range(1, 9)], "n_components": 3}],
+        "eval_seed": 13, "pg_warmup_eps": 2, "pg_batch_eps": 2,
+        "dqn_hidden_dim": 16, "dqn_buffer_size": 100, "dqn_grad_steps_per_ep": 2,
+        "gen_temperature": 1., "num_gen_eps": 0, "exploration_gen_eps": 0,
+    }
+    parameters = {"dqn_batch_size": 8, "dqn_lr": .001, "dqn_eps_min": .2,
+                  "warmup_budget_fraction": .2, "epsilon_anneal_budget_ratio": 1.}
     if method == "dqn-bootstrap":
         parameters["dqn_target_update_freq"] = 2
-    hpo = tmp_path / "hpo.yaml"
-    config = yaml.safe_load(hpo.read_text())
-    config["training"]["parameter_ranges"] = {
-        name: {"type": "categorical", "choices": [value]}
-        for name, value in parameters.items()
+    budget = {"mode": "absolute_unique", "min_unique": 12, "initial_unique": 12, "max_unique": 12}
+    (path / "scenario.yaml").write_text(yaml.safe_dump(scenario, sort_keys=False))
+    config = {
+        "base_config": "scenario.yaml", "method": method, "random_seed": 42, "parallel_jobs": 1,
+        "evaluation": {"threshold": .5, "max_attempts_per_unique": 1.5},
+        "training": {"repeats": 1, "budget": budget, "parameter_ranges": {
+            name: {"type": "categorical", "choices": [value]} for name, value in parameters.items()}},
+        "generation": {"repeats": 1, "budget": budget, "initial_values": [1.]},
     }
+    hpo = path / "hpo.yaml"
     hpo.write_text(yaml.safe_dump(config, sort_keys=False))
+    return hpo
+
+
+@pytest.mark.parametrize("method", ["dqn-mc", "dqn-bootstrap"])
+def test_legacy_hpo_restart_obeys_sealed_release_boundary(tmp_path, legacy_source, method):
+    installed = compatibility.inventory_digests(compatibility.source_inventory(ROOT / "src"))
+    approvals = [compatibility.approved_performance_upgrade(baseline, installed[kind], kind=kind)
+                 for kind, baseline in (("package", compatibility.BASELINE_PACKAGE_SHA256),
+                                        ("execution", compatibility.BASELINE_EXECUTION_SHA256))]
+    approved_release = all(evidence is not None for evidence in approvals)
+    hpo = _write_historical_inputs(tmp_path, method)
     control, interrupted = tmp_path / "old-control", tmp_path / "old-interrupted"
-    for out, stop in ((control, False), (interrupted, True)):
+    # The reference full run is needed only for an authenticated target. An
+    # unsealed runtime is tested against a real stopped legacy checkpoint.
+    runs = ((control, False), (interrupted, True)) if approved_release else ((interrupted, True),)
+    for out, stop in runs:
         result = _cli(legacy_source, tmp_path, "run", "--hpo-config", str(hpo),
                       "--out", str(out), "--stage", "ranges", stop=stop)
         if stop:
@@ -150,6 +179,22 @@ def test_legacy_hpo_check_only_and_restart_preserve_learning_exactly(tmp_path, l
 
     before = _snapshot(interrupted)
     checked = _cli(ROOT / "src", tmp_path, "restart", "--out", str(interrupted), "--check-only")
+    if not approved_release:
+        assert all(evidence is None for evidence in approvals)
+        assert checked.returncode == 2, checked.stdout + checked.stderr
+        # Removed authored group syntax now rejects before the source-upgrade
+        # guard. Both are explicit rejection paths; neither may mutate the job.
+        expected_rejection = "Group 'metal' has unused or removed parameters: ['fraction_set', 'n_components']"
+        assert ("exact audited DQN performance release" in checked.stderr
+                or expected_rejection in checked.stderr)
+        assert _snapshot(interrupted) == before
+        rejected = _cli(ROOT / "src", tmp_path, "restart", "--out", str(interrupted))
+        assert rejected.returncode == 2, rejected.stdout + rejected.stderr
+        assert ("exact audited DQN performance release" in rejected.stderr
+                or expected_rejection in rejected.stderr)
+        assert _snapshot(interrupted) == before
+        assert not (interrupted / "source_upgrades").exists()
+        return
     _success(checked)
     assert "SYNCHRONIZED" in checked.stdout
     assert compatibility.UPGRADE_ID in checked.stdout

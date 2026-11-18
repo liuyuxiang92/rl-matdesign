@@ -36,8 +36,8 @@ class ValueAlphabet(tuple):
 def value_alphabet(env):
     specs = getattr(env, "value_specs", None)
     encoding = (ValueEncoding.from_specs(specs) if specs is not None
-                else ValueEncoding([float(code) for code in env.fraction_set], kind="numeric"))
-    return ValueAlphabet(env.fraction_set, encoding)
+                else ValueEncoding([float(code) for code in env.action_values], kind="numeric"))
+    return ValueAlphabet(env.action_values, encoding)
 
 
 def value_features(alphabet, indices):

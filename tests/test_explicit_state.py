@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from rl_matdesign.encoding import decode_one_hot
-from rl_matdesign.env import CompositionEnv
+from rl_matdesign.amounts import ChemicalAmountsGroup
 
 
 def _descriptor(_formula):
@@ -17,24 +17,24 @@ def _descriptor(_formula):
 
 
 def _env(*, zero=False, species=("Ni", "Fe", "Co", "Cu"), descriptor=_descriptor):
-    return CompositionEnv(
+    return ChemicalAmountsGroup(
         species_set=species,
-        fraction_set=[f"{i / 10:.2f}" for i in range(0 if zero else 1, 9)],
-        total_units=10, n_components=3, state_featurizer=descriptor,
+        amount_set=[f"{i / 10:.2f}" for i in range(0 if zero else 1, 9)],
+        total=1, unique=True, n_steps=3, state_featurizer=descriptor,
     )
 
 
 def _pick(env, element, amount):
     for action in env.allowed_actions():
         if (decode_one_hot(action[0], env.species_set) == element
-                and float(decode_one_hot(action[1], env.fraction_set)) == amount):
+                and float(decode_one_hot(action[1], env.action_values)) == amount):
             env.step(action)
             return
     raise AssertionError(f"No legal action for {element}={amount}")
 
 
 def _decoded(env):
-    return [(decode_one_hot(a, env.species_set), decode_one_hot(b, env.fraction_set))
+    return [(decode_one_hot(a, env.species_set), decode_one_hot(b, env.action_values))
             for a, b in env.allowed_actions()]
 
 
@@ -49,9 +49,9 @@ def test_absolute_amount_is_visible_even_when_descriptor_is_identical():
     assert low.state_labels == high.state_labels == ("Co", "Cu", "Fe", "Ni")
     np.testing.assert_array_equal(low.current_state_features()[:2], [2, 5])
     np.testing.assert_array_equal(high.current_state_features()[:2], [2, 5])
-    np.testing.assert_array_equal(_explicit(low), [0, 0, 0, 0.2, 0.8, 2])
-    np.testing.assert_array_equal(_explicit(high), [0, 0, 0, 0.6, 0.4, 2])
-    assert low.current_state_features().size == 2 + 4 + 2
+    np.testing.assert_array_equal(_explicit(low), [0, 0, 0, 0.2, 0, 0, 0, 1, 0.8, 2])
+    np.testing.assert_array_equal(_explicit(high), [0, 0, 0, 0.6, 0, 0, 0, 1, 0.4, 2])
+    assert low.current_state_features().size == 2 + 8 + 2
 
 
 def test_default_magpie_descriptor_is_supplemented_with_absolute_state():
@@ -79,12 +79,12 @@ def test_equal_assignments_have_exactly_equal_state_and_canonical_descriptor_inp
         _pick(a, element, amount)
     for element, amount in [("Fe", 0.4), ("Ni", 0.2)]:
         _pick(b, element, amount)
-    assert a.state == b.state == "Fe0.40Ni0.20"
+    assert a.state == b.state == "Fe0.4Ni0.2"
     assert a.cation_fractions() == b.cation_fractions() == {"Fe": 0.4, "Ni": 0.2}
     assert a.remaining_units == b.remaining_units == 4
     np.testing.assert_array_equal(a.current_state_features(), b.current_state_features())
-    assert calls[-2:] == ["Fe0.40Ni0.20", "Fe0.40Ni0.20"]
-    assert _decoded(a) == _decoded(b) == [("Co", "0.40"), ("Cu", "0.40")]
+    assert calls[-2:] == ["Fe0.4Ni0.2", "Fe0.4Ni0.2"]
+    assert _decoded(a) == _decoded(b) == [("Co", "0.4"), ("Cu", "0.4")]
 
 
 def test_zero_value_has_assignment_status_without_redundant_mutable_state():
@@ -105,11 +105,11 @@ def test_zero_value_has_assignment_status_without_redundant_mutable_state():
     assert "_selected" not in vars(a) and "_used_units" not in vars(a)
 
 
-def test_positive_only_grid_derives_assignment_from_value_without_mask():
+def test_positive_only_grid_still_records_pick_counts_for_repeated_amount_domains():
     env = _env()
-    schema = env.state_feature_schema()
-    assert not schema["assignment_mask"]
-    assert not any(name.startswith("assigned:") for name in schema["explicit_feature_labels"])
+    assert "pick_counts" in env.state_feature_schema()["layout"]
+    _pick(env, "Ni", .2)
+    np.testing.assert_array_equal(_explicit(env)[4:8], [0, 0, 0, 1])
 
 
 def test_transition_stores_full_pre_action_state_and_does_not_alias_future_state():
@@ -124,7 +124,7 @@ def test_transition_stores_full_pre_action_state_and_does_not_alias_future_state
     _pick(env, "Co", 0.4)
     assert env.counter == 3  # The fourth candidate species remains unassigned.
     assert env.remaining_units == 0
-    assert env.terminal_formula == "Co0.40Fe0.40Ni0.20"
+    assert env.terminal_formula == "Co0.4Fe0.4Ni0.2"
     assert "Cu" not in env.cation_fractions()
     assert _explicit(env)[-2:].tolist() == [0, 0]
 
@@ -136,7 +136,7 @@ def test_formula_is_derived_and_cannot_override_assignment_map():
         env.state = "Ni0.60"
     exported = env.cation_fractions()
     exported["Ni"] = 0.6
-    assert env.state == "Ni0.20"
+    assert env.state == "Ni0.2"
     assert env.remaining_units == 8
 
 
@@ -168,7 +168,7 @@ def test_descriptor_dimension_cannot_change_with_episode_progress():
     initial_schema = env.state_feature_schema()
     _pick(env, "Ni", 0.2)
     assert env.state_feature_schema() == initial_schema
-    with pytest.raises(ValueError, match="dimension must remain fixed"):
+    with pytest.raises(ValueError, match="dimension must stay fixed"):
         env.current_state_features()
 
 

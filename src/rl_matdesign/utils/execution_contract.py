@@ -87,7 +87,7 @@ def execution_contract(config, predictor, manifest_path, device) -> dict:
     active_prefix = "dqn_" if config["method"] == "dqn" else "pg_"
     adjustable_budgets = {"dqn_num_train_eps", "pg_num_iters"}
     learning = {key: value for key, value in config.items()
-                if key in {"method", "train_seed", "constrain_training", "train_count_duplicates", "train_max_duplicate_attempts"}
+                if key in {"method", "train_seed", "train_count_duplicates", "train_max_duplicate_attempts"}
                 or (key.startswith(active_prefix) and key not in adjustable_budgets)}
     # Saving limits DQN candidate prefetch waves. Changing this frequency
     # changes when the policy is updated relative to subsequent sampling.

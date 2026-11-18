@@ -15,11 +15,8 @@ import signal
 import subprocess
 import sys
 import time
-import uuid
-import warnings
 from multiprocessing import Pipe
 from multiprocessing.connection import wait
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -188,70 +185,42 @@ class ParallelStructureBuilder:
         options = cfg.get("structure_parallel")
         if not isinstance(options, dict):
             raise ValueError("structure_parallel must be a mapping")
-        known = {"devices", "reserve_devices", "workers_per_device", "min_speedup",
-                 "candidate_batch_size",
-                 "threads_per_worker", "timeout_s", "startup_timeout_s", "min_successful_configs"}
+        known = {"devices", "reserve_devices", "candidate_batch_size",
+                 "threads_per_worker", "timeout_s", "startup_timeout_s"}
         extra = set(options) - known
         if extra:
             raise ValueError(f"Unknown structure_parallel options: {sorted(extra)}")
         self.threads = _positive_int(options.get("threads_per_worker", 1), "threads_per_worker")
         self.timeout = _positive_seconds(options.get("timeout_s", 3600), "timeout_s")
         self.startup_timeout = _positive_seconds(options.get("startup_timeout_s", 300), "startup_timeout_s")
-        min_successful = _positive_int(options.get("min_successful_configs", 1), "min_successful_configs")
-        if min_successful > 1:
-            warnings.warn(
-                "structure_parallel.min_successful_configs is deprecated and values "
-                "above 1 are ignored; every nonempty successful ensemble is accepted",
-                DeprecationWarning, stacklevel=2,
-            )
-        self.min_successful = 1
         self.candidate_batch_size = options.get("candidate_batch_size", "auto")
         if self.candidate_batch_size != "auto":
             self.candidate_batch_size = _positive_int(self.candidate_batch_size, "candidate_batch_size")
         self.devices = _device_tokens(options.get("devices", "auto"), options.get("reserve_devices", []), self.startup_timeout)
-        workers_per_device = options.get("workers_per_device", 1)
-        if workers_per_device == "auto":
-            warnings.warn(
-                "structure_parallel.workers_per_device: auto is deprecated and now "
-                "uses one worker per GPU; remove this option or set it to 1",
-                DeprecationWarning, stacklevel=2,
-            )
-        elif type(workers_per_device) is not int or workers_per_device != 1:
-            raise ValueError(
-                "structure_parallel.workers_per_device must be 1; each GPU runs "
-                "one structure at a time"
-            )
-        self.workers_per_device = 1
-        if "min_speedup" in options:
-            warnings.warn(
-                "structure_parallel.min_speedup is deprecated and ignored; "
-                "GPU concurrency is fixed at one worker per GPU",
-                DeprecationWarning, stacklevel=2,
-            )
-        overrides = ((cfg.get("md") or {}).get("env") or {})
-        reserved = {"CUDA_VISIBLE_DEVICES", "LOCAL_RANK", "DEVICE"}.intersection(overrides)
-        if reserved:
-            raise ValueError(
-                f"md.env overrides {sorted(reserved)} would break structure_parallel GPU isolation; "
-                "remove them and use structure_parallel.devices"
-            )
+        environments = [(f"steps[{index}].env", step.get("env") or {})
+                        for index, step in enumerate(cfg.get("steps", []))
+                        if step.get("type") == "md_average"]
+        for location, overrides in environments:
+            reserved = {"CUDA_VISIBLE_DEVICES", "LOCAL_RANK", "DEVICE"}.intersection(overrides)
+            if reserved:
+                raise ValueError(
+                    f"{location} overrides {sorted(reserved)} would break structure_parallel GPU isolation; "
+                    "remove them and use structure_parallel.devices"
+                )
         self.kind = kind
         self.cfg = copy.deepcopy(cfg)
         self.cfg.pop("structure_parallel", None)
         self.seed = seed
         self._rng = np.random.default_rng(seed)
-        self._workers: dict[tuple[int, int], _Worker] = {}
+        self._workers: dict[int, _Worker] = {}
         self._closed = False
         self._registered = False
-        self._run_id = uuid.uuid4().hex[:12]
         self.last_build_timings: list[dict] = []
         self.last_build_job_timings: list[dict] = []
         self.last_build_wall_s = 0.0
         self.last_sample_records: list[list[dict]] = []
-        go = cfg.get("geo_opt") or {}
-        self.handles_geo_opt = bool(go) and bool(go.get("enabled", True))
 
-    def _ensure_targets(self, targets: list[tuple[int, int]]) -> None:
+    def _ensure_targets(self, targets: list[int]) -> None:
         if self._closed:
             raise RuntimeError("ParallelStructureBuilder is closed")
         if not self._registered:
@@ -259,18 +228,12 @@ class ParallelStructureBuilder:
             self._registered = True
         new_workers = []
         try:
-            for device, slot in targets:
-                if (device, slot) in self._workers:
+            for device in targets:
+                if device in self._workers:
                     continue
                 cfg = copy.deepcopy(self.cfg)
-                if cfg.get("md_debug_dir"):
-                    # Restarted workers reset the plugin's file counter.
-                    cfg["md_debug_dir"] = str(
-                        Path(cfg["md_debug_dir"]) / self._run_id /
-                        f"gpu_{device}_slot_{slot}_{uuid.uuid4().hex[:8]}"
-                    )
                 worker = _Worker(self.devices[device], cfg, self.kind, self.seed, self.threads)
-                self._workers[device, slot] = worker
+                self._workers[device] = worker
                 new_workers.append(worker)
             deadline = time.monotonic() + self.startup_timeout
             for worker in new_workers:
@@ -285,7 +248,7 @@ class ParallelStructureBuilder:
             raise
 
     def _run_jobs(self, candidates: list[Any], jobs: list[tuple],
-                  targets: list[tuple[int, int]],
+                  targets: list[int],
                   *, label: str) -> list[dict]:
         """Queue (candidate index, config index, seed, sample) across workers.
 
@@ -351,8 +314,8 @@ class ParallelStructureBuilder:
             raise
         return [replies[i] for i in range(len(jobs))]
 
-    def _retire(self, device: int, slot: int) -> None:
-        worker = self._workers.pop((device, slot), None)
+    def _retire(self, device: int) -> None:
+        worker = self._workers.pop(device, None)
         if worker is not None:
             worker.close()
 
@@ -364,8 +327,7 @@ class ParallelStructureBuilder:
         n_configs = self._validate_n_configs(n_configs)
         if self.candidate_batch_size != "auto":
             return self.candidate_batch_size
-        slots = len(self.devices)
-        return max(1, (slots + n_configs - 1) // n_configs)
+        return max(1, (len(self.devices) + n_configs - 1) // n_configs)
 
     def build(self, candidate: Any, *, n_configs: int = 1,
               rng: np.random.Generator | None = None) -> list[Atoms]:
@@ -392,7 +354,7 @@ class ParallelStructureBuilder:
             raise result
         return result
 
-    def _require_sample_capabilities(self, targets: list[tuple[int, int]]) -> None:
+    def _require_sample_capabilities(self, targets: list[int]) -> None:
         if any(not self._workers[target].sample_protocol for target in targets):
             self._stop_workers()
             raise SamplingProtocolError(
@@ -417,9 +379,9 @@ class ParallelStructureBuilder:
         if not candidates:
             return []
         jobs, plan_failures = [], {}
-        self._ensure_targets([(0, 0)])
-        self._require_sample_capabilities([(0, 0)])
-        worker = self._workers[0, 0]
+        self._ensure_targets([0])
+        self._require_sample_capabilities([0])
+        worker = self._workers[0]
         try:
             for candidate_index, candidate in enumerate(candidates):
                 worker.connection.send({"op": "plan", "candidate": candidate,
@@ -462,9 +424,9 @@ class ParallelStructureBuilder:
         groups = [[] for _ in candidates]
         for index, (candidate_index, _config_index, _seed, _sample) in enumerate(jobs):
             groups[candidate_index].append(index)
-        targets = [(device, 0) for device in range(min(len(self.devices), len(jobs)))]
-        for device, slot in set(self._workers) - set(targets):
-            self._retire(device, slot)
+        targets = list(range(min(len(self.devices), len(jobs))))
+        for device in set(self._workers) - set(targets):
+            self._retire(device)
         print(f"[structure_parallel] scheduling {len(candidates)} candidates / "
               f"{len(jobs)} configurations on {len(targets)} GPUs (one structure per GPU)", flush=True)
         try:
@@ -519,8 +481,8 @@ class ParallelStructureBuilder:
         return results
 
     def composition_formula(self, candidate: Any) -> str | None:
-        self._ensure_targets([(0, 0)])
-        worker = self._workers[0, 0]
+        self._ensure_targets([0])
+        worker = self._workers[0]
         try:
             worker.connection.send({"op": "formula", "candidate": candidate})
             if not worker.connection.poll(self.timeout):

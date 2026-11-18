@@ -135,12 +135,12 @@ def test_filter_prunes_non_neutral_final_pick():
     actions = [(_oh(1, 2), _oh(u, 4)) for u in range(4)]  # elem=F, comp=u
     kept = filt.filter_actions(
         actions=actions,
-        units_map={"Ca": 1},
+        chemical_amounts={"Ca": 1}, action_amounts=[0, 1, 2, 3],
         steps_left=0,
         allowed_units=allowed_units,
         possible_sums_by_k=[],
         species_set=species,
-        fraction_set=ratio,
+        action_values=ratio,
     )
     kept_units = {int(c.index(1.0)) for _, c in kept}
     assert 2 in kept_units        # CaF2 neutral -> kept
@@ -153,8 +153,8 @@ def test_filter_noop_before_final_step():
     filt = SMACTChargeFilter()
     actions = [(_oh(0, 2), _oh(1, 4))]
     out = filt.filter_actions(
-        actions=actions, units_map={}, steps_left=2, allowed_units=[0, 1, 2, 3],
-        possible_sums_by_k=[], species_set=["Fe", "O"], fraction_set=["0", "1", "2", "3"],
+        actions=actions, chemical_amounts={}, action_amounts=[0, 1, 2, 3], steps_left=2, allowed_units=[0, 1, 2, 3],
+        possible_sums_by_k=[], species_set=["Fe", "O"], action_values=["0", "1", "2", "3"],
     )
     assert out == actions  # untouched away from the final step
 
@@ -170,48 +170,15 @@ def test_make_smact_charge_with_scaffold_formula():
     assert filt.scaffold_per_fu == {"O": 2.0, "H": 1.0}
 
 
-def test_smact_charge_enabled_detection():
-    from rl_matdesign.registry import smact_charge_enabled
-
-    assert smact_charge_enabled({}) is False                       # not configured
-    assert smact_charge_enabled({"filters": [{"type": "last_step_element"}]}) is False
-    assert smact_charge_enabled({"filters": [{"type": "smact_charge"}]}) is True
-    assert smact_charge_enabled({"filters": ["smact_charge"]}) is True   # bare-string shorthand
-    assert smact_charge_enabled(
-        {"filters": [
-            {"type": "last_step_element", "required_elements": ["O"]},
-            {"type": "smact_charge"},
-        ]}
-    ) is True
-    # per-group placement (multi_group configs attach filters inside groups:)
-    assert smact_charge_enabled(
-        {"groups": [{"name": "g", "filters": [{"type": "smact_charge"}]}]}
-    ) is True
-
-
-def test_pauling_en_detection_and_combined_switches():
-    from rl_matdesign.registry import (
-        pauling_en_enabled, charge_check_enabled, charge_use_pauling,
-    )
-
-    chain = {"filters": [
-        {"type": "last_step_element", "required_elements": ["O"]},
-        {"type": "smact_charge"},
-        {"type": "pauling_en"},
-    ]}
-    assert pauling_en_enabled({}) is False
-    assert pauling_en_enabled({"filters": [{"type": "pauling_en"}]}) is True
-    assert pauling_en_enabled(chain) is True
-
-    # charge_check_enabled = smact_charge OR pauling_en; pauling alone still gates.
-    assert charge_check_enabled({}) is False
-    assert charge_check_enabled({"filters": [{"type": "smact_charge"}]}) is True
-    assert charge_check_enabled({"filters": [{"type": "pauling_en"}]}) is True
-    assert charge_check_enabled(chain) is True
-
-    # charge_use_pauling tracks pauling_en specifically.
-    assert charge_use_pauling({"filters": [{"type": "smact_charge"}]}) is False
-    assert charge_use_pauling(chain) is True
+def test_group_filter_detection_and_combined_switches():
+    from rl_matdesign.registry import smact_charge_enabled, pauling_en_enabled, charge_check_enabled, charge_use_pauling
+    for filters, smact, pauling in [([], False, False), (["smact_charge"], True, False),
+            ([{"type": "pauling_en"}], False, True), (["smact_charge", "pauling_en"], True, True)]:
+        cfg = {"groups": [{"name": "oxide", "filters": filters}]}
+        assert smact_charge_enabled(cfg) is smact
+        assert pauling_en_enabled(cfg) is pauling
+        assert charge_check_enabled(cfg) is (smact or pauling)
+        assert charge_use_pauling(cfg) is pauling
 
 
 def test_make_pauling_en_filter_uses_pauling():
@@ -234,9 +201,9 @@ def test_electronegativity_filter_prunes_en_implausible_final_pick():
     assert filt.use_pauling is True
     actions = [(_oh(1, 2), _oh(u, 4)) for u in range(4)]  # elem=O, comp=u units
     kept = filt.filter_actions(
-        actions=actions, units_map={"Fe": 2}, steps_left=0,
+        actions=actions, chemical_amounts={"Fe": 2}, action_amounts=[0, 1, 2, 3], steps_left=0,
         allowed_units=[0, 1, 2, 3], possible_sums_by_k=[],
-        species_set=species, fraction_set=ratio,
+        species_set=species, action_values=ratio,
     )
     kept_units = {int(c.index(1.0)) for _, c in kept}
     assert 3 in kept_units  # Fe2O3 neutral + EN-sensible -> kept

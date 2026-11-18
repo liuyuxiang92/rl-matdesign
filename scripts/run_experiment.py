@@ -13,7 +13,7 @@ if _SRC not in sys.path:
 
 from rl_matdesign.experiment import *  # noqa: F401,F403,E402
 from rl_matdesign.configuration import (  # noqa: F401,E402
-    _FLAG_ALIASES, _FAILED_CANDIDATE_REWARD, _apply_flag_aliases,
+    _FLAG_ALIASES, _apply_flag_aliases,
 )
 from rl_matdesign.experiment import main  # noqa: E402
 

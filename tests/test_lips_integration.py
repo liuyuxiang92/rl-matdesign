@@ -1,38 +1,33 @@
 """End-to-end (no-GPU) integration for the LiPS config on the general multi_group.
 
-Builds the env from the friendly configs/lips_sse.yaml (P-site composition
-group with the host included explicitly, S-site categorical), drives
-episodes, and asserts the O-form masking by metal category and the recipe's
-charge neutrality. DeepMD eval / geo-opt are GPU-gated.
+Builds the public chemical amount groups and their operation-owned masks,
+then plans the shared SSE pipeline against a synthetic template. No model or
+geometry optimization runs; the planned atom counts must be charge neutral.
 """
 import os
 import sys
+from copy import deepcopy
 
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-import yaml  # noqa: E402
-
-from rl_matdesign.env_multigroup import MultiGroupEnv, normalize_group_spec  # noqa: E402
-from rl_matdesign.registry import build_constraints  # noqa: E402
-from rl_matdesign.predictors.builders.sse import SSESupercellBuilder  # noqa: E402
+from rl_matdesign.configuration import build_env, load_config  # noqa: E402
+from rl_matdesign.predictors.builders.pipeline import PipelineBuilder  # noqa: E402
+from pymatgen.core import Composition  # noqa: E402
 
 CFG_PATH = os.path.join(os.path.dirname(__file__), "..", "configs", "lips_sse.yaml")
 
 
 def _load_cfg():
-    with open(CFG_PATH) as f:
-        return yaml.safe_load(f)
+    return load_config(CFG_PATH)
 
 
 def _build_env(cfg):
-    built = []
-    for g in cfg["groups"]:
-        gs = normalize_group_spec(g)
-        gs["constraint_filter"] = build_constraints(gs, env=None)
-        built.append(gs)
-    return MultiGroupEnv(groups=built)
+    class Predictor:
+        def predict(self, candidate):
+            return 0.0, 0.0
+    return build_env(cfg, Predictor())[0]
 
 
 def _val(valences, el, sc):
@@ -45,8 +40,7 @@ def test_lips_config_is_friendly():
     cfg = _load_cfg()
     assert "env_type" not in cfg                       # removed public key
     assert "constraint_filter" not in cfg
-    # total_units is still derived-only (never authored); fraction_set is now
-    # the one public grid knob, so it's legitimately present, not banned.
+    # Amount menus are public; lattice units and legacy O-form flags are not.
     banned = {"cl_map", "o_off", "o_on", "formula_units", "total_units"}
     keys = set(cfg) | {k for g in cfg["groups"] for k in g}
     assert not (keys & banned), f"internal-encoding knobs leaked back: {keys & banned}"
@@ -54,66 +48,92 @@ def test_lips_config_is_friendly():
     assert "P" in p_site["species_set"]                 # host listed explicitly
 
 
-def test_lips_masking_and_charge_neutrality():
+def test_lips_masking_and_charge_neutrality(tmp_path):
     cfg = _load_cfg()
+    # The configured recipe infers 500 formula units from the original P block.
+    # Positions are irrelevant to count planning; no structure is relaxed here.
+    template = tmp_path / "POSCAR"
+    total_atoms = 3000 + 500 + 3000
+    lines = ["SSE test", "1", "100 0 0", "0 100 0", "0 0 100",
+             "Li P S", "3000 500 3000", "Direct"]
+    lines.extend(f"{i / total_atoms} 0 0" for i in range(total_atoms))
+    template.write_text("\n".join(lines) + "\n")
+    cfg = deepcopy(cfg)
+    cfg["structure"]["base_poscar"] = str(template)
     env = _build_env(cfg)
-    # counts() with an explicit formula_units (so it needn't read the POSCAR here)
-    from rl_matdesign.structure_sources import normalize_structure_sources
-    plan = normalize_structure_sources(cfg, needs_structure=["conductivity", "stability"])
-    source_id = plan.property_sources["conductivity"]
-    assert plan.property_sources["stability"] == source_id
-    builder_cfg = plan.source(source_id).builder_config
-    builder = SSESupercellBuilder({**builder_cfg, "formula_units": 500})
 
-    s_group = next(g for g in cfg["groups"] if g["name"] == "S_site")
-    sse_filter_cfg = next(f for f in s_group["filters"] if f.get("type") == "sse_doping")
-    metal_only, oxide_only = set(sse_filter_cfg["metal_only"]), set(sse_filter_cfg["oxide_only"])
-    o_form_slots = [str(c.get("name", c["element"])) for c in s_group["choices"]
-                    if str(c["element"]) == sse_filter_cfg.get("o_element", "O")]
-    valences = builder_cfg["valences"]
+    from rl_matdesign.structure_sources import resolve_structure_plan
+    properties = [prop["name"] for prop in cfg["properties"]]
+    plan = resolve_structure_plan(cfg, needs_structure=properties)
+    source_ids = {plan.property_sources[name] for name in properties}
+    assert len(source_ids) == 1
+    builder_cfg = plan.structure.effective_config
+    builder = PipelineBuilder(builder_cfg)
+    balance = next(step for step in builder_cfg["steps"] if step["type"] == "sse_charge_balance")
+    valences = balance["valences"]
+    p_group = next(g for g in cfg["groups"] if g["name"] == "P_site")
+    halide = next(g for g in cfg["groups"] if g["name"] == "halide")
+    assert p_group["kind"] == halide["kind"] == "composition"
+    assert "S_site" not in env.group_names
+
+    def recipe(label):
+        counts = Composition(label).get_el_amt_dict()
+        metal = next(element for element in counts if element != "O")
+        return metal, counts.get("O", 0) / counts[metal]
+
+    # Explicitly verify that a selected metal form excludes only its alternate
+    # oxide form, while selecting more of the same form remains legal.
+    def choose(label, amount):
+        inner = env._active()
+        selected = next(a for a in env.allowed_actions()
+                        if inner.species_set[int(np.argmax(env._from_union(a)[0]))] == label
+                        and float(inner.action_values[int(np.argmax(env._from_union(a)[1]))]) == amount)
+        env.step(selected)
+    choose("P", .92)
+    choose("Ni", .04)
+    inner = env._active()
+    remaining = {(inner.species_set[int(np.argmax(env._from_union(a)[0]))],
+                  float(inner.action_values[int(np.argmax(env._from_union(a)[1]))]))
+                 for a in env.allowed_actions()}
+    assert ("Ni2O3", .04) not in remaining and ("Ni", .04) in remaining
 
     rng = np.random.default_rng(0)
     seen_metals = set()
     for _ in range(300):
         env.initialize()
-        while env.counter < env.n_components:
-            a = env.allowed_actions()
-            assert a, "agent stranded with no legal action"
-            env.step(a[int(rng.integers(len(a)))])
+        while not env.is_terminal:
+            actions = env.allowed_actions()
+            assert actions, "agent stranded with no legal action"
+            env.step(actions[int(rng.integers(len(actions)))])
         term = env.terminal_cation_fractions()
-        p_site, s_site = term["P_site"], term["S_site"]
-
-        assert "P" in p_site                                      # host now explicit
-        # 1-2 distinct dopants: an unused second slot lands on some OTHER
-        # element at 0.0 (a filler pick, not an active dopant) -- exclude it,
-        # matching SSESupercellBuilder._decode's own `p_site[el] > 0` filter.
-        metals = sorted(k for k in p_site if k != "P" and p_site[k] > 0)
+        p_site, halide_amounts = term["P_site"], term["halide"]
+        active_forms = {label: value for label, value in p_site.items() if label != "P" and value > 0}
+        metals = [recipe(label)[0] for label in active_forms]
         assert 1 <= len(metals) <= 2
+        assert len(metals) == len(set(metals))  # One positive form per base metal.
         seen_metals.update(metals)
-        dopant_total = sum(p_site[m] for m in metals)
-        # element_bounds P:[0.92,0.98] <=> combined dopant fraction in [0.02,0.08]
+        dopant_total = sum(active_forms.values())
         assert 0.02 - 1e-9 <= dopant_total <= 0.08 + 1e-9
         assert 0.92 - 1e-9 <= p_site["P"] <= 0.98 + 1e-9
         assert abs(p_site["P"] + dopant_total - 1.0) < 1e-9
+        assert halide_amounts["Cl"] in halide["amount_set"]
 
-        # Per-metal O-form masking: the i-th sorted metal reads the i-th O slot.
-        for i, m in enumerate(metals):
-            o_form = s_site[o_form_slots[i]]
-            assert o_form in (0, 1)
-            if m in metal_only:
-                assert o_form == 0                               # Ru: metal form only
-            elif m in oxide_only:
-                assert o_form == 1                               # oxide-only: oxide only
-        assert s_site["Cl"] in (0.6, 0.8, 1.0, 1.2, 1.4)         # real Cl count
-
-        c = builder.counts(term)
-        cation = c["Li"] + c["P"] * 5
-        for m, n_m in c["metals"].items():
-            sc = "oxide" if c["o_forms"][m] > 0 else "sulfide"
-            cation += n_m * _val(valences, m, sc)
-        anion = c["S"] * 2 + c["O"] * 2 + c["Cl"] + c["Br"]
-        assert cation == anion, (metals, c)
-        assert c["Br"] == int(round(1.7 * 500)) - c["Cl"]
-        assert 0 <= c["Li_delete"] <= 3000
-
+        planned = builder.plan_candidate(term)
+        counts = planned["sse"]["P_site"]
+        assert counts["formula_units"] == 500
+        assert counts["metals"] == {recipe(label)[0]: round(fraction * 500)
+                                    for label, fraction in active_forms.items()}
+        assert counts["O"] == sum(round(recipe(label)[1] * round(fraction * 500))
+                                  for label, fraction in active_forms.items())
+        positive = counts["Li"] + counts["P"] * 5
+        for metal, number in counts["metals"].items():
+            scenario = "oxide" if counts["o_forms"][metal] else "sulfide"
+            positive += number * _val(valences, metal, scenario)
+        negative = 2 * counts["S"] + 2 * counts["O"] + counts["Cl"] + counts["Br"]
+        assert positive == negative, (active_forms, counts)
+        assert counts["Br"] == round(1.7 * 500) - counts["Cl"]
+        assert 0 <= counts["Li_delete"] <= 3000
+        expected_counts = {**counts["metals"], **{element: counts[element]
+                           for element in ("Li", "P", "S", "O", "Cl", "Br")}}
+        assert planned["counts"] == {element: number for element, number in expected_counts.items() if number}
     assert len(seen_metals) > 10

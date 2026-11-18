@@ -17,10 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _config():
     return {
-        "predictor": "dummy", "method": "a2c",
+        "properties": [{"name": "score", "predictor": "dummy", "direction": "max", "objective": "mean"}], "method": "a2c",
         "groups": [{"name": "metal", "kind": "composition",
                     "species_set": ["Ni", "Fe", "Co"],
-                    "fraction_set": ["0.25", "0.50", "0.75"], "n_components": 2}],
+                    "amount_set": [.25, .5, .75], "n_steps": 2, "total": 1, "unique": True}],
         "eval_seed": 13, "train_seed": 17, "gen_seed": 19,
         "dqn_warmup_eps": 4, "dqn_num_train_eps": 4,
         "dqn_batch_size": 2, "dqn_buffer_size": 100,
