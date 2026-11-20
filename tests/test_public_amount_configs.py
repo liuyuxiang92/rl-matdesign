@@ -30,7 +30,8 @@ PUBLIC_CONFIGS = [
     "ooh", "hea", "ti_alloy", "cs2agbicl6_level1", "cs2agbicl6_level2", "cs2agbicl6_level3",
     "perovskite", "lips_sse", "oxides_calcine", "oxides_sinter", "oxides_sinter_calcine", "actmof",
     "peptide_parent_gp", "peptide_novel_gp", "peptide_parent_ecfp_gp", "peptide_novel_ecfp_gp",
-    *[f"glassnet_{grid}_{method}" for grid in ("coarse_2pct", "fine_0p5pct", "1pct")
+    "glassnet_coarse_2pct",
+    *[f"glassnet_{grid}_{method}" for grid in ("fine_0p5pct", "1pct")
       for method in ("a2c", "dqn_bootstrap", "dqn_mc")],
 ]
 
@@ -314,8 +315,9 @@ def test_public_configs_use_one_property_schema_and_section_order(name):
 
 
 def test_requested_scenario_inventory_is_consolidated():
-    assert len(PUBLIC_CONFIGS) == 25
+    assert len(PUBLIC_CONFIGS) == 23
     removed = ["ooh_dqn", "ooh_fine", "ooh_design_space_29", "ooh_design_space_34", "perovskite_level1"]
+    removed += [f"glassnet_coarse_2pct_{method}" for method in ("a2c", "dqn_bootstrap", "dqn_mc")]
     removed += [f"oxides_{kind}_{variant}" for kind in ("calcine", "sinter", "sinter_calcine")
                 for variant in ("a2c", "no_train_filter")]
     assert not any((CONFIGS / f"{name}.yaml").exists() for name in removed)

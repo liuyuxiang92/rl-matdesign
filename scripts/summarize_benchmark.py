@@ -107,8 +107,8 @@ def outputs_and_feasibility(cfg, row):
                 if selector in physical:
                     raise ValueError(f"Ambiguous multiple properties select {selector}")
                 physical[selector] = output.mean
-        combiner = RewardCombiner(cfg.get("reward"), list(raw))
-        passed = combiner.evaluate(raw, {name: 0.0 for name in raw})["gate_passed"]
+        combiner = RewardCombiner.from_config(cfg, list(raw))
+        passed = all(gate["passed"] for gate in combiner.gate_details(raw))
         return passed, physical, None
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
         return None, {}, str(exc)

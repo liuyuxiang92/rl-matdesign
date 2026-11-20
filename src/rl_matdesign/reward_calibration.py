@@ -1,4 +1,4 @@
-"""Fixed scientific reward calibration, independent of adaptive value normalization.
+"""Fit the fixed scientific reward used by experiments in PopArt mode.
 
 Observations contain native gate inputs and complete, signed scientific utilities.
 No evaluator is called here. A fitted artifact is immutable and content-addressed;
@@ -10,11 +10,10 @@ from copy import deepcopy
 import hashlib
 import json
 import math
-from numbers import Integral
 from typing import Any, Mapping, Sequence
 
 from .predictors.outputs import _mean, _population_std
-from .rewards import RewardCombiner, _keys, _mapping, _number
+from .rewards import CALIBRATION_CANDIDATES, RewardCombiner, _mapping, _number
 
 
 class CalibrationPendingError(ValueError):
@@ -31,28 +30,6 @@ def _positive(value: Any, context: str, *, allow_zero: bool = False) -> float:
     if value < 0 or (value == 0 and not allow_zero):
         raise ValueError(f"{context} must be {'nonnegative' if allow_zero else 'strictly positive'}.")
     return value
-
-
-def _normalization(value: Any, context: str, *, reference: bool = False) -> dict:
-    if isinstance(value, str):
-        value = {"mode": value}
-    value = dict(_mapping(value, context))
-    mode = value.get("mode", "auto_fixed")
-    if mode not in ("auto_fixed", "fixed"):
-        raise ValueError(f"{context}.mode must be auto_fixed or fixed.")
-    allowed = {"mode", "scale_floor"} if mode == "auto_fixed" else {"mode", "scale"}
-    if reference and mode == "fixed":
-        allowed.add("reference")
-    _keys(value, allowed, context)
-    result = {"mode": mode}
-    if mode == "fixed":
-        result["scale"] = _positive(value.get("scale"), f"{context}.scale")
-        if reference:
-            result["reference"] = _number(value.get("reference", 0.0), f"{context}.reference")
-    else:
-        result["scale_floor"] = _positive(value.get("scale_floor", 0.0),
-                                         f"{context}.scale_floor", allow_zero=True)
-    return result
 
 
 def _moments(values: Sequence[float]) -> tuple[float, float]:
@@ -72,108 +49,53 @@ def _rms(values: Sequence[float]) -> float:
 
 
 class RewardCalibration:
-    """Fit and evaluate an explicitly selected immutable reward convention.
+    """Fit and evaluate the immutable reward convention for the selected reward type.
 
     ``objective_values`` in observations are already signed and uncertainty
     adjusted. Applying direction or uncertainty again would change the task.
-    Fixed property references are declared in physical coordinates and oriented
-    once by ``directions``. Automatically fitted references use signed utility
-    coordinates, including any declared uncertainty adjustment.
+    Pilot references use signed utility coordinates, including any declared
+    uncertainty adjustment.
     """
 
     SCHEMA_VERSION = 1
 
     def __init__(self, combiner: RewardCombiner, properties: Sequence[Mapping[str, Any]], *,
-                 directions: Mapping[str, float | None] | None = None,
                  gate_domain_widths: Mapping[str, float] | None = None,
                  scientific_identity: Mapping[str, Any] | None = None) -> None:
         self.combiner = combiner
-        specs = {p["name"]: dict(p) for p in properties}
         self._state = None
         if combiner.type not in ("weighted_sum", "gated"):
             raise ValueError("Automatic calibration supports weighted_sum and gated rewards, not max alternatives.")
-        cfg = dict(combiner.calibration_config)
-        _keys(cfg, {"profile", "num_candidates", "quality_mode", "quality_scale_floor"}, "reward.calibration")
-        expected = "auto_gated_softplus_v1" if combiner.type == "gated" else "auto_weighted_sum_v1"
-        self.profile = cfg.get("profile", expected)
-        if self.profile != expected:
-            raise ValueError(f"reward.calibration.profile must be {expected!r} for {combiner.type}.")
-        if combiner.type == "gated" and not combiner.calibrated_gated:
-            raise ValueError("Gated property calibration requires an explicit complete reward.calibration profile.")
-        self.quality_mode = cfg.get("quality_mode", "per_property")
-        if self.quality_mode not in ("per_property", "aggregate"):
-            raise ValueError("reward.calibration.quality_mode must be per_property or aggregate.")
-        if self.quality_mode == "aggregate" and combiner.type != "gated":
-            raise ValueError("Aggregate quality calibration requires the gated profile.")
-        self.quality_specs = {}
-        if directions is None:
-            aliases = {"min": -1.0, "minimize": -1.0, "max": 1.0, "maximize": 1.0,
-                       "target": None}
-            directions = {}
-            for name, prop in specs.items():
-                direction = str(prop.get("direction", "max")).lower()
-                if direction not in aliases:
-                    raise ValueError(f"Property {name!r} has an unsupported direction {direction!r}.")
-                directions[name] = aliases[direction]
-        for name, prop in specs.items():
-            if "normalization" in prop and "scale" in prop:
-                raise ValueError(f"Property {name!r} cannot declare both scale and normalization.")
-            if combiner.type == "gated" and "scale" in prop:
-                raise ValueError(f"Calibrated property {name!r} cannot also declare legacy scale.")
-            if name not in combiner.objective_terms:
-                if "normalization" in prop:
-                    raise ValueError(f"Gate-only property {name!r} must use gate violation_normalization.")
-                continue
-            if self.quality_mode == "aggregate":
-                if "normalization" in prop:
-                    raise ValueError("Aggregate quality mode cannot also normalize individual properties.")
-                continue
-            normalization = prop.get("normalization")
-            if combiner.objective_terms[name] == 0:
-                if normalization is not None:
-                    raise ValueError(f"Zero-weight objective {name!r} does not use normalization.")
-                continue
-            if normalization is None and combiner.type == "gated":
-                normalization = {"mode": "auto_fixed"}
-            if normalization is not None:
-                spec = _normalization(normalization, f"Property {name!r} normalization", reference=True)
-                if spec["mode"] == "fixed":
-                    direction = directions.get(name, 1.0)
-                    if direction is None:
-                        raise ValueError("Fixed physical references for target-distance objectives are unsupported.")
-                    spec["reference"] *= float(direction)
-                self.quality_specs[name] = spec
+        if not combiner.calibrate:
+            raise ValueError("Automatic reward calibration requires value_normalization: popart.")
+        self.profile = "auto_gated_softplus_v1" if combiner.type == "gated" else "auto_weighted_sum_v1"
+        self.quality_mode = combiner.quality_mode
+        for prop in properties:
+            if "scale" in prop:
+                raise ValueError(f"Calibrated property {prop['name']!r} cannot declare a manual scale.")
+        self.quality_names = [name for name, weight in combiner.objective_terms.items()
+                              if weight != 0 and self.quality_mode == "per_property"]
         if combiner.type == "gated":
             weights = list(combiner.objective_terms.values())
             if any(w < 0 for w in weights) or not any(w > 0 for w in weights):
                 raise ValueError("Calibrated gated objective weights must be nonnegative with positive total.")
-        self.aggregate_floor = _positive(cfg.get("quality_scale_floor", 0.0),
-                                         "quality_scale_floor", allow_zero=True)
-        if "quality_scale_floor" in cfg and self.quality_mode != "aggregate":
-            raise ValueError("quality_scale_floor is for aggregate mode; use per-property scale_floor otherwise.")
-        if combiner.type == "weighted_sum" and not self.quality_specs:
-            raise ValueError("Weighted-sum reward calibration requires at least one normalized objective.")
-        self.gate_specs = {}
-        widths = dict(gate_domain_widths or {})
+        if combiner.type == "weighted_sum" and not self.quality_names:
+            raise ValueError("Weighted-sum reward calibration requires at least one nonzero objective weight.")
+        self.gate_floors = {}
+        widths = gate_domain_widths or {}
         for gate in combiner._gates:
-            spec = _normalization(combiner.gate_normalizations[gate.name], f"Gate {gate.name!r} normalization")
-            physical_floor = _positive(widths.get(gate.name, 0.0), "Gate domain width", allow_zero=True)
+            floor = _positive(widths.get(gate.name, 0.0), "Gate domain width", allow_zero=True)
             if gate.lower is not None and gate.upper is not None:
-                physical_floor = max(physical_floor, _number(gate.upper - gate.lower, "Gate width"))
-            spec["physical_floor"] = physical_floor
-            self.gate_specs[gate.name] = spec
-        needs_pilot = (self.quality_mode == "aggregate"
-                       or any(v["mode"] == "auto_fixed" for v in self.quality_specs.values())
-                       or any(v["mode"] == "auto_fixed" for v in self.gate_specs.values()))
-        count = cfg.get("num_candidates", 100)
-        if isinstance(count, bool) or not isinstance(count, Integral) or count <= 0:
-            raise ValueError("reward.calibration.num_candidates must be a positive integer.")
-        if not needs_pilot and "num_candidates" in cfg:
-            raise ValueError("reward.calibration.num_candidates is unused when all scales are fixed.")
-        self.num_candidates = int(count) if needs_pilot else 0
+                floor = max(floor, _number(gate.upper - gate.lower, "Gate width"))
+            self.gate_floors[gate.name] = floor
+        self.num_candidates = CALIBRATION_CANDIDATES
+        # Keep the effective numerical rules in the versioned calibration artifact.
+        auto = {"mode": "auto_fixed", "scale_floor": 0.0}
         self.spec = {"schema_version": self.SCHEMA_VERSION, "profile": self.profile,
-                     "quality_mode": self.quality_mode, "quality_specs": self.quality_specs,
-                     "gate_specs": self.gate_specs, "aggregate_floor": self.aggregate_floor,
+                     "quality_mode": self.quality_mode, "aggregate_floor": 0.0,
+                     "quality_specs": {name: auto for name in self.quality_names},
+                     "gate_specs": {name: {**auto, "physical_floor": floor}
+                                    for name, floor in self.gate_floors.items()},
                      "objective_terms": combiner.objective_terms,
                      "gates": [{"name": g.name, "terms": g.terms, "min": g.lower, "max": g.upper,
                                 "priority": g.penalty_weight} for g in combiner._gates],
@@ -182,8 +104,6 @@ class RewardCalibration:
         # Work with the same JSON types that a later artifact load returns.
         self.spec = json.loads(json.dumps(self.spec, allow_nan=False))
         self.spec_hash = _hash(self.spec)
-        if not needs_pilot:
-            self.fit([])
 
     @property
     def frozen(self) -> bool:
@@ -217,20 +137,17 @@ class RewardCalibration:
                 _number(values.get(name), f"Calibration objective {name!r}")
             self.combiner.gate_details(row.get("gate_values"))
             rows.append(row)
-        if len(rows) < self.num_candidates:
+        if len(rows) != self.num_candidates:
             raise ValueError(f"Calibration requires {self.num_candidates} distinct valid candidates; got {len(rows)}.")
         return rows
 
     @staticmethod
-    def _fit_quality(values: Sequence[float], spec: Mapping[str, Any]) -> dict:
-        if spec["mode"] == "fixed":
-            return {"reference": spec["reference"], "scale": spec["scale"], "source": "fixed"}
+    def _fit_quality(values: Sequence[float]) -> dict:
         mean, std = _moments(values)
-        scale = max(std, spec.get("scale_floor", 0.0))
-        if scale <= 0:
-            raise ValueError("Quality calibration is unresolved: zero spread requires a meaningful declared scale_floor.")
-        return {"reference": mean, "scale": scale, "population_std": std,
-                "scale_floor": spec.get("scale_floor", 0.0), "source": "pilot"}
+        if std <= 0:
+            raise ValueError("Quality calibration is unresolved: the pilot has zero spread.")
+        return {"reference": mean, "scale": std, "population_std": std,
+                "scale_floor": 0.0, "source": "pilot"}
 
     def fit(self, observations: Sequence[Mapping[str, Any]]) -> dict:
         if self._state is not None:
@@ -239,23 +156,18 @@ class RewardCalibration:
         qualities = {}
         if self.quality_mode == "aggregate":
             qualities["__aggregate__"] = self._fit_quality(
-                [self._sum(row["objective_values"]) for row in rows],
-                {"mode": "auto_fixed", "scale_floor": self.aggregate_floor})
+                [self._sum(row["objective_values"]) for row in rows])
         else:
-            for name, spec in self.quality_specs.items():
-                qualities[name] = self._fit_quality([row["objective_values"][name] for row in rows], spec)
+            for name in self.quality_names:
+                qualities[name] = self._fit_quality([row["objective_values"][name] for row in rows])
         gates = {}
         for gate in self.combiner._gates:
-            spec = self.gate_specs[gate.name]
-            if spec["mode"] == "fixed":
-                gates[gate.name] = {"scale": spec["scale"], "source": "fixed"}
-                continue
             scores = [self.combiner._sum(gate.terms, row["gate_values"], "gate_values") for row in rows]
             _, std = _moments(scores)
             distances = [_number(min(abs(score - bound) for bound in (gate.lower, gate.upper)
                                      if bound is not None), "Gate boundary distance") for score in scores]
             rms = _rms(distances)
-            floor = max(spec["physical_floor"], spec.get("scale_floor", 0.0))
+            floor = self.gate_floors[gate.name]
             scale = max(std, rms, floor)
             if scale <= 0:
                 raise ValueError(f"Gate {gate.name!r} calibration unresolved: zero scale needs physical metadata.")
@@ -277,14 +189,29 @@ class RewardCalibration:
         if not content_hash or _hash(state) != content_hash:
             raise ValueError("Reward calibration artifact content hash mismatch.")
         state["content_hash"] = content_hash
-        if state.get("schema_version") != self.SCHEMA_VERSION or state.get("spec_hash") != self.spec_hash:
+        stored_spec = state.get("spec")
+        if (state.get("schema_version") != self.SCHEMA_VERSION or not isinstance(stored_spec, dict)
+                or state.get("spec_hash") != _hash(stored_spec)):
             raise ValueError("Reward calibration artifact has a different scientific contract/profile.")
-        if state.get("spec") != self.spec:
-            raise ValueError("Reward calibration artifact specification mismatch.")
-        quality_keys = {"__aggregate__"} if self.quality_mode == "aggregate" else set(self.quality_specs)
+        if stored_spec != self.spec:
+            # Older v1 artifacts also stored the authored normalization field.
+            # Compare the effective rules and preserve the original content hash.
+            previous = deepcopy(stored_spec)
+            old_identity = _mapping(previous.get("scientific_identity"), "Stored scientific identity")
+            declarations = old_identity.get("properties", [])
+            if not isinstance(declarations, list):
+                raise ValueError("Invalid stored property declarations.")
+            for declaration in declarations:
+                prop = _mapping(declaration, "Stored property declaration")
+                if prop.get("normalization") in ("auto_fixed", {"mode": "auto_fixed"},
+                                                  {"mode": "auto_fixed", "scale_floor": 0.0}):
+                    del prop["normalization"]
+            if previous != self.spec:
+                raise ValueError("Reward calibration artifact has a different scientific contract/profile.")
+        quality_keys = {"__aggregate__"} if self.quality_mode == "aggregate" else set(self.quality_names)
         quality = _mapping(state.get("quality"), "Stored quality calibration")
         gates = _mapping(state.get("gates"), "Stored gate calibration")
-        if set(quality) != quality_keys or set(gates) != set(self.gate_specs):
+        if set(quality) != quality_keys or set(gates) != set(self.gate_floors):
             raise ValueError("Reward calibration artifact is missing quality/gate scales.")
         for item in quality.values():
             item = _mapping(item, "Stored quality scale")
@@ -296,7 +223,7 @@ class RewardCalibration:
         count = state.get("observation_count")
         keys = state.get("candidate_keys")
         if (not isinstance(keys, list) or isinstance(count, bool) or not isinstance(count, int)
-                or count < self.num_candidates or count != len(keys)):
+                or count != self.num_candidates or count != len(keys)):
             raise ValueError("Reward calibration artifact has an invalid observation count.")
         if any(not isinstance(key, str) or not key for key in keys) or len(set(keys)) != len(keys):
             raise ValueError("Reward calibration artifact must identify distinct candidates.")

@@ -8,7 +8,7 @@ import pytest
 import torch
 import yaml
 
-from tests.test_experiment_reproducibility import _config, _run, _scientific_rows
+from tests.test_experiment_reproducibility import _config, _popart_config, _run, _scientific_rows
 from rl_matdesign.utils.seeding import capture_rng_state, restore_rng_state, isolated_rng
 from rl_matdesign.utils.timing import PredictorTimer
 
@@ -40,7 +40,7 @@ def test_inference_cannot_consume_training_rng_or_depend_on_query_order():
 def test_interrupted_runner_matches_uninterrupted_training(
     tmp_path, method, target, weights, mid, value_normalization,
 ):
-    cfg = _config()
+    cfg = _popart_config() if value_normalization == 'popart' else _config()
     cfg['value_normalization'] = value_normalization
     config = tmp_path / 'config.yaml'
     config.write_text(yaml.safe_dump(cfg))
@@ -49,6 +49,11 @@ def test_interrupted_runner_matches_uninterrupted_training(
     resumed.mkdir()
     shutil.copyfile(full / mid, resumed / 'checkpoint.pt')
     shutil.copyfile(full / 'std_scaler.bin', resumed / 'std_scaler.bin')
+    if value_normalization == 'popart':
+        shutil.copyfile(full / 'reward_calibration.json', resumed / 'reward_calibration.json')
+    else:
+        assert not (full / 'calibration_checkpoint.pt').exists()
+        assert not (full / 'reward_calibration.json').exists()
     _run(config, resumed, method, target, '--resume-training', '--save-checkpoint-freq', '1')
     role = 'qnet_state' if method == 'dqn' else 'policy_state'
     a = torch.load(full / weights, weights_only=True)

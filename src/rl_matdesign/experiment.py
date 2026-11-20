@@ -144,7 +144,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Stop after this many consecutive duplicate training episodes in "
                         "unique-budget mode (default 1000). Overrides YAML.")
     p.add_argument("--value-normalization", choices=["none", "popart"], default=None,
-                   help="Override the Q/value target normalization mode.")
+                   help="Select raw rewards (none) or automatic property calibration and PopArt (popart).")
     p.add_argument("--value-normalization-profile", choices=["popart_v1"], default=None,
                    help="Select the versioned value normalization recipe.")
     p.add_argument("--load-reward-calibration", help="Load a compatible frozen reward calibration JSON.")

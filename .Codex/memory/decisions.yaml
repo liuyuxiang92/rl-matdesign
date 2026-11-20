@@ -275,7 +275,10 @@
     Default generation.repeats to 3 per the user's explicit preference; three
     trained models then produce nine runs for each generation setting/budget.
     Select the last explicitly authored generation strategy, including zero,
-    and preserve it across config resolution and sorted exports. Phase budgets
+    and preserve it across config resolution and sorted exports. When migrating
+    an older multi-strategy YAML, read the old runner's selection logic and write
+    only the strategy it actually used. Oxide sintering with temperature 3 and
+    epsilon zero sampled at temperature 3 under the original runner. Phase budgets
     independently support fractions or absolute unique counts. Keep the budget
     multiplier/divisor fixed at 2 and both training and generation range extra
     probes fixed at 2 per direction internally. Each search round admits up to 3 distinct
@@ -588,7 +591,11 @@
   choice: Checkpoint each settled pilot observation without a scalar reward, freeze
     calibration by content hash, and finalize stored observations once. Bind learner
     and generation artifacts to that hash, reuse DQN pilot trajectories in warmup,
-    and record A2C pilot trajectories only for accounting.
+    and record A2C pilot trajectories only for accounting. The experiment setting
+    value_normalization selects the whole recipe. PopArt mode calibrates weighted-sum
+    and gated rewards from exactly 100 distinct valid candidates on a fresh run.
+    Raw mode skips calibration and uses raw learner targets. Preserve raw GlassNet
+    T3 in kelvin on pass and its native-unit CTE/Tg penalties on failure.
   alternatives_considered:
   - Updating scientific scales online would alter objective weights or failure severity
     and invalidate replay labels.

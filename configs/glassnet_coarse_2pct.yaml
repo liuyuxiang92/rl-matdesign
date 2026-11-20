@@ -1,5 +1,4 @@
-# GlassNet Step 1 example. Maximize T3 subject to the CTE and Tg gates.
-# Training settings are inherited from the corresponding reviewed grid and method.
+# GlassNet coarse grid (2 mol%). Select the learner with --method and --dqn-target-mode.
 groups:
 - name: glass
   kind: composition
@@ -47,8 +46,6 @@ properties:
   representation: physical
   direction: max
   objective: mean
-  normalization:
-    mode: auto_fixed
 - name: thermal_expansion
   predictor: glassnet
   output: CTEbelowTg
@@ -65,6 +62,7 @@ properties:
   objective: mean
 reward:
   type: gated
+  failure: {reward: -10.0}  # Raw reward when value_normalization is none
   objective:
     terms:
       forming_temperature: 1.0
@@ -75,34 +73,47 @@ reward:
         thermal_expansion: 1.0
     min: 0.0
     max: 5.0e-06
-    violation_normalization: auto_fixed
+    penalty_weight: 1000000.0  # Raw CTE violation
   - name: sufficient_transition_temperature
     score:
       terms:
         glass_transition: 1.0
     min: 773.0
-    violation_normalization: auto_fixed
-  calibration:
-    profile: auto_gated_softplus_v1
-    num_candidates: 100
+    penalty_weight: 0.001  # Raw Tg violation
+
+# Coarse HPO selections (2026-11-16). Each training budget includes the pilot.
+method: dqn
+dqn_target_mode: bootstrap
+train_budget: {dqn-bootstrap: 458, dqn-mc: 115, a2c: 916}
+num_gen_eps: {dqn-bootstrap: 1, dqn-mc: 115, a2c: 229}
+gen_temperature: {dqn-bootstrap: 0.0, dqn-mc: 1.0, a2c: 10.0}
+value_normalization: popart
 gamma: 1.0
 train_count_duplicates: false
 train_max_duplicate_attempts: 2000
-num_gen_eps: 0
-dqn_warmup_eps: 100
-dqn_batch_size: 32
-dqn_grad_steps_per_ep: 1
-dqn_hidden_dim: 128
-dqn_buffer_size: 20000
-dqn_loss: smoothl1
-dqn_eps_anneal_eps: 700
-dqn_lr: 0.002584117593731318
-dqn_eps_min: 0.17457109949576843
-dqn_target_update_freq: 50
-train_budget: 10000
-method: dqn
 eval_seed: 0
 train_seed: 11
 gen_seed: 11
-dqn_target_mode: bootstrap
-value_normalization: popart
+
+# DQN shares the pilot with warmup. train_budget determines dqn_num_train_eps.
+dqn_warmup_eps: 100
+dqn_lr: 0.001
+dqn_batch_size: 256
+dqn_hidden_dim: 256
+dqn_buffer_size: 50000
+dqn_grad_steps_per_ep: 5
+dqn_loss: smoothl1
+dqn_eps_anneal_eps: 10000
+dqn_eps_min: 0.05
+dqn_target_update_freq: 100  # Bootstrap only
+dqn_augment_permutations: 0
+
+# A2C scaler warmup is unscored. train_budget determines pg_num_iters.
+pg_warmup_eps: 200
+pg_batch_eps: 15
+pg_lr_actor: 0.001
+pg_lr_critic: 0.001
+pg_entropy_coef: 0.01
+pg_entropy_min: 0.3
+pg_repeat_penalty_coef: 0.0
+pg_repeat_penalty_shape: log

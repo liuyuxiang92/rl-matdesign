@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import redirect_stdout
 import sys
 
+from ..rewards import CALIBRATION_CANDIDATES, reward_calibration_requested
 from .artifacts import digest
 
 
@@ -46,6 +47,8 @@ def minimum_training_budget(plan: dict, domain: dict) -> int:
     from .budget_search import minimum_unique_for_preparation
     from .spec import phase_efficiency
     cfg, space = plan["base_config_data"], plan["search_space"]
+    pilot = CALIBRATION_CANDIDATES if reward_calibration_requested(cfg) else 0
+
     def largest(name):
         spec = space[name]
         return max(spec["choices"]) if spec["type"] == "categorical" else spec["high"]
@@ -53,13 +56,13 @@ def minimum_training_budget(plan: dict, domain: dict) -> int:
         warmup = cfg.get("pg_warmup_eps", 0)
         limit = phase_efficiency(plan, "train")["max_attempts_per_unique"]
         batch = largest("pg_batch_eps")
-        return max(batch, minimum_unique_for_preparation(warmup, limit))
+        return max(pilot + batch, minimum_unique_for_preparation(warmup, limit))
     batch = largest("dqn_batch_size")
-    minimum = math.ceil(batch / max(1, domain.get("episode_steps", 1))) + 1
+    minimum = max(pilot, math.ceil(batch / max(1, domain.get("episode_steps", 1)))) + 1
     if plan["method"] == "dqn-bootstrap":
         freq = largest("dqn_target_update_freq")
         warm_fraction = largest("warmup_budget_fraction")
-        minimum = max(minimum, math.ceil((freq + 1) / (1 - warm_fraction)))
+        minimum = max(minimum, pilot + freq + 1, math.ceil((freq + 1) / (1 - warm_fraction)))
     return minimum
 
 

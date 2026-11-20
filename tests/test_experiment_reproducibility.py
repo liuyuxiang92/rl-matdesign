@@ -31,6 +31,15 @@ def _config():
     }
 
 
+def _popart_config():
+    cfg = _config()
+    # Enough distinct two-element mixtures for the full pilot and online updates.
+    cfg["groups"][0]["species_set"] = "Ni Fe Co Cu Mn Cr Al Ti Mg Zn V Zr Ca Si Sn W".split()
+    cfg.update(value_normalization="popart", train_budget=105, dqn_warmup_eps=1)
+    del cfg["dqn_num_train_eps"], cfg["pg_num_iters"]
+    return cfg
+
+
 def _run(config, out, method, target, *extra):
     command = [sys.executable, str(ROOT / "scripts/run_experiment.py"),
                "--config", str(config), "--out", str(out), "--device", "cpu",

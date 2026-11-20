@@ -129,6 +129,7 @@ properties:
   objective: mean
 reward:
   type: gated
+  failure: {reward: -10.0}  # Raw reward when value_normalization is none
   gates:
   - name: synthesis
     score:
@@ -136,17 +137,13 @@ reward:
       terms:
         pure_probability: 1.0
     min: 0.8
-    violation_normalization: auto_fixed
   objective:
+    quality_mode: aggregate
     type: weighted_sum
     terms:
       delta_T400: 0.33333
       delta_T500: 0.33333
       delta_T600: 0.33333
-  calibration:
-    profile: auto_gated_softplus_v1
-    num_candidates: 100
-    quality_mode: aggregate
 k: 1.0
 method: dqn
 gamma: 0.9

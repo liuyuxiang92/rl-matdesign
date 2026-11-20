@@ -140,6 +140,8 @@ class StructureScorePredictor:
         self._source_builders: Dict[str, Any] = {}
         seen: set[str] = set()
         for i, p in enumerate(raw_props):
+            if "normalization" in p:
+                raise EvaluationProtocolError(f"properties[{i}].normalization was removed; calibration fits property scales automatically")
             if "weight" in p:
                 raise EvaluationProtocolError(
                     f"properties[{i}].weight was removed; put coefficients in reward terms")
@@ -165,7 +167,7 @@ class StructureScorePredictor:
             is_dp_backend = predictor_name in ("dp_energy", "dp_property", "dp_classification")
             physical_cfg = dict(p)
             for field_name in ("name", "direction", "target_value", "target_tolerance",
-                               "scale", "normalization", "objective", "transform", "uncertainty",
+                               "scale", "objective", "transform", "uncertainty",
                                "output", "unit", "representation", "fparam", "aparam"):
                 physical_cfg.pop(field_name, None)
             if is_dp_backend:
@@ -380,8 +382,8 @@ class StructureScorePredictor:
 
         from ..rewards import RewardCombiner
 
-        self._reward_combiner = RewardCombiner(
-            cfg.get("reward"), [p["name"] for p in self.properties]
+        self._reward_combiner = RewardCombiner.from_config(
+            cfg, [p["name"] for p in self.properties]
         )
         self._objective_names = set(self._reward_combiner.objective_terms)
         for _, terms in self._reward_combiner.alternatives:
@@ -450,9 +452,7 @@ class StructureScorePredictor:
         declarations = [
             {**raw, "name": prop["name"]} for raw, prop in zip(raw_props, self.properties)
         ]
-        if not self._reward_combiner.calibration_config and not any(
-            "normalization" in prop for prop in declarations
-        ):
+        if not self._reward_combiner.calibrate:
             self._reward_calibration = None
             return
 
@@ -469,7 +469,6 @@ class StructureScorePredictor:
         }
         self._reward_calibration = RewardCalibration(
             self._reward_combiner, declarations,
-            directions={prop["name"]: prop["direction"] for prop in self.properties},
             gate_domain_widths=widths,
             scientific_identity={"oracle": self.oracle_identity(),
                                  "properties": declarations, "k": self.k},
@@ -478,10 +477,6 @@ class StructureScorePredictor:
     @property
     def reward_calibration_enabled(self) -> bool:
         return self._reward_calibration is not None
-
-    @property
-    def reward_calibration_frozen(self) -> bool:
-        return not self.reward_calibration_enabled or self._reward_calibration.frozen
 
     @property
     def reward_calibration_num_candidates(self) -> int:

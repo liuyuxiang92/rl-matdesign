@@ -1,10 +1,13 @@
 """Exercise the calibrated reward through the scientific predictor adapter."""
 from copy import deepcopy
+import hashlib
 import json
 import math
+from pathlib import Path
 
 import pytest
 
+from rl_matdesign.config_schema import load_yaml_config, resolve_config
 from rl_matdesign.predictors.outputs import ModelSamples, OutputSchema, aggregate_samples
 from rl_matdesign.predictors.structure_score import (
     StructureScorePredictor,
@@ -13,6 +16,11 @@ from rl_matdesign.predictors.structure_score import (
 )
 from rl_matdesign.reward_calibration import CalibrationPendingError
 from rl_matdesign.utils.timing import PredictorTimer
+
+
+def pilot(predictor, candidates):
+    return [predictor.calibration_observation({**candidates[i % len(candidates)], "sample_id": i + 1})
+            for i in range(100)]
 
 
 class PhysicalProperty:
@@ -32,10 +40,10 @@ def _property(name, direction="max", **fields):
 
 def _glassnet_cfg(cte_multiplier=1.0, kelvin_offset=0.0):
     return {
+        "value_normalization": "popart",
         "properties": [_property("T3"), _property("CTE", "min"), _property("Tg")],
         "reward": {
             "type": "gated",
-            "calibration": {"profile": "auto_gated_softplus_v1", "num_candidates": 2},
             "objective": {"terms": {"T3": 1.0}},
             "gates": [
                 {"name": "expansion", "score": {"terms": {"CTE": 1.0}},
@@ -55,15 +63,16 @@ def test_glassnet_all_failed_pilot_and_fixed_gate_scaling():
     with pytest.raises(CalibrationPendingError):
         p.predict(a)
     assert p.cached_outputs(a) is None
-    observations = [p.calibration_observation(candidate) for candidate in (a, b)]
+    observations = pilot(p, [a, b])
     # The same records can cross a pre-model checkpoint without rerunning an oracle.
     observations = json.loads(json.dumps(observations, allow_nan=False))
     assert all("reward" not in row["prediction_record"] for row in observations)
-    assert p.cached_outputs(a)["T3"].mean == 1200.0
-    assert p.calibration_observation({**a, "T3": 1200})["candidate_key"] == observations[0]["candidate_key"]
+    assert p.cached_outputs({**a, "sample_id": 1})["T3"].mean == 1200.0
+    assert p.calibration_observation({**a, "T3": 1200, "sample_id": 1})["candidate_key"] == observations[0]["candidate_key"]
     with pytest.raises(ValueError, match="distinct"):
         p.fit_reward_calibration([observations[0], observations[0]])
     artifact = p.fit_reward_calibration(observations)
+    assert artifact["spec"]["profile"] == "auto_gated_softplus_v1"
     assert artifact["quality"]["T3"]["reference"] == pytest.approx(1300)
     assert artifact["quality"]["T3"]["scale"] == pytest.approx(100)
     assert artifact["gates"]["expansion"]["scale"] == pytest.approx(5e-6)
@@ -115,13 +124,13 @@ def test_calibration_invariant_to_consistent_unit_changes():
                     "Tg": row["Tg"] + offset}
 
         p = StructureScorePredictor(_glassnet_cfg(multiplier, offset), seed=0)
-        p.fit_reward_calibration([p.calibration_observation(converted(row)) for row in samples])
+        p.fit_reward_calibration(pilot(p, [converted(row) for row in samples]))
         return [p.predict(converted(row))[0] for row in candidates]
 
     assert evaluate(1.0, 0.0) == pytest.approx(evaluate(1e6, -273.15))
 
 
-def test_zero_quality_spread_requires_an_explicit_physical_floor():
+def test_zero_quality_spread_stops_calibration():
     cfg = _glassnet_cfg()
     rows = [
         {"T3": 1200.0, "CTE": 4e-6, "Tg": 800.0},
@@ -129,12 +138,17 @@ def test_zero_quality_spread_requires_an_explicit_physical_floor():
     ]
     p = StructureScorePredictor(cfg)
     with pytest.raises(ValueError, match="zero spread"):
-        p.fit_reward_calibration([p.calibration_observation(row) for row in rows])
-    cfg["properties"][0]["normalization"] = {"mode": "auto_fixed", "scale_floor": 25.0}
-    p = StructureScorePredictor(cfg)
-    artifact = p.fit_reward_calibration([p.calibration_observation(row) for row in rows])
-    assert artifact["quality"]["T3"]["scale"] == 25.0
-    assert artifact["gates"]["transition"]["scale"] == pytest.approx(27.0)
+        p.fit_reward_calibration(pilot(p, rows))
+    assert p.reward_calibration_state_dict() is None
+
+
+@pytest.mark.parametrize("count", [99, 101])
+def test_fitting_requires_exactly_100_distinct_candidates(count):
+    p = StructureScorePredictor(_glassnet_cfg())
+    observations = [p.calibration_observation({"T3": 1000 + i, "CTE": 4e-6, "Tg": 800})
+                    for i in range(count)]
+    with pytest.raises(ValueError, match=r"requires 100 distinct valid candidates"):
+        p.fit_reward_calibration(observations)
 
 
 @pytest.mark.parametrize("n_models", [1, 2])
@@ -144,6 +158,7 @@ def test_perovskite_gate_and_aggregate_uncertainty(monkeypatch, n_models):
         "structure": {"builder": "pipeline", "base_poscar": "unused", "n_random_configs": 1,
                       "steps": [{"type": "substitute", "a_site_symbol": "Fe",
                                  "a_dopant_group": "alloy"}]},
+        "value_normalization": "popart",
         "properties": [
             {"name": "pure", "predictor": "dp_classification",
              "models": [f"classifier_{i}.pt" for i in range(n_models)],
@@ -152,17 +167,11 @@ def test_perovskite_gate_and_aggregate_uncertainty(monkeypatch, n_models):
         ],
         "reward": {
             "type": "gated",
-            "calibration": {"profile": "auto_gated_softplus_v1", "num_candidates": 2,
-                            "quality_mode": "aggregate"},
-            "objective": {"terms": {"delta_400": 0.33333, "delta_500": 0.33333,
+            "objective": {"quality_mode": "aggregate", "terms": {"delta_400": 0.33333, "delta_500": 0.33333,
                                     "delta_600": 0.33333}},
             "gates": [{"name": "synthesis", "score": {"terms": {"pure": 1.0}}, "min": 0.8}],
         },
     }
-    if n_models == 2:
-        # An ensemble's conservative score is not bounded by the raw
-        # probability range. Explicitly supply one probability unit.
-        cfg["reward"]["gates"][0]["violation_normalization"] = {"mode": "auto_fixed", "scale_floor": 1.0}
     p = StructureScorePredictor(cfg, seed=0)
 
     def evaluate(candidate):
@@ -181,15 +190,15 @@ def test_perovskite_gate_and_aggregate_uncertainty(monkeypatch, n_models):
 
     monkeypatch.setattr(p, "_evaluation", evaluate)
     failed_probabilities = [0.7] if n_models == 1 else [0.75, 0.95]
-    pilot = [{"probabilities": failed_probabilities, "spread": spread} for spread in (0.5, 2.5)]
-    observations = [p.calibration_observation(row) for row in pilot]
+    samples = [{"probabilities": failed_probabilities, "spread": spread} for spread in (0.5, 2.5)]
+    observations = pilot(p, samples)
     artifact = p.fit_reward_calibration(observations)
-    assert artifact["gates"]["synthesis"]["scale"] == 1.0
+    assert artifact["gates"]["synthesis"]["scale"] == pytest.approx(1.0 if n_models == 1 else 0.05)
     assert artifact["quality"]["__aggregate__"]["reference"] == pytest.approx(0.33333 * 9.0)
     assert artifact["quality"]["__aggregate__"]["scale"] == pytest.approx(0.33333)
     failure = p.score_calibration_observation(observations[-1])
     assert failure["gate_passed"] is False
-    assert failure["reward"] == pytest.approx(-0.1 if n_models == 1 else -0.05)
+    assert failure["reward"] == pytest.approx(-0.1 if n_models == 1 else -1.0)
     pass_probabilities = [0.9] if n_models == 1 else [0.9, 0.9]
     assert p.predict({"probabilities": pass_probabilities, "spread": 2.5})[0] == pytest.approx(
         1.0 + math.log1p(math.e)
@@ -198,17 +207,20 @@ def test_perovskite_gate_and_aggregate_uncertainty(monkeypatch, n_models):
 
 def test_calibrated_weighted_sum_preserves_declared_directions_and_weights():
     cfg = {
+        "value_normalization": "popart",
         "properties": [
-            _property("quality", normalization={"mode": "auto_fixed"}),
-            _property("cost", "min", normalization={"mode": "fixed", "reference": 10.0, "scale": 2.0}),
+            _property("quality"),
+            _property("cost", "min"),
         ],
-        "reward": {"type": "weighted_sum", "calibration": {"num_candidates": 2},
+        "reward": {"type": "weighted_sum",
                    "objective": {"terms": {"quality": 2.0, "cost": 0.5}}},
     }
     p = StructureScorePredictor(cfg)
-    observations = [p.calibration_observation({"quality": quality, "cost": 10.0})
-                    for quality in (100.0, 300.0)]
-    p.fit_reward_calibration(observations)
+    observations = pilot(p, [{"quality": 100.0, "cost": 8.0}, {"quality": 300.0, "cost": 12.0}])
+    artifact = p.fit_reward_calibration(observations)
+    assert artifact["spec"]["profile"] == "auto_weighted_sum_v1"
+    assert artifact["quality"]["cost"]["reference"] == -10.0
+    assert artifact["quality"]["cost"]["scale"] == 2.0
     assert p.predict({"quality": 300.0, "cost": 12.0})[0] == pytest.approx(1.5)
 
 
@@ -233,3 +245,75 @@ def test_pending_calibration_has_physical_evidence_and_no_reward(tmp_path):
     assert ledger["reward"] is None
     assert ledger["best_reward"] is None
     assert ledger["outputs"]["T3"]["mean"] == 1200.0
+
+
+@pytest.mark.parametrize("reward_type", ["weighted_sum", "gated"])
+def test_value_normalization_selects_pilot(reward_type):
+    from rl_matdesign.hpo.artifacts import reward_calibration_requested
+
+    cfg = {"properties": [_property("T3")], "reward": {"type": reward_type}}
+    if reward_type == "gated":
+        cfg["reward"].update(gates=[{"name": "gate", "score": {"terms": {"T3": 1}}, "min": 0}],
+                             failure={"reward": -5})
+    assert not reward_calibration_requested(cfg)
+    uncalibrated = StructureScorePredictor(cfg)
+    assert not uncalibrated.reward_calibration_enabled
+    assert uncalibrated.predict({"T3": 5.0})[0] == 5.0
+    cfg["value_normalization"] = "popart"
+    assert reward_calibration_requested(cfg)
+    p = StructureScorePredictor(cfg)
+    assert p.reward_calibration_num_candidates == 100
+    with pytest.raises(CalibrationPendingError):
+        p.predict({"T3": 5.0})
+
+
+@pytest.mark.parametrize(("scenario", "expected_profile", "examples"), [
+    ("glassnet_coarse_2pct", "auto_gated_softplus_v1", [
+        ({"forming_temperature": 1500, "thermal_expansion": 4e-6, "glass_transition": 800}, 1500),
+        ({"forming_temperature": 1500, "thermal_expansion": 6e-6, "glass_transition": 800}, -11),
+        ({"forming_temperature": 1500, "thermal_expansion": 4e-6, "glass_transition": 763}, -10.01),
+    ]),
+    ("oxides_sinter", "auto_weighted_sum_v1", [({"sinter": 850}, -850), ({"sinter": 875}, -875)]),
+])
+def test_shipped_yaml_switches_reward_with_the_learner(scenario, expected_profile, examples):
+    path = Path(__file__).resolve().parents[1] / "configs" / f"{scenario}.yaml"
+    yaml = load_yaml_config(path)
+    assert "calibration" not in yaml["reward"]
+    # Supply predictions in native units, keeping the scenario's real objective and gates.
+    for prop in yaml["properties"]:
+        prop.pop("models", None)
+        prop.pop("output", None)
+        prop.update(predictor=f"{__name__}:PhysicalProperty", quantity=prop["name"])
+    raw = StructureScorePredictor(resolve_config(yaml, {"value_normalization": "none"}).config)
+    assert raw.reward_calibration_num_candidates == 0
+    for candidate, expected in examples:
+        assert raw.predict(candidate)[0] == pytest.approx(expected)
+    calibrated = StructureScorePredictor(resolve_config(yaml).config)
+    assert calibrated.reward_calibration_num_candidates == 100
+    first = examples[0][0]
+    with pytest.raises(CalibrationPendingError):
+        calibrated.predict(first)
+    quality = yaml["properties"][0]["name"]
+    higher = {**first, quality: first[quality] + 100}
+    artifact = calibrated.fit_reward_calibration(pilot(calibrated, [first, higher]))
+    assert artifact["spec"]["profile"] == expected_profile
+    assert artifact["observation_count"] == 100
+    assert calibrated.predict(first)[0] != pytest.approx(examples[0][1])
+
+
+def test_reuse_previous_explicit_auto_artifact_without_changing_its_hash():
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    cfg = _glassnet_cfg()
+    p = StructureScorePredictor(cfg, seed=0)
+    samples = [{"T3": t, "CTE": 4e-6, "Tg": 800.0} for t in (1200.0, 1400.0)]
+    artifact = p.fit_reward_calibration(pilot(p, samples))
+    artifact["spec"]["scientific_identity"]["properties"][0]["normalization"] = {"mode": "auto_fixed"}
+    artifact["spec_hash"] = digest(artifact["spec"])
+    del artifact["content_hash"]
+    artifact["content_hash"] = digest(artifact)
+    restored = StructureScorePredictor(cfg, seed=0)
+    restored.load_reward_calibration(artifact)
+    assert restored.reward_calibration_state_dict() == artifact
+    assert restored.predict(samples[0]) == p.predict(samples[0])

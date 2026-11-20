@@ -67,9 +67,6 @@ def prepare_reward_calibration(
         if not only_generate and not resume_learner and source != artifact_path:
             _write_json(artifact_path, predictor.reward_calibration_state_dict())
         return []
-    if predictor.reward_calibration_frozen:
-        _write_json(artifact_path, predictor.reward_calibration_state_dict())
-        return []
 
     needed = predictor.reward_calibration_num_candidates
     if needed > total_budget:

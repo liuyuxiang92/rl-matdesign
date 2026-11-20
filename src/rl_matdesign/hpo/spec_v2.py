@@ -10,7 +10,8 @@ from copy import deepcopy
 from pathlib import Path
 import random
 
-from ..config_schema import ConfigError, load_yaml_config, resolve_config, selected_generation_parameter
+from ..config_schema import (ConfigError, load_yaml_config, resolve_config,
+                             select_method_values, selected_generation_parameter)
 from ..rewards import RewardCombiner
 from .algorithm_profiles import METHODS, get_profile, validate_search_space
 from .spec import (_GEN_WEIGHTS, _TRAIN_WEIGHTS, _efficiency, _integer, _mapping,
@@ -43,7 +44,7 @@ def infer_objective(base: Mapping, threshold: float) -> dict:
             raise ConfigError("base_config.properties must have distinct explicit nonempty names")
         named[name] = prop
     try:
-        combiner = RewardCombiner(base.get("reward"), list(named))
+        combiner = RewardCombiner.from_config(base, list(named))
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"Cannot infer HPO objective from base_config: {exc}") from exc
     active = [(name, coefficient) for name, coefficient in combiner.objective_terms.items() if coefficient != 0]
@@ -114,7 +115,8 @@ def load_simplified_plan(path: Path, value, method=None) -> dict:
         raise ConfigError("base_config must name an existing scenario YAML")
     base_path = (path.parent / Path(raw["base_config"]).expanduser()).resolve()
     base_raw = load_yaml_config(base_path)
-    base = resolve_config(_resolve_asset_paths(base_raw, base_path.parent)).config
+    scenario = select_method_values(base_raw, method=method)
+    base = resolve_config(_resolve_asset_paths(scenario, base_path.parent)).config
     master = _integer(raw.get("random_seed", 42), "random_seed")
     if master >= 2**32:
         raise ConfigError("random_seed must be < 2**32")
@@ -142,7 +144,7 @@ def load_simplified_plan(path: Path, value, method=None) -> dict:
     if startup > trials:
         raise ConfigError("training.search.startup_random_trials must not exceed trials_per_round")
 
-    parameter = selected_generation_parameter(base_raw)
+    parameter = selected_generation_parameter(base)
     initial_values = generation.get("initial_values", _GENERATION_DEFAULTS[parameter])
     if not isinstance(initial_values, list) or not initial_values:
         raise ConfigError("generation.initial_values must be a nonempty list")

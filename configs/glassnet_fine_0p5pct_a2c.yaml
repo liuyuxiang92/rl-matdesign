@@ -47,8 +47,6 @@ properties:
   representation: physical
   direction: max
   objective: mean
-  normalization:
-    mode: auto_fixed
 - name: thermal_expansion
   predictor: glassnet
   output: CTEbelowTg
@@ -65,6 +63,7 @@ properties:
   objective: mean
 reward:
   type: gated
+  failure: {reward: -10.0}  # Raw reward when value_normalization is none
   objective:
     terms:
       forming_temperature: 1.0
@@ -75,16 +74,13 @@ reward:
         thermal_expansion: 1.0
     min: 0.0
     max: 5.0e-06
-    violation_normalization: auto_fixed
+    penalty_weight: 1000000.0  # Raw CTE violation
   - name: sufficient_transition_temperature
     score:
       terms:
         glass_transition: 1.0
     min: 773.0
-    violation_normalization: auto_fixed
-  calibration:
-    profile: auto_gated_softplus_v1
-    num_candidates: 100
+    penalty_weight: 0.001  # Raw Tg violation
 gamma: 1.0
 train_count_duplicates: false
 train_max_duplicate_attempts: 2000

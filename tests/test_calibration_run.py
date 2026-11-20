@@ -9,25 +9,21 @@ import torch
 import yaml
 
 from rl_matdesign import calibration_run, experiment
-from tests.test_experiment_reproducibility import _config, _run, _scientific_rows
+from tests.test_experiment_reproducibility import _popart_config, _run, _scientific_rows
 
 
 def _calibration_config():
-    cfg = _config()
-    cfg["properties"][0]["normalization"] = {"mode": "auto_fixed"}
+    cfg = _popart_config()
     # The fixture deliberately has no feasible candidate in the pilot.
     cfg["reward"] = {
         "type": "gated",
-        "calibration": {"profile": "auto_gated_softplus_v1", "num_candidates": 3},
+        "failure": {"reward": -10},
         "objective": {"terms": {"score": 1.0}},
         "gates": [{
             "name": "high_score", "score": {"terms": {"score": 1.0}},
-            "min": 1000000.0, "priority": 1.0, "violation_normalization": "auto_fixed",
+            "min": 1000000.0, "priority": 1.0,
         }],
     }
-    cfg.update(value_normalization="popart", train_budget=8, dqn_warmup_eps=1)
-    cfg.pop("dqn_num_train_eps")
-    cfg.pop("pg_num_iters")
     return cfg
 
 
@@ -42,17 +38,17 @@ def test_calibrated_runner_charges_pilot_once_and_loads_for_generation(tmp_path,
 
     artifact = json.loads((out / "reward_calibration.json").read_text())
     rows = json.loads((out / "reward_calibration_observations.json").read_text())
-    assert len(rows) == artifact["observation_count"] == 3
+    assert len(rows) == artifact["observation_count"] == 100
     assert all(row["reward_status"] == "final" and row["reward"] < 0 for row in rows)
     ledger = [json.loads(row) for row in (out / "evaluations.jsonl").read_text().splitlines()]
     pilot = [row for row in ledger if row["phase"] == "calibration"]
-    assert len(pilot) == 3
+    assert len(pilot) == 100
     assert all(row["reward"] is None and row["reward_status"] == "pending" for row in pilot)
     with (out / "training_samples.csv").open() as stream:
         rows = list(csv.DictReader(stream))
-    assert len(rows) == 8
-    assert rows[2]["training_budget_used"] == "3"
-    assert rows[-1]["training_budget_used"] == "8"
+    assert len(rows) == 105
+    assert rows[99]["training_budget_used"] == "100"
+    assert rows[-1]["training_budget_used"] == "105"
 
     checkpoint = torch.load(out / "checkpoint.pt", weights_only=False)
     assert checkpoint["execution_contract"]["evaluation"]["reward_calibration"] == artifact["content_hash"]
@@ -116,7 +112,7 @@ def test_pilot_resume_preserves_paid_evaluations_and_model(tmp_path, monkeypatch
     for name in ("reward_calibration.json", "reward_calibration_observations.json"):
         assert json.loads((resumed / name).read_text()) == json.loads((full / name).read_text())
     ledger = [json.loads(row) for row in (resumed / "evaluations.jsonl").read_text().splitlines()]
-    assert sum(row["phase"] == "calibration" for row in ledger) == 3
+    assert sum(row["phase"] == "calibration" for row in ledger) == 100
     a = torch.load(full / "qnet.pt", weights_only=True)["qnet_state"]
     b = torch.load(resumed / "qnet.pt", weights_only=True)["qnet_state"]
     assert all(torch.equal(a[key], b[key]) for key in a)

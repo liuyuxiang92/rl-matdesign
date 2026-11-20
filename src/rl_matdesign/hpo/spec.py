@@ -7,7 +7,7 @@ import math
 import warnings
 from pathlib import Path
 
-from ..config_schema import ConfigError, load_yaml_config, resolve_config
+from ..config_schema import ConfigError, load_yaml_config, resolve_config, select_method_values
 from .algorithm_profiles import METHODS, get_profile, validate_search_space, validate_parameter_value
 
 _TRAIN_WEIGHTS = {"qualified_fraction": .45, "best_fraction_quality": .30,
@@ -254,7 +254,8 @@ def _load_legacy_plan(path: str | Path, method: str | None = None) -> dict:
         raise ConfigError("base_config must name an existing scenario YAML")
     base_path = (path.parent / Path(raw["base_config"]).expanduser()).resolve()
     base_raw = load_yaml_config(base_path)
-    base = resolve_config(_resolve_asset_paths(base_raw, base_path.parent)).config
+    scenario = select_method_values(base_raw, method=method)
+    base = resolve_config(_resolve_asset_paths(scenario, base_path.parent)).config
     profile_ref = raw.get("parameter_profile", f"builtin:{method}")
     if not isinstance(profile_ref, str):
         raise ConfigError("parameter_profile must be a builtin name or YAML path")

@@ -90,18 +90,21 @@ operational flags (seeds, resume, checkpoint). This means:
 |---|---|---|
 | `configs/hea.yaml` | High-entropy alloy formation energy | A2C |
 | `configs/lips_sse.yaml` | Multi-sublattice LiPS solid electrolyte | A2C |
-| `configs/oxides_sinter.yaml` | Oxide sintering temperature | DQN |
+| `configs/oxides_sinter.yaml` | Minimize calibrated oxide sintering temperature | DQN bootstrap |
 | `configs/oxides_calcine.yaml` | Oxide calcination temperature | DQN |
-| `configs/glassnet_*.yaml` | Calibrated T3 maximization subject to CTE and Tg gates | A2C, DQN bootstrap, or DQN MC |
+| `configs/glassnet_coarse_2pct.yaml` | Coarse glass grid with HPO-selected budgets for each method | DQN bootstrap |
+| Medium and fine `configs/glassnet_*.yaml` | Calibrated T3 maximization subject to CTE and Tg gates | A2C, DQN bootstrap, or DQN MC |
 | `configs/perovskite_calibrated.example.yaml` | Calibrated delta quality with a synthesizability gate | DQN |
 | `configs/test_dummy.yaml` | Fast smoke test with a dummy predictor | A2C |
 | `configs/test_multigroup_dummy.yaml` | Multi-sublattice smoke test with a dummy predictor | A2C |
 
-The consolidated oxide configurations support algorithm selection through
-`--method`. The GlassNet and perovskite examples enable automatic reward
-calibration and PopArt. See the [YAML reference](docs/yaml_config_reference.md)
-for the calibration fields. Scientific examples may require local model or
-structure assets.
+For GlassNet coarse and oxide sintering, use the same scenario file for all three runs.
+Choose `--method dqn --dqn-target-mode bootstrap`, `--method dqn --dqn-target-mode mc`,
+or `--method a2c`, and give each run its own `--out` directory. Both scenarios and
+the perovskite example default to `value_normalization: popart`. A fresh run uses
+100 distinct, successfully evaluated training candidates to calibrate the reward.
+Pass `--value-normalization none` for the raw reward and unnormalized value targets.
+Scientific examples may require local model or structure assets. [YAML reference](docs/yaml_config_reference.md)
 
 ---
 

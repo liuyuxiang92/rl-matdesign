@@ -8,14 +8,10 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
+from ..rewards import reward_calibration_requested
+
 REWARD_CALIBRATION = "reward_calibration.json"
 CALIBRATION_CHECKPOINT = "calibration_checkpoint.pt"
-
-
-def reward_calibration_requested(config: dict) -> bool:
-    return bool((config.get("reward") or {}).get("calibration")) or any(
-        "normalization" in prop for prop in config.get("properties", ())
-    )
 
 
 def resumable_checkpoint(directory: Path, phase: str) -> Path:

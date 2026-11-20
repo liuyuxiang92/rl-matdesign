@@ -25,6 +25,7 @@ class ConfigError(ValueError):
 # sorted: iteration over the source mapping, rather than this tuple, decides.
 GENERATION_PARAMETERS = ("gen_temperature", "gen_top_frac", "gen_epsilon")
 _GENERATION_METADATA = "generation_selection"
+_METHOD_VALUE_FIELDS = ("train_budget", "num_gen_eps", "gen_temperature")
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -125,7 +126,7 @@ class Parameter:
 # Experiment defaults are defined once; each algorithm owns its warmup budget.
 PARAMETERS: dict[str, Parameter] = {
     "method": Parameter(str, "a2c", "Training algorithm; inactive algorithm settings are retained.", choices=("dqn", "reinforce", "a2c")),
-    "value_normalization": Parameter(str, "none", "Adaptive value-target normalization for DQN and A2C.", choices=("none", "popart")),
+    "value_normalization": Parameter(str, "none", "Use raw RL rewards, or automatic reward calibration and PopArt value targets for DQN and A2C.", choices=("none", "popart")),
     "value_normalization_profile": Parameter(str, "popart_v1", "Versioned PopArt settings shared by DQN and A2C.", choices=("popart_v1",)),
     "eval_seed": Parameter(int, 0, "Random seed for property evaluation and structure sampling.", minimum=0, maximum=2**32 - 1),
     "train_seed": Parameter(int, None, "Training random seed.", minimum=0, maximum=2**32 - 1, nullable=True, fallback="eval_seed"),
@@ -193,6 +194,38 @@ _RETIRED_KEYS = frozenset({
 _DELEGATED_NAMES = frozenset().union(*DELEGATED_KEYS.values())
 
 
+def select_method_values(raw: Mapping, *, method: str | None = None) -> dict:
+    """Flatten method-specific training and generation settings before resolving defaults.
+
+    A scalar still applies to every method. Only the run budgets and generation
+    temperature accept a mapping. Check even inactive entries for invalid values.
+    """
+    cfg = dict(raw)
+    fields = [key for key in _METHOD_VALUE_FIELDS if isinstance(cfg.get(key), Mapping)]
+    if not fields:
+        return cfg
+    if method is None:
+        method = PARAMETERS["method"].normalize("method", cfg.get("method", PARAMETERS["method"].default))
+        if method == "dqn":
+            mode = PARAMETERS["dqn_target_mode"].normalize(
+                "dqn_target_mode", cfg.get("dqn_target_mode", PARAMETERS["dqn_target_mode"].default))
+            method = f"dqn-{mode}"
+    elif method in ("dqn-bootstrap", "dqn-mc"):
+        cfg.update(method="dqn", dqn_target_mode=method.removeprefix("dqn-"))
+    else:
+        cfg["method"] = method
+    for key in fields:
+        values = _mapping(cfg[key], key)
+        for name, value in values.items():
+            if name not in ("dqn-bootstrap", "dqn-mc", "a2c", "reinforce"):
+                raise ConfigError(f"{key} has unknown method {name!r}")
+            PARAMETERS[key].normalize(f"{key}.{name}", value)
+        if method not in values:
+            raise ConfigError(f"{key} has no value for the selected method {method!r}")
+        cfg[key] = values[method]
+    return cfg
+
+
 def _generation_selection(raw: Mapping, source: str = "yaml") -> tuple[str, str]:
     """Select before defaults, respecting a saved effective-value snapshot.
 
@@ -234,7 +267,7 @@ def selected_generation_parameter(raw: Mapping) -> str:
     value edits are treated as new explicit choices. When no field is authored,
     the existing temperature default is selected.
     """
-    return _generation_selection(_mapping(raw, "Configuration"))[0]
+    return _generation_selection(select_method_values(_mapping(raw, "Configuration")))[0]
 
 
 def with_generation_selection(raw: Mapping, parameter: str) -> dict:
@@ -246,7 +279,7 @@ def with_generation_selection(raw: Mapping, parameter: str) -> dict:
     """
     if parameter not in GENERATION_PARAMETERS:
         raise ConfigError(f"Generation parameter must be one of {GENERATION_PARAMETERS}")
-    cfg = _mapping(raw, "Configuration")
+    cfg = select_method_values(_mapping(raw, "Configuration"))
     for key in GENERATION_PARAMETERS:
         cfg[key] = (PARAMETERS[key].normalize(key, cfg.get(key, PARAMETERS[key].default))
                     if key == parameter else 0.0)
@@ -263,7 +296,7 @@ def validate_config(raw: Mapping) -> None:
 
     Extension schemas retain authority over their own values and nested keys.
     """
-    cfg = _mapping(raw, "Configuration")
+    cfg = select_method_values(_mapping(raw, "Configuration"))
     _generation_selection(cfg)
     for key, value in cfg.items():
         if key in PARAMETERS:
@@ -318,6 +351,8 @@ def validate_config(raw: Mapping) -> None:
         elif structure["builder"] != "peptide" and ":" not in structure["builder"]:
             raise ConfigError("structure.builder must be pipeline, peptide, or a custom class FQN")
     for index, prop in enumerate(cfg.get("properties", [])):
+        if "normalization" in prop:
+            raise ConfigError(f"properties[{index}].normalization was removed; calibration fits property scales automatically")
         if "weight" in prop:
             raise ConfigError(f"properties[{index}].weight was removed; put coefficients in reward terms")
         misplaced = set(prop) & (_RETIRED_KEYS | {"source", "model", "dp_models", "model_ref"})
@@ -349,8 +384,8 @@ def validate_config(raw: Mapping) -> None:
         try:
             properties = [dict(prop, name=prop.get("name", f"prop{i}"))
                           for i, prop in enumerate(cfg["properties"])]
-            combiner = RewardCombiner(cfg.get("reward"), [prop["name"] for prop in properties])
-            if combiner.calibration_config or any("normalization" in prop for prop in properties):
+            combiner = RewardCombiner.from_config(cfg, [prop["name"] for prop in properties])
+            if combiner.calibrate:
                 from .reward_calibration import RewardCalibration
 
                 RewardCalibration(combiner, properties)
@@ -382,16 +417,20 @@ def resolve_config(raw: Mapping, overrides: Mapping | None = None) -> ResolvedCo
     Both DQN and policy-gradient settings remain present regardless of method.
     """
     cfg = _mapping(raw, "Configuration")
+    override_values = {} if overrides is None else _mapping(overrides, "Overrides")
+    cli = {key: value for key, value in override_values.items() if value is not None}
+    # Explicit runtime overrides are scalar. YAML can instead give each method its own value.
+    for key in _METHOD_VALUE_FIELDS:
+        if key in cli:
+            PARAMETERS[key].normalize(key, cli[key])
+    cfg.update({key: cli[key] for key in ("method", "dqn_target_mode") if key in cli})
+    cfg = select_method_values(cfg)
     sources = {key: "yaml" for key in cfg}
     selected, selection_source = _generation_selection(cfg)
-    if overrides is not None:
-        explicit = {key: value for key, value in _mapping(overrides, "Overrides").items() if value is not None}
-        cli = explicit
-        cli_sources = {key: "override" for key in cli}
-        if any(key in cli for key in GENERATION_PARAMETERS) or _GENERATION_METADATA in cli:
-            selected, selection_source = _generation_selection(cli, "override")
-        cfg.update(cli)
-        sources.update(cli_sources)
+    if any(key in cli for key in GENERATION_PARAMETERS) or _GENERATION_METADATA in cli:
+        selected, selection_source = _generation_selection(cli, "override")
+    cfg.update(cli)
+    sources.update(dict.fromkeys(cli, "override"))
     validate_config(cfg)
     authored_keys = set(cfg)
     for key, spec in PARAMETERS.items():

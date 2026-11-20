@@ -2,7 +2,7 @@
 
 Status: implementation on `codex/step1-normalization`, starting from `codex/unified-material-groups` at `c76614665`. The GlassNet task maximizes T3 with expansion and glass-transition gates. This document records the design and evaluation protocol.
 
-Step 1 has two independently switchable parts. **1A adds adaptive PopArt value normalization under a fixed selected reward definition. 1B adds optional automatic initialization of fixed property calibration when property scales are unknown.** Implement and test 1A first, then 1B, so their effects can be distinguished. For GlassNet, every scientific comparison arm uses the newly requested maximization task and only the two remaining gates. Existing explicit property scales remain supported.
+The experiment has one switch. With `value_normalization: none`, the learner uses the configured raw reward and raw value targets. With `value_normalization: popart`, the runner first calibrates a weighted-sum or gated reward on 100 distinct candidates, then the learner applies adaptive PopArt normalization to its value targets. The two calculations are tested separately.
 
 The review used local GlassNet and perovskite YAMLs. This branch supplies the migrated GlassNet examples and a portable perovskite template. Capture the configuration and model fingerprints in each comparison manifest.
 
@@ -41,18 +41,18 @@ The current [model definitions](../src/rl_matdesign/model.py) use scalar output 
 
 Scientific objective scaling already occurs in [the composite predictor](../src/rl_matdesign/predictors/structure_score.py). The [reward combiner](../src/rl_matdesign/rewards.py) owns coefficients, gates and alternative selection, and intentionally performs no normalization.
 
-The historical GlassNet configuration minimized forming temperature and constrained T3 to 0..2000 K. The [coarse bootstrap example](../configs/glassnet_coarse_2pct_dqn_bootstrap.yaml) now maximizes T3 with expansion and glass transition as its two gates. All comparison arms use this revised task to isolate the effects of calibration and PopArt.
+The historical GlassNet configuration minimized forming temperature and constrained T3 to 0..2000 K. The [coarse example](../configs/glassnet_coarse_2pct.yaml) now maximizes T3 with expansion and glass transition as its two gates. All comparison arms use this revised task to compare the two training recipes on the same physical criteria.
 
 ### Continuous objectives versus gates
 
 The distinction concerns the reward rule, not whether a material or property is complicated. A continuous weighted sum rewards improvements in every objective and permits one improvement to compensate for another property's deterioration. A gate checks an acceptance requirement; its property need not contribute to the passing objective at all. A property can have both roles.
 
-For the revised GlassNet task, thermal expansion must be between 0 and `5e-6 K^-1`, and glass-transition temperature must be at least `773 K`. T3 is exclusively a maximization objective; it contributes no gate decision or violation penalty. To establish the comparison using the existing reward combiner, use passing reward `+T3 / 1000` and failure reward `-10` minus the existing CTE/Tg native-unit penalties. This is the revised-task baseline, not the newly calibrated reward. Illustrative inputs, not evaluated materials:
+For the revised GlassNet task, thermal expansion must be between 0 and `5e-6 K^-1`, and glass-transition temperature must be at least `773 K`. With `none`, a passing glass earns its T3 in kelvin. A failed glass earns −10 minus its native-unit CTE and Tg violation penalties. The table uses illustrative predictions.
 
 | Forming temperature (K) | Expansion (K^-1) | Glass transition (K) | Result |
 |---:|---:|---:|---|
-| 1200 | 4e-6 | 800 | Pass; baseline reward 1.2 |
-| 2100 | 4e-6 | 800 | Pass; baseline reward 2.1; no upper T3 gate |
+| 1200 | 4e-6 | 800 | Pass, reward 1200 |
+| 2100 | 4e-6 | 800 | Pass, reward 2100 |
 | 1200 | 6e-6 | 800 | Fail expansion; reward -11 |
 | 1000 | 4e-6 | 760 | Fail glass transition; reward -10.013 |
 
@@ -137,23 +137,23 @@ A2C's existing feature-scaler warmup replaces rewards with zero and performs no 
 
 ## 6 Step 1B automatic fixed property calibration
 
-This is a separately enabled scientific reward feature, addressing unknown and unequal property ranges. It is not necessary to run PopArt on existing configured rewards.
+The PopArt recipe begins with scientific reward calibration to establish fixed units for properties with unknown or unequal ranges.
 
 ### Initial supported contract
 
-The revised proposal includes continuous `weighted_sum` calibration and an opt-in `auto_gated_softplus_v1` profile, using GlassNet first. The gated profile supports continuous min/max mean objectives without known bounds. It resolves their references/scales and gate violation scales from physical metadata and an initial pilot. It does not treat pilot minima/maxima as global bounds. Existing reward modes remain supported by Step 1A with their selected scientific definition unchanged by PopArt.
+The revised proposal includes continuous `weighted_sum` calibration and automatic selection of `auto_gated_softplus_v1` for calibrated gated rewards, using GlassNet first. The gated profile supports continuous min/max mean objectives without known bounds. It resolves their references/scales and gate violation scales from physical metadata and an initial pilot. It does not treat pilot minima/maxima as global bounds. The max-of-alternatives operator currently requires raw mode.
 
 Automatic calibration must select the appropriate complete reward profile. Do not silently center only the passing branch while retaining an unrelated failure constant, or independently transform competing max alternatives. Target-distance and uncertainty-aware property utilities need explicit calibration semantics; missing objective bounds alone are no longer a reason to reject gated calibration.
 
 For a maximization counterexample, naively replacing only the passing score with `(T3 - 1500) / 50` makes a passing 900 K candidate score -12, below a slightly failing candidate near -10. These illustrative calibration values show why the passing and failure branches must be designed together.
 
-The GlassNet profile below defines both branches together. T3 needs quality calibration only; CTE and Tg need violation scaling only. Gate thresholds remain scientific requirements. The fixed revised-task baseline plus PopArt remains one comparison arm alongside the new calibrated reward.
+The GlassNet profile below defines both branches together. T3 needs quality calibration only; CTE and Tg need violation scaling only. Gate thresholds remain scientific requirements. The raw-reward comparison uses the same physical gates.
 
 ### GlassNet automatic gated profile: proposed design
 
 This is an explicit scientific reward change, separate from PopArt. Retain three rules: passing candidates outrank failing candidates; **higher T3** is better among passes; smaller total normalized violation is better among failures. These rules follow the feasibility-comparison principle in [Deb (2000)](https://www.sciencedirect.com/science/article/abs/pii/S0045782599003898). The scalar mapping and calibration estimator below are our proposed adaptation, not a published RL performance guarantee.
 
-**Quality calibration.** Evaluate a declared initial sample and retain raw T3 outputs from all valid, distinct candidates, including gate failures. Fit a fixed reference `m = population_mean(T3)` and scale `s = population_std(T3)`. An optional declared physical difference scale/resolution is an always-active floor. Do not invent a T3 floor from 2000 K, absolute temperature, the pilot maximum or a numerical epsilon. The calibration sample need not contain any passing candidate.
+**Quality calibration.** Evaluate a declared initial sample and retain raw T3 outputs from all valid, distinct candidates, including gate failures. Fit a fixed reference `m = population_mean(T3)` and scale `s = population_std(T3)`. Do not invent a T3 floor from 2000 K, absolute temperature, the pilot maximum or a numerical epsilon. The calibration sample need not contain any passing candidate.
 
 For the single maximization objective, the standardized quality is `(T3 - m) / s`. For several continuous mean objectives, use:
 
@@ -190,7 +190,7 @@ Do not multiply normalized violations by existing native-unit `penalty_weight` c
 
 **Automatic gate scales.** Collect all valid, distinct pilot observations, including every candidate failing a scientific gate. A failed gate is a useful observation; a predictor exception or nonfinite output is a different event and cannot supply a fabricated property value.
 
-For each gate and pilot score `g_ij`, let `d_ij` be the absolute distance to its nearest finite gate boundary, whether the candidate passes or fails. Let `B_j` be a declared physical scale floor: use the width of an existing finite acceptance interval, or a certified domain width of the actual gate score when applicable; a declared physical resolution/scale can also supply a floor. Never invent a domain from a pilot minimum/maximum or from the magnitude of a threshold. With no such metadata, `B_j=0` and the pilot must identify a positive usable scale.
+For each gate and pilot score `g_ij`, let `d_ij` be the absolute distance to its nearest finite gate boundary, whether the candidate passes or fails. The physical scale floor `B_j` comes from the existing finite acceptance interval or a certified width of the actual gate score when available. Never invent a domain from a pilot minimum/maximum or from the magnitude of a threshold. With no such metadata, `B_j=0` and the pilot must identify a positive usable scale.
 
 ```
 violation_scale_j = max(
@@ -200,9 +200,9 @@ violation_scale_j = max(
 )
 ```
 
-Use stable float64 arithmetic. Physical width/resolution is an always-active floor, not an exactly-zero fallback. For GlassNet, the CTE interval supplies floor `5e-6 K^-1`. Tg has only a lower threshold; its typical pilot distance from 773 K supplies the empirical violation scale. A constant Tg of 750 K gives scale 23 K; a constant Tg of 800 K gives 27 K. Neither case requires any fully passing candidate. There is no T3 violation scale.
+Use stable float64 arithmetic. The physical width supplies a lower bound on the gate scale. For GlassNet, the CTE interval supplies floor `5e-6 K^-1`. Tg has only a lower threshold; its typical pilot distance from 773 K supplies the empirical violation scale. A constant Tg of 750 K gives scale 23 K; a constant Tg of 800 K gives 27 K. Neither case requires any fully passing candidate. There is no T3 violation scale.
 
-If every Tg equals 773 K without a physical fallback, or every T3 is identical without a declared quality difference scale, calibration remains unresolved. Near-zero quality spread and near-boundary gate data without meaningful physical resolution can also produce small scales; this rule is not a universal noise safeguard. Do not use machine epsilon, absolute temperature, or the removed T3 bounds to fabricate missing information, and do not silently expand the evaluation allowance. Finite extreme predictor outputs can enlarge scales and soften penalties or quality differences; log quality reference/spread and gate spread/RMS distance/floor, extremes and final scales. The estimators express empirical conventions, not scientifically proven tolerances.
+If every Tg equals 773 K without a physical fallback, or every T3 is identical, calibration remains unresolved. Near-zero quality spread and near-boundary gate data without meaningful physical resolution can also produce small scales; this rule is not a universal noise safeguard. Do not use machine epsilon, absolute temperature, or the removed T3 bounds to fabricate missing information, and do not silently expand the evaluation allowance. Finite extreme predictor outputs can enlarge scales and soften penalties or quality differences; log quality reference/spread and gate spread/RMS distance/floor, extremes and final scales. The estimators express empirical conventions, not scientifically proven tolerances.
 
 **Worked all-failed pilot.** Two rows illustrate arithmetic, not the recommended pilot size:
 
@@ -232,7 +232,7 @@ The same calibration procedure applies to coarse/medium/fine spaces without enum
 
 ### Proposed configuration
 
-The GlassNet configuration uses this shape. See the runnable configuration examples under `configs/glassnet_*.yaml` for complete design grids. The profile owns its passing/failing reward rules; there is no `forming_temperature_protocol_range` gate, legacy `scale: 1000`, `failure.reward`, or native-unit `penalty_weight` in this new-profile example:
+The GlassNet YAML below supports both modes. Raw mode uses the declared failure reward and native-unit penalty weights. PopArt mode uses calibrated violation scales and relative gate priorities. [Runnable coarse configuration](../configs/glassnet_coarse_2pct.yaml)
 
 ```yaml
 value_normalization: popart
@@ -246,8 +246,6 @@ properties:
     representation: physical
     direction: max
     objective: mean
-    normalization:
-      mode: auto_fixed
   - name: thermal_expansion
     predictor: glassnet
     output: CTEbelowTg
@@ -265,9 +263,7 @@ properties:
 
 reward:
   type: gated
-  calibration:
-    profile: auto_gated_softplus_v1
-    num_candidates: 100
+  failure: {reward: -10.0}
   objective:
     terms:
       forming_temperature: 1.0
@@ -278,29 +274,29 @@ reward:
           thermal_expansion: 1.0
       min: 0.0
       max: 5.0e-6
+      penalty_weight: 1000000.0
       priority: 1.0
-      violation_normalization: auto_fixed
     - name: sufficient_transition_temperature
       score:
         terms:
           glass_transition: 1.0
       min: 773.0
+      penalty_weight: 0.001
       priority: 1.0
-      violation_normalization: auto_fixed
 ```
 
-Keep legacy `scale: number` semantics, including reference zero, unchanged. Reject simultaneous legacy `scale` and new `normalization` declarations. New calibrated scales must be finite and strictly positive. User coefficients stay in `reward.objective.terms`.
+In PopArt mode the reward type selects the profile. The pilot supplies the property references and strictly positive scales. User coefficients stay in `reward.objective.terms`.
 
 Retain the separate simple `weighted_sum` automatic-calibration option, where the calibrated signed terms are summed without softplus. Do not silently change legacy coefficient semantics: normalized relative objective weights and softplus belong specifically to the new gated profile. Calibrate and orient each objective exactly once before combining, while gate evaluation continues to receive native physical scores.
 
-Remove the new reward-only configuration from physical leaf-predictor construction and model identity inputs, as is already done for the existing scale. Otherwise a normalization declaration could accidentally change a predictor key or leak into its constructor.
+Property references and scales belong to the frozen scientific reward artifact. Physical model identity uses the prediction settings.
 
 ### Calibration procedure
 
-1. Collect a predeclared number of fresh, distinct, successfully evaluated initial candidates. Expose a declared calibration count with proposed shared default 100; it is a calibration protocol, not an estimated sufficient search budget. Tiny finite test fixtures may explicitly select a smaller test profile. Production runs must not silently lower the count. Record all evaluation costs and discoveries normally.
+1. Collect exactly 100 distinct candidates with successful evaluations. This count is fixed in the code. Charge evaluations to the training budget and record discoveries.
 2. Persist their selected physical property outputs and candidate identities immediately. Do not rely on an LRU cache retaining all calibration candidates.
-3. For both profiles, fit automatic quality references as sample means and scales as population standard deviations, with any declared physical difference scale as an always-active floor. Apply directions once. For the gated profile, combine normalized relative objective weights, apply softplus once, and separately resolve the remaining gate violation scales. Include gate-failing candidates with valid physical outputs; do not fit calibration from the final failure reward.
-4. Freeze the calibration before the first optimizer update. An insufficient valid sample count or a scale unresolved by the selected profile must be reported explicitly rather than fabricated with epsilon. Predictor failures consume their normal allowance but do not count as valid calibration observations. User-supplied meaningful fixed scales can resolve missing scale information.
+3. For both profiles, fit automatic quality references as sample means and scales as population standard deviations. Apply directions once. For the gated profile, combine normalized relative objective weights, apply softplus once, and separately resolve the remaining gate violation scales. Include gate-failing candidates with valid physical outputs; do not fit calibration from the final failure reward.
+4. Freeze the calibration before the first optimizer update. An insufficient valid sample count or a scale unresolved by the selected profile must be reported explicitly rather than fabricated with epsilon. Predictor failures consume their normal allowance but do not count as valid calibration observations.
 5. Score the calibration episodes using the resolved reward. For DQN, insert them into replay only after reward resolution and compute MC returns with the existing discounted-return helper. This avoids mixing provisional reward labels with final ones.
 6. For A2C, use random calibration episodes only for calibration and discovery accounting. Subsequent actor training uses fresh episodes sampled from the current policy, not those random episodes.
 7. Use the frozen calibration for all later training and generation. Never refit it from a generation batch or after resume.
@@ -382,9 +378,9 @@ Extend the [existing all-method gated integration tests](../tests/test_reward_in
 | Interrupt immediately before/after first pass | Resume restores the same statistics, target network, optimizer and continuation |
 | Equivalent CTE unit conversion | Multiply values/bounds by `1e6` and divide violation penalty weight by `1e6`; gate decisions, penalty cost and total reward stay unchanged |
 | Passing-versus-failing ordering | New softplus profile gives passing rewards at least 1 and failing rewards at most 0; legacy combiner retains its own semantics |
-| Accidental passing-only calibration | Require the complete gated profile and reject ambiguous mixtures with legacy penalties; lack of quality bounds is supported |
+| Accidental passing-only calibration | Require the complete gated profile and verify that native-unit penalties apply only in raw mode; lack of quality bounds is supported |
 
-For the new profile, test the all-failed pilot and six new reward examples above, constant failing/passing Tg, exactly-at-threshold unresolved gate calibration, constant T3 quality calibration with/without a declared scale, active physical floors, zero valid predictions, and fixed calibration after the first success. Test unit conversion of both quality references/scales and gate penalties, including Kelvin/Celsius. Verify the two remaining gate labels match the revised-task baseline even though reward values differ. Exercise pending-pilot relabeling, checkpoint and generation behavior with all three methods.
+For the new profile, test the all-failed pilot and six new reward examples above, constant failing/passing Tg, exactly-at-threshold unresolved gate calibration, unresolved constant T3 quality calibration, active physical floors, zero valid predictions, and fixed calibration after the first success. Test unit conversion of both quality references/scales and gate penalties, including Kelvin/Celsius. Verify the two remaining gate labels match the revised-task baseline even though reward values differ. Exercise pending-pilot relabeling, checkpoint and generation behavior with all three methods.
 
 Add explicit removed-bound tests: T3=2100 and 3000 remain passing when CTE/Tg pass; increasing T3 improves their reward; a synthetic negative T3 must not fail an absent range gate. Changing only T3 while CTE or Tg fails leaves the failure reward unchanged. Test later values beyond pilot extrema without clipping/refitting. Test multiobjective fixed indifference contours and invariance to multiplying all objective weights by a positive constant. Check stable softplus at large finite positive/negative U, monotonicity where floating-point resolution permits it, documented lower-tail ties, and approximately linear increments at high U. Reject nonfinite computed utilities/rewards. Test rejection of old minimizing/three-gate calibration identities.
 
@@ -404,11 +400,11 @@ There is a specific sampling confound: DQN generation currently uses `exp(raw_Q 
 
 Use the revised GlassNet maximization task on coarse/medium/fine grids as the first scientific example. Every arm uses only the CTE/Tg gates. Perovskite's existing scientific definition can separately test PopArt; retain a simple two-objective fixture for weighted-sum calibration. Softplus does not require bounded perovskite delta properties. The perovskite example uses aggregate quality calibration. It applies the existing uncertainty-adjusted delta utilities and weights before fitting the combined reference and scale. Scientific runs also require the appropriate model and structure assets. Candidate count affects search difficulty, but neither normalization procedure enumerates the whole design space.
 
-For GlassNet, use four arms: revised-task baseline without/with PopArt, and new calibrated softplus reward without/with PopArt. The baseline means `+T3/1000` on pass, otherwise existing -10 and CTE/Tg native penalties; it does not mean the historical minimizing task or the removed T3 gate. Give paired arms the same initial evaluated candidates and charge calibration within their common allowance. Resolve one calibration per paired seed and reuse it across both new-reward arms. This separates reward-construction effects from PopArt. Evaluate all arms using the same two raw gates, feasible counts and highest-T3 metrics; their training reward numbers are not comparable quality measures.
+For GlassNet, compare the two supported recipes on the same grid, paired seeds and training and generation budgets. In raw mode the passing reward is T3 in kelvin. In PopArt mode the 100-candidate pilot is part of the training budget. Compare the number of distinct glasses passing the CTE and Tg gates and the highest T3 among them. This comparison measures the combined effect of the recipe. Numerical learner tests can isolate PopArt on identical supplied rewards.
 
-For a given fixed reward definition, compare PopArt off/on with matched training/generation allowances, evaluation protocol, sampling rules and paired seeds. A proposed initial real-task screen uses five paired seeds; report uncertainty and treat it as screening rather than strong proof. A larger confirmatory experiment and exact allowances belong in a reviewable run manifest before launching costly evaluations.
+Use the same evaluation protocol and sampling rules across both recipes. A proposed real-task screen uses five paired seeds and reports uncertainty. Declare the allowances before launching costly evaluations.
 
-For a calibration comparison, either give both arms the same resolved calibration or evaluate using common physical criteria. A legacy reward and a newly calibrated reward can express different scientific priorities; their scalar rewards and losses are not directly comparable.
+For a calibration comparison, either give both arms the same resolved calibration when both use PopArt, or evaluate using common physical criteria. A legacy reward and a newly calibrated reward can express different scientific priorities; their scalar rewards and losses are not directly comparable.
 
 Report qualifying unique candidates, relevant physical-property quality, instability/failure rate and outcome variation across reward multipliers. Separate engineering completion from demonstrated improvement. Freeze shared recipe settings before testing an untouched design setting or task family. No scenario-by-scenario tuning is used to make a failing transfer appear successful.
 
@@ -422,7 +418,7 @@ Before confirmatory runs, declare the primary feasible-discovery and quality met
 2. Implement PopArt statistics/head preservation and direct numerical tests.
 3. Integrate the shared DQN and A2C critic paths, raw-unit interfaces, target copies/cache behavior and default-off mode.
 4. Complete configuration, all load/save/resume paths and diagnostics; run the meaningful unit/integration/resume checks.
-5. Add the separate optional fixed property-calibration path, artifact and reward-contract tests, with its stated first-version scope.
+5. Add the automatic fixed property-calibration path for PopArt runs, artifact and reward-contract tests, with its stated first-version scope.
 6. Run the cheap scale-stress matrix and prepare a report separating algebraic correctness from learning behavior.
 7. Prepare the real-task comparison manifest with explicit allowances before material-evaluation runs. Review its results before declaring Step 1 scientifically successful or proceeding to Step 2.
 

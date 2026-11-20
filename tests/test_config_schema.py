@@ -370,19 +370,77 @@ def test_calibrated_glassnet_examples_use_two_gates_and_maximize_t3():
         assert {gate["name"] for gate in cfg["reward"]["gates"]} == {
             "low_expansion", "sufficient_transition_temperature",
         }
-        assert "failure" not in cfg["reward"]
-        assert all("penalty_weight" not in gate for gate in cfg["reward"]["gates"])
+        assert cfg["reward"]["failure"]["reward"] == -10
+        assert [gate["penalty_weight"] for gate in cfg["reward"]["gates"]] == [1e6, 0.001]
+
+
+@pytest.mark.parametrize(("method", "mode", "train", "generate", "temperature"), [
+    ("dqn", "bootstrap", 458, 1, 0.0),
+    ("dqn", "mc", 115, 115, 1.0),
+    ("a2c", None, 916, 229, 10.0),
+])
+def test_coarse_glassnet_selects_historical_hpo_budgets(method, mode, train, generate, temperature):
+    raw = load_yaml_config(Path(__file__).resolve().parents[1] / "configs/glassnet_coarse_2pct.yaml")
+    overrides = {"method": method, "dqn_target_mode": mode}
+    cfg = resolve_config(raw, overrides).config
+    assert (cfg["train_budget"], cfg["num_gen_eps"], cfg["gen_temperature"]) == (train, generate, temperature)
+    assert cfg["generation_selection"]["parameter"] == "gen_temperature"
+    assert cfg["max_gen_attempts"] == 10 * generate
+    assert "calibration" not in cfg["reward"]
+    assert cfg["value_normalization"] == "popart"
+    assert cfg["dqn_num_train_eps"] == train - cfg["dqn_warmup_eps"]
+    assert resolve_config(cfg).config == cfg
+    explicit = resolve_config(raw, {**overrides, "train_budget": 250}).config
+    assert (explicit["train_budget"], explicit["num_gen_eps"]) == (250, generate)
+
+
+@pytest.mark.parametrize(("values", "message"), [
+    ({"dqn-bootstrap": 10, "a2c": -2}, "num_gen_eps.a2c"),
+    ({"dqn-bootstrap": 10, "dqn_mc": 2}, "unknown method"),
+    ({"dqn-mc": 10}, "no value for the selected method"),
+])
+def test_method_specific_budget_rejects_invalid_entries(values, message):
+    with pytest.raises(ConfigError, match=message):
+        resolve_config({"method": "dqn", "num_gen_eps": values})
+
+
+def test_sinter_retains_old_training_allowances_and_temperature_sampling():
+    raw = load_yaml_config(Path(__file__).resolve().parents[1] / "configs/oxides_sinter.yaml")
+    cfg = resolve_config(raw).config
+    assert cfg["dqn_warmup_eps"] + cfg["dqn_num_train_eps"] == 51000
+    assert cfg["pg_num_iters"] * cfg["pg_batch_eps"] == 7500
+    assert (cfg["num_gen_eps"], cfg["max_gen_attempts"], cfg["gen_temperature"]) == (1000, 100000, 3.0)
+    assert cfg["generation_selection"]["parameter"] == "gen_temperature"
+    assert "calibration" not in cfg["reward"]
+    assert "normalization" not in cfg["properties"][0]
+    assert cfg["value_normalization"] == "popart"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("normalization", {"mode": "auto_fixed"}),
+    ("normalization", {"mode": "fixed", "reference": 0, "scale": 20}),
+    ("violation_normalization", "auto_fixed"),
+    ("calibration", {"num_candidates": 100}),
+])
+def test_retired_calibration_fields_are_rejected(field, value):
+    path = Path(__file__).resolve().parents[1] / "configs/glassnet_coarse_2pct.yaml"
+    cfg = load_yaml_config(path)
+    owner = {"normalization": cfg["properties"][0], "violation_normalization": cfg["reward"]["gates"][0],
+             "calibration": cfg["reward"]}
+    owner[field][field] = value
+    with pytest.raises(ConfigError, match=field):
+        validate_config(cfg)
 
 
 def test_model_free_validation_rejects_conflicting_calibration_settings():
-    path = Path(__file__).resolve().parents[1] / "configs" / "glassnet_coarse_2pct_a2c.yaml"
+    path = Path(__file__).resolve().parents[1] / "configs" / "glassnet_coarse_2pct.yaml"
     cfg = load_yaml_config(path)
     cfg["properties"][0]["scale"] = 1000
-    with pytest.raises(ConfigError, match="cannot declare both scale and normalization"):
+    with pytest.raises(ConfigError, match="cannot declare a manual scale"):
         validate_config(cfg)
     del cfg["properties"][0]["scale"]
-    cfg["reward"]["gates"][0]["penalty_weight"] = 1.0
-    with pytest.raises(ConfigError, match="legacy penalty_weight"):
+    cfg["reward"]["gates"][0]["penalty_weight"] = -1.0
+    with pytest.raises(ConfigError, match="penalty_weight"):
         validate_config(cfg)
 
 
@@ -390,7 +448,7 @@ def test_perovskite_example_calibrates_existing_combined_quality():
     path = Path(__file__).resolve().parents[1] / "configs" / "perovskite_calibrated.example.yaml"
     cfg = resolve_config(load_yaml_config(path)).config
     reward = cfg["reward"]
-    assert reward["calibration"]["quality_mode"] == "aggregate"
+    assert reward["objective"]["quality_mode"] == "aggregate"
     assert reward["objective"]["terms"] == dict.fromkeys(
         ("delta_T400", "delta_T500", "delta_T600"), 0.33333,
     )
@@ -398,7 +456,7 @@ def test_perovskite_example_calibrates_existing_combined_quality():
     gate, = reward["gates"]
     assert gate["score"]["terms"] == {"pure_probability": 1.0}
     assert gate["min"] == 0.8
-    assert "failure" not in reward and "penalty_weight" not in gate
+    assert reward["failure"]["reward"] == -10 and "penalty_weight" not in gate
 
 
 @pytest.mark.parametrize("value", [True, False])

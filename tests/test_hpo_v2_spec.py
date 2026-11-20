@@ -20,6 +20,15 @@ def write_plan(tmp_path, extra=None, scene=None):
     return path
 
 
+def test_campaign_method_selects_budgets_from_a_shared_scenario(tmp_path):
+    coarse = Path(__file__).resolve().parents[1] / 'configs/glassnet_coarse_2pct.yaml'
+    plan = load_plan(write_plan(tmp_path, {'method': 'dqn-mc', 'base_config': str(coarse)}))
+    base = plan['base_config_data']
+    assert base['method'] == 'dqn' and base['dqn_target_mode'] == 'mc'
+    assert (base['train_budget'], base['num_gen_eps'], base['gen_temperature']) == (115, 115, 1.0)
+    assert plan['generation_search']['parameter'] == 'gen_temperature'
+
+
 @pytest.mark.parametrize('method', ['a2c', 'dqn-mc', 'dqn-bootstrap'])
 def test_simplified_defaults_inherit_named_property_and_fixed_rules(tmp_path, method):
     plan = load_plan(write_plan(tmp_path, {'method': method}))

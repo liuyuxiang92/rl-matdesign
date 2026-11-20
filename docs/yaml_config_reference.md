@@ -184,39 +184,50 @@ spread are distinct; unavailable uncertainty must not be represented as zero.
 
 ### Automatic reward calibration
 
-The GlassNet examples in `configs/glassnet_*.yaml` maximize `T3` while requiring
-expansion within its declared interval and `Tg` at or above its declared threshold.
-They enable `reward.calibration.profile: auto_gated_softplus_v1`. The profile
-estimates quality references and scales from a declared sample of distinct valid
-evaluations, including candidates that fail the gates. It freezes those values
-before learning. Gates compare native values against the configured bounds.
+The top-level `value_normalization` setting controls both reward calibration
+and value-target normalization for DQN-bootstrap, DQN-MC and A2C. Use this
+setting for a fresh pilot of exactly 100 distinct, successfully evaluated candidates.
 
-Passing candidates receive `1 + softplus(U)`, where `U` combines the calibrated
-quality terms using their relative objective weights. Failing candidates receive
-the negative sum of normalized violations, weighted by their gate priorities.
-Each gate defaults to `priority: 1.0` and `violation_normalization: auto_fixed`.
-A fixed violation scale can be declared as
-`violation_normalization: {mode: fixed, scale: 20.0}` in that gate's physical units.
-The calibrated profile takes the place of `failure.reward`, `penalty_weight`
-and legacy objective `scale`. Remove those fields when migrating a gated reward.
+```yaml
+value_normalization: popart
+```
 
-The [perovskite example](../configs/perovskite_calibrated.example.yaml) selects
-`reward.calibration.quality_mode: aggregate`. It first combines the three
-uncertainty-adjusted delta terms with their authored weights, then calibrates
-that combined quality. The classifier probability remains a separate gate.
+The reward type selects the profile. A weighted sum uses
+`auto_weighted_sum_v1`. The pilot estimates the mean and population standard
+deviation of each nonzero objective term before combining the standardized
+terms with the user’s weights. Oxide sintering rewards lower predicted
+temperatures. [Oxide sintering configuration](../configs/oxides_sinter.yaml)
 
-For a weighted sum, use `normalization: {mode: auto_fixed}` on each property
-to estimate its quality reference and scale, or
-`normalization: {mode: fixed, reference: 0.0, scale: 1.0}` to declare them.
-The weighted sum remains linear. Automatic calibration uses 100 valid distinct
-candidates by default. Use `reward.calibration.num_candidates` to declare the
-sample count. The pilot uses the training allowance and supplies DQN warmup
-observations. A2C uses the pilot for calibration and trains its actor on
-subsequent policy samples. Successful, distinct pilot observations are charged
-to the same candidate allowance. Evaluation failures and skipped preparations
-are recorded separately, and pilot retries are bounded.
+A gated reward uses `auto_gated_softplus_v1`. In GlassNet, the pilot fits a
+reference and scale for T3 and a separate violation scale for each gate.
+Gate checks still use the original CTE and Tg bounds. Passing candidates
+receive `1 + softplus(U)`, where `U` is the weighted standardized quality.
+Failing candidates receive the negative sum of normalized violations, with a
+default priority of 1 per gate. [GlassNet coarse configuration](../configs/glassnet_coarse_2pct.yaml)
 
-The runner stores pilot state in `calibration_checkpoint.pt` and writes the
+The perovskite example uses `quality_mode: aggregate` to calibrate the combined
+uncertainty-adjusted delta objective. Its synthesizability probability supplies
+the gate. [Perovskite configuration](../configs/perovskite_calibrated.example.yaml)
+
+The runner freezes the fitted scales for training and generation. Gate failures
+with valid predictions count toward the pilot. Duplicate candidates and failed
+evaluations do not fill pilot slots. The pilot counts toward the training
+allowance and supplies DQN warmup data. A2C trains on subsequent policy samples.
+
+With `value_normalization: none` (the default when omitted), training uses the
+configured raw reward, skips the pilot, and learns values in raw reward units.
+A passing 1500 K GlassNet candidate earns 1500. A gate failure starts at
+`failure.reward` and subtracts the weighted violations in native units.
+In the oxide example a predicted sintering temperature of 850 earns −850.
+The `max` reward operator uses this mode to compare its declared alternatives.
+
+When migrating a calibrated YAML, delete the entire `reward.calibration`
+section, property `normalization` and gate `violation_normalization`. Keep
+scientific weights and thresholds. Gate `priority` applies in PopArt mode.
+The raw gated reward uses `failure.reward` and each gate's `penalty_weight`.
+For an aggregate gated objective, put `quality_mode: aggregate` under `reward.objective`.
+
+In PopArt mode the runner stores pilot state in `calibration_checkpoint.pt` and writes the
 frozen `reward_calibration.json` before training. `--resume-training`
 continues from the last settled pilot checkpoint when a learner checkpoint
 has yet to be created. The frozen JSON is required for generation and learner
@@ -241,7 +252,14 @@ training names are accepted. Use shared `gamma` for every method; DQN and PG
 warmup budgets are independent. `num_gen_eps` is the entire generation quota.
 Training counts distinct successful candidates by default; set
 `train_count_duplicates: true` or pass `--train-count-duplicates` to count
-repeats too. Scientific output columns and the 200,000-record prediction cache
+repeats too. The [coarse GlassNet scenario](../configs/glassnet_coarse_2pct.yaml) gives
+`train_budget`, `num_gen_eps` and `gen_temperature` a value for each method.
+Each of these three fields also accepts a single value shared by all methods.
+For DQN the key is `dqn-bootstrap` or `dqn-mc`, selected by `dqn_target_mode`.
+For policy-gradient runs the key is the method name. The runner applies explicit
+CLI overrides after selecting the method's values. Resolved run configs store scalars.
+
+Scientific output columns and the 200,000-record prediction cache
 limit are fixed by the implementation.
 The fully resolved config and scientific contracts are stored with run artifacts.
 A metadata-only audit does not validate external model weights or template files.

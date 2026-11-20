@@ -164,7 +164,7 @@ parameter definitions. A test checks it for drift.
 | Parameter | Type | Default / fallback | Constraints | Meaning |
 |---|---|---|---|---|
 | `method` | str | 'a2c' | dqn, reinforce, a2c | Training algorithm; inactive algorithm settings are retained. |
-| `value_normalization` | str | 'none' | none, popart | Adaptive value-target normalization for DQN and A2C. |
+| `value_normalization` | str | 'none' | none, popart | Use raw RL rewards, or automatic reward calibration and PopArt value targets for DQN and A2C. |
 | `value_normalization_profile` | str | 'popart_v1' | popart_v1 | Versioned PopArt settings shared by DQN and A2C. |
 | `eval_seed` | int | 0 | >= 0; <= 4294967295 | Random seed for property evaluation and structure sampling. |
 | `train_seed` | int | eval_seed | >= 0; <= 4294967295 | Training random seed. |

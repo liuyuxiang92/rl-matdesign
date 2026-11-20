@@ -180,12 +180,11 @@ def test_reward_calibration_is_fingerprinted_and_forwarded_to_generation(tmp_pat
     source = public_plan_path(tmp_path)
     scene_path = tmp_path / "scene.yaml"
     scene = yaml.safe_load(scene_path.read_text())
-    scene["properties"][0]["normalization"] = {"mode": "auto_fixed"}
-    scene["reward"]["calibration"] = {"num_candidates": 2}
+    scene["value_normalization"] = "popart"
     scene_path.write_text(yaml.safe_dump(scene, sort_keys=False))
     worker = FakeWorker(monkeypatch)
     runner = JobRunner(load_plan(source), tmp_path / "campaign")
-    trained = runner({"pg_batch_eps": 2}, 8, 11, "train")
+    trained = runner({"pg_batch_eps": 2}, 105, 11, "train")
     calibration_path = trained["checkpoint_paths"][REWARD_CALIBRATION]
     checksum = file_digest(calibration_path)
     assert trained["artifact_hashes"][calibration_path] == checksum

@@ -155,6 +155,15 @@ def test_training_minimum_supports_range_updated_categorical_and_integer_specs(t
     assert minimum_training_budget(plan, {"episode_steps": 2}) == 7
 
 
+@pytest.mark.parametrize(("method", "required"), [("a2c", 108), ("dqn-mc", 101), ("dqn-bootstrap", 111)])
+def test_popart_budget_includes_fixed_pilot_and_learning(tmp_path, method, required):
+    plan = small_plan(tmp_path) if method == "a2c" else small_dqn_plan(tmp_path, method)
+    plan["base_config_data"]["value_normalization"] = "popart"
+    if method == "a2c":
+        plan["search_space"]["pg_batch_eps"] = {"type": "categorical", "choices": [8]}
+    assert minimum_training_budget(plan, {"episode_steps": 2}) == required
+
+
 def fake_worker(monkeypatch):
     calls = []
     class Process:
