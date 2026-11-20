@@ -1,69 +1,65 @@
-# HEA case study configuration
-# Usage:
-#   python scripts/run_experiment.py --config configs/hea.yaml --method a2c \
-#       --out runs/hea_a2c_seed0 --dp-seed 0 --train-seed 0 --gen-seed 0
-
-
-# ---- Environment ----
+# Chemical amounts and categorical assignments; see docs/design_groups.md.
 groups:
-  - name: hea
-    kind: composition
-    species_set:
-      - Co
-      - Cr
-      - Fe
-      - Mn
-      - Ni
-      - Al
-      - Ti
-      - Cu
-      - V
-      - Mo
-      - W
-      - Nb
-      - Ta
-      - Hf
-      - Zr
-    fraction_set:
-      - "0.05"
-      - "0.10"
-      - "0.15"
-      - "0.20"
-      - "0.25"
-      - "0.30"
-      - "0.35"
-      - "0.40"
-      - "0.45"
-      - "0.50"
-      - "0.55"
-      - "0.60"
-      - "0.65"
-      - "0.70"
-      - "0.75"
-      - "0.80"
-    n_components: 5           # Classic 5-component HEA
-    # No chemical constraint (no filters:); DPA reward handles stability.
-
-anion_formula: ""         # No anion for metallic alloys
-
-# ---- Reward (one structure objective -> single-objective, auto-detected) ----
-builder: substitute               # fixed-lattice element swap onto placeholder sites
-poscar: data/hea/FCC.POSCAR       # FCC supercell template; change to BCC.POSCAR if needed
-site_symbol: "X"                  # placeholder element in the POSCAR template
-n_random_configs: 5               # random configs per composition during RL training
-k: 1.0
+- name: hea
+  kind: composition
+  species_set:
+  - Co
+  - Cr
+  - Fe
+  - Mn
+  - Ni
+  - Al
+  - Ti
+  - Cu
+  - V
+  - Mo
+  - W
+  - Nb
+  - Ta
+  - Hf
+  - Zr
+  amount_set:
+  - 0.05
+  - 0.1
+  - 0.15
+  - 0.2
+  - 0.25
+  - 0.3
+  - 0.35
+  - 0.4
+  - 0.45
+  - 0.5
+  - 0.55
+  - 0.6
+  - 0.65
+  - 0.7
+  - 0.75
+  - 0.8
+  n_steps: 5
+  total: 1
+  unique: true
+structure:
+  builder: pipeline
+  base_poscar: data/hea/FCC.POSCAR
+  n_random_configs: 5
+  steps:
+  - type: substitute
+    a_site_symbol: X
+    a_dopant_group: hea
 properties:
-  - name: energy
-    predictor: dp_energy          # DP potential energy (lower = more stable)
-    models:
-      - models/hea/model_1.pt
-      - models/hea/model_2.pt
-      - models/hea/model_3.pt
-    direction: min                # minimize formation energy
-    objective: mean_minus_kstd    # exploit (use mean_plus_kstd to explore)
-
-# ---- RL hyperparameters ----
-method: a2c                # Default method (overridable via --method)
+- name: energy
+  predictor: dp_energy
+  models:
+  - models/hea/model_1.pt
+  - models/hea/model_2.pt
+  - models/hea/model_3.pt
+  direction: min
+  objective: mean_minus_kstd
+  uncertainty: model_spread
+reward:
+  type: weighted_sum
+k: 1.0
+method: a2c
 pg_warmup_eps: 200
 pg_num_iters: 500
 pg_batch_eps: 15
@@ -74,18 +70,11 @@ gen_temperature: 1.0
 gen_top_frac: 0.0
 gen_epsilon: 0.0
 gamma: 0.99
-
 pg_repeat_penalty_coef: 0.1
 pg_repeat_penalty_shape: log
-
-# ---- Generation ----
-num_gen_eps: 200          # Exploitation candidates
-exploration_gen_eps: 50   # Exploration candidates (high dp_std; for DFT validation)
-
-# ---- DQN-specific (only used when --method dqn) ----
+num_gen_eps: 250
 dqn_lr: 0.001
 dqn_batch_size: 256
-# Classical online DQN
 dqn_warmup_eps: 200
 dqn_num_train_eps: 20000
 dqn_buffer_size: 50000

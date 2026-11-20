@@ -1,148 +1,392 @@
-# Doped Li6PS6 solid-state electrolyte — a plain, friendly multi_group config.
-#
-# Two sublattice groups:
-#   P_site (composition) — P plus up to two dopant metals from the same menu,
-#                          on a fraction_set that is the explicit UNION of the
-#                          dopant grid and the P-complement grid; element_bounds
-#                          pins P into [0.92, 0.98], which is algebraically
-#                          equivalent to the old "combined dopant fraction in
-#                          [0.02, 0.08]" sum-budget (0.02 <= 1-x_P <= 0.08).
-#   S_site (categorical) — a per-metal oxygen FORM (0 = metal/sulfide, 1 = oxide,
-#                          each masked by its metal's category) + the Cl count.
-# Br = halide_total - Cl and the charge-neutral Li vacancy are derived by the
-# `sse` builder; formula_units is read from the POSCAR.
-#
-#   python scripts/run_experiment.py --config configs/lips_sse.yaml \
-#       --method a2c --out runs/lips_a2c_s0 --train-seed 0 --dp-seed 0 --gen-seed 0
-
+# Chemical amounts and categorical assignments; see docs/design_groups.md.
 groups:
-  - name: P_site
-    kind: composition
-    species_set:
-      [P, Mn, Ni, Cu, Zn, Mo, In, Sn, Sb, W, Ru, Tm, Yb,
-       Mg, Al, Si, Sc, Ti, V, Cr, Fe, Co, Ga, Ge, Y, Zr, Nb, Hf, Ta, Ho, Er, Lu]
-    sites: 1
-    n_components: 3                   # 2 dopant slots + 1 mandatory P slot
-    # Explicit UNION grid (not a densified 0.00-1.00 grid): the dopant range
-    # 0.02-0.08 (0.01 rung deliberately omitted -- no "trace" single-percent
-    # dopant) union the P-complement range 0.92-0.98, plus 0.00 so an unused
-    # dopant slot can be absent.
-    fraction_set:
-      [0.00, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08,
-       0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98]
-    element_bounds:
-      P: [0.92, 0.98]                 # mandatory (lo > 0) + caps P's range
-
-  - name: S_site                      # categorical: per-metal O form + Cl count (real values)
-    kind: categorical
-    sites: 6
-    choices:
-      - {name: O_a, element: O, values: [0, 1]}       # O-form for dopant metal #1 (sorted)
-      - {name: O_b, element: O, values: [0, 1]}       # O-form for dopant metal #2 (sorted)
-      - {element: Cl, values: [0.6, 0.8, 1.0, 1.2, 1.4]}   # Cl atoms per formula unit
-    filters:
-      - type: sse_doping
-        o_element: O
-        metal_only: [Ru]                                  # never take oxygen
-        oxide_only: [Mg, Al, Si, Sc, Ti, V, Cr, Fe, Co, Ga, Ge, Y, Zr, Nb, Hf, Ta, Ho, Er, Lu]
-        # "both" (decide O or not) = every other metal: Mn Ni Cu Zn Mo In Sn Sb W Tm Yb
-
-# ---- Reward: build once -> relax once -> conductivity + stability (two objectives) ----
-# share_structure: true (default) = one relaxed cell, scored by both property heads.
-builder: sse
-# S-site substitution region: dope the last 1000 S by default; only when a
-# composition's O+Cl+Br won't fit (e.g. two oxide dopants) expand to the first 2000.
-eligible_region: {symbol: S, take: last, count: 1000}
-eligible_region_fallback: {symbol: S, take: first, count: 2000}
-base_poscar: POSCAR_supercell         # (Li6PS6)*500 ; edit to your absolute path
-halide_total: 1.7                     # Cl + Br per formula unit
-host: {P: P, S: S, Li: Li}
-n_random_configs: 1
-
-# Charge-neutrality valences (metal: {metal-form, oxide-form}); drives the Li
-# vacancy solve and the oxide O count. From the user's VALENCY_MAP.
-valences:
-  Li: 1
-  P: 5
-  S: -2
-  O: -2
-  Cl: -1
-  Br: -1
-  Cu: {sulfide: 2, oxide: 2}
-  Hf: {sulfide: 4, oxide: 4}
-  In: {sulfide: 3, oxide: 3}
-  Mn: {sulfide: 2, oxide: 4}
-  Mo: {sulfide: 4, oxide: 6}
-  Nb: {sulfide: 4, oxide: 5}
-  Ni: {sulfide: 2, oxide: 3}
-  Ru: {sulfide: 4, oxide: 2}
-  Sn: {sulfide: 4, oxide: 4}
-  W:  {sulfide: 4, oxide: 6}
-  Al: {sulfide: 3, oxide: 3}
-  Co: {sulfide: 2, oxide: 2}
-  Cr: {sulfide: 3, oxide: 3}
-  Fe: {sulfide: 2, oxide: 3}
-  Ga: {sulfide: 3, oxide: 3}
-  Mg: {sulfide: 2, oxide: 2}
-  Sb: {sulfide: 5, oxide: 3}
-  Si: {sulfide: 4, oxide: 4}
-  Ti: {sulfide: 4, oxide: 4}
-  V:  {sulfide: 3, oxide: 5}
-  Zn: {sulfide: 2, oxide: 2}
-  Zr: {sulfide: 4, oxide: 4}
-  Ge: {sulfide: 4, oxide: 4}
-  Y:  {sulfide: 3, oxide: 3}
-  Sc: {sulfide: 3, oxide: 3}
-  Ta: {sulfide: 5, oxide: 5}
-  Ho: {sulfide: 3, oxide: 3}
-  Er: {sulfide: 3, oxide: 3}
-  Tm: {sulfide: 3, oxide: 3}
-  Yb: {sulfide: 3, oxide: 3}
-  Lu: {sulfide: 3, oxide: 3}
-
-geo_opt:
-  model: ./models/DPA-3.1-3M_1.pt
-  head: SSE_ABACUS
-  fmax: 0.001
-  steps: 10
-  relax_cell: true
-
-# Inner per-composition optimization over the operating temperature. For each
-# composition the predictor builds+relaxes ONCE, then scores both heads at every
-# temperature and keeps the single shared T maximizing (conductivity+stability).
-# The chosen T is logged as the `obj_temperature_mean` column in generated.csv.
-sweep:
-  name: temperature
-  values: [460, 470, 480, 490]        # K; 460-490 step 10
-
+- name: P_site
+  kind: composition
+  species_set:
+  - P
+  - Mn
+  - MnO2
+  - Ni
+  - Ni2O3
+  - Cu
+  - CuO
+  - Zn
+  - ZnO
+  - Mo
+  - MoO3
+  - In
+  - In2O3
+  - Sn
+  - SnO2
+  - Sb
+  - Sb2O3
+  - W
+  - WO3
+  - Ru
+  - Tm
+  - Tm2O3
+  - Yb
+  - Yb2O3
+  - MgO
+  - Al2O3
+  - SiO2
+  - Sc2O3
+  - TiO2
+  - V2O5
+  - Cr2O3
+  - Fe2O3
+  - CoO
+  - Ga2O3
+  - GeO2
+  - Y2O3
+  - ZrO2
+  - Nb2O5
+  - HfO2
+  - Ta2O5
+  - Ho2O3
+  - Er2O3
+  - Lu2O3
+  amount_set:
+  - 0.0
+  - 0.02
+  - 0.03
+  - 0.04
+  - 0.05
+  - 0.06
+  - 0.07
+  - 0.08
+  - 0.92
+  - 0.93
+  - 0.94
+  - 0.95
+  - 0.96
+  - 0.97
+  - 0.98
+  n_steps: 3
+  total: 1
+  element_bounds:
+    P:
+    - 0.92
+    - 0.98
+- name: halide
+  kind: composition
+  species_set:
+  - Cl
+  amount_set:
+  - 0.6
+  - 0.8
+  - 1
+  - 1.2
+  - 1.4
+  n_steps: 1
+structure:
+  builder: pipeline
+  base_poscar: POSCAR_supercell
+  n_random_configs: 1
+  steps:
+  - type: substitute
+    a_site_symbol: P
+    a_dopant_group: P_site
+    amount_basis: cation_fraction
+  - type: sse_charge_balance
+    p_site_group: P_site
+    halide_group: halide
+    eligible_region:
+      count: 1000
+      symbol: S
+      take: last
+    eligible_region_fallback:
+      count: 2000
+      symbol: S
+      take: first
+    host:
+      Li: Li
+      P: P
+      S: S
+    halide_total: 1.7
+    valences:
+      Al:
+        oxide: 3
+        sulfide: 3
+      Br: -1
+      Cl: -1
+      Co:
+        oxide: 2
+        sulfide: 2
+      Cr:
+        oxide: 3
+        sulfide: 3
+      Cu:
+        oxide: 2
+        sulfide: 2
+      Er:
+        oxide: 3
+        sulfide: 3
+      Fe:
+        oxide: 3
+        sulfide: 2
+      Ga:
+        oxide: 3
+        sulfide: 3
+      Ge:
+        oxide: 4
+        sulfide: 4
+      Hf:
+        oxide: 4
+        sulfide: 4
+      Ho:
+        oxide: 3
+        sulfide: 3
+      In:
+        oxide: 3
+        sulfide: 3
+      Li: 1
+      Lu:
+        oxide: 3
+        sulfide: 3
+      Mg:
+        oxide: 2
+        sulfide: 2
+      Mn:
+        oxide: 4
+        sulfide: 2
+      Mo:
+        oxide: 6
+        sulfide: 4
+      Nb:
+        oxide: 5
+        sulfide: 4
+      Ni:
+        oxide: 3
+        sulfide: 2
+      O: -2
+      P: 5
+      Ru:
+        oxide: 2
+        sulfide: 4
+      S: -2
+      Sb:
+        oxide: 3
+        sulfide: 5
+      Sc:
+        oxide: 3
+        sulfide: 3
+      Si:
+        oxide: 4
+        sulfide: 4
+      Sn:
+        oxide: 4
+        sulfide: 4
+      Ta:
+        oxide: 5
+        sulfide: 5
+      Ti:
+        oxide: 4
+        sulfide: 4
+      Tm:
+        oxide: 3
+        sulfide: 3
+      V:
+        oxide: 5
+        sulfide: 3
+      W:
+        oxide: 6
+        sulfide: 4
+      Y:
+        oxide: 3
+        sulfide: 3
+      Yb:
+        oxide: 3
+        sulfide: 3
+      Zn:
+        oxide: 2
+        sulfide: 2
+      Zr:
+        oxide: 4
+        sulfide: 4
+  - type: geo_opt
+    fmax: 0.001
+    head: SSE_ABACUS
+    model: ./models/DPA-3.1-3M_1.pt
+    relax_cell: true
+    steps: 10
 properties:
-  - name: conductivity
-    predictor: dp_property            # DP property head read on the shared relaxed cell
-    models: [SSE-models/models/model1.pt, SSE-models/models/model2.pt,
-             SSE-models/models/model3.pt, SSE-models/models/model4.pt,
-             SSE-models/models/model5.pt]
-    head: experiment
-    fparam: [0.00336, null, 6]        # [C, T, 6]; C = 1/(25+273), null = swept T slot
-    transform: exp                    # head emits log(conductivity); report real value
-    direction: max
-    weight: 0.5
-    scale: 1.0
-    objective: mean_plus_kstd
-  - name: stability
-    predictor: dp_property
-    models: [SSE-models/models_stab/model1.pt, SSE-models/models_stab/model2.pt,
-             SSE-models/models_stab/model3.pt, SSE-models/models_stab/model4.pt,
-             SSE-models/models_stab/model5.pt]
-    head: null
-    fparam: [.00336, null, 6, 4]      # [C, T, 6, 4]; C = 1/(25+273), null = swept T slot
-    transform: exp                    # head emits log(stability); report real value
-    direction: max
-    weight: 0.5
-    scale: 1.0
-    objective: mean_plus_kstd
+- name: conductivity_T460
+  predictor: dp_property
+  models:
+  - SSE-models/models/model1.pt
+  - SSE-models/models/model2.pt
+  - SSE-models/models/model3.pt
+  - SSE-models/models/model4.pt
+  - SSE-models/models/model5.pt
+  head: experiment
+  fparam:
+  - 0.00336
+  - 460
+  - 6
+  transform: exp
+  direction: max
+  scale: 1.0
+  objective: mean_plus_kstd
+  uncertainty: model_spread
+  representation: ln
+- name: stability_T460
+  predictor: dp_property
+  models:
+  - SSE-models/models_stab/model1.pt
+  - SSE-models/models_stab/model2.pt
+  - SSE-models/models_stab/model3.pt
+  - SSE-models/models_stab/model4.pt
+  - SSE-models/models_stab/model5.pt
+  head: null
+  fparam:
+  - 0.00336
+  - 460
+  - 6
+  - 4
+  transform: exp
+  direction: max
+  scale: 1.0
+  objective: mean_plus_kstd
+  uncertainty: model_spread
+  representation: ln
+- name: conductivity_T470
+  predictor: dp_property
+  models:
+  - SSE-models/models/model1.pt
+  - SSE-models/models/model2.pt
+  - SSE-models/models/model3.pt
+  - SSE-models/models/model4.pt
+  - SSE-models/models/model5.pt
+  head: experiment
+  fparam:
+  - 0.00336
+  - 470
+  - 6
+  transform: exp
+  direction: max
+  scale: 1.0
+  objective: mean_plus_kstd
+  uncertainty: model_spread
+  representation: ln
+- name: stability_T470
+  predictor: dp_property
+  models:
+  - SSE-models/models_stab/model1.pt
+  - SSE-models/models_stab/model2.pt
+  - SSE-models/models_stab/model3.pt
+  - SSE-models/models_stab/model4.pt
+  - SSE-models/models_stab/model5.pt
+  head: null
+  fparam:
+  - 0.00336
+  - 470
+  - 6
+  - 4
+  transform: exp
+  direction: max
+  scale: 1.0
+  objective: mean_plus_kstd
+  uncertainty: model_spread
+  representation: ln
+- name: conductivity_T480
+  predictor: dp_property
+  models:
+  - SSE-models/models/model1.pt
+  - SSE-models/models/model2.pt
+  - SSE-models/models/model3.pt
+  - SSE-models/models/model4.pt
+  - SSE-models/models/model5.pt
+  head: experiment
+  fparam:
+  - 0.00336
+  - 480
+  - 6
+  transform: exp
+  direction: max
+  scale: 1.0
+  objective: mean_plus_kstd
+  uncertainty: model_spread
+  representation: ln
+- name: stability_T480
+  predictor: dp_property
+  models:
+  - SSE-models/models_stab/model1.pt
+  - SSE-models/models_stab/model2.pt
+  - SSE-models/models_stab/model3.pt
+  - SSE-models/models_stab/model4.pt
+  - SSE-models/models_stab/model5.pt
+  head: null
+  fparam:
+  - 0.00336
+  - 480
+  - 6
+  - 4
+  transform: exp
+  direction: max
+  scale: 1.0
+  objective: mean_plus_kstd
+  uncertainty: model_spread
+  representation: ln
+- name: conductivity_T490
+  predictor: dp_property
+  models:
+  - SSE-models/models/model1.pt
+  - SSE-models/models/model2.pt
+  - SSE-models/models/model3.pt
+  - SSE-models/models/model4.pt
+  - SSE-models/models/model5.pt
+  head: experiment
+  fparam:
+  - 0.00336
+  - 490
+  - 6
+  transform: exp
+  direction: max
+  scale: 1.0
+  objective: mean_plus_kstd
+  uncertainty: model_spread
+  representation: ln
+- name: stability_T490
+  predictor: dp_property
+  models:
+  - SSE-models/models_stab/model1.pt
+  - SSE-models/models_stab/model2.pt
+  - SSE-models/models_stab/model3.pt
+  - SSE-models/models_stab/model4.pt
+  - SSE-models/models_stab/model5.pt
+  head: null
+  fparam:
+  - 0.00336
+  - 490
+  - 6
+  - 4
+  transform: exp
+  direction: max
+  scale: 1.0
+  objective: mean_plus_kstd
+  uncertainty: model_spread
+  representation: ln
+reward:
+  type: max
+  alternatives:
+  - name: T460
+    terms:
+      conductivity_T460: 0.5
+      stability_T460: 0.5
+  - name: T470
+    terms:
+      conductivity_T470: 0.5
+      stability_T470: 0.5
+  - name: T480
+    terms:
+      conductivity_T480: 0.5
+      stability_T480: 0.5
+  - name: T490
+    terms:
+      conductivity_T490: 0.5
+      stability_T490: 0.5
 k: 1.0
-
-# ---- RL hyperparameters ----
 method: a2c
 pg_warmup_eps: 200
 pg_num_iters: 500
@@ -155,4 +399,3 @@ gamma: 0.99
 pg_repeat_penalty_coef: 0.5
 pg_repeat_penalty_shape: log
 num_gen_eps: 200
-exploration_gen_eps: 0

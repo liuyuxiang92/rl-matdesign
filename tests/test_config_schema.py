@@ -345,6 +345,62 @@ def test_documented_parameter_table_is_generated_from_definitions():
     assert content.split("<!-- schema:start -->\n")[1].split("<!-- schema:end -->")[0] == schema_markdown()
 
 
+def test_value_normalization_requires_a_value_network():
+    assert resolve_config({}).config["value_normalization"] == "none"
+    for method in ("dqn", "a2c"):
+        cfg = resolve_config({"value_normalization": "popart"}, {"method": method}).config
+        assert cfg["value_normalization_profile"] == "popart_v1"
+    with pytest.raises(ConfigError, match="REINFORCE has no value network"):
+        resolve_config({"value_normalization": "popart"}, {"method": "reinforce"})
+    with pytest.raises(ConfigError, match="value_normalization_profile"):
+        resolve_config({"value_normalization": "popart", "value_normalization_profile": "unknown"})
+
+
+def test_calibrated_glassnet_examples_use_two_gates_and_maximize_t3():
+    configs = Path(__file__).resolve().parents[1] / "configs"
+    paths = sorted(configs.glob("glassnet_*.yaml"))
+    assert paths
+    for path in paths:
+        cfg = resolve_config(load_yaml_config(path)).config
+        assert cfg["value_normalization"] == "popart"
+        t3 = next(prop for prop in cfg["properties"] if prop["output"] == "T3")
+        assert t3["direction"] == "max"
+        assert "scale" not in t3
+        assert cfg["reward"]["objective"]["terms"] == {t3["name"]: 1.0}
+        assert {gate["name"] for gate in cfg["reward"]["gates"]} == {
+            "low_expansion", "sufficient_transition_temperature",
+        }
+        assert "failure" not in cfg["reward"]
+        assert all("penalty_weight" not in gate for gate in cfg["reward"]["gates"])
+
+
+def test_model_free_validation_rejects_conflicting_calibration_settings():
+    path = Path(__file__).resolve().parents[1] / "configs" / "glassnet_coarse_2pct_a2c.yaml"
+    cfg = load_yaml_config(path)
+    cfg["properties"][0]["scale"] = 1000
+    with pytest.raises(ConfigError, match="cannot declare both scale and normalization"):
+        validate_config(cfg)
+    del cfg["properties"][0]["scale"]
+    cfg["reward"]["gates"][0]["penalty_weight"] = 1.0
+    with pytest.raises(ConfigError, match="legacy penalty_weight"):
+        validate_config(cfg)
+
+
+def test_perovskite_example_calibrates_existing_combined_quality():
+    path = Path(__file__).resolve().parents[1] / "configs" / "perovskite_calibrated.example.yaml"
+    cfg = resolve_config(load_yaml_config(path)).config
+    reward = cfg["reward"]
+    assert reward["calibration"]["quality_mode"] == "aggregate"
+    assert reward["objective"]["terms"] == dict.fromkeys(
+        ("delta_T400", "delta_T500", "delta_T600"), 0.33333,
+    )
+    assert all(prop["objective"] == "mean_plus_kstd" for prop in cfg["properties"][:3])
+    gate, = reward["gates"]
+    assert gate["score"]["terms"] == {"pure_probability": 1.0}
+    assert gate["min"] == 0.8
+    assert "failure" not in reward and "penalty_weight" not in gate
+
+
 @pytest.mark.parametrize("value", [True, False])
 @pytest.mark.parametrize("source", ["yaml", "override"])
 def test_removed_training_filter_toggle_is_rejected(value, source):

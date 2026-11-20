@@ -581,3 +581,25 @@
     src/rl_matdesign/training.py, src/rl_matdesign/utils/execution_contract.py,
     src/rl_matdesign/utils/metrics.py, src/rl_matdesign/predictors/structure_score.py]
   tags: [configuration-ownership, training, schema-cleanup]
+
+- id: decision-step1-calibration-lifecycle-001
+  date: '2026-11-20'
+  title: Freeze scientific reward calibration before updating the learner
+  choice: Checkpoint each settled pilot observation without a scalar reward, freeze
+    calibration by content hash, and finalize stored observations once. Bind learner
+    and generation artifacts to that hash, reuse DQN pilot trajectories in warmup,
+    and record A2C pilot trajectories only for accounting.
+  alternatives_considered:
+  - Updating scientific scales online would alter objective weights or failure severity
+    and invalidate replay labels.
+  trade_off: Pilot collection is sequential for settled resume boundaries. Scientific
+    failures are valid calibration data, while unavailable predictions stay in the
+    attempt ledger. Synthetic tests do not establish improved discovery.
+  files:
+  - src/rl_matdesign/calibration_run.py
+  - src/rl_matdesign/reward_calibration.py
+  - src/rl_matdesign/utils/execution_contract.py
+  tags:
+  - calibration
+  - exact-resume
+  - scientific-rewards

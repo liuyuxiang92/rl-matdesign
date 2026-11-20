@@ -125,6 +125,8 @@ class Parameter:
 # Experiment defaults are defined once; each algorithm owns its warmup budget.
 PARAMETERS: dict[str, Parameter] = {
     "method": Parameter(str, "a2c", "Training algorithm; inactive algorithm settings are retained.", choices=("dqn", "reinforce", "a2c")),
+    "value_normalization": Parameter(str, "none", "Adaptive value-target normalization for DQN and A2C.", choices=("none", "popart")),
+    "value_normalization_profile": Parameter(str, "popart_v1", "Versioned PopArt settings shared by DQN and A2C.", choices=("popart_v1",)),
     "eval_seed": Parameter(int, 0, "Random seed for property evaluation and structure sampling.", minimum=0, maximum=2**32 - 1),
     "train_seed": Parameter(int, None, "Training random seed.", minimum=0, maximum=2**32 - 1, nullable=True, fallback="eval_seed"),
     "gen_seed": Parameter(int, None, "Candidate-generation random seed.", minimum=0, maximum=2**32 - 1, nullable=True, fallback="eval_seed"),
@@ -266,6 +268,8 @@ def validate_config(raw: Mapping) -> None:
     for key, value in cfg.items():
         if key in PARAMETERS:
             PARAMETERS[key].normalize(key, value)
+    if cfg.get("method") == "reinforce" and cfg.get("value_normalization") == "popart":
+        raise ConfigError("value_normalization=popart requires DQN or A2C. REINFORCE has no value network")
     retired = set(cfg) & (_RETIRED_KEYS | _PROPERTY_OWNED_KEYS)
     if retired:
         raise ConfigError(f"Removed top-level parameters: {sorted(retired)}; use groups, structure and properties")
@@ -343,8 +347,13 @@ def validate_config(raw: Mapping) -> None:
     if cfg.get("properties"):
         from .rewards import RewardCombiner
         try:
-            RewardCombiner(cfg.get("reward"), [prop.get("name", f"prop{i}")
-                                               for i, prop in enumerate(cfg["properties"])])
+            properties = [dict(prop, name=prop.get("name", f"prop{i}"))
+                          for i, prop in enumerate(cfg["properties"])]
+            combiner = RewardCombiner(cfg.get("reward"), [prop["name"] for prop in properties])
+            if combiner.calibration_config or any("normalization" in prop for prop in properties):
+                from .reward_calibration import RewardCalibration
+
+                RewardCalibration(combiner, properties)
         except (TypeError, ValueError) as exc:
             raise ConfigError(str(exc)) from exc
     known = set(PARAMETERS) | set(_DELEGATED_NAMES) | {_GENERATION_METADATA}

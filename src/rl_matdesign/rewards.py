@@ -3,14 +3,14 @@
 The caller supplies gate scores in native property units and separately supplies
 property values with direction, uncertainty objective, and scale already
 applied for reward optimization. This module never normalizes either input.
-Structure scoring uses mean minus std for classification gates, raw means for
-other gates; those statistics are selected by the caller.
+Structure scoring uses mean minus model spread for classification gates and
+raw means for other gates.
 Reward terms own all coefficients. A sole property has implicit coefficient 1;
 multiple properties require an explicit reward objective.
 
-A gated reward is a piecewise scalar objective, not a guarantee that every
-feasible candidate outranks every infeasible one: that guarantee also needs a
-known lower bound on the passing objective and a lower failure reward.
+The legacy gated reward requires a known passing-utility lower bound for global
+feasibility dominance. The calibrated profile supplies its own positive
+passing utility and normalized violation penalties in reward_calibration.py.
 """
 from __future__ import annotations
 
@@ -91,15 +91,22 @@ class RewardCombiner:
         self.type = config.get("type", "weighted_sum")
         if self.type not in ("weighted_sum", "gated", "max"):
             raise ValueError("reward.type must be 'weighted_sum', 'gated', or 'max'.")
-        allowed = {"type", "objective"}
+        self.calibration_config = dict(_mapping(config.get("calibration", {}), "reward.calibration"))
+        if "calibration" in config and not self.calibration_config:
+            raise ValueError("reward.calibration must declare a profile or calibration options.")
+        self.calibrated_gated = bool(self.calibration_config) and self.type == "gated"
+        allowed = {"type", "objective", "calibration"}
         if self.type == "max":
             allowed = {"type", "alternatives"}
         if self.type == "gated":
             allowed |= {"gates", "failure"}
+            if self.calibrated_gated and "failure" in config:
+                raise ValueError("Calibrated gated rewards cannot also declare legacy failure.reward.")
         _keys(config, allowed, "reward")
 
         self.objective_terms: dict[str, float] = {}
         self._gates: list[_Gate] = []
+        self.gate_normalizations: dict[str, Any] = {}
         self._failure_reward = 0.0
         self.alternatives: list[tuple[str, dict[str, float]]] = []
         if self.type == "max":
@@ -133,7 +140,12 @@ class RewardCombiner:
         for index, item in enumerate(gates):
             context = f"reward.gates[{index}]"
             gate = _mapping(item, context)
-            _keys(gate, {"name", "score", "min", "max", "penalty_weight"}, context)
+            gate_keys = {"name", "score", "min", "max", "penalty_weight"}
+            if self.calibrated_gated:
+                gate_keys |= {"priority", "violation_normalization"}
+                if "penalty_weight" in gate:
+                    raise ValueError("Calibrated gates cannot also declare legacy penalty_weight.")
+            _keys(gate, gate_keys, context)
             name = gate.get("name")
             if not isinstance(name, str) or not name.strip():
                 raise ValueError(f"{context}.name must be a non-empty string.")
@@ -149,10 +161,16 @@ class RewardCombiner:
             upper = _number(gate["max"], f"{context}.max") if "max" in gate else None
             if lower is not None and upper is not None and lower > upper:
                 raise ValueError(f"{context}.min must be <= max.")
-            penalty_weight = _number(gate.get("penalty_weight", 1.0), f"{context}.penalty_weight")
+            weight_key = "priority" if self.calibrated_gated else "penalty_weight"
+            penalty_weight = _number(gate.get(weight_key, 1.0), f"{context}.{weight_key}")
             if penalty_weight < 0:
-                raise ValueError(f"{context}.penalty_weight must be >= 0.")
+                raise ValueError(f"{context}.{weight_key} must be >= 0.")
             self._gates.append(_Gate(name, terms, lower, upper, penalty_weight))
+            if self.calibrated_gated:
+                self.gate_normalizations[name] = gate.get("violation_normalization", "auto_fixed")
+
+        if self.calibrated_gated:
+            return
 
         failure = _mapping(config.get("failure"), "reward.failure")
         _keys(failure, {"reward"}, "reward.failure")
@@ -195,6 +213,8 @@ class RewardCombiner:
         Every referenced value must be present and finite. The returned mapping
         is fresh on each call and contains only ordinary JSON-compatible values.
         """
+        if self.calibration_config:
+            raise ValueError("Calibrated reward evaluation requires its frozen reward calibration.")
         raw = _mapping(raw_values, "raw_values")
         adjusted = _mapping(objective_values, "objective_values")
         if self.type == "max":
@@ -206,28 +226,8 @@ class RewardCombiner:
                     "selected_alternative": best["name"], "alternatives": alternatives,
                     "gate_passed": True, "gates": []}
         objective = self._sum(self.objective_terms, adjusted, "objective_values")
-        diagnostics = []
-        total_penalty = 0.0
-        for gate in self._gates:
-            score = self._sum(gate.terms, raw, f"raw_values for gate {gate.name!r}")
-            violation = 0.0
-            if gate.lower is not None:
-                violation += max(0.0, gate.lower - score)
-            if gate.upper is not None:
-                violation += max(0.0, score - gate.upper)
-            violation = _number(violation, f"Gate {gate.name!r} bound violation")
-            penalty = _number(gate.penalty_weight * violation, f"Gate {gate.name!r} penalty")
-            total_penalty += penalty
-            diagnostics.append({
-                "name": gate.name,
-                "score": score,
-                "min": gate.lower,
-                "max": gate.upper,
-                "passed": violation == 0.0,
-                "violation": violation,
-                "penalty_weight": gate.penalty_weight,
-                "penalty": penalty,
-            })
+        diagnostics = self.gate_details(raw)
+        total_penalty = sum(gate["penalty"] for gate in diagnostics)
         passed = all(gate["passed"] for gate in diagnostics)
         reward = objective if passed else self._failure_reward - total_penalty
         return {
@@ -237,3 +237,31 @@ class RewardCombiner:
             "gate_passed": passed,
             "gates": diagnostics,
         }
+
+    def gate_details(self, raw_values: Mapping[str, float]) -> list[dict[str, Any]]:
+        """Native gate arithmetic shared by legacy and calibrated reward profiles."""
+        raw = _mapping(raw_values, "raw_values")
+        diagnostics = []
+        for gate in self._gates:
+            score = self._sum(gate.terms, raw, f"raw_values for gate {gate.name!r}")
+            violation = 0.0
+            if gate.lower is not None:
+                violation += max(0.0, gate.lower - score)
+            if gate.upper is not None:
+                violation += max(0.0, score - gate.upper)
+            violation = _number(violation, f"Gate {gate.name!r} bound violation")
+            diagnostic = {
+                "name": gate.name,
+                "score": score,
+                "min": gate.lower,
+                "max": gate.upper,
+                "passed": violation == 0.0,
+                "violation": violation,
+            }
+            if self.calibrated_gated:
+                diagnostic["priority"] = gate.penalty_weight
+            else:
+                diagnostic["penalty_weight"] = gate.penalty_weight
+                diagnostic["penalty"] = _number(gate.penalty_weight * violation, f"Gate {gate.name!r} penalty")
+            diagnostics.append(diagnostic)
+        return diagnostics

@@ -1,17 +1,40 @@
-# Smoke test for the multi_group env wiring (no ASE/DeepMD; dummy predictor).
-# Two sublattice groups, each sums to 1 (P-site and S-site shaped).
+# Chemical amounts and categorical assignments; see docs/design_groups.md.
 groups:
-  - name: P_site
-    species_set: [Mn, Ni, P]
-    fraction_set: ["0.05", "0.10", "0.90", "0.95"]
-    n_components: 2
-  - name: S_site
-    species_set: [S, O, Cl]
-    fraction_set: ["0.20", "0.30", "0.70", "0.80"]
-    n_components: 2
-
-predictor: dummy
-
+- name: P_site
+  kind: composition
+  species_set:
+  - Mn
+  - Ni
+  - P
+  amount_set:
+  - 0.05
+  - 0.1
+  - 0.9
+  - 0.95
+  n_steps: 2
+  total: 1
+  unique: true
+- name: S_site
+  kind: composition
+  species_set:
+  - S
+  - O
+  - Cl
+  amount_set:
+  - 0.2
+  - 0.3
+  - 0.7
+  - 0.8
+  n_steps: 2
+  total: 1
+  unique: true
+properties:
+- name: quality
+  predictor: dummy
+  direction: max
+  objective: mean
+reward:
+  type: weighted_sum
 pg_warmup_eps: 20
 pg_num_iters: 8
 pg_batch_eps: 5
@@ -24,8 +47,7 @@ gen_epsilon: 0.0
 gamma: 0.99
 pg_repeat_penalty_coef: 0.1
 pg_repeat_penalty_shape: log
-num_gen_eps: 15
-exploration_gen_eps: 5
+num_gen_eps: 20
 dqn_lr: 0.001
 dqn_batch_size: 32
 dqn_warmup_eps: 20

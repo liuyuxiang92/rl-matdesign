@@ -1,0 +1,166 @@
+# Calibrated perovskite example. Supply the local POSCAR, DeepMD checkpoints,
+# binary classifier and a LAMMPS binary built for the declared pair style.
+# The classifier must use class index 1 for the pure phase.
+# Aggregate calibration preserves the weighted delta objective across temperatures.
+groups:
+- name: A_dopant
+  kind: composition
+  species_set:
+  - Ca
+  - Ba
+  - Sr
+  n_steps: 3
+  amount_set:
+    min: 0.0
+    max: 1.0
+    step: 0.03125
+  total: 1
+  unique: true
+- name: B_dopant
+  kind: composition
+  species_set:
+  - Fe
+  - Mn
+  - Co
+  n_steps: 3
+  amount_set:
+    min: 0.0
+    max: 1.0
+    step: 0.03125
+  total: 1
+  unique: true
+structure:
+  builder: pipeline
+  base_poscar: perovskite.vasp
+  n_random_configs: 2
+  steps:
+  - type: substitute
+    a_site_symbol: Sr
+    a_dopant_group: A_dopant
+    b_site_symbol: Fe
+    b_dopant_group: B_dopant
+  - type: md_average
+    model: ./compressed_dpa4c.pt2
+    head: null
+    pair_style: deepmd/kk
+    atom_style: atomic
+    plugin: null
+    temperature_k: 300
+    nsteps: 50000
+    timestep_ps: 0.002
+    thermo_freq: 10
+    dump_freq: 100
+    pressure_bar: 0.0
+    tau_t: 0.1
+    tau_p: 0.5
+    lmp_bin: lmp
+    lmp_args:
+    - -k
+    - 'on'
+    - g
+    - '1'
+    - -sf
+    - kk
+    average_last_ps: 20
+    avg_rms_max: 0.5
+  - type: geo_opt
+    model: ./dpa4.ckpt.pt
+    head: perovskite
+    fmax: 0.01
+    steps: 500
+    relax_cell: true
+properties:
+- name: delta_T400
+  predictor: dp_property
+  models:
+  - 20260901_model1.ckpt.pt
+  - 20260901_model2.ckpt.pt
+  - 20260901_model3.ckpt.pt
+  - 20260901_model4.ckpt.pt
+  - 20260901_model5.ckpt.pt
+  head: delta
+  fparam:
+  - 0.2
+  - 0.005
+  - 673.15
+  direction: max
+  objective: mean_plus_kstd
+  uncertainty: model_spread
+- name: delta_T500
+  predictor: dp_property
+  models:
+  - 20260901_model1.ckpt.pt
+  - 20260901_model2.ckpt.pt
+  - 20260901_model3.ckpt.pt
+  - 20260901_model4.ckpt.pt
+  - 20260901_model5.ckpt.pt
+  head: delta
+  fparam:
+  - 0.2
+  - 0.005
+  - 773.15
+  direction: max
+  objective: mean_plus_kstd
+  uncertainty: model_spread
+- name: delta_T600
+  predictor: dp_property
+  models:
+  - 20260901_model1.ckpt.pt
+  - 20260901_model2.ckpt.pt
+  - 20260901_model3.ckpt.pt
+  - 20260901_model4.ckpt.pt
+  - 20260901_model5.ckpt.pt
+  head: delta
+  fparam:
+  - 0.2
+  - 0.005
+  - 873.15
+  direction: max
+  objective: mean_plus_kstd
+  uncertainty: model_spread
+- name: pure_probability
+  predictor: dp_classification
+  models:
+  - ./synthesizability_binary.pt
+  head: synthesizability
+  output_aggregator: index
+  output_index: 1
+  direction: max
+  objective: mean
+reward:
+  type: gated
+  gates:
+  - name: synthesis
+    score:
+      type: weighted_sum
+      terms:
+        pure_probability: 1.0
+    min: 0.8
+    violation_normalization: auto_fixed
+  objective:
+    type: weighted_sum
+    terms:
+      delta_T400: 0.33333
+      delta_T500: 0.33333
+      delta_T600: 0.33333
+  calibration:
+    profile: auto_gated_softplus_v1
+    num_candidates: 100
+    quality_mode: aggregate
+k: 1.0
+method: dqn
+gamma: 0.9
+dqn_lr: 0.001
+dqn_batch_size: 256
+dqn_hidden_dim: 256
+dqn_loss: smoothl1
+dqn_warmup_eps: 400
+dqn_buffer_size: 5000
+dqn_grad_steps_per_ep: 6
+dqn_target_update_freq: 20
+dqn_eps_anneal_eps: 100
+dqn_eps_min: 0.05
+num_gen_eps: 50
+gen_temperature: 0.1
+value_normalization: popart
+train_budget: 2000

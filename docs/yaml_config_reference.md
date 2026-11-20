@@ -182,6 +182,53 @@ The supported reward operators and scientific uncertainty contract are described
 in [scientific outputs](scientific_output_migration.md). Geometric randomness and model
 spread are distinct; unavailable uncertainty must not be represented as zero.
 
+### Automatic reward calibration
+
+The GlassNet examples in `configs/glassnet_*.yaml` maximize `T3` while requiring
+expansion within its declared interval and `Tg` at or above its declared threshold.
+They enable `reward.calibration.profile: auto_gated_softplus_v1`. The profile
+estimates quality references and scales from a declared sample of distinct valid
+evaluations, including candidates that fail the gates. It freezes those values
+before learning. Gates compare native values against the configured bounds.
+
+Passing candidates receive `1 + softplus(U)`, where `U` combines the calibrated
+quality terms using their relative objective weights. Failing candidates receive
+the negative sum of normalized violations, weighted by their gate priorities.
+Each gate defaults to `priority: 1.0` and `violation_normalization: auto_fixed`.
+A fixed violation scale can be declared as
+`violation_normalization: {mode: fixed, scale: 20.0}` in that gate's physical units.
+The calibrated profile takes the place of `failure.reward`, `penalty_weight`
+and legacy objective `scale`. Remove those fields when migrating a gated reward.
+
+The [perovskite example](../configs/perovskite_calibrated.example.yaml) selects
+`reward.calibration.quality_mode: aggregate`. It first combines the three
+uncertainty-adjusted delta terms with their authored weights, then calibrates
+that combined quality. The classifier probability remains a separate gate.
+
+For a weighted sum, use `normalization: {mode: auto_fixed}` on each property
+to estimate its quality reference and scale, or
+`normalization: {mode: fixed, reference: 0.0, scale: 1.0}` to declare them.
+The weighted sum remains linear. Automatic calibration uses 100 valid distinct
+candidates by default. Use `reward.calibration.num_candidates` to declare the
+sample count. The pilot uses the training allowance and supplies DQN warmup
+observations. A2C uses the pilot for calibration and trains its actor on
+subsequent policy samples. Successful, distinct pilot observations are charged
+to the same candidate allowance. Evaluation failures and skipped preparations
+are recorded separately, and pilot retries are bounded.
+
+The runner stores pilot state in `calibration_checkpoint.pt` and writes the
+frozen `reward_calibration.json` before training. `--resume-training`
+continues from the last settled pilot checkpoint when a learner checkpoint
+has yet to be created. The frozen JSON is required for generation and learner
+resume. Use `--load-reward-calibration /path/to/reward_calibration.json` to
+reuse compatible calibration on another grid without evaluating another pilot.
+
+`value_normalization: popart` enables adaptive value-target normalization for
+DQN or A2C under the shared `value_normalization_profile: popart_v1`. PopArt
+adapts to the learning targets after the scientific reward is computed.
+See the [Step 1 design](reusable_training_step1_plan.md) for the scale rules,
+failed-candidate examples and experiment comparisons.
+
 ## Running and validation
 
 ```bash

@@ -1,0 +1,107 @@
+# GlassNet Step 1 example. Maximize T3 subject to the CTE and Tg gates.
+# Training settings are inherited from the corresponding reviewed grid and method.
+groups:
+- name: glass
+  kind: composition
+  species_set:
+  - SiO2
+  - B2O3
+  - Al2O3
+  - Na2O
+  - K2O
+  - CaO
+  - MgO
+  amount_set:
+    min: 0.0
+    max: 1.0
+    step: 0.02
+  n_steps: 7
+  total: 1
+  element_bounds:
+    SiO2:
+    - 0.5
+    - 0.85
+    B2O3:
+    - 0.05
+    - 0.25
+    Al2O3:
+    - 0.0
+    - 0.15
+    Na2O:
+    - 0.0
+    - 0.2
+    K2O:
+    - 0.0
+    - 0.1
+    CaO:
+    - 0.0
+    - 0.15
+    MgO:
+    - 0.0
+    - 0.1
+properties:
+- name: forming_temperature
+  predictor: glassnet
+  output: T3
+  unit: K
+  representation: physical
+  direction: max
+  objective: mean
+  normalization:
+    mode: auto_fixed
+- name: thermal_expansion
+  predictor: glassnet
+  output: CTEbelowTg
+  unit: K^-1
+  representation: physical
+  direction: min
+  objective: mean
+- name: glass_transition
+  predictor: glassnet
+  output: Tg
+  unit: K
+  representation: physical
+  direction: max
+  objective: mean
+reward:
+  type: gated
+  objective:
+    terms:
+      forming_temperature: 1.0
+  gates:
+  - name: low_expansion
+    score:
+      terms:
+        thermal_expansion: 1.0
+    min: 0.0
+    max: 5.0e-06
+    violation_normalization: auto_fixed
+  - name: sufficient_transition_temperature
+    score:
+      terms:
+        glass_transition: 1.0
+    min: 773.0
+    violation_normalization: auto_fixed
+  calibration:
+    profile: auto_gated_softplus_v1
+    num_candidates: 100
+gamma: 1.0
+train_count_duplicates: false
+train_max_duplicate_attempts: 2000
+num_gen_eps: 0
+dqn_warmup_eps: 100
+dqn_batch_size: 64
+dqn_grad_steps_per_ep: 1
+dqn_hidden_dim: 128
+dqn_buffer_size: 20000
+dqn_loss: smoothl1
+dqn_eps_anneal_eps: 700
+dqn_lr: 0.0026762686165498857
+dqn_eps_min: 0.06812587684997393
+train_budget: 10000
+method: dqn
+eval_seed: 0
+train_seed: 11
+gen_seed: 11
+dqn_target_mode: mc
+value_normalization: popart

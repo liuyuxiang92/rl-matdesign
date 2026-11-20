@@ -103,10 +103,16 @@ class PredictorTimer:
                 with self._episode_log_path.open("w", newline="") as stream:
                     csv.DictWriter(stream, fieldnames=self.EPISODE_COLUMNS).writeheader()
 
+    def evaluation_log_size(self) -> int | None:
+        """Detect work beyond a settled calibration checkpoint on resume."""
+        if self._ledger_path is None or not self._ledger_path.exists():
+            return None
+        return self._ledger_path.stat().st_size
+
     def set_phase(self, phase: str) -> None:
         self.phase = phase
 
-    def _observation(self, candidate, result=None, error=None, timing=None) -> None:
+    def _observation(self, candidate, result=None, error=None, timing=None, *, reward_pending=False) -> None:
         cost = self._phase_costs.setdefault(self.phase, {
             "requests": 0, "successes": 0, "failures": 0, "seen": set(),
             "best_reward": None, "known_cache_hits": 0, "cache_status_known": 0,
@@ -117,9 +123,10 @@ class PredictorTimer:
         if result is not None:
             cost["successes"] += 1
             cost["seen"].add(key)
-            reward = float(result[0])
-            if cost["best_reward"] is None or reward > cost["best_reward"]:
-                cost["best_reward"] = reward
+            if not reward_pending:
+                reward = float(result[0])
+                if cost["best_reward"] is None or reward > cost["best_reward"]:
+                    cost["best_reward"] = reward
         else:
             cost["failures"] += 1
         timing = timing or {}
@@ -130,12 +137,16 @@ class PredictorTimer:
                "candidate_key": repr(key), "candidate": candidate,
                "status": "ok" if result is not None else "failed",
                "new_successful_candidate": bool(unique), "unique": len(cost["seen"]),
-               "reward": result[0] if result is not None else None,
+               "reward": result[0] if result is not None and not reward_pending else None,
                "best_reward": cost["best_reward"], "timing": timing,
                "error": None if error is None else f"{type(error).__name__}: {error}"}
-        cached = getattr(self._inner, "cached_outputs", None)
-        outputs = cached(candidate) if result is not None and callable(cached) else None
-        row["outputs"] = {name: value.to_dict() for name, value in outputs.items()} if outputs else None
+        if reward_pending:
+            row["reward_status"] = "pending" if result is not None else "unavailable"
+            row["outputs"] = result.get("outputs") if result is not None else None
+        else:
+            cached = getattr(self._inner, "cached_outputs", None)
+            outputs = cached(candidate) if result is not None and callable(cached) else None
+            row["outputs"] = {name: value.to_dict() for name, value in outputs.items()} if outputs else None
         backend = getattr(self._inner, "cost_counters", None)
         row["backend_costs"] = backend() if callable(backend) else None
         row["invocation"] = self._timing_session
@@ -203,7 +214,7 @@ class PredictorTimer:
     # Timed pass-throughs
     # ------------------------------------------------------------------
 
-    def _record(self, candidate: Any, mean: float, dt: float) -> None:
+    def _record(self, candidate: Any, mean: Optional[float], dt: float) -> None:
         self.n_calls += 1
         self.t_predict_s += dt
         key = candidate_key(candidate)
@@ -219,22 +230,31 @@ class PredictorTimer:
             self.best_mean = m
 
     def predict(self, candidate: Any) -> Tuple[float, float]:
+        return self._timed_scalar(candidate, self._inner.predict)
+
+    def calibration_observation(self, candidate: Any) -> dict:
+        """Account for a physical prediction whose reward is pending calibration."""
+        return self._timed_scalar(candidate, self._inner.calibration_observation, reward_pending=True)
+
+    def _timed_scalar(self, candidate, evaluate, *, reward_pending=False):
         self.last_evaluation_timings = []
         t = time.perf_counter()
         try:
             with isolated_rng(candidate_seed(self.eval_seed, candidate)):
-                out = self._inner.predict(candidate)
-            if not math.isfinite(float(out[0])):
+                out = evaluate(candidate)
+            if not reward_pending and not math.isfinite(float(out[0])):
                 raise ValueError("Predictor returned a nonfinite reward")
         except BaseException as exc:
             self.t_predict_s += time.perf_counter() - t
             self._take_evaluation_timings(1)
-            self._observation(candidate, error=exc, timing=self.last_evaluation_timings[0])
+            self._observation(candidate, error=exc, timing=self.last_evaluation_timings[0],
+                              reward_pending=reward_pending)
             raise
         self._take_evaluation_timings(1)
         dt = time.perf_counter() - t
-        self._record(candidate, out[0], dt)
-        self._observation(candidate, out, timing=self.last_evaluation_timings[0])
+        self._record(candidate, None if reward_pending else out[0], dt)
+        self._observation(candidate, out, timing=self.last_evaluation_timings[0],
+                          reward_pending=reward_pending)
         return out
 
     @property

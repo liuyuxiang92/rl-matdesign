@@ -8,9 +8,11 @@ import yaml
 from rl_matdesign.config_schema import (
     GENERATION_PARAMETERS, load_yaml_config, resolve_config, selected_generation_parameter,
 )
-from rl_matdesign.hpo.artifacts import atomic_json, file_digest, read_json
+from rl_matdesign.hpo.artifacts import (
+    REWARD_CALIBRATION, atomic_json, file_digest, read_json, reward_calibration_requested,
+)
 from rl_matdesign.hpo.calibration import QualityCalibrationError
-from rl_matdesign.hpo.job_runner import JobRunner
+from rl_matdesign.hpo.job_runner import JobError, JobRunner
 from rl_matdesign.hpo.spec import load_plan
 
 
@@ -77,6 +79,8 @@ class FakeWorker:
                     train_seed = args[args.index("--train-seed") + 1]
                     (directory / "policy.pt").write_text(f"frozen policy from seed {train_seed}")
                     (directory / "std_scaler.bin").write_text("frozen common scaler")
+                    if reward_calibration_requested(cfg):
+                        atomic_json(directory / REWARD_CALIBRATION, {"test": "frozen calibration"})
 
             def wait(self, timeout=None):
                 return self.returncode
@@ -169,6 +173,29 @@ def test_training_seen_candidates_count_in_independent_generation_budget(tmp_pat
     assert generated["raw_metrics"]["qualified_fraction"] == 1
     assert generated["eligible_for_selection"]
     assert generated["directory"] != trained["directory"]
+    assert len(worker.calls) == 2
+
+
+def test_reward_calibration_is_fingerprinted_and_forwarded_to_generation(tmp_path, monkeypatch):
+    source = public_plan_path(tmp_path)
+    scene_path = tmp_path / "scene.yaml"
+    scene = yaml.safe_load(scene_path.read_text())
+    scene["properties"][0]["normalization"] = {"mode": "auto_fixed"}
+    scene["reward"]["calibration"] = {"num_candidates": 2}
+    scene_path.write_text(yaml.safe_dump(scene, sort_keys=False))
+    worker = FakeWorker(monkeypatch)
+    runner = JobRunner(load_plan(source), tmp_path / "campaign")
+    trained = runner({"pg_batch_eps": 2}, 8, 11, "train")
+    calibration_path = trained["checkpoint_paths"][REWARD_CALIBRATION]
+    checksum = file_digest(calibration_path)
+    assert trained["artifact_hashes"][calibration_path] == checksum
+    generated = runner({"pg_batch_eps": 2, "gen_temperature": 1}, 4, 401, "generation", trained)
+    assert generated["input_models"][REWARD_CALIBRATION] == checksum
+    args = worker.calls[-1]["args"]
+    assert args[args.index("--load-reward-calibration") + 1] == calibration_path
+    Path(calibration_path).write_text("{}")
+    with pytest.raises(JobError, match="artifact changed"):
+        runner({"pg_batch_eps": 2, "gen_temperature": 1}, 4, 401, "generation", trained)
     assert len(worker.calls) == 2
 
 

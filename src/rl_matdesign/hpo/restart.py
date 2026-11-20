@@ -12,7 +12,10 @@ from decimal import Decimal
 import json
 from pathlib import Path
 
-from .artifacts import file_digest, read_json
+from .artifacts import (
+    CALIBRATION_CHECKPOINT, REWARD_CALIBRATION, digest, file_digest, read_json,
+    resumable_checkpoint, reward_calibration_requested,
+)
 
 _CLASSIFICATIONS = ("CACHED", "SYNCHRONIZED", "RECOVERABLE_TERMINAL", "BLOCKED")
 _TERMINAL = {"COMPLETED", "INFEASIBLE_EFFICIENCY", "INFEASIBLE_NUMERICAL"}
@@ -75,13 +78,66 @@ def _validate_final_models(directory, method, result=None):
         if len(candidates) != 1:
             raise ValueError("Completed training lacks an unambiguous final policy.pt/qnet.pt")
         weight = candidates[0]
-    for name in (weight, "std_scaler.bin"):
+    names = [weight, "std_scaler.bin"]
+    config_path = directory / "config.yaml"
+    if config_path.is_file():
+        import yaml
+        cfg = _mapping(yaml.safe_load(config_path.read_text()), "Job configuration")
+        if reward_calibration_requested(cfg):
+            names.append(REWARD_CALIBRATION)
+    for name in names:
         path = directory / name
         if not path.is_file() or path.stat().st_size == 0:
-            raise ValueError(f"Completed training is missing its final model/scaler: {path}; no sampling or export repair was attempted")
+            raise ValueError(f"Completed training is missing its final model/scaler or reward calibration: {path}")
         if result is not None and result.get("artifact_hashes"):
             if str(path) not in result["artifact_hashes"]:
                 raise ValueError(f"Completed training has no recorded fingerprint for final artifact: {path}")
+
+
+def _validate_pilot_checkpoint(directory, saved, ledger, identities):
+    """A settled pilot has trajectories and the oracle ledger before model setup."""
+    _require_fields(saved, ("execution_contract", "total_budget", "attempts", "evaluations",
+                            "misses", "entries", "evaluation_log_size"), "Calibration checkpoint")
+    if saved.get("type") != "reward_calibration" or saved["total_budget"] != ledger["target_unique"]:
+        raise ValueError("Calibration checkpoint type or training allowance differs from the ledger")
+    counters = [saved[key] for key in ("attempts", "evaluations", "misses", "evaluation_log_size")]
+    if any(type(value) is not int or value < 0 for value in counters):
+        raise ValueError("Calibration checkpoint counters must be nonnegative integers")
+    if (saved["attempts"] != ledger["attempts_started"] or
+            not len(identities) <= saved["evaluations"] <= saved["attempts"] or
+            saved["misses"] > saved["attempts"]):
+        raise ValueError("Calibration checkpoint counters differ from synchronized HPO accounting")
+
+    from ..utils.candidate_records import candidate_identity
+
+    entries = saved["entries"]
+    if not isinstance(entries, list) or len(entries) != len(identities):
+        raise ValueError("Calibration checkpoint trajectories differ from candidate archive count")
+    entry_keys, observation_keys = set(), set()
+    for entry in entries:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            raise ValueError("Calibration checkpoint entry needs a trajectory and a raw observation")
+        episode, obs = entry
+        if not getattr(episode, "path", None):
+            raise ValueError("Calibration checkpoint entry lacks its terminal trajectory")
+        observation = _mapping(obs, "Calibration observation")
+        key = observation.get("candidate_key")
+        if not isinstance(key, str) or not key or key in observation_keys:
+            raise ValueError("Calibration checkpoint needs distinct physical observations")
+        observation_keys.add(key)
+        entry_keys.add(candidate_identity(episode.terminal_key))
+    if entry_keys != identities:
+        raise ValueError("Calibration checkpoint trajectories differ from candidate archive identities")
+    evaluation_log = directory / "evaluations.jsonl"
+    if not evaluation_log.is_file() or evaluation_log.stat().st_size != saved["evaluation_log_size"]:
+        raise ValueError("Evaluation log differs from the last settled calibration checkpoint")
+    artifact_path = directory / REWARD_CALIBRATION
+    if artifact_path.exists():
+        artifact = _read(artifact_path)
+        frozen = _mapping(saved.get("frozen"), "Frozen calibration checkpoint state")
+        hashed = digest({key: value for key, value in frozen.items() if key != "content_hash"})
+        if artifact != frozen or hashed != frozen.get("content_hash"):
+            raise ValueError("Frozen reward calibration differs from the synchronized checkpoint")
 
 
 def _require_fields(state, names, description):
@@ -94,7 +150,7 @@ def _validate_checkpoint(directory, ledger, identities, method):
     import torch
 
     phase = ledger["phase"]
-    path = directory / ("generation_checkpoint.pt" if phase == "generation" else "checkpoint.pt")
+    path = resumable_checkpoint(directory, phase)
     if not path.is_file():
         raise ValueError(f"Consumed attempts have no resumable checkpoint: {path}; paid cost cannot be reset")
     saved = _mapping(torch.load(path, map_location="cpu", weights_only=False), "Checkpoint")
@@ -131,6 +187,9 @@ def _validate_checkpoint(directory, ledger, identities, method):
         contract = _mapping(saved.get("generation_contract"), "Generation sampling contract")
         _require_fields(contract, ("execution", "sampling", "frozen_artifacts"), "Generation contract")
         return
+    if path.name == CALIBRATION_CHECKPOINT:
+        _validate_pilot_checkpoint(directory, saved, ledger, identities)
+        return
     scaler = directory / "std_scaler.bin"
     if not scaler.is_file() or scaler.stat().st_size == 0:
         raise ValueError(f"Training restart requires the original scaler: {scaler}")
@@ -150,9 +209,14 @@ def _validate_checkpoint(directory, ledger, identities, method):
     if method and method.startswith("dqn") and saved.get("type") != "dqn":
         raise ValueError("Training checkpoint algorithm differs from campaign method")
     if saved.get("type") == "dqn":
-        _require_fields(saved, ("qnet_state", "target_net_state", "opt_state", "buffer",
+        _require_fields(saved, ("qnet_state", "opt_state", "buffer",
                                 "training_episodes_completed", "eps"), "DQN checkpoint")
-        networks, optimizers = ("qnet_state", "target_net_state"), ("opt_state",)
+        learning = saved["execution_contract"].get("learning", {})
+        target_mode = learning.get("dqn_target_mode", "mc" if method == "dqn_mc" else "bootstrap")
+        networks, optimizers = ("qnet_state",), ("opt_state",)
+        if target_mode != "mc":
+            _require_fields(saved, ("target_net_state",), "DQN bootstrap checkpoint")
+            networks += ("target_net_state",)
     elif saved.get("type") == "pg":
         _require_fields(saved, ("policy_state", "opt_actor_state", "iteration", "visit_counts",
                                 "entropy_coef_eff", "rl_method"), "PG checkpoint")
@@ -194,7 +258,8 @@ def _inspect_job(directory, method):
             _validate_hashes(result)
         ledger_path = directory / "candidate_budget.json"
         if not ledger_path.exists():
-            if (any((directory / name).exists() for name in ("candidate_records.jsonl", "checkpoint.pt", "generation_checkpoint.pt"))
+            if (any((directory / name).exists() for name in (
+                    "candidate_records.jsonl", "checkpoint.pt", "generation_checkpoint.pt", CALIBRATION_CHECKPOINT))
                     or (result or {}).get("ledger", {}).get("attempts_started", 0)):
                 raise ValueError("Candidate accounting is incomplete: original candidate_budget.json is missing")
             row.update(classification="SYNCHRONIZED", reason="Job has no candidate accounting yet; no recorded attempts need replay")

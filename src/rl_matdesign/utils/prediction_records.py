@@ -24,18 +24,24 @@ def objective_record(raw_mean, stats, details) -> dict:
     An unavailable spread remains None; mixed property units never produce a
     fabricated joint standard deviation.
     """
-    row = {"dp_mean": float(raw_mean)}
+    row = {} if raw_mean is None else {"dp_mean": float(raw_mean)}
     for name, (mean, std) in stats.items():
         row[f"obj_{name}_mean"] = float(mean)
         row[f"obj_{name}_std"] = None if std is None else float(std)
+    if details and "standardized_utility" in details:
+        row["reward_standardized_utility"] = float(details["standardized_utility"])
     if details and details.get("type") == "gated":
-        row["reward_objective"] = float(details["objective"])
+        if "objective" in details:
+            row["reward_objective"] = float(details["objective"])
         row["gate_passed"] = bool(details["gate_passed"])
         for gate in details["gates"]:
             prefix = f"gate_{gate['name']}"
             row[f"{prefix}_value"] = float(gate["score"])
             row[f"{prefix}_passed"] = bool(gate["passed"])
             row[f"{prefix}_violation"] = float(gate["violation"])
+            if "violation_scale" in gate:
+                for name in ("violation_scale", "normalized_violation", "priority", "penalty"):
+                    row[f"{prefix}_{name}"] = float(gate[name])
     if details and details.get("type") == "max":
         row["reward_objective"] = float(details["objective"])
         row["selected_alternative"] = details["selected_alternative"]

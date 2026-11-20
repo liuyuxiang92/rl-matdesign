@@ -10,6 +10,7 @@ import torch
 
 from rl_matdesign.domain_runtime import EpisodeStep
 from rl_matdesign.training import CandidateEvaluationFailed, train_dqn_online
+from rl_matdesign.utils.episode_batch import snapshot_episode
 
 
 class ScriptedEnv:
@@ -85,9 +86,36 @@ def optimizer_steps(state):
     return {int(item["step"].item()) for item in state["opt_state"]["state"].values()}
 
 
+def test_popart_warmup_reuses_finalized_calibration_episodes(tmp_path):
+    pilot = ScriptedEnv(["A", "A", "B"])
+    snapshots = []
+    for _ in range(3):
+        pilot.initialize()
+        for _ in range(pilot.max_steps):
+            pilot.step(pilot.sample_random_action())
+        snapshots.append(snapshot_episode(pilot))
+
+    online = ScriptedEnv(["A", "C"])
+    _, _, rows = run(
+        online, tmp_path, dqn_num_train_eps=1, dqn_target_mode="mc",
+        value_normalization="popart", calibration_warmup=snapshots,
+    )
+    assert online.starts == 2
+    assert [row["budget_counted"] for row in rows] == [True, False, True, False, True]
+    assert rows[-1]["training_budget_used"] == 3
+    assert rows[-1]["value_popart_updates"] == 2
+    state = checkpoint(tmp_path)
+    assert [row["reward"] for row in state["buffer"][1::2]] == [1., 1., 2., 1., 3.]
+    assert [row["mc_return"] for row in state["buffer"][::2]] == pytest.approx(
+        [.9, .9, 1.8, .9, 2.7],
+    )
+
+
 def reconstruct_resume(state, qnet, scaler):
-    target = copy.deepcopy(qnet)
-    target.load_state_dict(state["target_net_state"])
+    target = None
+    if state["target_net_state"] is not None:
+        target = copy.deepcopy(qnet)
+        target.load_state_dict(state["target_net_state"])
     qnet.load_state_dict(state["qnet_state"])
     optimizer = torch.optim.Adam(qnet.parameters())
     optimizer.load_state_dict(state["opt_state"])

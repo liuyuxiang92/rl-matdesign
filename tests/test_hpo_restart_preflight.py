@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from rl_matdesign.hpo.artifacts import file_digest
+from rl_matdesign.hpo.artifacts import CALIBRATION_CHECKPOINT, file_digest
 from rl_matdesign.hpo.restart import inspect_restart
 from rl_matdesign.utils.candidate_records import CandidateRecorder
 from rl_matdesign.utils.seeding import capture_rng_state
@@ -51,8 +51,8 @@ def _job(tmp_path, kind="a2c", phase="train", *, terminal=False):
         name = "checkpoint.pt"
     else:
         checkpoint.update(type="dqn", qnet_state={"w": torch.tensor([1.])},
-                          target_net_state={"w": torch.tensor([2.])}, opt_state=optimizer,
-                          buffer=[], training_episodes_completed=1, eps=0.9)
+                          target_net_state=None if kind == "dqn_mc" else {"w": torch.tensor([2.])},
+                          opt_state=optimizer, buffer=[], training_episodes_completed=1, eps=0.9)
         name = "checkpoint.pt"
     torch.save(checkpoint, directory / name)
     (directory / "std_scaler.bin").write_bytes(b"original scaler")
@@ -94,6 +94,33 @@ def test_ledger_ahead_preserves_paid_attempts_and_refuses_restart(tmp_path):
     assert not report["ready"]
     assert "advanced beyond checkpoint" in report["jobs"][0]["reason"]
     assert _snapshot(tmp_path) == before
+
+
+def test_pre_model_calibration_checkpoint_resumes_only_at_settled_boundary(tmp_path):
+    directory, learner_checkpoint = _job(tmp_path)
+    (directory / "checkpoint.pt").unlink()
+    (directory / "std_scaler.bin").unlink()
+    log = directory / "evaluations.jsonl"
+    log.write_text('{"phase":"calibration","reward_status":"pending"}\n')
+    checkpoint = {
+        key: learner_checkpoint[key] for key in
+        ("hpo_state", "rng_state", "predictor_ledger", "execution_contract")
+    }
+    checkpoint.update(
+        type="reward_calibration", total_budget=4, attempts=1, evaluations=1, misses=0,
+        entries=[(SimpleNamespace(terminal_key="A", path=[object()]), {"candidate_key": "raw-A"})],
+        evaluation_log_size=log.stat().st_size, frozen=None,
+    )
+    torch.save(checkpoint, directory / CALIBRATION_CHECKPOINT)
+    before = _snapshot(tmp_path)
+    assert inspect_restart(tmp_path)["job_counts"]["SYNCHRONIZED"] == 1
+    assert _snapshot(tmp_path) == before
+
+    with log.open("a") as stream:
+        stream.write('{"phase":"calibration","reward_status":"pending"}\n')
+    report = inspect_restart(tmp_path)
+    assert not report["ready"]
+    assert "last settled calibration checkpoint" in report["jobs"][0]["reason"]
 
 
 @pytest.mark.parametrize("change,expected", [

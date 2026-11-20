@@ -1,12 +1,32 @@
-# Test config using dummy predictor (no ASE/DeepMD required)
+# Chemical amounts and categorical assignments; see docs/design_groups.md.
 groups:
-  - name: alloy
-    kind: composition
-    species_set: [Co, Cr, Fe, Mn, Ni, Al, Ti, Cu, V, Mo]
-    fraction_set: {min: 0.05, max: 0.80, step: 0.05}   # was the env's implicit default grid
-    n_components: 5
-anion_formula: ""
-predictor: dummy
+- name: alloy
+  kind: composition
+  species_set:
+  - Co
+  - Cr
+  - Fe
+  - Mn
+  - Ni
+  - Al
+  - Ti
+  - Cu
+  - V
+  - Mo
+  amount_set:
+    min: 0.05
+    max: 0.8
+    step: 0.05
+  n_steps: 5
+  total: 1
+  unique: true
+properties:
+- name: quality
+  predictor: dummy
+  direction: max
+  objective: mean
+reward:
+  type: weighted_sum
 pg_warmup_eps: 20
 pg_num_iters: 10
 pg_batch_eps: 5
@@ -19,11 +39,9 @@ gen_epsilon: 0.0
 gamma: 0.99
 pg_repeat_penalty_coef: 0.1
 pg_repeat_penalty_shape: log
-num_gen_eps: 20
-exploration_gen_eps: 10
+num_gen_eps: 30
 dqn_lr: 0.001
 dqn_batch_size: 32
-# Classical online DQN (used when --method dqn with general-framework)
 dqn_warmup_eps: 20
 dqn_num_train_eps: 100
 dqn_buffer_size: 1000

@@ -31,13 +31,17 @@ def test_inference_cannot_consume_training_rng_or_depend_on_query_order():
             raise RuntimeError('model initialization failed')
 
 
+@pytest.mark.parametrize('value_normalization', ['none', 'popart'])
 @pytest.mark.parametrize('method,target,weights,mid', [
     ('dqn', 'mc', 'qnet.pt', 'checkpoint-ep2.pt'),
     ('dqn', 'bootstrap', 'qnet.pt', 'checkpoint-ep2.pt'),
     ('a2c', 'bootstrap', 'policy.pt', 'checkpoint-iter1.pt'),
 ])
-def test_interrupted_runner_matches_uninterrupted_training(tmp_path, method, target, weights, mid):
+def test_interrupted_runner_matches_uninterrupted_training(
+    tmp_path, method, target, weights, mid, value_normalization,
+):
     cfg = _config()
+    cfg['value_normalization'] = value_normalization
     config = tmp_path / 'config.yaml'
     config.write_text(yaml.safe_dump(cfg))
     full, resumed = tmp_path / 'full', tmp_path / 'resumed'
@@ -50,10 +54,17 @@ def test_interrupted_runner_matches_uninterrupted_training(tmp_path, method, tar
     a = torch.load(full / weights, weights_only=True)
     b = torch.load(resumed / weights, weights_only=True)
     assert all(torch.equal(a[role][key], b[role][key]) for key in a[role])
+    value_state = a[role]
     if method == 'a2c':
         a = torch.load(full / 'value_net.pt', weights_only=True)['value_net_state']
         b = torch.load(resumed / 'value_net.pt', weights_only=True)['value_net_state']
         assert all(torch.equal(a[key], b[key]) for key in a)
+        value_state = a
+    updates = value_state.get('value_normalizer.updates')
+    if value_normalization == 'popart':
+        assert updates is not None and updates.item() > 0
+    else:
+        assert updates is None
     assert _scientific_rows(full / 'generated.csv') == _scientific_rows(resumed / 'generated.csv')
     left = torch.load(full / 'checkpoint.pt', weights_only=False)
     right = torch.load(resumed / 'checkpoint.pt', weights_only=False)

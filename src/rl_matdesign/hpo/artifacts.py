@@ -8,6 +8,23 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
+REWARD_CALIBRATION = "reward_calibration.json"
+CALIBRATION_CHECKPOINT = "calibration_checkpoint.pt"
+
+
+def reward_calibration_requested(config: dict) -> bool:
+    return bool((config.get("reward") or {}).get("calibration")) or any(
+        "normalization" in prop for prop in config.get("properties", ())
+    )
+
+
+def resumable_checkpoint(directory: Path, phase: str) -> Path:
+    if phase == "generation":
+        return directory / "generation_checkpoint.pt"
+    learner = directory / "checkpoint.pt"
+    pilot = directory / CALIBRATION_CHECKPOINT
+    return pilot if not learner.exists() and pilot.is_file() else learner
+
 
 def digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
@@ -67,5 +84,6 @@ def asset_fingerprints(plan: dict) -> list[dict]:
 def checkpoint_files(directory: str | Path) -> dict[str, str]:
     directory = Path(directory)
     return {name: str(directory / name) for name in
-            ("qnet.pt", "policy.pt", "value_net.pt", "std_scaler.bin", "checkpoint.pt")
+            ("qnet.pt", "policy.pt", "value_net.pt", "std_scaler.bin", "checkpoint.pt",
+             CALIBRATION_CHECKPOINT, REWARD_CALIBRATION)
             if (directory / name).is_file()}

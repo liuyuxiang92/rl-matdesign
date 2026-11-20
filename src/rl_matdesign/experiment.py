@@ -48,6 +48,7 @@ from rl_matdesign.configuration import (
     build_predictor,
     load_config,
 )
+from rl_matdesign.calibration_run import CALIBRATION_ARTIFACT, CALIBRATION_STATE, prepare_reward_calibration
 from rl_matdesign.config_schema import load_yaml_config, resolve_config
 from rl_matdesign.utils.provenance import write_run_manifest
 from rl_matdesign.utils.model_contract import load_artifact, save_weights, validate_scaler
@@ -126,14 +127,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "with a warning for REINFORCE/A2C (on-policy methods can't use "
                         "permuted trajectories). Default 0 (off). Overrides config "
                         "'dqn_augment_permutations'.")
-    # --- BEGIN mc-target experiment (removable) ---
     p.add_argument("--dqn-target-mode", choices=["bootstrap", "mc"], default=None,
                    dest="dqn_target_mode",
                    help="DQN-only: regression target. 'bootstrap' (default) uses the one-step "
                         "TD target r + gamma*max_a' Q_target(s',a'); 'mc' regresses to the fixed "
                         "discounted Monte-Carlo return G (no bootstrap, matches the reference npj "
                         "DQN). Overrides config 'dqn_target_mode'.")
-    # --- END mc-target experiment ---
     p.add_argument("--max-gen-attempts", type=int, default=None,
                    dest="max_gen_attempts",
                    help="Max generation attempts before stopping. Default: 10 × num_gen_eps.")
@@ -144,6 +143,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--train-max-duplicate-attempts", type=int, default=None,
                    help="Stop after this many consecutive duplicate training episodes in "
                         "unique-budget mode (default 1000). Overrides YAML.")
+    p.add_argument("--value-normalization", choices=["none", "popart"], default=None,
+                   help="Override the Q/value target normalization mode.")
+    p.add_argument("--value-normalization-profile", choices=["popart_v1"], default=None,
+                   help="Select the versioned value normalization recipe.")
+    p.add_argument("--load-reward-calibration", help="Load a compatible frozen reward calibration JSON.")
     args = p.parse_args(argv)
     if not args.out and not args.validate_config:
         p.error("--out is required unless --validate-config is used")
@@ -198,6 +202,7 @@ def _run_experiment(resources: ExitStack) -> None:
         "method", "eval_seed", "train_seed", "gen_seed", "dqn_loss", "train_budget",
         "dqn_augment_permutations", "dqn_target_mode", "max_gen_attempts",
         "train_count_duplicates", "train_max_duplicate_attempts",
+        "value_normalization", "value_normalization_profile",
     )
     resolved = resolve_config(raw_cfg, {key: getattr(args, key) for key in override_keys})
     cfg = resolved.config
@@ -209,6 +214,17 @@ def _run_experiment(resources: ExitStack) -> None:
     TrainingBudget(count_duplicates=train_count_duplicates,
                    max_duplicate_attempts=train_max_duplicate_attempts)
     method = cfg["method"]
+    model_normalization = {key: cfg[key] for key in ("value_normalization", "value_normalization_profile")}
+    learner_source = Path(
+        (args.load_qnet if method == "dqn" else args.load_policy) or Path(args.out) / "checkpoint.pt"
+    )
+    pilot_source = Path(args.out) / CALIBRATION_STATE
+    resume_pilot = bool(args.resume_training and not learner_source.exists()
+                        and pilot_source.is_file()
+                        and not args.load_qnet and not args.load_policy)
+    resume_learner = args.resume_training and not resume_pilot
+    if resume_pilot and args.load_reward_calibration:
+        raise ValueError("A resumed pilot must continue its original calibration observations")
     hpo_recorder = None
     hpo_generation_resume = None
     if cfg["hpo_resume_generation"] and (not cfg["hpo_recording"] or cfg["hpo_phase"] != "generation" or not args.only_generate):
@@ -226,7 +242,7 @@ def _run_experiment(resources: ExitStack) -> None:
         from .utils.candidate_records import CandidateRecorder
         hpo_resume = None
         if args.resume_training:
-            source = (args.load_qnet if method == "dqn" else args.load_policy) or os.path.join(args.out, "checkpoint.pt")
+            source = pilot_source if resume_pilot else learner_source
             if not os.path.exists(source):
                 raise ValueError("HPO resume requires the original synchronized checkpoint")
             saved_hpo = torch.load(source, map_location="cpu", weights_only=False)
@@ -255,9 +271,10 @@ def _run_experiment(resources: ExitStack) -> None:
     device = torch.device(device_str)
     phase = "generate" if args.only_generate else "resume" if args.resume_training else "train"
     input_files = [path for path in (args.load_qnet, args.load_policy, args.load_scaler,
-                                     args.load_value_net) if path]
+                                     args.load_value_net, args.load_reward_calibration) if path]
     if args.only_generate or args.resume_training:
-        for name in ("qnet.pt", "policy.pt", "value_net.pt", "std_scaler.bin", "checkpoint.pt"):
+        for name in ("qnet.pt", "policy.pt", "value_net.pt", "std_scaler.bin", "checkpoint.pt",
+                     CALIBRATION_ARTIFACT, CALIBRATION_STATE):
             path = Path(args.out) / name
             if path.is_file():
                 input_files.append(str(path))
@@ -303,23 +320,9 @@ def _run_experiment(resources: ExitStack) -> None:
         env, env_type, flat_cfg = build_env(cfg, predictor)
         with isolated_rng(eval_seed):
             run_contract = execution_contract(cfg, predictor, manifest_path, device)
-        env.evaluation_contract = run_contract["evaluation"]
-        with (manifest_path.parent / "execution_contract.json").open("w") as stream:
-            json.dump(run_contract, stream, indent=2, allow_nan=False)
 
     if hpo_recorder is not None:
         env.hpo_recorder = hpo_recorder
-        if cfg["hpo_phase"] == "generation":
-            from .utils.provenance import sha256_file
-            weight_name = "qnet.pt" if method == "dqn" else "policy.pt"
-            weight_path = (args.load_qnet if method == "dqn" else args.load_policy) or os.path.join(args.out, weight_name)
-            scaler_path_hpo = args.load_scaler or os.path.join(args.out, "std_scaler.bin")
-            env.hpo_generation_contract = {
-                "execution": run_contract,
-                "sampling": generation_sampling_contract(cfg),
-                "frozen_artifacts": {weight_name: sha256_file(weight_path), "std_scaler.bin": sha256_file(scaler_path_hpo)},
-            }
-            env.hpo_generation_resume = hpo_generation_resume
         from .registry import charge_check_enabled, charge_use_pauling
         if charge_check_enabled(cfg):
             from .constraints.charge import charge_neutral
@@ -328,7 +331,47 @@ def _run_experiment(resources: ExitStack) -> None:
                 use_pauling=charge_use_pauling(cfg),
             )
 
-    step_dim     = env.max_steps
+    warmup_eps = int(cfg["dqn_warmup_eps"])
+    train_total = (warmup_eps + int(cfg["dqn_num_train_eps"]) if method == "dqn"
+                   else cfg["train_budget"] or cfg["pg_num_iters"] * cfg["pg_batch_eps"])
+    with phases("calibration"):
+        if getattr(predictor, "reward_calibration_enabled", False):
+            pilot_episodes = prepare_reward_calibration(
+                env=env, predictor=predictor, out=args.out, contract=run_contract,
+                total_budget=train_total, attempt_limit=train_max_duplicate_attempts,
+                only_generate=args.only_generate, resume_learner=resume_learner,
+                resume_pilot=resume_pilot, load_path=args.load_reward_calibration,
+            )
+            calibration = predictor.reward_calibration_state_dict()
+            run_contract["evaluation"]["reward_calibration"] = calibration["content_hash"]
+            if method == "dqn":
+                warmup_eps = max(warmup_eps, len(pilot_episodes))
+        else:
+            if args.load_reward_calibration or resume_pilot:
+                raise ValueError("The configured predictor has no reward calibration")
+            pilot_episodes = []
+    env.evaluation_contract = run_contract["evaluation"]
+    with (manifest_path.parent / "execution_contract.json").open("w") as stream:
+        json.dump(run_contract, stream, indent=2, allow_nan=False)
+
+    if hpo_recorder is not None:
+        if cfg["hpo_phase"] == "generation":
+            from .utils.provenance import sha256_file
+            weight_name = "qnet.pt" if method == "dqn" else "policy.pt"
+            weight_path = (args.load_qnet if method == "dqn" else args.load_policy) or os.path.join(args.out, weight_name)
+            scaler_path_hpo = args.load_scaler or os.path.join(args.out, "std_scaler.bin")
+            frozen_artifacts = {weight_name: sha256_file(weight_path),
+                                "std_scaler.bin": sha256_file(scaler_path_hpo)}
+            if "reward_calibration" in run_contract["evaluation"]:
+                path = args.load_reward_calibration or Path(args.out) / CALIBRATION_ARTIFACT
+                frozen_artifacts[CALIBRATION_ARTIFACT] = sha256_file(path)
+            env.hpo_generation_contract = {
+                "execution": run_contract,
+                "sampling": generation_sampling_contract(cfg),
+                "frozen_artifacts": frozen_artifacts,
+            }
+            env.hpo_generation_resume = hpo_generation_resume
+    step_dim = env.max_steps
     action_values = value_alphabet(env)
 
     # Labels retain identity; values use numeric or categorical features.
@@ -379,21 +422,14 @@ def _run_experiment(resources: ExitStack) -> None:
             scaler = joblib.load(scaler_path)
             validate_scaler(scaler, env, scaler_path)
             state_dim = int(getattr(scaler, "n_features_in_", scaler.mean_.shape[0]))
-            # NB: no local `from rl_matdesign.model import QRegressor` here. A local
-            # import binds the name for the WHOLE of main(), shadowing the
-            # module-level one at the top, so the --resume-training branch below hit
-            # UnboundLocalError whenever --only-generate was not taken.
-            # Must match the architecture used at train time. Resolve hidden_dim
-            # from the SAME cfg default (256) as the training path below;
-            # otherwise the QRegressor class default (128) is used and the saved
-            # state_dict fails to load with a size mismatch.
             _hidden = int(cfg["dqn_hidden_dim"])
             qnet = QRegressor(
                 state_dim=state_dim, step_dim=step_dim,
                 elem_dim=elem_dim, frac_dim=frac_dim, hidden_dim=_hidden,
+                **model_normalization,
             ).to(device)
             _raw = load_artifact(qnet_path, env, device=device, scaler=scaler)
-            qnet.load_state_dict(_raw["qnet_state"] if isinstance(_raw, dict) and "qnet_state" in _raw else _raw)
+            qnet.load_state_dict(_raw["qnet_state"])
             print(f"[INFO] Loaded qnet from {qnet_path}", flush=True)
         else:
             # Resolve hyperparameters early so resume + fresh paths share them.
@@ -402,10 +438,10 @@ def _run_experiment(resources: ExitStack) -> None:
             _buf_size     = int(cfg["dqn_buffer_size"])
             _eps_anneal   = int(cfg["dqn_eps_anneal_eps"])
             _eps_min      = float(cfg["dqn_eps_min"])
-            _n_train_eps  = int(cfg["dqn_num_train_eps"])
+            _n_train_eps  = train_total - warmup_eps
 
             resume_state = None
-            if args.resume_training:
+            if resume_learner:
                 if not os.path.exists(scaler_path):
                     raise SystemExit(
                         f"--resume-training (dqn) requires {scaler_path} (use --load-scaler to override)"
@@ -418,9 +454,10 @@ def _run_experiment(resources: ExitStack) -> None:
                 qnet = QRegressor(
                     state_dim=state_dim_loaded, step_dim=step_dim,
                     elem_dim=elem_dim, frac_dim=frac_dim, hidden_dim=_hidden,
+                    **model_normalization,
                 ).to(device)
-                target_net = copy.deepcopy(qnet)
-                target_net.eval()
+                target_net = (copy.deepcopy(qnet).eval()
+                              if cfg["dqn_target_mode"] == "bootstrap" else None)
                 optimizer = torch.optim.Adam(qnet.parameters(), lr=_lr_dqn)
                 buffer: collections.deque = collections.deque(maxlen=_buf_size)
 
@@ -451,7 +488,8 @@ def _run_experiment(resources: ExitStack) -> None:
                     from .utils.generation_resume import restore_predictor_state
                     restore_predictor_state(predictor, _mid)
                     qnet.load_state_dict(_mid["qnet_state"])
-                    target_net.load_state_dict(_mid["target_net_state"])
+                    if target_net is not None:
+                        target_net.load_state_dict(_mid["target_net_state"])
                     optimizer.load_state_dict(_mid["opt_state"])
                     for _row in _mid["buffer"]:
                         buffer.append(_row)
@@ -464,6 +502,10 @@ def _run_experiment(resources: ExitStack) -> None:
                             flush=True,
                         )
                     start_ep = int(_mid["episodes_completed"])
+                    if getattr(predictor, "reward_calibration_enabled", False):
+                        used = _mid["training_budget_state"]["counted"]
+                        warmup_eps = used - start_ep
+                        _n_train_eps = max(0, train_total - warmup_eps)
                     eps_val  = float(_mid.get("eps", max(_eps_min, 1.0 - start_ep / _eps_anneal)))
                     print(
                         f"[INFO] DQN resume from {_resume_src}: ep={start_ep}, "
@@ -479,9 +521,10 @@ def _run_experiment(resources: ExitStack) -> None:
                         )
                     _raw_q = load_artifact(qnet_path, env, device=device, scaler=scaler)
                     qnet.load_state_dict(
-                        _raw_q["qnet_state"] if isinstance(_raw_q, dict) and "qnet_state" in _raw_q else _raw_q
+                        _raw_q["qnet_state"]
                     )
-                    target_net.load_state_dict(qnet.state_dict())
+                    if target_net is not None:
+                        target_net.load_state_dict(qnet.state_dict())
                     start_ep = 0
                     eps_val  = 1.0
                     print(
@@ -523,7 +566,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     elem_feats_scaled=elem_feats_scaled,
                     action_values=action_values,
                     device=device,
-                    n_warmup_eps=int(cfg["dqn_warmup_eps"]),
+                    n_warmup_eps=warmup_eps,
                     dqn_num_train_eps=_n_train_eps,
                     dqn_buffer_size=_buf_size,
                     batch_size=int(cfg["dqn_batch_size"]),
@@ -542,9 +585,9 @@ def _run_experiment(resources: ExitStack) -> None:
                     training_samples=training_samples,
                     train_count_duplicates=train_count_duplicates,
                     train_max_duplicate_attempts=train_max_duplicate_attempts,
-                    # --- BEGIN mc-target experiment (removable) ---
                     dqn_target_mode=cfg["dqn_target_mode"],
-                    # --- END mc-target experiment ---
+                    calibration_warmup=pilot_episodes,
+                    **model_normalization,
                 )
             # DQN's warmup runs inside train_dqn_online, so split it back out of
             # "train" using the warmup_end mark. Without this, phases_s["warmup"]
@@ -619,11 +662,11 @@ def _run_experiment(resources: ExitStack) -> None:
                 elem_dim=elem_dim, frac_dim=frac_dim,
             ).to(device)
             _raw = load_artifact(policy_path, env, device=device, scaler=scaler)
-            policy.load_state_dict(_raw["policy_state"] if isinstance(_raw, dict) and "policy_state" in _raw else _raw)
+            policy.load_state_dict(_raw["policy_state"])
             print(f"[INFO] Loaded policy from {policy_path}", flush=True)
             value_net = None
 
-        elif args.resume_training:
+        elif resume_learner:
             if not os.path.exists(scaler_path):
                 raise SystemExit(f"--resume-training requires {scaler_path} (use --load-scaler to override)")
             scaler = joblib.load(scaler_path)
@@ -634,7 +677,8 @@ def _run_experiment(resources: ExitStack) -> None:
                 state_dim=state_dim_loaded, step_dim=step_dim,
                 elem_dim=elem_dim, frac_dim=frac_dim,
             ).to(device)
-            value_net = ValueNet(state_dim=state_dim_loaded, step_dim=step_dim).to(device) if method == "a2c" else None
+            value_net = (ValueNet(state_dim=state_dim_loaded, step_dim=step_dim,
+                                  **model_normalization).to(device) if method == "a2c" else None)
 
             # Prefer mid-training checkpoint.pt; fall back to policy.pt.
             _mid_ckpt = None
@@ -649,7 +693,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     from .utils.generation_resume import restore_predictor_state
                     restore_predictor_state(predictor, _raw)
                     policy.load_state_dict(_raw["policy_state"])
-                    if value_net is not None and _raw.get("value_net_state") is not None:
+                    if value_net is not None:
                         value_net.load_state_dict(_raw["value_net_state"])
                     print(f"[INFO] Resuming from mid-training checkpoint ({_raw['episodes_completed']} eps) → {_resume_src}", flush=True)
                 else:
@@ -707,7 +751,8 @@ def _run_experiment(resources: ExitStack) -> None:
                 state_dim=state_dim, step_dim=step_dim,
                 elem_dim=elem_dim, frac_dim=frac_dim,
             ).to(device)
-            value_net = ValueNet(state_dim=state_dim, step_dim=step_dim).to(device) if method == "a2c" else None
+            value_net = (ValueNet(state_dim=state_dim, step_dim=step_dim,
+                                  **model_normalization).to(device) if method == "a2c" else None)
 
         if not args.only_generate:
             with phases("train"):
@@ -734,6 +779,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     training_samples=training_samples,
                     train_count_duplicates=train_count_duplicates,
                     train_max_duplicate_attempts=train_max_duplicate_attempts,
+                    calibration_warmup=pilot_episodes,
                 )
             for r in train_rows:
                 metrics.log(**r)

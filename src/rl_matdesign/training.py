@@ -4,23 +4,9 @@ All functions are domain-agnostic: they operate on a :class:`MultiGroupEnv`
 and a :class:`~rl_matdesign.predictors.base.PropertyPredictor` and contain
 no material-system-specific logic.
 
-Key improvements
-----------------
-- Classical online DQN (``train_dqn_online``): FIFO replay buffer, TD Bellman
-  targets, hard target-network copy, SmoothL1 loss.  Replaces offline MC
-  Q-learning.
-- Action features: labelled choices retain explicit identity; material
-  descriptors supplement chemical labels. Numeric values use their actual
-  magnitude, while categorical values use identity rather than ordinal codes.
-- Unified generation flags (``gen_temperature / gen_top_frac / gen_epsilon``):
-  same three-mode exploration strategy for DQN and PG generation.  Default
-  Boltzmann T=1.0 prevents pure-greedy composition collapse.
-- ``pg_epsilon`` removed from PG rollout: epsilon-greedy is off-policy
-  contamination in an on-policy method; removed entirely.
-- Return normalisation in ``train_pg`` (default True): per-episode
-  ``(G - mean) / (std + ε)`` reduces gradient variance.
-- Dual-phase generation in ``generate_candidates``: exploitation + exploration
-  candidates from one call, tagged with ``purpose`` column.
+Online DQN supports TD and Monte Carlo targets. DQN and the A2C critic may
+fit PopArt-normalized targets while exposing predictions in return units.
+Policy-gradient training standardizes actor advantages across the batch.
 """
 from __future__ import annotations
 
@@ -41,6 +27,7 @@ from tqdm import tqdm
 from .env_multigroup import MultiGroupEnv
 from .action_features import value_features, value_feature_dim
 from .predictors.base import PropertyPredictor
+from .value_normalization import POPART_PROFILE
 from .utils.training_budget import TrainingBudget
 from .utils.stage_timing import checkpoint_stage, checkpoint_prepared, record_checkpoint
 from .utils.checkpoint_serialization import save_checkpoint_payload
@@ -48,8 +35,9 @@ from .utils.rollout_errors import InfeasibleEpisode, EvaluationProtocolError
 from .utils.seeding import capture_rng_state, restore_rng_state
 from .utils.generation_resume import predictor_checkpoint_fields
 from .utils.model_contract import bind_scaler, environment_contract, scaler_fingerprint
+from .utils.prediction_records import metadata_record, objective_record
 from .utils.episode_batch import (
-    CandidateEvaluationFailed, EpisodeBatchEvaluator, training_wave_limit,
+    CandidateEvaluationFailed, EpisodeBatchEvaluator, EpisodeSnapshot, training_wave_limit,
 )
 
 
@@ -223,7 +211,6 @@ def _precompute_elem_features(
 # Replay buffer helpers (classical DQN)
 # ---------------------------------------------------------------------------
 
-# --- BEGIN mc-target experiment (removable) ---
 def _attach_mc_returns(rows: list, path: list, gamma: float) -> None:
     """Attach the discounted Monte-Carlo return G to each buffer row in place.
 
@@ -237,7 +224,6 @@ def _attach_mc_returns(rows: list, path: list, gamma: float) -> None:
     for k in reversed(range(len(path))):
         G = float(path[k].reward) + gamma * G   # terminal step: G = reward
         rows[k]["mc_return"] = G
-# --- END mc-target experiment ---
 
 
 def _action_value_record(step, alphabet) -> dict:
@@ -338,8 +324,7 @@ def _path_to_rows(path: list, action_values: List[str], gamma: float = 0.9) -> L
     return rows
 
 
-# Module-level guards so the "no alternatives possible" / "non-DQN method"
-# warnings fire only once per training run, not once per episode.
+# Warn only once when there are insufficient alternative action orders.
 _AUG_WARNED_NO_ALTS = False
 
 
@@ -352,6 +337,7 @@ def _augment_episode_in_buffer(
     *,
     K: int,
     gamma: float = 0.9,
+    terminal_key=None,
 ) -> None:
     """Insert *original_path* plus up to *K* permutation-augmented copies.
 
@@ -380,7 +366,6 @@ def _augment_episode_in_buffer(
 
     permutable = list(range(N))
 
-    import math
     import itertools
 
     if len(permutable) < 2:
@@ -438,7 +423,7 @@ def _augment_episode_in_buffer(
     # Stash the original terminal reward and predictor.
     original_R = float(original_path[-1].reward)
     saved_reward_fn = env.reward_fn
-    original_key = env.terminal_comp_key()
+    original_key = env.terminal_comp_key() if terminal_key is None else terminal_key
 
     try:
         env.reward_fn = lambda _formula: original_R
@@ -512,7 +497,7 @@ def _compute_td_target(
 def _dqn_gradient_step(
     qnet: torch.nn.Module,
     batch: list,
-    target_net: torch.nn.Module,
+    target_net: torch.nn.Module | None,
     s_mat_scaler: StandardScaler,
     elem_feats_scaled: np.ndarray,
     action_values: List[str],
@@ -522,18 +507,17 @@ def _dqn_gradient_step(
     gamma: float,
     target_mode: str = "bootstrap",
     target_cache=None,
+    diagnostics: dict | None = None,
 ) -> float:
-    """One DQN gradient step: SmoothL1(Q(s,a), target).
+    """Fit one minibatch of raw returns in the selected value coordinates.
 
     ``target_mode='bootstrap'`` (default) uses the one-step TD target
     ``r + gamma*max_a' Q_target(s',a')``. ``target_mode='mc'`` regresses to the
     fixed discounted Monte-Carlo return stored on each row (no bootstrap).
     """
-    # --- BEGIN mc-target experiment (removable) ---
     if target_mode == "mc":
         y = [float(r["mc_return"]) for r in batch]
     else:
-    # --- END mc-target experiment ---
         y = [
             _compute_td_target(r, target_net, s_mat_scaler, elem_feats_scaled,
                                action_values, device, gamma, target_cache=target_cache)
@@ -555,12 +539,24 @@ def _dqn_gradient_step(
         np.asarray([_row_value_features(r) for r in batch], dtype=float),
         dtype=torch.float32, device=device,
     )
-    y_t = torch.tensor(y, dtype=torch.float32, device=device).reshape(-1, 1)
     qnet.train()
-    loss = loss_fn(qnet(s_mat_b, s_step_b, a_elem_b, a_comp_b), y_t)
+    inputs = (s_mat_b, s_step_b, a_elem_b, a_comp_b)
+    normalizer = getattr(qnet, "value_normalizer", None)
+    if normalizer is None:
+        targets = torch.tensor(y, dtype=torch.float32, device=device).reshape(-1, 1)
+        prediction = qnet(*inputs)
+    else:
+        raw_targets = torch.tensor(y, dtype=torch.float64, device=device).reshape(-1, 1)
+        targets = qnet.update_value_normalization(raw_targets)
+        prediction = qnet.forward_normalized(*inputs)
+    loss = loss_fn(prediction, targets)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
+    if diagnostics is not None and normalizer is not None:
+        raw_error = (normalizer.decode(prediction.detach()) - raw_targets).abs().mean()
+        loss_value, diagnostics["value_raw_mae"] = torch.stack((loss.detach(), raw_error)).tolist()
+        return loss_value
     return float(loss.item())
 
 
@@ -594,12 +590,16 @@ def train_dqn_online(
     train_count_duplicates: bool = False,
     train_max_duplicate_attempts: int = 1000,
     training_samples=None,
+    value_normalization: str = "none",
+    value_normalization_profile: str = POPART_PROFILE,
+    calibration_warmup: Sequence[EpisodeSnapshot] | None = None,
 ) -> Tuple[torch.nn.Module, StandardScaler, List[dict]]:
     """Classical online DQN with FIFO replay buffer and TD targets.
 
     Phase 0 — Warmup (skipped when ``resume_state`` is provided):
         Roll out ``n_warmup_eps`` random episodes with real rewards to pre-fill
-        the buffer and fit the s_mat StandardScaler.
+        the buffer and fit the s_mat StandardScaler. Reuse finalized
+        ``calibration_warmup`` episodes before making fresh evaluations.
 
     Phase 1 — Training loop (``dqn_num_train_eps`` episodes):
         Each episode:
@@ -641,6 +641,15 @@ def train_dqn_online(
     """
     from .model import QRegressor
 
+    calibration_warmup = collections.deque(calibration_warmup or ())
+    if calibration_warmup and resume_state is not None:
+        raise ValueError("Cannot add calibration warmup to a restored DQN learner")
+    if calibration_warmup:
+        distinct = len({episode.terminal_key for episode in calibration_warmup})
+        used = len(calibration_warmup) if train_count_duplicates else distinct
+        if used > n_warmup_eps:
+            raise ValueError("DQN warmup budget does not cover the supplied calibration episodes")
+
     budget_state = resume_state.get("training_budget_state") if resume_state else None
     if resume_state is not None and budget_state is None and not train_count_duplicates:
         raise ValueError(
@@ -663,7 +672,6 @@ def train_dqn_online(
         print("[INFO] Training budget counts new candidates across DQN warmup and training; "
               "duplicate episodes still enter replay and receive gradient updates.", flush=True)
 
-    # --- BEGIN mc-target experiment (removable) ---
     if dqn_target_mode == "mc":
         print(
             "[INFO] DQN target_mode='mc': regressing to fixed discounted "
@@ -678,7 +686,6 @@ def train_dqn_online(
                 "Set dqn_augment_permutations=0 for the "
                 "mc comparison run."
             )
-    # --- END mc-target experiment ---
 
     if training_samples is not None:
         training_samples.start(
@@ -698,7 +705,7 @@ def train_dqn_online(
     if resume_state is not None:
         scaler     = resume_state["scaler"]
         qnet       = resume_state["qnet"]
-        target_net = resume_state["target_net"]
+        target_net = resume_state["target_net"] if dqn_target_mode == "bootstrap" else None
         optimizer  = resume_state["optimizer"]
         buffer     = resume_state["buffer"]
         start_ep   = int(resume_state.get("start_ep", 0))
@@ -726,14 +733,17 @@ def train_dqn_online(
         pbar = tqdm(total=n_warmup_eps, desc="DQN warmup")
         warmup_counted = 0
         warmup_attempts = 0
-        while warmup_counted < n_warmup_eps:
-            budget.check_can_sample()
-            episode = evaluator.next(
-                lambda: _rollout_random_episode(env),
-                limit=training_wave_limit(budget, n_warmup_eps - warmup_counted),
-                retry_scalar=_rollout_with_retry,
-                phase="dqn_warmup",
-            )
+        while calibration_warmup or warmup_counted < n_warmup_eps:
+            if calibration_warmup:
+                episode = calibration_warmup.popleft()
+            else:
+                budget.check_can_sample()
+                episode = evaluator.next(
+                    lambda: _rollout_random_episode(env),
+                    limit=training_wave_limit(budget, n_warmup_eps - warmup_counted),
+                    retry_scalar=_rollout_with_retry,
+                    phase="dqn_warmup",
+                )
             counted = budget.record(episode.terminal_key)
             warmup_counted += int(counted)
             warmup_attempts += 1
@@ -756,7 +766,7 @@ def train_dqn_online(
             if augment_permutations > 0:
                 _augment_episode_in_buffer(
                     env, episode.path, buffer, elem_feats_scaled, action_values,
-                    K=augment_permutations, gamma=gamma,
+                    K=augment_permutations, gamma=gamma, terminal_key=episode.terminal_key,
                 )
             else:
                 add_episode_to_buffer(episode.path, buffer, elem_feats_scaled, action_values, gamma=gamma)
@@ -782,9 +792,10 @@ def train_dqn_online(
         qnet = QRegressor(
             state_dim=state_dim, step_dim=step_dim,
             elem_dim=elem_dim, frac_dim=value_feature_dim(action_values), hidden_dim=hidden_dim,
+            value_normalization=value_normalization,
+            value_normalization_profile=value_normalization_profile,
         ).to(device)
-        target_net = copy.deepcopy(qnet)
-        target_net.eval()
+        target_net = copy.deepcopy(qnet).eval() if dqn_target_mode == "bootstrap" else None
         optimizer = torch.optim.Adam(qnet.parameters(), lr=lr)
         loss_fn = _make_loss_fn(loss_name)
         start_ep = 0
@@ -814,7 +825,7 @@ def train_dqn_online(
     if recorder is not None:
         recorder.partial_checkpoint_factory = lambda: {
             "type": "dqn", "qnet_state": qnet.state_dict(),
-            "target_net_state": target_net.state_dict(), "opt_state": optimizer.state_dict(),
+            "target_net_state": target_net.state_dict() if target_net is not None else None, "opt_state": optimizer.state_dict(),
             "buffer": list(buffer), "scaler": scaler,
             "training_budget_state": budget.state_dict(),
         }
@@ -878,7 +889,7 @@ def train_dqn_online(
         if augment_permutations > 0:
             _augment_episode_in_buffer(
                 env, episode.path, buffer, elem_feats_scaled, action_values,
-                K=augment_permutations, gamma=gamma,
+                K=augment_permutations, gamma=gamma, terminal_key=episode.terminal_key,
             )
         else:
             add_episode_to_buffer(episode.path, buffer, elem_feats_scaled, action_values, gamma=gamma)
@@ -886,9 +897,12 @@ def train_dqn_online(
         # 2. Gradient steps.
         mean_loss = float("nan")
         optimizer_steps = 0
+        fit_diagnostics = {}
+        value_normalizer = getattr(qnet, "value_normalizer", None)
         if len(buffer) >= batch_size:
             buf_list = list(buffer)
             losses = []
+            raw_errors = []
             for _ in range(dqn_grad_steps_per_ep):
                 _batch = random.sample(buf_list, batch_size)
                 losses.append(_dqn_gradient_step(
@@ -896,17 +910,21 @@ def train_dqn_online(
                     elem_feats_scaled, action_values, optimizer, loss_fn, device, gamma,
                     target_mode=dqn_target_mode,
                     target_cache=target_cache,
+                    diagnostics=fit_diagnostics if value_normalizer is not None else None,
                 ))
+                if value_normalizer is not None:
+                    raw_errors.append(fit_diagnostics["value_raw_mae"])
             _check_hpo_numerical(env, *losses, models=(qnet,))
             mean_loss = float(np.mean(losses))
             optimizer_steps = len(losses)
+            if raw_errors:
+                fit_diagnostics["value_raw_mae"] = float(np.mean(raw_errors))
 
         # 3. Hard target-net copy.
-        if train_attempts % dqn_target_update_freq == 0:
+        if target_cache is not None and train_attempts % dqn_target_update_freq == 0:
             target_net.load_state_dict(qnet.state_dict())
             target_net.eval()
-            if target_cache is not None:
-                target_cache.clear()
+            target_cache.clear()
 
         # 4. Linear epsilon anneal.
         eps = max(dqn_eps_min, 1.0 - (train_attempts - 1) / dqn_eps_anneal_eps)
@@ -928,12 +946,16 @@ def train_dqn_online(
             "terminal_reward": episode_reward,
             "train_loss": mean_loss,
             "optimizer_steps": optimizer_steps,
-            "mse_loss": mean_loss,
             "epsilon": eps,
             "epsilon_used": episode.metadata["epsilon_used"],
             "buffer_rows": len(buffer),
             **_episode_timing_row(episode, update_s),
         }
+        if value_normalizer is not None:
+            _row.update(fit_diagnostics)
+            _row.update(value_normalizer.diagnostics("value_popart"))
+            if target_cache is not None:
+                _row.update(target_net.value_normalizer.diagnostics("target_popart"))
         if timer is not None:
             _row.update(timer.snapshot())
         metrics.append(_row)
@@ -970,7 +992,7 @@ def train_dqn_online(
                     "hpo_state": env.hpo_recorder.checkpoint_state() if getattr(env, "hpo_recorder", None) is not None else None,
                     "training_budget_history_complete": budget_history_complete,
                     "qnet_state": qnet.state_dict(),
-                    "target_net_state": target_net.state_dict(),
+                    "target_net_state": target_net.state_dict() if target_net is not None else None,
                     "opt_state": optimizer.state_dict(),
                     "buffer": list(buffer),
                     "dqn_buffer_size": dqn_buffer_size,
@@ -1259,6 +1281,7 @@ def _episode_pg_terms(
     max_entropies: List[float] = []
     critic_losses: List[torch.Tensor] = []
 
+    value_normalizer = getattr(value_net, "value_normalizer", None)
     for step, G_t in zip(path, returns):
         allowed = step.allowed_actions
         if not allowed:
@@ -1296,16 +1319,21 @@ def _episode_pg_terms(
         if taken_idx is None:
             continue
 
-        G_raw_t = torch.tensor(G_t, dtype=torch.float32, device=device)
-
         if value_net is not None:
             s_mat_single  = torch.tensor(s_mat.reshape(1, -1),  dtype=torch.float32, device=device)
             s_step_single = torch.tensor(s_step.reshape(1, -1), dtype=torch.float32, device=device)
-            value = value_net(s_mat_single, s_step_single).reshape(-1)[0]
-            # The critic regresses the *raw* return: it is a value function for the
-            # real objective, not for the exploration-shaped one.
-            critic_losses.append((value - G_raw_t) ** 2)
-            advantage = G_t - float(value.detach().item())
+            inputs = (s_mat_single, s_step_single)
+            if value_normalizer is None:
+                prediction = value_net(*inputs).reshape(-1)[0]
+                target = torch.tensor(G_t, dtype=torch.float32, device=device)
+                value_raw = prediction.detach()
+            else:
+                prediction = value_net.forward_normalized(*inputs).reshape(-1)[0]
+                raw_target = torch.tensor(G_t, dtype=torch.float64, device=device)
+                target = value_normalizer.normalize(raw_target, dtype=prediction.dtype)
+                value_raw = value_normalizer.decode(prediction.detach())
+            critic_losses.append((prediction - target) ** 2)
+            advantage = G_t - float(value_raw.item())
         else:
             # REINFORCE: no baseline. Batch standardisation in train_pg supplies
             # the variance reduction a critic would otherwise give.
@@ -1347,6 +1375,7 @@ def train_pg(
     checkpoint_cfg: Optional[dict] = None,
     timer: Optional[object] = None,
     training_samples=None,
+    calibration_warmup: Sequence[EpisodeSnapshot] | None = None,
 ) -> List[dict]:
     """Batched REINFORCE / A2C training loop (matches feat/classical-dqn).
 
@@ -1362,7 +1391,9 @@ def train_pg(
     the run can perform more updates than ``num_iters``. The final batch may
     contain fewer than ``batch_eps`` trajectories. A resumed invocation requests
     this many *additional* budgeted episodes while retaining all previously seen
-    compositions; PG's scaler-only warmup does not enter the seen set.
+    compositions. Finalized calibration episodes consume the fresh run's
+    candidate budget and populate the seen set, without policy updates.
+    Scaler-only warmup does not enter the seen set.
 
     Scale invariance
     ----------------
@@ -1404,8 +1435,7 @@ def train_pg(
         max_duplicate_attempts=train_max_duplicate_attempts,
         state=budget_state,
     )
-    budget_start = budget.counted
-    budget_target = budget_start + max(0, int(num_iters)) * int(batch_eps)
+    budget_target = budget.counted + max(0, int(num_iters)) * int(batch_eps)
     if checkpoint_cfg and checkpoint_cfg.get("total_budget") is not None:
         budget_target = int(checkpoint_cfg["total_budget"])
     if int(batch_eps) < 1:
@@ -1417,11 +1447,41 @@ def train_pg(
         print("[WARN] Legacy checkpoint has no training budget history: new diagnostic "
               "counters start at this resume; the existing episode schedule is preserved.", flush=True)
 
+    calibration_episodes = tuple(calibration_warmup or ())
+    if calibration_episodes:
+        if resuming or budget.attempted:
+            raise ValueError("Cannot add calibration episodes to a restored policy-gradient learner")
+        if any(not episode.path for episode in calibration_episodes):
+            raise ValueError("Reward calibration requires completed episodes")
+        used = (len(calibration_episodes) if train_count_duplicates
+                else len({episode.terminal_key for episode in calibration_episodes}))
+        if used > budget_target:
+            raise ValueError("Policy-gradient budget does not cover the supplied calibration episodes")
+
     if training_samples is not None:
         training_samples.start(
             budget.counted, history_complete=budget_history_complete,
             session_id=checkpoint_cfg.get("training_sample_session_id") if checkpoint_cfg else None,
         )
+    metrics: List[dict] = []
+    for index, episode in enumerate(calibration_episodes, start=1):
+        counted = budget.record(episode.terminal_key)
+        row = {
+            "phase": "reward_calibration",
+            "episode": index,
+            "terminal_reward": float(episode.path[-1].reward),
+            "terminal_comp_key": str(episode.terminal_key),
+            "budget_counted": counted,
+            "training_budget_history_complete": budget_history_complete,
+            **budget.snapshot(),
+            **_episode_timing_row(episode),
+        }
+        metrics.append(row)
+        _record_episode_timing(timer, row)
+        if training_samples is not None:
+            training_samples.record(episode, row)
+    budget_start = budget.counted
+
     evaluator = EpisodeBatchEvaluator(
         env, max_retries=_MAX_CANDIDATE_RETRIES, timer=timer,
         capture_predictions=training_samples is not None,
@@ -1465,7 +1525,6 @@ def train_pg(
     if checkpoint_cfg and checkpoint_cfg.get("entropy_coef_eff") is not None:
         coef_eff = float(checkpoint_cfg["entropy_coef_eff"])
 
-    metrics: List[dict] = []
     accepted = int(checkpoint_cfg.get("start_episode", 0)) if checkpoint_cfg else 0
     attempted = 0
     start_iteration = int(checkpoint_cfg.get("start_iteration", 0)) if checkpoint_cfg else 0
@@ -1617,6 +1676,15 @@ def train_pg(
 
         _sync_training_device(device)
         update_started = time.perf_counter()
+        value_normalizer = getattr(value_net, "value_normalizer", None)
+        if value_normalizer is not None:
+            targets = [target for path, returns in zip(batch_paths, batch_returns)
+                       for step, target in zip(path, returns) if step.allowed_actions]
+            if targets:
+                # Reparameterize once, before any critic autograd graph exists.
+                value_net.update_value_normalization(
+                    torch.tensor(targets, dtype=torch.float64, device=device)
+                )
         all_logp: List[torch.Tensor] = []
         all_adv_raw: List[float] = []
         all_penalty: List[float] = []
@@ -1737,6 +1805,9 @@ def train_pg(
             **budget.snapshot(),
             "training_budget_history_complete": budget_history_complete,
         }
+        if value_normalizer is not None:
+            _row.update(value_normalizer.diagnostics("value_popart"))
+            _row["value_raw_mae"] = float(np.mean(np.abs(all_adv_raw)))
         if timer is not None:
             _row.update(timer.snapshot())
         metrics.append(_row)
@@ -2078,10 +2149,8 @@ def generate_candidates(
             details = details_fn(comp) if callable(details_fn) else {}
             metadata_fn = getattr(predictor, "candidate_metadata", None)
             metadata = metadata_fn(comp) if callable(metadata_fn) else {}
-            if not isinstance(metadata, dict):
-                raise TypeError("candidate_metadata must return a mapping")
+            metadata_fields = metadata_record(metadata)
             candidate_json = json.dumps(comp, sort_keys=True, ensure_ascii=False, allow_nan=False)
-            metadata_json = json.dumps(metadata, sort_keys=True, ensure_ascii=False, allow_nan=False)
         except EvaluationProtocolError:
             raise
         except Exception as exc:  # noqa: BLE001 - any predictor/builder failure
@@ -2107,33 +2176,13 @@ def generate_candidates(
         row: dict = {
             "formula": formula,
             "reward": reward,
-            "dp_mean": raw_mean,
             "candidate_json": candidate_json,
-            "metadata_json": metadata_json,
+            **metadata_fields,
+            **objective_record(raw_mean, per_stats, details),
         }
-        for name, value in metadata.items():
-            if value is None or isinstance(value, (str, bool, int, float)):
-                row[f"meta_{name}"] = value
-        if use_per_obj_stats:
-            # Composite predictor: each property keeps its own std in
-            # native physical units. A joint dp_std across mixed units
-            # would be meaningless, so dp_std / dp_mean_minus_std stay
-            # absent (pandas writes NaN). Per-property columns below.
-            for obj_name, (m, s) in per_stats.items():
-                row[f"obj_{obj_name}_mean"] = float(m)
-                row[f"obj_{obj_name}_std"] = None if s is None else float(s)
-        else:
+        if not use_per_obj_stats:
             row["dp_std"] = std
             row["dp_mean_minus_std"] = None if std is None else raw_mean - k * std
-        if details:
-            if details.get("type") == "gated":
-                row["reward_objective"] = float(details["objective"])
-                row["gate_passed"] = bool(details["gate_passed"])
-                for gate in details["gates"]:
-                    prefix = f"gate_{gate['name']}"
-                    row[f"{prefix}_value"] = float(gate["score"])
-                    row[f"{prefix}_passed"] = bool(gate["passed"])
-                    row[f"{prefix}_violation"] = float(gate["violation"])
         if use_check_phase:
             phase_ok, phase_label = predictor.check_phase(comp)
             row["primary_ok"] = bool(phase_ok)

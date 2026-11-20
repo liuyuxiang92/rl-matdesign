@@ -1,6 +1,7 @@
 """PG duplicate-budget integration with real losses and optimizer updates."""
 from __future__ import annotations
 
+import csv
 import math
 
 import numpy as np
@@ -12,6 +13,9 @@ torch = pytest.importorskip("torch")
 
 from rl_matdesign import training
 from rl_matdesign.env_multigroup import MultiGroupEnv
+from rl_matdesign.model import ValueNet
+from rl_matdesign.utils.episode_batch import snapshot_episode
+from rl_matdesign.utils.training_samples import TrainingSampleWriter
 
 
 class _Policy(torch.nn.Module):
@@ -103,6 +107,38 @@ def test_explicit_duplicate_counting_has_no_duplicate_guard(monkeypatch):
     assert sampled == learned == [0, 0, 0, 0]
     assert rows[-1]["training_budget_used"] == 4
     assert rows[-1]["training_duplicate_episodes"] == 3
+
+
+def test_a2c_calibration_charges_budget_without_learning_from_pilot(monkeypatch, tmp_path):
+    kwargs, sampled, learned = _setup(monkeypatch, [0, 2, 3], method="a2c")
+    env = kwargs["env"]
+    calibration = []
+    for index in (0, 1):
+        env.initialize()
+        action = next(a for a in env.allowed_actions() if int(np.argmax(a[0])) == index)
+        env.step(action)
+        calibration.append(snapshot_episode(env))
+    kwargs["value_net"] = ValueNet(
+        state_dim=kwargs["scaler"].n_features_in_,
+        step_dim=len(calibration[0].path[0].state_step_onehot),
+        value_normalization="popart",
+    )
+    samples = tmp_path / "training_samples.csv"
+    rows = training.train_pg(
+        **kwargs, calibration_warmup=calibration, checkpoint_cfg={"total_budget": 4},
+        training_samples=TrainingSampleWriter(samples),
+    )
+    assert [r["phase"] for r in rows[:2]] == ["reward_calibration"] * 2
+    assert rows[:2][-1]["training_budget_used"] == 2
+    assert sampled == learned == [0, 2, 3]
+    updates = [r for r in rows if r["phase"] == "pg_train"]
+    assert [r["episode"] for r in updates] == [2, 3]
+    assert updates[-1]["training_budget_used"] == 4
+    assert updates[-1]["value_popart_targets_seen"] == 3
+    with samples.open(newline="") as handle:
+        exported = list(csv.DictReader(handle))
+    assert [int(r["training_budget_used"]) for r in exported] == [1, 2, 3, 4]
+    assert [r["phase"] for r in exported] == ["reward_calibration"] * 2 + ["pg_episode"] * 2
 
 
 @pytest.mark.parametrize("stop", ["duplicate_limit", "attempt_limit"])

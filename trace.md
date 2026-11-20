@@ -3011,3 +3011,15 @@ Validation:177schema/CLI and301downstream tests passed. Full suite initially2674
 ### EARS — Commit Digest (2026-11-18 16:59)
 <!-- concepts: configuration-ownership, checkpoint-contracts, worktree-isolation -->
 The user requests a local commit of the verified training cleanup: one gamma and generation quota, fixed internal cache, automatic CSV columns, opt-in duplicate counting, and removal of retired training aliases. Shared gamma remains explicitly included in the resume learning contract. Validation records2685unique passing tests and3external-asset skips,29config audits, and installed-wheel parity. All configs/ changes remain local and excluded; no push or merge authorized. Reflection is already recorded in decisions/pitfalls, with no new technical lesson this commit-only turn. The global EARS hook again reported unrelated original-checkout history; leave it untouched and verify the intended worktree HEAD before retrying.
+
+### EARS — Session Start (2026-11-20 13:30)
+<!-- concepts: reward-calibration, value-normalization, exact-resume -->
+- Task: Complete the authorized Step1 implementation and obsolete-code cleanup on codex/step1-normalization based on codex/unified-material-groups.
+- Why: Reduce scenario-specific RL tuning while keeping scientific priorities and gated rewards explicit. Recover partial implementation after interrupted turns.
+
+### 2026-11-20 — Implement automatic reward calibration and PopArt
+<!-- concepts: value-normalization, calibration-lifecycle, checkpoint-contracts -->
+- Implemented authorized Step1 on codex/step1-normalization at the c76614665 unified-material-groups base. Native gate decisions stay fixed; pilot observations (including scientific failures) freeze reward calibration, and Q/critic learning uses optional PopArt. GlassNet maximizes T3 with only CTE/Tg gates; perovskite uses aggregate uncertainty-adjusted delta utility.
+- Calibration checkpoint settlement persists raw observations, RNG, predictor ledger and paid candidate identities before freezing. DQN reuses pilot trajectories in warmup, A2C charges them to budget without on-policy updates. Generation and HPO load the same hash-bound calibration. Refuse a pilot resume if the evaluation log advanced outside the checkpoint.
+- Removed inert DQN-MC target allocation/copies, unused MSE alias, unused batch-calibration entry point, duplicated diagnostics, superseded GlassNet gate/scale/penalty declarations and six retired oxide variants. Preserved active legacy reward contracts.
+- Final focused regression suite 258 passed. Earlier broad run had 2656 passes and 19 skips; its 37 failures cleared targeted reruns or the five local ActMOF/peptide fixture overlays absent from the source commit. Full suite was not repeated after final edits. Synthetic 900-case reward-scale benchmark ran with finite losses but did not demonstrate lower sensitivity. No scientific-model evaluations ran.

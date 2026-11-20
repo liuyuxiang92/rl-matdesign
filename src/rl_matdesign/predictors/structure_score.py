@@ -165,7 +165,7 @@ class StructureScorePredictor:
             is_dp_backend = predictor_name in ("dp_energy", "dp_property", "dp_classification")
             physical_cfg = dict(p)
             for field_name in ("name", "direction", "target_value", "target_tolerance",
-                               "scale", "objective", "transform", "uncertainty",
+                               "scale", "normalization", "objective", "transform", "uncertainty",
                                "output", "unit", "representation", "fparam", "aparam"):
                 physical_cfg.pop(field_name, None)
             if is_dp_backend:
@@ -383,6 +383,9 @@ class StructureScorePredictor:
         self._reward_combiner = RewardCombiner(
             cfg.get("reward"), [p["name"] for p in self.properties]
         )
+        self._objective_names = set(self._reward_combiner.objective_terms)
+        for _, terms in self._reward_combiner.alternatives:
+            self._objective_names.update(terms)
 
         # Any structure predictor present? Only then do we need a builder / base
         # POSCAR — a pure composition-predictor config (e.g. rf_magpie) builds
@@ -439,44 +442,180 @@ class StructureScorePredictor:
         self._freeze_model_assets()
         self._dp_cost = {"ensemble_evaluation_calls": 0, "model_configuration_pairs_attempted": 0,
                          "network_forwards": None}
+        self._initialize_reward_calibration(raw_props)
+
+    def _initialize_reward_calibration(self, raw_props) -> None:
+        from ..reward_calibration import RewardCalibration
+
+        declarations = [
+            {**raw, "name": prop["name"]} for raw, prop in zip(raw_props, self.properties)
+        ]
+        if not self._reward_combiner.calibration_config and not any(
+            "normalization" in prop for prop in declarations
+        ):
+            self._reward_calibration = None
+            return
+
+        # A single classifier probability has a known unit-width domain.
+        # An ensemble's mean-minus-spread score has a different domain.
+        single_probabilities = {
+            p["name"] for p in self.properties
+            if p["backend"] == "classification" and len(p["models"]) == 1
+        }
+        widths = {
+            gate.name: abs(next(iter(gate.terms.values())))
+            for gate in self._reward_combiner._gates
+            if len(gate.terms) == 1 and next(iter(gate.terms)) in single_probabilities
+        }
+        self._reward_calibration = RewardCalibration(
+            self._reward_combiner, declarations,
+            directions={prop["name"]: prop["direction"] for prop in self.properties},
+            gate_domain_widths=widths,
+            scientific_identity={"oracle": self.oracle_identity(),
+                                 "properties": declarations, "k": self.k},
+        )
+
+    @property
+    def reward_calibration_enabled(self) -> bool:
+        return self._reward_calibration is not None
+
+    @property
+    def reward_calibration_frozen(self) -> bool:
+        return not self.reward_calibration_enabled or self._reward_calibration.frozen
+
+    @property
+    def reward_calibration_num_candidates(self) -> int:
+        return self._reward_calibration.num_candidates if self.reward_calibration_enabled else 0
+
+    def _require_reward_calibration(self):
+        if self._reward_calibration is None:
+            raise ValueError("Reward calibration is disabled.")
+        return self._reward_calibration
+
+    def _require_reward_ready(self) -> None:
+        if self._reward_calibration is not None:
+            self._reward_calibration.require_frozen()
+
+    def fit_reward_calibration(self, observations) -> dict:
+        return self._require_reward_calibration().fit(observations)
+
+    def reward_calibration_state_dict(self) -> dict | None:
+        if self.reward_calibration_enabled:
+            return self._reward_calibration.state_dict()
+        return None
+
+    def load_reward_calibration(self, artifact) -> None:
+        self._require_reward_calibration().load_state_dict(artifact)
+
+    def calibration_observation(self, candidate: Any) -> dict:
+        """Capture the physical output and signed objectives without scalar reward."""
+        calibration = self._require_reward_calibration()
+        return self._calibration_observation(candidate, self._evaluation(candidate), calibration)
+
+    def _calibration_observation(self, candidate, record, calibration) -> dict:
+        from ..rewards import _number
+        from ..utils.candidate_records import candidate_identity
+
+        def canonical_numbers(key):
+            # Cache equality treats 1 and 1.0 as the same physical value.
+            if isinstance(key, tuple):
+                return tuple(canonical_numbers(value) for value in key)
+            if isinstance(key, float) and key.is_integer():
+                return int(key)
+            return key
+
+        gate_values = self._gate_values(record.stats)
+        objective_values = self._objective_values(record.stats)
+        raw_values = self._objective_values(record.stats, raw=True)
+        calibration.combiner.gate_details(gate_values)
+        return {
+            "candidate_key": candidate_identity(canonical_numbers(self._key(candidate))),
+            "spec_hash": calibration.spec_hash,
+            "gate_values": {key: _number(value, key) for key, value in gate_values.items()},
+            "objective_values": {key: _number(value, key) for key, value in objective_values.items()},
+            "raw_objective_values": {key: _number(value, key) for key, value in raw_values.items()},
+            "physical_stats": {
+                name: [_number(mean, name), None if std is None else _number(std, name)]
+                for name, (mean, std) in record.stats.items()
+            },
+            "outputs": {name: output.to_dict() for name, output in record.outputs.items()},
+            "prediction_record": self._prediction_metadata(candidate, record),
+        }
+
+    def _calibration_for_observation(self, observation):
+        calibration = self._require_reward_calibration()
+        if observation.get("spec_hash") != calibration.spec_hash:
+            raise ValueError("Calibration observation belongs to a different scientific contract.")
+        return calibration
+
+    def calibration_prediction_record(self, observation) -> dict:
+        """Export physical properties and gate status while reward is pending."""
+        from ..utils.prediction_records import objective_record
+
+        calibration = self._calibration_for_observation(observation)
+        gates = calibration.combiner.gate_details(observation["gate_values"])
+        details = {"type": calibration.combiner.type, "gates": gates,
+                   "gate_passed": all(gate["passed"] for gate in gates)}
+        return {**deepcopy(observation["prediction_record"]),
+                **objective_record(None, observation["physical_stats"], details)}
+
+    def score_calibration_observation(self, observation, *, raw: bool = False) -> dict:
+        """Score a saved observation with the same rule as an ordinary prediction."""
+        from ..utils.prediction_records import objective_record
+
+        calibration = self._calibration_for_observation(observation)
+        native = calibration.evaluate(observation["gate_values"], observation["raw_objective_values"])
+        details = native if raw else calibration.evaluate(
+            observation["gate_values"], observation["objective_values"],
+        )
+        details["prediction_record"] = {
+            **deepcopy(observation["prediction_record"]),
+            **objective_record(native["reward"], observation["physical_stats"], details),
+            "reward": details["reward"],
+        }
+        return details
 
     # ------------------------------------------------------------------
     # PropertyPredictor protocol
     # ------------------------------------------------------------------
 
-    def _reward_details(
-        self, stats: Dict[str, Tuple[float, float]], *, raw: bool = False,
-    ) -> Dict[str, Any]:
-        """Use one reward rule for training, generation and diagnostics."""
+    def _gate_values(self, stats):
         # Classifier gates use a fixed one-std margin across model means.
         # Keep this independent of objective direction/scale/k and of `raw`,
         # so training, CSV diagnostics and raw_combine agree on feasibility.
-        gate_values = {
+        outputs = getattr(stats, "outputs", {})
+        return {
             p["name"]: stats[p["name"]][0] - (
-                (getattr(stats, "outputs", {}).get(p["name"]).model_spread or 0.0)
-                if p["backend"] == "classification" and p["name"] in getattr(stats, "outputs", {})
+                (outputs[p["name"]].model_spread or 0.0)
+                if p["backend"] == "classification" and p["name"] in outputs
                 else (stats[p["name"]][1] or 0.0) if p["backend"] == "classification" else 0.0
             )
             for p in self.properties
         }
+
+    def _objective_values(self, stats, *, raw=False):
         # Gate-only and diagnostic properties do not contribute an adjusted
         # objective. Their physical outputs remain available above and in reports.
-        objective_names = set(self._reward_combiner.objective_terms)
-        for _, terms in self._reward_combiner.alternatives:
-            objective_names.update(terms)
-        values = {
+        return {
             p["name"]: self._property_value(
                 p, stats[p["name"]][0], 0.0 if raw else stats[p["name"]][1]
             ) / p["scale"]
-            for p in self.properties if p["name"] in objective_names
+            for p in self.properties if p["name"] in self._objective_names
         }
-        return self._reward_combiner.evaluate(gate_values, values)
+
+    def _reward_details(
+        self, stats: Dict[str, Tuple[float, float]], *, raw: bool = False,
+    ) -> Dict[str, Any]:
+        """Use one reward rule for training, generation and diagnostics."""
+        reward = self._reward_calibration or self._reward_combiner
+        return reward.evaluate(self._gate_values(stats), self._objective_values(stats, raw=raw))
 
     def _combine(self, stats: Dict[str, Tuple[float, float]]) -> float:
         return self._reward_details(stats)["reward"]
 
     def reward_details(self, candidate: Any) -> Dict[str, Any]:
         """Return objective and gate diagnostics using the cached property stats."""
+        self._require_reward_ready()
         return self._reward_details(self._raw_stats(candidate))
 
     def _property_value(self, prop: Dict[str, Any], mean: float, std: float) -> float:
@@ -504,12 +643,14 @@ class StructureScorePredictor:
         return objective_from_mean_std(-e, float(std), prop["objective"], self.k)
 
     def predict(self, candidate: Any) -> Tuple[float, None]:
+        self._require_reward_ready()
         stats = self._raw_stats(candidate)
         reward = self._combine(stats)
         return reward, None
 
     def predict_raw(self, candidate: Any) -> Tuple[float, None]:
         """Unpenalized objective with the same gates — for the dp_mean column."""
+        self._require_reward_ready()
         return float(self.raw_combine(self._raw_stats(candidate))), None
 
     def per_objective_stats(self, candidate: Any) -> Dict[str, Tuple[float, Optional[float]]]:
@@ -522,9 +663,7 @@ class StructureScorePredictor:
         return dict(self._evaluation(candidate).outputs)
 
     def batch_predict_outputs(self, candidates: List[Any]) -> List[Dict[str, ScientificOutput]]:
-        candidates = list(candidates)
-        self.batch_predict(candidates)
-        return [dict(self._evaluation(candidate).outputs) for candidate in candidates]
+        return self._batch_evaluate(candidates, lambda candidate, record: dict(record.outputs))
 
     def cached_outputs(self, candidate: Any) -> Optional[Dict[str, ScientificOutput]]:
         """Read the existing paired record only; a miss never evaluates a model."""
@@ -534,7 +673,7 @@ class StructureScorePredictor:
 
     def prediction_record(self, candidate: Any, prediction, *, k: float = 1.0) -> dict:
         """Export the completed scientific record without inference or timing changes."""
-        from ..utils.prediction_records import metadata_record, objective_record
+        from ..utils.prediction_records import objective_record
 
         key = self._key(candidate)
         record = self._batch_stats.get(key, self._stats_cache.get(key))
@@ -544,7 +683,13 @@ class StructureScorePredictor:
         # metadata belongs to this exact (completed) evaluation.
         row = objective_record(self.raw_combine(record.stats), record.stats,
                                self._reward_details(record.stats))
-        row.update(metadata_record(record.metadata))
+        row.update(self._prediction_metadata(candidate, record))
+        return row
+
+    def _prediction_metadata(self, candidate, record):
+        from ..utils.prediction_records import metadata_record
+
+        row = metadata_record(record.metadata)
         try:
             formula = self.composition_formula(candidate)
         except Exception:
@@ -634,6 +779,13 @@ class StructureScorePredictor:
     def batch_predict(
         self, candidates: List[Any], *, return_exceptions: bool = False,
     ) -> List[Any]:
+        self._require_reward_ready()
+        return self._batch_evaluate(
+            candidates, lambda candidate, record: (self._combine(record.stats), None),
+            return_exceptions=return_exceptions,
+        )
+
+    def _batch_evaluate(self, candidates, result_from_record, *, return_exceptions=False) -> list:
         """Build unique uncached candidates together; score them in input order.
 
         GPU workers only handle construction/relaxation. Property inference and
@@ -668,7 +820,7 @@ class StructureScorePredictor:
                 if record is None:
                     pending[key] = candidate
                 else:
-                    results[key] = self._prediction_from_stats(record.stats)
+                    results[key] = result_from_record(candidate, record)
                     timings[key] = _empty_timing(cache_hit=True)
                     self._batch_stats[key] = record
                     if key in self._stats_cache:
@@ -700,7 +852,7 @@ class StructureScorePredictor:
                             prop_inputs, _candidate, self._materialization_diagnostics[index])
                     finally:
                         timing["property_s"] = time.perf_counter() - started
-                    results[key] = self._prediction_from_stats(record.stats)
+                    results[key] = result_from_record(_candidate, record)
                     self._cache_evaluation(key, record)
                     self._batch_stats[key] = record
                 except EvaluationProtocolError:
@@ -724,10 +876,6 @@ class StructureScorePredictor:
                 if isinstance(result, Exception):
                     raise result
         return out
-
-    def _prediction_from_stats(self, stats: Dict[str, Tuple[float, float]]) -> Tuple[float, float]:
-        reward = self._combine(stats)
-        return reward, None
 
     def close(self) -> None:
         """Close every owned resource exactly once, including failed constructors."""
@@ -881,6 +1029,7 @@ class StructureScorePredictor:
 
     def score_breakdown(self, candidate: Any) -> Dict[str, Any]:
         """Return explicit property statistics and reward for one built ensemble."""
+        self._require_reward_ready()
         self._validate_source_assets()
         prop_structures = self._materialize_structures(candidate)
         diagnostics = deepcopy(self._materialization_diagnostics[0])

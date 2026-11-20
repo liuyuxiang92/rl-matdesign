@@ -1,105 +1,111 @@
-# Tiny smoke config — end-to-end validation with minimal episode counts.
-
+# Chemical amounts and categorical assignments; see docs/design_groups.md.
 groups:
-  - name: oxide
-    kind: integer
-    species_set:
-    - O
-    - Te
-    - N
-    - B
-    - Tm
-    - Ga
-    - Hf
-    - Ca
-    - Al
-    - P
-    - Li
-    - S
-    - Cr
-    - Zr
-    - Ta
-    - Sn
-    - Au
-    - Hg
-    - Cd
-    - Mn
-    - Cs
-    - Pd
-    - Th
-    - K
-    - Ti
-    - Ag
-    - Zn
-    - W
-    - Ce
-    - Nd
-    - Sr
-    - Tl
-    - Cl
-    - Mg
-    - Pr
-    - Rb
-    - Pb
-    - Ru
-    - Ho
-    - Nb
-    - Mo
-    - C
-    - V
-    - Er
-    - Pt
-    - Fe
-    - Ir
-    - Sb
-    - Y
-    - Na
-    - Co
-    - Be
-    - In
-    - La
-    - U
-    - Pu
-    - As
-    - Sm
-    - Br
-    - Ni
-    - Eu
-    - Ba
-    - F
-    - Rh
-    - Yb
-    - Gd
-    - Os
-    - Lu
-    - Ge
-    - Cu
-    - H
-    - Sc
-    - Si
-    - Re
-    - Dy
-    - Bi
-    - Tb
-    - Se
-
-    ratio_set: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
-    anion_formula: ""
-    n_components: 5
-
-    filters:
-      - type: last_step_element
-        required_elements: ["O"]
-        nonzero_ratio_at_last: true
-        reserve_for_last: true
-
-k: 0.0
+- name: oxide
+  kind: composition
+  species_set:
+  - O
+  - Te
+  - N
+  - B
+  - Tm
+  - Ga
+  - Hf
+  - Ca
+  - Al
+  - P
+  - Li
+  - S
+  - Cr
+  - Zr
+  - Ta
+  - Sn
+  - Au
+  - Hg
+  - Cd
+  - Mn
+  - Cs
+  - Pd
+  - Th
+  - K
+  - Ti
+  - Ag
+  - Zn
+  - W
+  - Ce
+  - Nd
+  - Sr
+  - Tl
+  - Cl
+  - Mg
+  - Pr
+  - Rb
+  - Pb
+  - Ru
+  - Ho
+  - Nb
+  - Mo
+  - C
+  - V
+  - Er
+  - Pt
+  - Fe
+  - Ir
+  - Sb
+  - Y
+  - Na
+  - Co
+  - Be
+  - In
+  - La
+  - U
+  - Pu
+  - As
+  - Sm
+  - Br
+  - Ni
+  - Eu
+  - Ba
+  - F
+  - Rh
+  - Yb
+  - Gd
+  - Os
+  - Lu
+  - Ge
+  - Cu
+  - H
+  - Sc
+  - Si
+  - Re
+  - Dy
+  - Bi
+  - Tb
+  - Se
+  amount_set:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  n_steps: 5
+  element_bounds:
+    O:
+    - 1
+    - 9
 properties:
-  - name: sinter
-    predictor: rf_magpie
-    model: models/sinter_calcine/optimal_sinter_RF.joblib
-    direction: min
-
+- name: sinter
+  predictor: rf_magpie
+  models:
+  - models/sinter_calcine/optimal_sinter_RF.joblib
+  direction: min
+reward:
+  type: weighted_sum
+k: 0.0
 method: a2c
 pg_warmup_eps: 5
 pg_num_iters: 2
@@ -111,16 +117,12 @@ gen_temperature: 3.0
 gen_top_frac: 0.0
 gen_epsilon: 0.0
 gamma: 0.99
-
 pg_repeat_penalty_coef: 0.1
 pg_repeat_penalty_shape: log
-
 num_gen_eps: 20
-max_gen_attempts: 2000   # cap generation attempts before stopping (CLI --max-gen-attempts overrides)
-
+max_gen_attempts: 2000
 dqn_lr: 0.001
 dqn_batch_size: 64
-# Classical online DQN
 dqn_warmup_eps: 5
 dqn_num_train_eps: 20
 dqn_buffer_size: 200

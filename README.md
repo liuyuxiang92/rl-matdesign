@@ -88,16 +88,20 @@ operational flags (seeds, resume, checkpoint). This means:
 
 | Config | Material system | Default method |
 |---|---|---|
-| `configs/hea.yaml` | High-entropy alloy formation energy | reinforce |
-| `configs/lips_sse.yaml` | Multi-sublattice LiPS solid electrolyte | Configured in YAML |
-| `configs/oxides_sinter.yaml` | Oxide sintering temperature | reinforce |
-| `configs/oxides_calcine.yaml` | Oxide calcination temperature | reinforce |
-| `configs/test_dummy.yaml` | Fast smoke test (no real predictor) | dqn |
-| `configs/test_multigroup_dummy.yaml` | Multi-sublattice smoke test (no real predictor) | CLI selection |
+| `configs/hea.yaml` | High-entropy alloy formation energy | A2C |
+| `configs/lips_sse.yaml` | Multi-sublattice LiPS solid electrolyte | A2C |
+| `configs/oxides_sinter.yaml` | Oxide sintering temperature | DQN |
+| `configs/oxides_calcine.yaml` | Oxide calcination temperature | DQN |
+| `configs/glassnet_*.yaml` | Calibrated T3 maximization subject to CTE and Tg gates | A2C, DQN bootstrap, or DQN MC |
+| `configs/perovskite_calibrated.example.yaml` | Calibrated delta quality with a synthesizability gate | DQN |
+| `configs/test_dummy.yaml` | Fast smoke test with a dummy predictor | A2C |
+| `configs/test_multigroup_dummy.yaml` | Multi-sublattice smoke test with a dummy predictor | A2C |
 
-New and migrated scenario YAML files are maintained locally. This release does
-not publish their contents or changes; previously published examples remain as-is. Examples below using those paths require your existing local configs
-and model/structure files. They are not included in a fresh checkout.
+The consolidated oxide configurations support algorithm selection through
+`--method`. The GlassNet and perovskite examples enable automatic reward
+calibration and PopArt. See the [YAML reference](docs/yaml_config_reference.md)
+for the calibration fields. Scientific examples may require local model or
+structure assets.
 
 ---
 
