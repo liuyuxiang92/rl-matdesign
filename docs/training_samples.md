@@ -32,9 +32,14 @@ The export follows the existing `budget_counted` decision in `training_log.csv`:
 - Failed evaluations that are retried without consuming training budget are
   absent. A successfully evaluated material that fails a reward gate is still
   saved when its episode consumes budget.
-- PG scaler warmup, replay-buffer reuse, DQN permutation augmentation,
+- Reward calibration, PG scaler warmup, replay-buffer reuse, DQN permutation augmentation,
   per-iteration metric summaries, and generation are not training-budget
   episodes and do not add rows.
+
+In PopArt mode, the 100 distinct reward-calibration candidates are saved in
+`reward_calibration_observations.json`. They precede training and do not seed
+the training seen-candidate set, so a later training occurrence can consume
+budget and appear in this CSV.
 
 Rows are written as episodes complete; an interrupted run retains samples
 already written. `--only-generate` leaves `training_samples.csv` unchanged.

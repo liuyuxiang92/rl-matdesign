@@ -10,7 +10,6 @@ import torch
 
 from rl_matdesign.domain_runtime import EpisodeStep
 from rl_matdesign.training import CandidateEvaluationFailed, train_dqn_online
-from rl_matdesign.utils.episode_batch import snapshot_episode
 
 
 class ScriptedEnv:
@@ -86,29 +85,44 @@ def optimizer_steps(state):
     return {int(item["step"].item()) for item in state["opt_state"]["state"].values()}
 
 
-def test_popart_warmup_reuses_finalized_calibration_episodes(tmp_path):
-    pilot = ScriptedEnv(["A", "A", "B"])
-    snapshots = []
-    for _ in range(3):
-        pilot.initialize()
-        for _ in range(pilot.max_steps):
-            pilot.step(pilot.sample_random_action())
-        snapshots.append(snapshot_episode(pilot))
+@pytest.mark.parametrize("normalization", ["none", "popart"])
+def test_fresh_dqn_requires_warmup_before_sampling(tmp_path, normalization):
+    env = ScriptedEnv([])
+    with pytest.raises(ValueError, match="Fresh DQN training requires dqn_warmup_eps >= 1"):
+        run(env, tmp_path, n_warmup_eps=0, value_normalization=normalization)
+    assert env.starts == 0
+    assert not (tmp_path / "checkpoint.pt").exists()
 
-    online = ScriptedEnv(["A", "C"])
+
+@pytest.mark.parametrize("target_mode", ["mc", "bootstrap"])
+@pytest.mark.parametrize("warmup", [1, 2])
+def test_popart_learner_has_its_own_warmup_budget_and_replay(tmp_path, target_mode, warmup):
+    env = ScriptedEnv(["A", "B", "Z", "A", "C", "D"])
+    # Prior property observations do not make a candidate seen by the learner.
+    # A is sampled again during RL; B and Z must never enter its replay buffer.
+    for _ in range(3):
+        env.initialize()
+        for _ in range(env.max_steps):
+            env.step(env.sample_random_action())
+
     _, _, rows = run(
-        online, tmp_path, dqn_num_train_eps=1, dqn_target_mode="mc",
-        value_normalization="popart", calibration_warmup=snapshots,
+        env, tmp_path, n_warmup_eps=warmup, dqn_num_train_eps=3 - warmup,
+        dqn_target_mode=target_mode, value_normalization="popart",
     )
-    assert online.starts == 2
-    assert [row["budget_counted"] for row in rows] == [True, False, True, False, True]
+    assert env.starts == 6
+    assert [row["phase"] for row in rows] == ["dqn_warmup"] * warmup + ["dqn_train"] * (3 - warmup)
+    assert [row["budget_counted"] for row in rows] == [True] * 3
+    assert [row["training_budget_used"] for row in rows] == [1, 2, 3]
+    assert rows[-1]["training_attempts"] == 3
     assert rows[-1]["training_budget_used"] == 3
-    assert rows[-1]["value_popart_updates"] == 2
+    assert rows[-1]["value_popart_updates"] == 3 - warmup
     state = checkpoint(tmp_path)
-    assert [row["reward"] for row in state["buffer"][1::2]] == [1., 1., 2., 1., 3.]
+    assert len(state["training_budget_state"]["seen_keys"]) == 3
+    assert [row["reward"] for row in state["buffer"][1::2]] == [1., 3., 4.]
     assert [row["mc_return"] for row in state["buffer"][::2]] == pytest.approx(
-        [.9, .9, 1.8, .9, 2.7],
+        [.9, 2.7, 3.6],
     )
+    assert optimizer_steps(state) == {3 - warmup}
 
 
 def reconstruct_resume(state, qnet, scaler):

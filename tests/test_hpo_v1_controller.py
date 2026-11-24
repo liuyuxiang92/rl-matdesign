@@ -8,7 +8,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import yaml
 
-from rl_matdesign.hpo.artifacts import atomic_json, digest, read_json
+from rl_matdesign.hpo.artifacts import CALIBRATION_CHECKPOINT, REWARD_CALIBRATION_BUDGET, atomic_json, digest, read_json
 from rl_matdesign.hpo.algorithm_profiles import get_profile, initial_parameters
 from rl_matdesign.hpo.controller import Campaign, CampaignError, aggregate_results
 from rl_matdesign.hpo.domain import design_space_info, minimum_training_budget, training_budget_preflight
@@ -155,13 +155,32 @@ def test_training_minimum_supports_range_updated_categorical_and_integer_specs(t
     assert minimum_training_budget(plan, {"episode_steps": 2}) == 7
 
 
-@pytest.mark.parametrize(("method", "required"), [("a2c", 108), ("dqn-mc", 101), ("dqn-bootstrap", 111)])
-def test_popart_budget_includes_fixed_pilot_and_learning(tmp_path, method, required):
+@pytest.mark.parametrize(("method", "required"), [("a2c", 8), ("dqn-mc", 5), ("dqn-bootstrap", 13)])
+def test_popart_calibration_does_not_raise_learning_budget(tmp_path, method, required):
     plan = small_plan(tmp_path) if method == "a2c" else small_dqn_plan(tmp_path, method)
-    plan["base_config_data"]["value_normalization"] = "popart"
     if method == "a2c":
         plan["search_space"]["pg_batch_eps"] = {"type": "categorical", "choices": [8]}
     assert minimum_training_budget(plan, {"episode_steps": 2}) == required
+    plan["base_config_data"]["value_normalization"] = "popart"
+    assert minimum_training_budget(plan, {"episode_steps": 2}) == required
+
+
+def test_popart_a2c_preserves_scaler_preparation_efficiency_minimum(tmp_path):
+    plan = small_plan(tmp_path)
+    plan["base_config_data"].update(value_normalization="popart", pg_warmup_eps=100)
+    assert minimum_training_budget(plan, {"episode_steps": 2}) == 201
+
+
+@pytest.mark.parametrize("method", ["a2c", "dqn-mc", "dqn-bootstrap"])
+def test_popart_small_fixed_budget_reaches_range_diagnosis(tmp_path, campaign_environment, method):
+    plan = small_plan(tmp_path) if method == "a2c" else small_dqn_plan(tmp_path, method)
+    plan["base_config_data"]["value_normalization"] = "popart"
+    plan["budget"]["train"].update(min_unique=16, initial_unique=16, max_unique=16)
+    runner = FakeRunner()
+    result = campaign(plan, tmp_path / "run", runner).run_ranges()
+    assert result["status"] == "COMPLETED"
+    assert result["budget_grid"] == [16]
+    assert runner.calls and all(call["budget"] == 16 for call in runner.calls)
 
 
 def fake_worker(monkeypatch):
@@ -219,6 +238,26 @@ def test_zero_attempt_initialization_artifacts_are_not_silently_deleted(tmp_path
         runner({}, 16, 101, "train")
     assert not calls
     assert read_json(directory / "candidate_budget.json")["attempts_started"] == 0
+
+
+def test_pilot_checkpoint_resumes_before_any_training_attempt(tmp_path, monkeypatch):
+    plan = small_plan(tmp_path)
+    calls = fake_worker(monkeypatch)
+    runner = JobRunner(plan, tmp_path / "runner")
+    key = {"parameters": {}, "budget": 16, "seed": 101, "phase": "train", "input_models": {}}
+    directory = runner.out / "jobs" / digest(key)[:24]
+    atomic_json(directory / "candidate_budget.json", {
+        "attempts_started": 0, "unique_evaluated": 0, "target_unique": 16, "status": "INTERRUPTED"})
+    (directory / CALIBRATION_CHECKPOINT).write_text("worker verifies synchronized pilot checkpoint")
+    pilot = {"schema_version": 1, "accounting": "outside_training_budget", "target_candidates": 100,
+             "valid_candidates": 3, "attempts_started": 4, "evaluations": 3, "status": "RUNNING"}
+    atomic_json(directory / REWARD_CALIBRATION_BUDGET, pilot)
+    result = runner({}, 16, 101, "train")
+    assert result["eligible_for_selection"]
+    assert "--resume-training" in calls[0]["args"]
+    assert result["reward_calibration_budget"] == pilot
+    assert str(directory / REWARD_CALIBRATION_BUDGET) in result["artifact_hashes"]
+    assert result["wall_seconds"] is None
 
 
 def test_generation_resume_requires_checkpoint_and_sets_explicit_mode(tmp_path, monkeypatch):

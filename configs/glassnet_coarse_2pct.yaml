@@ -81,7 +81,7 @@ reward:
     min: 773.0
     penalty_weight: 0.001  # Raw Tg violation
 
-# Coarse HPO selections (2026-11-16). Each training budget includes the pilot.
+# Coarse HPO selections (2026-11-16). Calibration adds 100 candidates outside training.
 method: dqn
 dqn_target_mode: bootstrap
 train_budget: {dqn-bootstrap: 458, dqn-mc: 115, a2c: 916}
@@ -95,7 +95,7 @@ eval_seed: 0
 train_seed: 11
 gen_seed: 11
 
-# DQN shares the pilot with warmup. train_budget determines dqn_num_train_eps.
+# DQN collects warmup after calibration. train_budget determines dqn_num_train_eps.
 dqn_warmup_eps: 100
 dqn_lr: 0.001
 dqn_batch_size: 256

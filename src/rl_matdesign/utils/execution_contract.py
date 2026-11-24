@@ -91,6 +91,8 @@ def execution_contract(config, predictor, manifest_path, device) -> dict:
     # Saving limits DQN candidate prefetch waves. Changing this frequency
     # changes when the policy is updated relative to subsequent sampling.
     learning["checkpoint_frequency"] = manifest.get("runtime_args", {}).get("save_checkpoint_freq", 0)
+    if config.get("value_normalization") == "popart":
+        learning["reward_calibration_accounting"] = "outside_training_budget"
     return json.loads(json.dumps({"evaluation": evaluation, "learning": learning}, sort_keys=True))
 
 

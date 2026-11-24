@@ -223,6 +223,8 @@ def _run_experiment(resources: ExitStack) -> None:
                         and pilot_source.is_file()
                         and not args.load_qnet and not args.load_policy)
     resume_learner = args.resume_training and not resume_pilot
+    if method == "dqn" and not args.only_generate and not resume_learner and cfg["dqn_warmup_eps"] < 1:
+        raise ValueError("Fresh DQN training requires dqn_warmup_eps >= 1 to fit the state scaler")
     if resume_pilot and args.load_reward_calibration:
         raise ValueError("A resumed pilot must continue its original calibration observations")
     hpo_recorder = None
@@ -336,7 +338,7 @@ def _run_experiment(resources: ExitStack) -> None:
                    else cfg["train_budget"] or cfg["pg_num_iters"] * cfg["pg_batch_eps"])
     with phases("calibration"):
         if getattr(predictor, "reward_calibration_enabled", False):
-            pilot_episodes = prepare_reward_calibration(
+            prepare_reward_calibration(
                 env=env, predictor=predictor, out=args.out, contract=run_contract,
                 total_budget=train_total, attempt_limit=train_max_duplicate_attempts,
                 only_generate=args.only_generate, resume_learner=resume_learner,
@@ -344,12 +346,9 @@ def _run_experiment(resources: ExitStack) -> None:
             )
             calibration = predictor.reward_calibration_state_dict()
             run_contract["evaluation"]["reward_calibration"] = calibration["content_hash"]
-            if method == "dqn":
-                warmup_eps = max(warmup_eps, len(pilot_episodes))
         else:
             if args.load_reward_calibration or resume_pilot:
                 raise ValueError("The configured predictor has no reward calibration")
-            pilot_episodes = []
     env.evaluation_contract = run_contract["evaluation"]
     with (manifest_path.parent / "execution_contract.json").open("w") as stream:
         json.dump(run_contract, stream, indent=2, allow_nan=False)
@@ -502,10 +501,6 @@ def _run_experiment(resources: ExitStack) -> None:
                             flush=True,
                         )
                     start_ep = int(_mid["episodes_completed"])
-                    if getattr(predictor, "reward_calibration_enabled", False):
-                        used = _mid["training_budget_state"]["counted"]
-                        warmup_eps = used - start_ep
-                        _n_train_eps = max(0, train_total - warmup_eps)
                     eps_val  = float(_mid.get("eps", max(_eps_min, 1.0 - start_ep / _eps_anneal)))
                     print(
                         f"[INFO] DQN resume from {_resume_src}: ep={start_ep}, "
@@ -586,7 +581,6 @@ def _run_experiment(resources: ExitStack) -> None:
                     train_count_duplicates=train_count_duplicates,
                     train_max_duplicate_attempts=train_max_duplicate_attempts,
                     dqn_target_mode=cfg["dqn_target_mode"],
-                    calibration_warmup=pilot_episodes,
                     **model_normalization,
                 )
             # DQN's warmup runs inside train_dqn_online, so split it back out of
@@ -779,7 +773,6 @@ def _run_experiment(resources: ExitStack) -> None:
                     training_samples=training_samples,
                     train_count_duplicates=train_count_duplicates,
                     train_max_duplicate_attempts=train_max_duplicate_attempts,
-                    calibration_warmup=pilot_episodes,
                 )
             for r in train_rows:
                 metrics.log(**r)

@@ -11,6 +11,7 @@ from typing import Any
 from ..rewards import reward_calibration_requested
 
 REWARD_CALIBRATION = "reward_calibration.json"
+REWARD_CALIBRATION_BUDGET = "reward_calibration_budget.json"
 CALIBRATION_CHECKPOINT = "calibration_checkpoint.pt"
 
 

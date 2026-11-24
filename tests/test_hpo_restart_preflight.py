@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from rl_matdesign.hpo.artifacts import CALIBRATION_CHECKPOINT, file_digest
+from rl_matdesign.hpo.artifacts import CALIBRATION_CHECKPOINT, REWARD_CALIBRATION_BUDGET, file_digest
 from rl_matdesign.hpo.restart import inspect_restart
 from rl_matdesign.utils.candidate_records import CandidateRecorder
 from rl_matdesign.utils.seeding import capture_rng_state
@@ -96,31 +96,73 @@ def test_ledger_ahead_preserves_paid_attempts_and_refuses_restart(tmp_path):
     assert _snapshot(tmp_path) == before
 
 
-def test_pre_model_calibration_checkpoint_resumes_only_at_settled_boundary(tmp_path):
-    directory, learner_checkpoint = _job(tmp_path)
-    (directory / "checkpoint.pt").unlink()
-    (directory / "std_scaler.bin").unlink()
+def _pilot_job(tmp_path):
+    _json(tmp_path / "manifest.json", {"plan": {"method": "a2c"}})
+    directory = tmp_path / "jobs" / "one"
+    directory.mkdir(parents=True)
+    recorder = CandidateRecorder(directory, 4, phase="train")
+    hpo_state = recorder.checkpoint_state()
+    recorder.close()
     log = directory / "evaluations.jsonl"
     log.write_text('{"phase":"calibration","reward_status":"pending"}\n')
     checkpoint = {
-        key: learner_checkpoint[key] for key in
-        ("hpo_state", "rng_state", "predictor_ledger", "execution_contract")
+        "hpo_state": hpo_state, "rng_state": capture_rng_state(), "execution_contract": {"test": True},
+        "predictor_ledger": {"schema_version": 1, "n_calls": 1, "seen": ["A"],
+                             "t_predict_s": 0.1, "phase": "calibration", "phase_costs": {}},
     }
     checkpoint.update(
-        type="reward_calibration", total_budget=4, attempts=1, evaluations=1, misses=0,
+        type="reward_calibration", accounting="outside_training_budget", num_candidates=100,
+        total_budget=4, attempts=1, evaluations=1, misses=0,
         entries=[(SimpleNamespace(terminal_key="A", path=[object()]), {"candidate_key": "raw-A"})],
         evaluation_log_size=log.stat().st_size, frozen=None,
     )
+    _json(directory / REWARD_CALIBRATION_BUDGET, {
+        "schema_version": 1, "accounting": "outside_training_budget", "target_candidates": 100,
+        "valid_candidates": 1, "attempts_started": 1, "evaluations": 1, "status": "RUNNING"})
     torch.save(checkpoint, directory / CALIBRATION_CHECKPOINT)
+    return directory, checkpoint
+
+
+def test_pre_model_calibration_checkpoint_resumes_only_at_settled_boundary(tmp_path):
+    directory, _ = _pilot_job(tmp_path)
     before = _snapshot(tmp_path)
     assert inspect_restart(tmp_path)["job_counts"]["SYNCHRONIZED"] == 1
     assert _snapshot(tmp_path) == before
+    assert (directory / "candidate_records.jsonl").read_bytes() == b""
 
+    log = directory / "evaluations.jsonl"
     with log.open("a") as stream:
         stream.write('{"phase":"calibration","reward_status":"pending"}\n')
     report = inspect_restart(tmp_path)
     assert not report["ready"]
     assert "last settled calibration checkpoint" in report["jobs"][0]["reason"]
+
+
+@pytest.mark.parametrize("corruption,expected", [
+    ("pilot_report", "Calibration budget report differs"),
+    ("missing_report", REWARD_CALIBRATION_BUDGET),
+    ("legacy_accounting", "separate pilot accounting"),
+    ("duplicate_trajectory", "distinct candidate trajectories"),
+])
+def test_pilot_restart_rejects_inconsistent_separate_accounting(tmp_path, corruption, expected):
+    directory, saved = _pilot_job(tmp_path)
+    report_path = directory / REWARD_CALIBRATION_BUDGET
+    if corruption == "pilot_report":
+        report = json.loads(report_path.read_text())
+        _json(report_path, {**report, "attempts_started": 2})
+    elif corruption == "missing_report":
+        report_path.unlink()
+    elif corruption == "legacy_accounting":
+        saved.pop("accounting")
+    else:
+        saved["entries"].append((SimpleNamespace(terminal_key="A", path=[object()]), {"candidate_key": "raw-B"}))
+        saved.update(attempts=2, evaluations=2)
+    torch.save(saved, directory / CALIBRATION_CHECKPOINT)
+    before = _snapshot(tmp_path)
+    result = inspect_restart(tmp_path)
+    assert not result["ready"]
+    assert expected in result["jobs"][0]["reason"]
+    assert _snapshot(tmp_path) == before
 
 
 @pytest.mark.parametrize("change,expected", [

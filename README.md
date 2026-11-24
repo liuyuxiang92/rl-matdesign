@@ -101,8 +101,12 @@ operational flags (seeds, resume, checkpoint). This means:
 For GlassNet coarse and oxide sintering, use the same scenario file for all three runs.
 Choose `--method dqn --dqn-target-mode bootstrap`, `--method dqn --dqn-target-mode mc`,
 or `--method a2c`, and give each run its own `--out` directory. Both scenarios and
-the perovskite example default to `value_normalization: popart`. A fresh run uses
-100 distinct, successfully evaluated training candidates to calibrate the reward.
+the perovskite example default to `value_normalization: popart`. A fresh run first
+evaluates 100 distinct candidates to calibrate the reward, outside the training
+budget. DQN then collects its configured warmup within that budget; fresh training
+needs at least one warmup candidate to fit the state scaler, with no 100-candidate
+minimum. A2C uses the full training budget for policy training. Calibration costs
+are recorded separately in `reward_calibration_budget.json`.
 Pass `--value-normalization none` for the raw reward and unnormalized value targets.
 Scientific examples may require local model or structure assets. [YAML reference](docs/yaml_config_reference.md)
 
@@ -738,7 +742,9 @@ generation quota, sampled with the selected generation strategy.
 
 Training samples are saved automatically as episodes complete. DQN includes
 random warmup and online training; REINFORCE/A2C include policy training, while
-scaler warmup is outside their budget. Repeats are saved exactly when
+scaler warmup is outside their budget. Reward-calibration candidates are saved
+separately in `reward_calibration_observations.json` and do not enter this CSV.
+Repeats are saved exactly when
 `budget_counted` is true. Property values come from that episode's evaluation,
 without another predictor call; unavailable scientific uncertainty stays blank.
 `candidate_json` retains sequence, categorical and multi-group structure.

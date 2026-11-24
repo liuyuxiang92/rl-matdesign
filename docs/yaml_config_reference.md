@@ -211,8 +211,34 @@ the gate. [Perovskite configuration](../configs/perovskite_calibrated.example.ya
 
 The runner freezes the fitted scales for training and generation. Gate failures
 with valid predictions count toward the pilot. Duplicate candidates and failed
-evaluations do not fill pilot slots. The pilot counts toward the training
-allowance and supplies DQN warmup data. A2C trains on subsequent policy samples.
+evaluations do not fill pilot slots. These 100 candidates are separate calibration
+overhead: they do not consume training or generation budget, populate DQN replay,
+or enter the training seen-candidate set. DQN collects its configured warmup
+after calibration and spends the rest of its training budget on online samples.
+Fresh DQN training requires `dqn_warmup_eps >= 1` to fit the state scaler; there
+is no calibration-imposed minimum of 100. A2C uses its full training budget for
+policy samples; its descriptor-only scaler warmup remains separate. A
+calibration candidate encountered later can count toward training.
+
+For a fresh run with `train_budget: 115`, DQN-MC therefore collects 100 calibration
+candidates and then 115 budgeted training candidates, including its configured
+warmup. The calibration observations are saved in
+`reward_calibration_observations.json`, not `training_samples.csv`. They are also
+excluded from HPO training scores and attempt-efficiency accounting. Predictor
+work can include retries, failures and cache reuse. The independent
+`reward_calibration_budget.json` records this overhead with
+`accounting: outside_training_budget`:
+
+| Field | Meaning |
+| --- | --- |
+| `target_candidates` | Required distinct valid candidates: 100 |
+| `valid_candidates` | Distinct valid calibration observations collected so far |
+| `attempts_started` | Calibration sampling attempts, including duplicates and failed attempts |
+| `evaluations` | Calls to obtain calibration observations, including failed evaluations; cache reuse can reduce backend work |
+| `status` | `RUNNING` until the calibration is frozen, then `COMPLETED` |
+
+The counters are saved at settled calibration checkpoints. Loading an existing
+compatible calibration artifact skips new calibration sampling.
 
 With `value_normalization: none` (the default when omitted), training uses the
 configured raw reward, skips the pilot, and learns values in raw reward units.
@@ -233,6 +259,9 @@ continues from the last settled pilot checkpoint when a learner checkpoint
 has yet to be created. The frozen JSON is required for generation and learner
 resume. Use `--load-reward-calibration /path/to/reward_calibration.json` to
 reuse compatible calibration on another grid without evaluating another pilot.
+Exact resume requires the same calibration accounting protocol and source version;
+checkpoints made when calibration consumed training budget need the archived code
+or a new run directory.
 
 `value_normalization: popart` enables adaptive value-target normalization for
 DQN or A2C under the shared `value_normalization_profile: popart_v1`. PopArt

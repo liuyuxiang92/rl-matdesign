@@ -1,0 +1,61 @@
+checkpoint_version: '3.0.0'
+created_at: '2026-11-24T05:41:33Z'
+branch: codex/step1-normalization
+base_commit: ede3423d3871ea038fa74490e358e4edfac55d39
+phase:
+  current: implementation_verified
+  completed: [separate_calibration, independent_learner_budgets, hpo_accounting_and_resume, documentation, regression_validation, reflection]
+  next: []
+state:
+  parameters:
+    - name: calibration_candidates
+      value: 100
+      source: Explicit user request for common outside-budget calibration
+      confidence: high
+    - name: fixed_training_budgets
+      value: {a2c: 916, dqn_bootstrap: 458, dqn_mc: 115}
+      source: User-provided training-budget figure and prior HPO configuration edits
+      confidence: high
+    - name: generation_budget
+      value: 500
+      source: Explicit user request in prior configuration update
+      confidence: high
+  experiments:
+    - name: targeted_regression_suites
+      status: completed
+      passed_unique_tests: 442
+      details: >-
+        13 calibration integration/guard tests, 30 learner budget tests,
+        98 HPO controller/restart/reporting/cooperative-stop tests,
+        99 HPO job/parallel/config-contract tests, and 202 reward calibration,
+        PopArt, schema, exact-resume and reproducibility tests. A stale generated
+        documentation row was corrected and its failing check rerun successfully.
+        After the final pilot report guard, 4 selected pilot resume/report tests passed.
+    - name: scientific_training
+      status: not_run
+      reason: Validation uses dummy predictors; production model runs were not requested.
+  decisions:
+    - decision: Keep calibration separate from all learner and HPO candidate accounting.
+      rationale: User requests the full fixed RL budget after the common 100-sample pilot.
+    - decision: Keep fresh DQN warmup at least one, without the former 100-candidate floor.
+      rationale: State scaler fitting requires a nonempty replay buffer; HPO already derives positive warmup.
+    - decision: Preserve independent pilot report and exact resume boundaries.
+      rationale: Zero training attempts can coexist with real calibration cost; never discard advanced cost evidence.
+  worktree: /Users/liuyuxiang/Dropbox/Macbook_air/aisi/shanghai/reinforcement_learning/rl-matdesign/.worktrees/step1-normalization
+  changes_committed: false
+blockers: []
+artifacts:
+  - path: src/rl_matdesign/calibration_run.py
+    role: Separate pilot, independent cost report, checkpoint resume guard
+  - path: src/rl_matdesign/experiment.py
+    role: Run pilot before independent learner warmup and training
+  - path: src/rl_matdesign/training.py
+    role: Learners no longer accept or consume calibration trajectories
+  - path: docs/yaml_config_reference.md
+    role: Updated protocol and budget report documentation
+resume_instructions:
+  - Work in the named PopArt worktree; the outer checkout is an unrelated older branch.
+  - Review git diff and preserve existing trace entries, replicate launcher and older checkpoint.
+  - Use PYTHONPATH=src with Python/rl-matdesign because the installed CLI may import the outer checkout.
+  - Start new run/campaign directories for this protocol; old coupled-budget checkpoints require their archived code.
+  - No implementation work remains. Do not repeat long integration suites without a new change or concern.

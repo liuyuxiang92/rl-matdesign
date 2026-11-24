@@ -17,6 +17,8 @@ from .utils.seeding import restore_rng_state
 
 CALIBRATION_STATE = "calibration_checkpoint.pt"
 CALIBRATION_ARTIFACT = "reward_calibration.json"
+CALIBRATION_BUDGET = "reward_calibration_budget.json"
+CALIBRATION_ACCOUNTING = "outside_training_budget"
 
 
 def _write_json(path: Path, value) -> None:
@@ -53,7 +55,11 @@ def prepare_reward_calibration(
     *, env, predictor, out, contract, total_budget, attempt_limit,
     only_generate=False, resume_learner=False, resume_pilot=False, load_path=None,
 ):
-    """Return finalized paid observations for warmup/accounting, when collected here."""
+    """Freeze a separate prediction pilot before any learner budget is consumed.
+
+    Pilot observations never enter replay, training seen sets, or HPO candidate
+    archives. Their costs are recorded separately from the training allowance.
+    """
     out = Path(out)
     artifact_path = out / CALIBRATION_ARTIFACT
     checkpoint_path = out / CALIBRATION_STATE
@@ -66,21 +72,29 @@ def prepare_reward_calibration(
         # A run using another grid's compatible artifact keeps a local copy.
         if not only_generate and not resume_learner and source != artifact_path:
             _write_json(artifact_path, predictor.reward_calibration_state_dict())
-        return []
+        return
 
     needed = predictor.reward_calibration_num_candidates
-    if needed > total_budget:
-        raise ValueError(f"Reward calibration needs {needed} distinct valid candidates "
-                         f"but the total training allowance is {total_budget}")
-
     entries = []
     attempts = 0
     evaluations = 0
     misses = 0
     frozen = None
+
+    def budget_report():
+        return {
+            "schema_version": 1, "accounting": CALIBRATION_ACCOUNTING,
+            "target_candidates": needed, "valid_candidates": len(entries),
+            "attempts_started": attempts, "evaluations": evaluations,
+            "status": "COMPLETED" if frozen is not None else "RUNNING",
+        }
+
     if resume_pilot:
         saved = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        if saved.get("type") != "reward_calibration" or saved.get("total_budget") != total_budget:
+        if (saved.get("type") != "reward_calibration"
+                or saved.get("accounting") != CALIBRATION_ACCOUNTING
+                or saved.get("num_candidates") != needed
+                or saved.get("total_budget") != total_budget):
             raise ValueError("Calibration resume requires the original pilot and training allowance")
         require_execution_contract(saved["execution_contract"], contract)
         if predictor.evaluation_log_size() != saved["evaluation_log_size"]:
@@ -90,6 +104,9 @@ def prepare_reward_calibration(
         evaluations = saved["evaluations"]
         misses = saved["misses"]
         frozen = saved["frozen"]
+        report_path = out / CALIBRATION_BUDGET
+        if not report_path.is_file() or json.loads(report_path.read_text()) != budget_report():
+            raise ValueError("Calibration budget report differs from the last settled checkpoint")
         restore_predictor_state(predictor, saved)
         restore_rng_state(saved["rng_state"])
     elif checkpoint_path.exists() or artifact_path.exists():
@@ -98,6 +115,7 @@ def prepare_reward_calibration(
     def save():
         payload = {
             "type": "reward_calibration", "execution_contract": contract,
+            "accounting": CALIBRATION_ACCOUNTING, "num_candidates": needed,
             "total_budget": total_budget, "attempts": attempts,
             "evaluations": evaluations, "misses": misses, "entries": entries,
             "frozen": frozen, "evaluation_log_size": predictor.evaluation_log_size(),
@@ -105,31 +123,26 @@ def prepare_reward_calibration(
         }
         if recorder is not None:
             payload["hpo_state"] = recorder.checkpoint_state()
+        _write_json(out / CALIBRATION_BUDGET, budget_report())
         _save_checkpoint(str(checkpoint_path), payload)
 
     predictor.set_phase("calibration")
     seen = {episode.terminal_key for episode, _ in entries}
     observed = {obs["candidate_key"] for _, obs in entries}
     while len(entries) < needed:
-        # Bound both paid evaluation work and retries that never reach a predictor.
-        if evaluations >= total_budget or misses >= attempt_limit:
+        # Bound consecutive failed/duplicate attempts independently of RL work.
+        if misses >= attempt_limit:
             raise ValueError(f"Reward calibration unresolved after {attempts} attempts "
                              f"and {evaluations} evaluations ({len(entries)}/{needed} valid distinct candidates)")
-        if recorder is not None:
-            recorder.start()
         attempts += 1
         started = time.perf_counter()
         try:
             candidate, episode = _draw_candidate(env)
         except InfeasibleEpisode:
-            if recorder is not None:
-                recorder.failure()
             misses += 1
             save()
             continue
         if episode.terminal_key in seen:
-            if recorder is not None:
-                recorder.failure(preparation=True)
             misses += 1
             save()
             continue
@@ -140,12 +153,8 @@ def prepare_reward_calibration(
         try:
             obs = predictor.calibration_observation(candidate)
         except EvaluationProtocolError:
-            if recorder is not None:
-                recorder.failure()
             raise
         except Exception as exc:
-            if recorder is not None:
-                recorder.failure()
             predictor.record_episode({"phase": "calibration", "status": "failed",
                                       "formula": episode.formula, "rollout_s": rollout_s})
             misses += 1
@@ -154,8 +163,6 @@ def prepare_reward_calibration(
             continue
         eval_s = time.perf_counter() - started
         if obs["candidate_key"] in observed:
-            if recorder is not None:
-                recorder.failure(preparation=True)
             misses += 1
             save()
             continue
@@ -165,8 +172,6 @@ def prepare_reward_calibration(
                           "rollout_s": rollout_s, "eval_wall_share_s": eval_s,
                           "episode_wall_share_s": rollout_s + eval_s}
         episode.prediction_record = predictor.calibration_prediction_record(obs)
-        if recorder is not None:
-            recorder.success(episode)
         seen.add(episode.terminal_key)
         observed.add(obs["candidate_key"])
         entries.append((episode, obs))
@@ -182,17 +187,13 @@ def prepare_reward_calibration(
         predictor.load_reward_calibration(frozen)
 
     finalized_rows = []
-    for episode, obs in entries:
+    for _, obs in entries:
         scored = predictor.score_calibration_observation(obs)
         reward = scored["reward"]
-        episode.path[-1].reward = reward
-        episode.prediction = (reward, None)
-        episode.prediction_record = scored["prediction_record"]
         finalized_rows.append({"observation": obs, "reward_status": "final", "reward": reward})
     _write_json(out / "reward_calibration_observations.json", finalized_rows)
     _write_json(artifact_path, frozen)
     predictor.set_phase("train")
     predictor.mark("calibration_end")
     print(f"[INFO] Froze reward calibration from {len(entries)} distinct candidates "
-          f"after {evaluations} evaluations", flush=True)
-    return [episode for episode, _ in entries]
+          f"after {evaluations} evaluations (outside the training budget)", flush=True)

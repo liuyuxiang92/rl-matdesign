@@ -586,12 +586,18 @@
   tags: [configuration-ownership, training, schema-cleanup]
 
 - id: decision-step1-calibration-lifecycle-001
-  date: '2026-11-20'
+  date: '2026-11-24'
+  expires: '2027-05-24'
   title: Freeze scientific reward calibration before updating the learner
   choice: Checkpoint each settled pilot observation without a scalar reward, freeze
     calibration by content hash, and finalize stored observations once. Bind learner
-    and generation artifacts to that hash, reuse DQN pilot trajectories in warmup,
-    and record A2C pilot trajectories only for accounting. The experiment setting
+    and generation artifacts to that hash. Per the revised protocol, exclude the
+    100 pilot candidates from RL budgets, replay, training seen sets and HPO scoring
+    or efficiency. Report their attempts and evaluations separately, including
+    interrupted jobs. DQN collects its configured warmup inside the subsequent RL
+    allowance, with a minimum of one for scaler fitting; A2C retains its full policy
+    training allowance. Preserve untouched HPO accounting in pilot checkpoints and
+    permit resume/stop before the first training attempt. The experiment setting
     value_normalization selects the whole recipe. PopArt mode calibrates weighted-sum
     and gated rewards from exactly 100 distinct valid candidates on a fresh run.
     Raw mode skips calibration and uses raw learner targets. Preserve raw GlassNet
@@ -599,6 +605,8 @@
   alternatives_considered:
   - Updating scientific scales online would alter objective weights or failure severity
     and invalidate replay labels.
+  - Reusing the pilot as budgeted DQN warmup imposed a 100-candidate floor and made
+    small fixed budgets incomparable to A2C; the user requested a common separate pilot.
   trade_off: Pilot collection is sequential for settled resume boundaries. Scientific
     failures are valid calibration data, while unavailable predictions stay in the
     attempt ledger. Synthetic tests do not establish improved discovery.
@@ -606,6 +614,8 @@
   - src/rl_matdesign/calibration_run.py
   - src/rl_matdesign/reward_calibration.py
   - src/rl_matdesign/utils/execution_contract.py
+  - src/rl_matdesign/hpo/restart.py
+  - src/rl_matdesign/hpo/reporting.py
   tags:
   - calibration
   - exact-resume

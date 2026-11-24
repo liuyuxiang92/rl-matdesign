@@ -62,8 +62,8 @@ def checkpoint_committed(data):
     """Honor a pending stop only after a resumable HPO checkpoint is on disk.
 
     Call after serialization, atomic replacement, and any latest-file link
-    replacement succeed.  Zero-attempt initialization checkpoints are not yet
-    resumable jobs.  Terminal budgets must finish their normal final model and
+    replacement succeed. Settled calibration work can stop before any training
+    attempt; empty initialization checkpoints cannot. Terminal budgets finish their final model and
     report exports instead of being interrupted between checkpoint and export.
     """
     request = _active_stop
@@ -75,6 +75,13 @@ def checkpoint_committed(data):
         return
     counters = ("pending", "attempts_started", "unique_evaluated", "target_unique", "max_attempts")
     if any(type(budget.get(name)) is not int for name in counters):
+        return
+    if (data.get("type") == "reward_calibration"
+            and data.get("accounting") == "outside_training_budget"):
+        if (budget["pending"] == budget["attempts_started"] == budget["unique_evaluated"] == 0
+                and budget.get("status") not in _TERMINAL
+                and type(data.get("attempts")) is int and data["attempts"] > 0):
+            raise SystemExit(128 + request.signum)
         return
     if (budget["pending"] != 0 or budget["attempts_started"] <= 0
             or budget["unique_evaluated"] >= budget["target_unique"]

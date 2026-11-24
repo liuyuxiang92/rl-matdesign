@@ -16,7 +16,8 @@ import time
 import yaml
 
 from .artifacts import (
-    REWARD_CALIBRATION, atomic_json, checkpoint_files, digest, file_digest, read_json,
+    CALIBRATION_CHECKPOINT, REWARD_CALIBRATION, REWARD_CALIBRATION_BUDGET,
+    atomic_json, checkpoint_files, digest, file_digest, read_json,
     resumable_checkpoint, reward_calibration_requested,
 )
 from .scoring import score_records
@@ -196,12 +197,14 @@ class JobRunner:
                 raise JobError(f"Job {job_id} has a terminal ledger but its execution failed; "
                                "the recorded failure and consumed cost cannot be cleared by recovery. "
                                "Inspect result.json and the preserved worker logs.")
-            if not recover_terminal and not old_ledger.get("attempts_started", 0):
+            resume_checkpoint = resumable_checkpoint(directory, phase)
+            has_pilot_checkpoint = (resume_checkpoint.name == CALIBRATION_CHECKPOINT
+                                    and resume_checkpoint.is_file())
+            if not recover_terminal and not old_ledger.get("attempts_started", 0) and not has_pilot_checkpoint:
                 raise JobError(f"Job {job_id} has initialized accounting artifacts but no consumed attempts; "
                                "inspect the preserved initialization failure before starting a new campaign. "
                                "Existing ledgers are never silently erased.")
-            if not recover_terminal and old_ledger.get("attempts_started", 0):
-                resume_checkpoint = resumable_checkpoint(directory, phase)
+            if not recover_terminal and (old_ledger.get("attempts_started", 0) or has_pilot_checkpoint):
                 if not resume_checkpoint.exists():
                     raise JobError(f"Job {job_id} consumed attempts without a resumable checkpoint; "
                                    "cost is preserved and will not be reset. See candidate_budget.json.")
@@ -399,6 +402,9 @@ class JobRunner:
         prior_time_unknown = resume and (previous is None or previous.get("wall_seconds") is None)
         calibration_path = self.out / "quality_calibration.json"
         calibration_artifacts = [str(calibration_path)] if include_quality and calibration_path.is_file() else []
+        pilot_budget_path = directory / REWARD_CALIBRATION_BUDGET
+        if pilot_budget_path.is_file():
+            calibration_artifacts.append(str(pilot_budget_path))
         result = {**evaluation, "job_id": job_id, **key,
                   "checkpoint_paths": paths, "ledger": ledger, "directory": str(directory),
                   "records_path": str(record_path), "returncode": returncode,
@@ -410,6 +416,8 @@ class JobRunner:
                                     "partial_after_resume" if prior_time_unknown else "measured"),
                   "artifact_hashes": {p: file_digest(p) for p in
                       [*paths.values(), str(record_path), str(ledger_path), *calibration_artifacts] if Path(p).is_file()}}
+        if pilot_budget_path.is_file():
+            result["reward_calibration_budget"] = read_json(pilot_budget_path)
         if include_quality:
             result["quality_normalization"] = copy.deepcopy(self.plan["objective"]["normalization"])
         if payload.get("execution_error") is not None:

@@ -5,7 +5,7 @@ import csv
 import json
 from pathlib import Path
 
-from .artifacts import atomic_json, read_json
+from .artifacts import REWARD_CALIBRATION_BUDGET, atomic_json, read_json
 
 
 def _csv(path: Path, rows: list[dict]):
@@ -26,15 +26,21 @@ def export_reports(out: str | Path) -> dict:
     def fraction(budget):
         return budget / space_size if isinstance(space_size, int) and space_size > 0 else None
     jobs = [read_json(path) for path in sorted((out / "jobs").glob("*/result.json"))]
+    pilots = {path.parent.name: read_json(path)
+              for path in sorted((out / "jobs").glob(f"*/{REWARD_CALIBRATION_BUDGET}"))}
     rows = []
     for job in jobs:
         ledger = job.get("ledger", {})
+        pilot = pilots.get(job["job_id"], {})
         rows.append({"job_id": job["job_id"], "phase": job["phase"], "status": job["status"],
             "budget": job["budget"], "budget_fraction_of_space": fraction(job["budget"]),
             "seed": job["seed"], "parameters": job["parameters"],
             "eligible_for_selection": job["eligible_for_selection"], "score": job["score"],
             **job.get("raw_metrics", {}), "attempts_started": ledger.get("attempts_started", 0),
             "unique_evaluated": ledger.get("unique_evaluated", 0),
+            "calibration_attempts": pilot.get("attempts_started", 0),
+            "calibration_evaluations": pilot.get("evaluations", 0),
+            "calibration_valid_candidates": pilot.get("valid_candidates", 0),
             "wall_seconds": job.get("wall_seconds"),
             "timing_status": job.get("timing_status", "complete" if job.get("wall_seconds") is not None else "unknown")})
     _csv(out / "trials.csv", [r for r in rows if r["phase"] == "train"])
@@ -75,6 +81,15 @@ def export_reports(out: str | Path) -> dict:
             "known_wall_seconds": known_seconds,
             "jobs_with_unknown_total_time": unknown_time_jobs,
         }
+    cost["calibration"] = {
+        "jobs": len(pilots),
+        "unfinished_jobs": sum(pilot.get("status") != "COMPLETED" for pilot in pilots.values()),
+        "attempts_started": sum(pilot.get("attempts_started", 0) for pilot in pilots.values()),
+        "evaluations": sum(pilot.get("evaluations", 0) for pilot in pilots.values()),
+        "valid_candidates": sum(pilot.get("valid_candidates", 0) for pilot in pilots.values()),
+        "accounting": "outside_training_budget",
+        "wall_time_scope": "Included in train job wall_seconds; not added a second time",
+    }
     summary = {"selections": selections, "physical_cost": cost,
                "quality_calibration": read_json(out / "quality_calibration.json")
                    if (out / "quality_calibration.json").is_file() else None,
@@ -82,6 +97,7 @@ def export_reports(out: str | Path) -> dict:
                    if (out / "generation_pairings.json").is_file() else None,
                "design_space_size": space_size,
                "unfinished_jobs_with_cost": unfinished,
-               "cost_scope": "Distinct job records; candidate credits are phase-local, not campaign-global novelty"}
+               "cost_scope": "Distinct job records; training/generation candidate counts exclude separately reported calibration overhead. "
+                             "Candidate credits are phase-local, not campaign-global novelty; job wall time includes calibration."}
     atomic_json(out / "selection.json", summary)
     return summary

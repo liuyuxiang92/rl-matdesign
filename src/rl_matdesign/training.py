@@ -37,7 +37,7 @@ from .utils.generation_resume import predictor_checkpoint_fields
 from .utils.model_contract import bind_scaler, environment_contract, scaler_fingerprint
 from .utils.prediction_records import metadata_record, objective_record
 from .utils.episode_batch import (
-    CandidateEvaluationFailed, EpisodeBatchEvaluator, EpisodeSnapshot, training_wave_limit,
+    CandidateEvaluationFailed, EpisodeBatchEvaluator, training_wave_limit,
 )
 
 
@@ -592,14 +592,13 @@ def train_dqn_online(
     training_samples=None,
     value_normalization: str = "none",
     value_normalization_profile: str = POPART_PROFILE,
-    calibration_warmup: Sequence[EpisodeSnapshot] | None = None,
 ) -> Tuple[torch.nn.Module, StandardScaler, List[dict]]:
     """Classical online DQN with FIFO replay buffer and TD targets.
 
     Phase 0 — Warmup (skipped when ``resume_state`` is provided):
         Roll out ``n_warmup_eps`` random episodes with real rewards to pre-fill
-        the buffer and fit the s_mat StandardScaler. Reuse finalized
-        ``calibration_warmup`` episodes before making fresh evaluations.
+        the buffer and fit the s_mat StandardScaler. Any prior reward-calibration
+        observations are outside this learner's budget and replay buffer.
 
     Phase 1 — Training loop (``dqn_num_train_eps`` episodes):
         Each episode:
@@ -639,16 +638,9 @@ def train_dqn_online(
     successful episode. This delays behavior-policy refresh relative to scalar
     online DQN; ``epsilon_used`` records the collection wave's exploration rate.
     """
+    if resume_state is None and n_warmup_eps < 1:
+        raise ValueError("Fresh DQN training requires dqn_warmup_eps >= 1 to fit the state scaler")
     from .model import QRegressor
-
-    calibration_warmup = collections.deque(calibration_warmup or ())
-    if calibration_warmup and resume_state is not None:
-        raise ValueError("Cannot add calibration warmup to a restored DQN learner")
-    if calibration_warmup:
-        distinct = len({episode.terminal_key for episode in calibration_warmup})
-        used = len(calibration_warmup) if train_count_duplicates else distinct
-        if used > n_warmup_eps:
-            raise ValueError("DQN warmup budget does not cover the supplied calibration episodes")
 
     budget_state = resume_state.get("training_budget_state") if resume_state else None
     if resume_state is not None and budget_state is None and not train_count_duplicates:
@@ -733,17 +725,14 @@ def train_dqn_online(
         pbar = tqdm(total=n_warmup_eps, desc="DQN warmup")
         warmup_counted = 0
         warmup_attempts = 0
-        while calibration_warmup or warmup_counted < n_warmup_eps:
-            if calibration_warmup:
-                episode = calibration_warmup.popleft()
-            else:
-                budget.check_can_sample()
-                episode = evaluator.next(
-                    lambda: _rollout_random_episode(env),
-                    limit=training_wave_limit(budget, n_warmup_eps - warmup_counted),
-                    retry_scalar=_rollout_with_retry,
-                    phase="dqn_warmup",
-                )
+        while warmup_counted < n_warmup_eps:
+            budget.check_can_sample()
+            episode = evaluator.next(
+                lambda: _rollout_random_episode(env),
+                limit=training_wave_limit(budget, n_warmup_eps - warmup_counted),
+                retry_scalar=_rollout_with_retry,
+                phase="dqn_warmup",
+            )
             counted = budget.record(episode.terminal_key)
             warmup_counted += int(counted)
             warmup_attempts += 1
@@ -1375,7 +1364,6 @@ def train_pg(
     checkpoint_cfg: Optional[dict] = None,
     timer: Optional[object] = None,
     training_samples=None,
-    calibration_warmup: Sequence[EpisodeSnapshot] | None = None,
 ) -> List[dict]:
     """Batched REINFORCE / A2C training loop (matches feat/classical-dqn).
 
@@ -1391,9 +1379,8 @@ def train_pg(
     the run can perform more updates than ``num_iters``. The final batch may
     contain fewer than ``batch_eps`` trajectories. A resumed invocation requests
     this many *additional* budgeted episodes while retaining all previously seen
-    compositions. Finalized calibration episodes consume the fresh run's
-    candidate budget and populate the seen set, without policy updates.
-    Scaler-only warmup does not enter the seen set.
+    compositions. Prior reward calibration and scaler-only warmup do not consume
+    this budget or enter the learner's seen set.
 
     Scale invariance
     ----------------
@@ -1447,39 +1434,12 @@ def train_pg(
         print("[WARN] Legacy checkpoint has no training budget history: new diagnostic "
               "counters start at this resume; the existing episode schedule is preserved.", flush=True)
 
-    calibration_episodes = tuple(calibration_warmup or ())
-    if calibration_episodes:
-        if resuming or budget.attempted:
-            raise ValueError("Cannot add calibration episodes to a restored policy-gradient learner")
-        if any(not episode.path for episode in calibration_episodes):
-            raise ValueError("Reward calibration requires completed episodes")
-        used = (len(calibration_episodes) if train_count_duplicates
-                else len({episode.terminal_key for episode in calibration_episodes}))
-        if used > budget_target:
-            raise ValueError("Policy-gradient budget does not cover the supplied calibration episodes")
-
     if training_samples is not None:
         training_samples.start(
             budget.counted, history_complete=budget_history_complete,
             session_id=checkpoint_cfg.get("training_sample_session_id") if checkpoint_cfg else None,
         )
     metrics: List[dict] = []
-    for index, episode in enumerate(calibration_episodes, start=1):
-        counted = budget.record(episode.terminal_key)
-        row = {
-            "phase": "reward_calibration",
-            "episode": index,
-            "terminal_reward": float(episode.path[-1].reward),
-            "terminal_comp_key": str(episode.terminal_key),
-            "budget_counted": counted,
-            "training_budget_history_complete": budget_history_complete,
-            **budget.snapshot(),
-            **_episode_timing_row(episode),
-        }
-        metrics.append(row)
-        _record_episode_timing(timer, row)
-        if training_samples is not None:
-            training_samples.record(episode, row)
     budget_start = budget.counted
 
     evaluator = EpisodeBatchEvaluator(

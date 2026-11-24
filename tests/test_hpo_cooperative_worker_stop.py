@@ -57,6 +57,21 @@ def test_zero_pending_or_terminal_budget_does_not_interrupt_finalization(changes
         checkpoint_committed(checkpoint(**changes))
 
 
+def test_settled_calibration_stops_with_unspent_training_budget(tmp_path):
+    target = tmp_path / "calibration_checkpoint.pt"
+    state = checkpoint(attempts_started=0, unique_evaluated=0)
+    state.update(type="reward_calibration", accounting="outside_training_budget", attempts=1)
+    with cooperative_worker_stop():
+        signal.raise_signal(signal.SIGTERM)
+        checkpoint_committed({**state, "attempts": 0})
+        with pytest.raises(SystemExit) as stopped:
+            training._save_checkpoint(str(target), state)
+    assert stopped.value.code == 128 + signal.SIGTERM
+    saved = torch.load(target, map_location="cpu", weights_only=False)
+    assert saved["attempts"] == 1
+    assert saved["hpo_state"]["budget"]["attempts_started"] == 0
+
+
 @pytest.mark.parametrize("first_signal", [signal.SIGINT, signal.SIGTERM])
 def test_later_worker_sigint_forces_exit_without_checkpoint(first_signal):
     with pytest.raises(SystemExit) as stopped:

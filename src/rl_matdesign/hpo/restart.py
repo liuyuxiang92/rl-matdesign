@@ -13,7 +13,8 @@ import json
 from pathlib import Path
 
 from .artifacts import (
-    CALIBRATION_CHECKPOINT, REWARD_CALIBRATION, digest, file_digest, read_json,
+    CALIBRATION_CHECKPOINT, REWARD_CALIBRATION, REWARD_CALIBRATION_BUDGET,
+    digest, file_digest, read_json,
     resumable_checkpoint, reward_calibration_requested,
 )
 
@@ -95,24 +96,30 @@ def _validate_final_models(directory, method, result=None):
 
 
 def _validate_pilot_checkpoint(directory, saved, ledger, identities):
-    """A settled pilot has trajectories and the oracle ledger before model setup."""
-    _require_fields(saved, ("execution_contract", "total_budget", "attempts", "evaluations",
+    """Pilot work is durable while training accounting remains unspent."""
+    _require_fields(saved, ("execution_contract", "total_budget", "num_candidates", "attempts", "evaluations",
                             "misses", "entries", "evaluation_log_size"), "Calibration checkpoint")
     if saved.get("type") != "reward_calibration" or saved["total_budget"] != ledger["target_unique"]:
         raise ValueError("Calibration checkpoint type or training allowance differs from the ledger")
+    if saved.get("accounting") != "outside_training_budget":
+        raise ValueError("Calibration checkpoint does not use separate pilot accounting")
+    if identities or any(ledger[key] for key in (
+            "attempts_started", "unique_evaluated", "pending", "failed_attempts", "preparation_only_attempts")):
+        raise ValueError("Calibration checkpoint requires an unspent training ledger and empty candidate archive")
     counters = [saved[key] for key in ("attempts", "evaluations", "misses", "evaluation_log_size")]
     if any(type(value) is not int or value < 0 for value in counters):
         raise ValueError("Calibration checkpoint counters must be nonnegative integers")
-    if (saved["attempts"] != ledger["attempts_started"] or
-            not len(identities) <= saved["evaluations"] <= saved["attempts"] or
-            saved["misses"] > saved["attempts"]):
-        raise ValueError("Calibration checkpoint counters differ from synchronized HPO accounting")
+    needed = saved["num_candidates"]
+    if type(needed) is not int or needed < 1 or saved["attempts"] < 1:
+        raise ValueError("Calibration checkpoint requires a positive pilot target and settled attempts")
 
     from ..utils.candidate_records import candidate_identity
 
     entries = saved["entries"]
-    if not isinstance(entries, list) or len(entries) != len(identities):
-        raise ValueError("Calibration checkpoint trajectories differ from candidate archive count")
+    if (not isinstance(entries, list) or len(entries) > needed
+            or not len(entries) <= saved["evaluations"] <= saved["attempts"]
+            or saved["misses"] > saved["attempts"]):
+        raise ValueError("Calibration checkpoint counters differ from its pilot trajectories")
     entry_keys, observation_keys = set(), set()
     for entry in entries:
         if not isinstance(entry, (list, tuple)) or len(entry) != 2:
@@ -126,8 +133,17 @@ def _validate_pilot_checkpoint(directory, saved, ledger, identities):
             raise ValueError("Calibration checkpoint needs distinct physical observations")
         observation_keys.add(key)
         entry_keys.add(candidate_identity(episode.terminal_key))
-    if entry_keys != identities:
-        raise ValueError("Calibration checkpoint trajectories differ from candidate archive identities")
+    if len(entry_keys) != len(entries):
+        raise ValueError("Calibration checkpoint requires distinct candidate trajectories")
+    if saved.get("frozen") is not None and len(entries) != needed:
+        raise ValueError("Frozen calibration checkpoint has not reached its pilot target")
+    pilot_budget = _read(directory / REWARD_CALIBRATION_BUDGET)
+    expected = {"schema_version": 1, "accounting": "outside_training_budget",
+                "target_candidates": needed, "valid_candidates": len(entries),
+                "attempts_started": saved["attempts"], "evaluations": saved["evaluations"],
+                "status": "COMPLETED" if saved.get("frozen") is not None else "RUNNING"}
+    if any(pilot_budget.get(key) != value for key, value in expected.items()):
+        raise ValueError("Calibration budget report differs from the last settled checkpoint")
     evaluation_log = directory / "evaluations.jsonl"
     if not evaluation_log.is_file() or evaluation_log.stat().st_size != saved["evaluation_log_size"]:
         raise ValueError("Evaluation log differs from the last settled calibration checkpoint")
@@ -287,7 +303,8 @@ def _inspect_job(directory, method):
                 if ledger["phase"] == "train":
                     _validate_final_models(directory, method)
             row.update(classification="RECOVERABLE_TERMINAL", reason="Terminal candidate artifacts can be finalized without new sampling")
-        elif not ledger["attempts_started"]:
+        elif not ledger["attempts_started"] and not (
+                ledger["phase"] == "train" and (directory / CALIBRATION_CHECKPOINT).is_file()):
             raise ValueError("Initialized accounting has zero consumed attempts; inspect the initialization failure (no automatic reset)")
         else:
             _validate_checkpoint(directory, ledger, identities, method)

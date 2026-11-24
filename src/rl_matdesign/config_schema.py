@@ -137,7 +137,7 @@ PARAMETERS: dict[str, Parameter] = {
     "hpo_target_unique": Parameter(int, None, "HPO target successfully evaluated distinct candidates.", minimum=1, nullable=True),
     "hpo_ratio_limit": Parameter(float, 1.5, "Strict HPO attempts/unique upper bound.", minimum=1, exclusive_minimum=True),
     "train_count_duplicates": Parameter(bool, False, "Count repeated terminal candidates toward training budgets."),
-    "train_budget": Parameter(int, None, "Total paid training candidates; derives algorithm episode limits when set.", minimum=1, nullable=True),
+    "train_budget": Parameter(int, None, "Training candidates including DQN warmup, excluding the separate 100-candidate PopArt calibration pilot; derives algorithm episode limits when set.", minimum=1, nullable=True),
     "train_max_duplicate_attempts": Parameter(int, 1000, "Maximum consecutive duplicates in a unique-candidate budget.", minimum=1),
     "gamma": Parameter(float, 0.9, "Discount factor used by DQN, REINFORCE and A2C.", minimum=0, maximum=1),
     "dqn_hidden_dim": Parameter(int, 256, "DQN hidden-layer width.", minimum=1),

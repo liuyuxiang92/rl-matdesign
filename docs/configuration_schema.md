@@ -137,6 +137,13 @@ according to `train_count_duplicates`. DQN spends `dqn_warmup_eps` from that
 budget and derives its remaining `dqn_num_train_eps`. Policy-gradient training
 derives `pg_num_iters = ceil(train_budget / pg_batch_eps)` and uses an exact final
 remainder batch. Its descriptor-only scaler warmup is outside paid training.
+With `value_normalization: popart`, the 100-candidate reward-calibration phase
+precedes training and is additional overhead for every method. Its candidates
+are not injected into DQN warmup, replay or the training seen-candidate set.
+DQN warmup has no calibration-imposed minimum of 100. Fresh DQN training requires
+at least one warmup candidate to fit its state scaler; the configured warmup plus
+online training consumes `train_budget`, while A2C spends that budget on policy
+samples. `reward_calibration_budget.json` records calibration overhead separately.
 The default `null` keeps legacy algorithm-specific limits. Warmup above the shared
 budget or contradictory explicitly authored totals are errors; remove redundant
 totals instead of maintaining two versions of the same budget.
@@ -175,7 +182,7 @@ parameter definitions. A test checks it for drift.
 | `hpo_target_unique` | int | None | >= 1 | HPO target successfully evaluated distinct candidates. |
 | `hpo_ratio_limit` | float | 1.5 | > 1 | Strict HPO attempts/unique upper bound. |
 | `train_count_duplicates` | bool | False | — | Count repeated terminal candidates toward training budgets. |
-| `train_budget` | int | None | >= 1 | Total paid training candidates; derives algorithm episode limits when set. |
+| `train_budget` | int | None | >= 1 | Training candidates including DQN warmup, excluding the separate 100-candidate PopArt calibration pilot; derives algorithm episode limits when set. |
 | `train_max_duplicate_attempts` | int | 1000 | >= 1 | Maximum consecutive duplicates in a unique-candidate budget. |
 | `gamma` | float | 0.9 | >= 0; <= 1 | Discount factor used by DQN, REINFORCE and A2C. |
 | `dqn_hidden_dim` | int | 256 | >= 1 | DQN hidden-layer width. |

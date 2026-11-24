@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from rl_matdesign.hpo.artifacts import atomic_json
+from rl_matdesign.hpo.artifacts import REWARD_CALIBRATION_BUDGET, atomic_json
 from rl_matdesign.hpo.cli import main
 from rl_matdesign.hpo.reporting import export_reports
 
@@ -90,3 +90,30 @@ def test_reports_empty_campaign_are_valid(tmp_path):
     assert result["physical_cost"]["train"]["jobs"] == 0
     assert result["physical_cost"]["train"]["wall_seconds"] == 0
     assert json.loads((tmp_path / "selection.json").read_text()) == result
+
+
+def test_calibration_cost_is_separate_including_interrupted_pilot(tmp_path):
+    job = {"job_id": "trained", "phase": "train", "status": "COMPLETED", "budget": 10,
+           "seed": 11, "parameters": {}, "eligible_for_selection": True, "score": .8,
+           "ledger": {"attempts_started": 12, "unique_evaluated": 10}, "wall_seconds": 3.5}
+    atomic_json(tmp_path / "jobs/trained/result.json", job)
+    completed_pilot = {"schema_version": 1, "accounting": "outside_training_budget", "target_candidates": 100,
+                       "valid_candidates": 100, "attempts_started": 102, "evaluations": 101, "status": "COMPLETED"}
+    atomic_json(tmp_path / "jobs/trained" / REWARD_CALIBRATION_BUDGET, completed_pilot)
+    atomic_json(tmp_path / "jobs/interrupted" / REWARD_CALIBRATION_BUDGET, {
+        **completed_pilot, "valid_candidates": 3, "attempts_started": 5, "evaluations": 4, "status": "RUNNING"})
+    atomic_json(tmp_path / "jobs/interrupted/candidate_budget.json", {
+        "phase": "train", "attempts_started": 0, "unique_evaluated": 0, "status": "INTERRUPTED"})
+    for label in ("ranges", "search"):
+        atomic_json(tmp_path / f"measurements/{label}.json", {"seed_results": [job]})
+    result = export_reports(tmp_path)
+    train = result["physical_cost"]["train"]
+    assert train["attempts_started"] == 12 and train["unique_evaluated"] == 10
+    assert train["known_wall_seconds"] == 3.5 and train["wall_seconds"] is None
+    pilot = result["physical_cost"]["calibration"]
+    assert pilot["jobs"] == 2 and pilot["unfinished_jobs"] == 1
+    assert pilot["attempts_started"] == 107 and pilot["evaluations"] == 105
+    assert pilot["valid_candidates"] == 103
+    with (tmp_path / "trials.csv").open() as stream:
+        row = next(csv.DictReader(stream))
+    assert int(row["unique_evaluated"]) == 10 and int(row["calibration_valid_candidates"]) == 100
