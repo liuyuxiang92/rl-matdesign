@@ -147,6 +147,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Select raw rewards (none) or automatic property calibration and PopArt (popart).")
     p.add_argument("--value-normalization-profile", choices=["popart_v1"], default=None,
                    help="Select the versioned value normalization recipe.")
+    p.add_argument("--gradient-clipping", choices=["none", "clipping"], default=None,
+                   help="Adaptive gradient clipping initialized from the separate 100-candidate pilot; none disables it.")
     p.add_argument("--load-reward-calibration", help="Load a compatible frozen reward calibration JSON.")
     args = p.parse_args(argv)
     if not args.out and not args.validate_config:
@@ -202,7 +204,7 @@ def _run_experiment(resources: ExitStack) -> None:
         "method", "eval_seed", "train_seed", "gen_seed", "dqn_loss", "train_budget",
         "dqn_augment_permutations", "dqn_target_mode", "max_gen_attempts",
         "train_count_duplicates", "train_max_duplicate_attempts",
-        "value_normalization", "value_normalization_profile",
+        "value_normalization", "value_normalization_profile", "gradient_clipping",
     )
     resolved = resolve_config(raw_cfg, {key: getattr(args, key) for key in override_keys})
     cfg = resolved.config
@@ -336,19 +338,22 @@ def _run_experiment(resources: ExitStack) -> None:
     warmup_eps = int(cfg["dqn_warmup_eps"])
     train_total = (warmup_eps + int(cfg["dqn_num_train_eps"]) if method == "dqn"
                    else cfg["train_budget"] or cfg["pg_num_iters"] * cfg["pg_batch_eps"])
+    gradient_calibration_episodes = None
     with phases("calibration"):
-        if getattr(predictor, "reward_calibration_enabled", False):
-            prepare_reward_calibration(
+        calibration_enabled = getattr(predictor, "reward_calibration_enabled", False)
+        if calibration_enabled or cfg["gradient_clipping"] == "clipping":
+            gradient_calibration_episodes = prepare_reward_calibration(
                 env=env, predictor=predictor, out=args.out, contract=run_contract,
                 total_budget=train_total, attempt_limit=train_max_duplicate_attempts,
                 only_generate=args.only_generate, resume_learner=resume_learner,
                 resume_pilot=resume_pilot, load_path=args.load_reward_calibration,
+                gradient_clipping=cfg["gradient_clipping"],
             )
-            calibration = predictor.reward_calibration_state_dict()
-            run_contract["evaluation"]["reward_calibration"] = calibration["content_hash"]
-        else:
-            if args.load_reward_calibration or resume_pilot:
-                raise ValueError("The configured predictor has no reward calibration")
+            if calibration_enabled:
+                calibration = predictor.reward_calibration_state_dict()
+                run_contract["evaluation"]["reward_calibration"] = calibration["content_hash"]
+        elif args.load_reward_calibration or resume_pilot:
+            raise ValueError("The configured predictor has no reward calibration")
     env.evaluation_contract = run_contract["evaluation"]
     with (manifest_path.parent / "execution_contract.json").open("w") as stream:
         json.dump(run_contract, stream, indent=2, allow_nan=False)
@@ -533,6 +538,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     "qnet": qnet,
                     "target_net": target_net,
                     "optimizer": optimizer,
+                    "gradient_clipping_state": _mid.get("gradient_clipping_state") if _mid else None,
                     "buffer": buffer,
                     "start_ep": start_ep,
                     "eps": eps_val,
@@ -581,6 +587,8 @@ def _run_experiment(resources: ExitStack) -> None:
                     train_count_duplicates=train_count_duplicates,
                     train_max_duplicate_attempts=train_max_duplicate_attempts,
                     dqn_target_mode=cfg["dqn_target_mode"],
+                    gradient_clipping=cfg["gradient_clipping"],
+                    gradient_calibration_episodes=gradient_calibration_episodes,
                     **model_normalization,
                 )
             # DQN's warmup runs inside train_dqn_online, so split it back out of
@@ -713,6 +721,7 @@ def _run_experiment(resources: ExitStack) -> None:
                 "freq": args.save_checkpoint_freq,
                 "start_episode": _mid_ckpt["episodes_completed"] if _mid_ckpt else 0,
                 "opt_actor_state": _mid_ckpt.get("opt_actor_state") if _mid_ckpt else None,
+                "gradient_clipping_state": _mid_ckpt.get("gradient_clipping_state") if _mid_ckpt else None,
                 "opt_critic_state": _mid_ckpt.get("opt_critic_state") if _mid_ckpt else None,
                 "visit_counts": _mid_ckpt.get("visit_counts") if _mid_ckpt else None,
                 "entropy_coef_eff": _mid_ckpt.get("entropy_coef_eff") if _mid_ckpt else None,
@@ -768,6 +777,8 @@ def _run_experiment(resources: ExitStack) -> None:
                     rl_method=method,
                     pg_repeat_penalty_coef=pg_repeat_penalty_coef,
                     pg_repeat_penalty_shape=pg_repeat_penalty_shape,
+                    gradient_clipping=cfg["gradient_clipping"],
+                    gradient_calibration_episodes=gradient_calibration_episodes,
                     checkpoint_cfg=checkpoint_cfg,
                     timer=predictor,
                     training_samples=training_samples,

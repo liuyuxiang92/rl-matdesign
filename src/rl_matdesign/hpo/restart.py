@@ -150,7 +150,11 @@ def _validate_pilot_checkpoint(directory, saved, ledger, identities):
     artifact_path = directory / REWARD_CALIBRATION
     if artifact_path.exists():
         artifact = _read(artifact_path)
-        frozen = _mapping(saved.get("frozen"), "Frozen calibration checkpoint state")
+        # Gradient-only pilots may use an already frozen scientific reward
+        # while their independent 100-trajectory collection is still RUNNING.
+        # The completion marker must not masquerade as scientific calibration.
+        field = "loaded_reward_calibration" if saved.get("purpose") == "gradient_clipping" else "frozen"
+        frozen = _mapping(saved.get(field), "Frozen calibration checkpoint state")
         hashed = digest({key: value for key, value in frozen.items() if key != "content_hash"})
         if artifact != frozen or hashed != frozen.get("content_hash"):
             raise ValueError("Frozen reward calibration differs from the synchronized checkpoint")

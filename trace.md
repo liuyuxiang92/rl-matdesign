@@ -3034,3 +3034,22 @@ Separate the frozen scientific reward from the adaptive learning scale. Bind the
 - Added reward_calibration_budget.json for independent attempt/evaluation costs. HPO reporting includes calibration separately; zero-training-attempt pilots can stop/resume. Both direct resume and HPO restart reject report/checkpoint disagreements, preserving failed-write evidence. Execution contracts explicitly name outside_training_budget accounting; old runs require their archived protocol or fresh output directories.
 - Validation: 442 distinct targeted tests passed across calibration, learner budgets, HPO, schema, PopArt, exact resume and reproducibility. The initial broader run found one stale generated documentation row; corrected it and reran that check successfully. Final resume/report guard passed its two corruption tests and both DQN-MC pilot interruption checkpoints. No scientific production training ran.
 - Reflect: updated decision-step1-calibration-lifecycle-001 in place, replacing its obsolete pilot reuse/accounting rule. Generalized the budget separation across learner entry points, HPO ranges, archives, cooperative shutdown, restart auditing and physical-cost reporting. Saved a local checkpoint; no commit, merge or push performed.
+
+### 2026-11-24 — Pilot-initialized adaptive gradient clipping
+<!-- concepts: adaptive-gradient-clipping, calibration, exact-resume -->
+- Implemented the user's single gradient_clipping setting: none preserves existing updates; clipping uses independent adaptive controllers for online Q, actor and critic. No fixed-threshold option or public percentile/window parameters. Remain on codex/step1-normalization in its existing worktree.
+- Reuse the same 100 distinct reward-calibration trajectories for gradient probes; raw rewards collect one separate diagnostic pilot without changing rewards. Fixed disposable network copies perform forward/backward only, with pooled copy-only PopArt coordinates and pilot-wide actor standardization. Live weights, normalizers, gradients and RNG are preserved. Pilot trajectories never enter replay or training sample exports and never charge RL/HPO candidate budgets; overhead is reported separately.
+- Startup cap is the 90th percentile of positive pilot norms. After 20 positive observations in the previous 200 successful updates, adapt from their raw pre-clipping norms. The current gradient cannot set its own threshold except the documented unresolved all-zero startup fallback. Clip before Adam; commit history after finite optimizer results. Validate both A2C gradient paths before either optimizer step. Save controller/profile state for exact resume and expose clipping/startup-source/update-norm diagnostics.
+- Validation: 528 distinct focused tests passed: 60 controller/probe, 64 pilot/restart, 216 config/schema/runtime contract, 9 clipping runner integration, 91 value/budget/capture, 7 existing reproducibility, 14 trainer wiring and 67 downstream CLI/export/cooperative-stop/checkpoint tests. Resume is bit-exact for MC, bootstrap and A2C with raw and PopArt targets. Two earlier calibration resume failures were concurrent source-fingerprint changes; all 13 original calibration tests passed after source freeze. Compilation and diff checks pass. No real scientific model or GPU performance run was performed.
+- Reflect: added decision-gradient-clipping-001, updated the raw-mode exception in decision-step1-calibration-lifecycle-001, and reused the existing freeze-source validation pattern. Saved a checkpoint with the implementation and validation state. Changes remain uncommitted; no merge or push.
+
+
+### EARS — Session Start (2026-11-25 11:18)
+<!-- concepts: adaptive-gradient-clipping, git-publication, worktree-isolation -->
+- Task: Commit and push the completed adaptive clipping changes on codex/step1-normalization, as requested by the user.
+- Why: Publish the verified generalization work while preserving the calibration-only 100-candidate pilot and existing branch.
+
+
+### 2026-11-25 — Publication reflection
+<!-- concepts: adaptive-gradient-clipping, git-publication, worktree-isolation -->
+The user requests publication of the completed clipping work on the existing branch. Prior validation covers 528 unique passing tests; no implementation changed in this publication turn. The existing decision-gradient-clipping-001 records the architecture and isolation rules, so reflection adds no duplicate memory. Preserve the unrelated local launcher, older checkpoint and historical trace edits.

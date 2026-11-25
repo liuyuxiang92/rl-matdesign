@@ -241,7 +241,9 @@ The counters are saved at settled calibration checkpoints. Loading an existing
 compatible calibration artifact skips new calibration sampling.
 
 With `value_normalization: none` (the default when omitted), training uses the
-configured raw reward, skips the pilot, and learns values in raw reward units.
+configured raw reward and learns values in raw reward units. It skips calibration
+sampling unless `gradient_clipping: clipping` requests the evaluation-only pilot
+described below.
 A passing 1500 K GlassNet candidate earns 1500. A gate failure starts at
 `failure.reward` and subtracts the weighted violations in native units.
 In the oxide example a predicted sintering temperature of 850 earns −850.
@@ -268,6 +270,53 @@ DQN or A2C under the shared `value_normalization_profile: popart_v1`. PopArt
 adapts to the learning targets after the scientific reward is computed.
 See the [Step 1 design](reusable_training_step1_plan.md) for the scale rules,
 failed-candidate examples and experiment comparisons.
+
+### Gradient clipping
+
+There is one public clipping setting, in YAML or as `--gradient-clipping`:
+
+```yaml
+gradient_clipping: clipping   # choices: none, clipping; default: none
+```
+
+`none` retains the existing training behavior without gradient clipping. It does
+not introduce another calibration phase. `clipping` enables adaptive global L2
+gradient clipping for DQN-MC, DQN-bootstrap and policy-gradient learning. DQN clips
+the online Q-network; A2C clips its actor and critic separately. Target networks
+receive model copies and have no gradient-clipping controller.
+
+The initial cap is measured from gradients evaluated on 100 distinct, successfully
+scored pilot candidates. With PopArt, these are the same candidates used for reward
+calibration, so enabling clipping does not request a second 100-candidate pilot.
+With raw rewards, the pilot keeps the configured scientific reward unchanged.
+Gradient evaluation performs forward/backward calculations without an optimizer
+step. The pilot does not train the RL networks, populate replay or training sample
+files, or spend the training/generation allowance. Its evaluation and computation
+cost are real overhead and must be reported separately. `gradient_calibration.json`
+records the per-network pilot norms, initial caps, resolved profile, target
+statistics and zero optimizer updates.
+
+The `adaptive_grad_clip_v1` recipe sets each network's initial cap to the 90th
+percentile of its positive pilot gradient norms. Each norm comes from the mean
+loss over one candidate trajectory on an unchanged disposable network copy.
+PopArt coordinates on that copy are updated once using all pilot targets; the
+live learner is untouched. Actor advantages use one pilot-wide standardization.
+
+After calibration, each network keeps its own initial cap until its last 200
+successful learning updates contain at least 20 positive gradient norms. It then
+uses the 90th percentile of those positive, unclipped norms. A gradient does not
+set its own adaptive threshold: only prior successful updates determine the cap.
+These percentile, window and startup rules are versioned implementation settings;
+there are no fixed-threshold, percentile or window options in scenario YAML. An
+all-zero pilot is recorded as unresolved and the first later positive gradient
+can establish a provisional cap without fabricating a fixed numerical threshold.
+
+Clipping occurs after backpropagation and before Adam. It limits the gradient
+norm supplied to Adam, not the optimizer's resulting parameter displacement.
+Q, actor and critic histories and their profile are saved in learner checkpoints.
+Exact resume restores them instead of recalibrating; generation does not update
+them. A frozen reward-calibration JSON alone does not contain the scored
+trajectories needed to evaluate initial gradients.
 
 ## Running and validation
 

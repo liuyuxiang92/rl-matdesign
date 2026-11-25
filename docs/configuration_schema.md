@@ -140,6 +140,14 @@ remainder batch. Its descriptor-only scaler warmup is outside paid training.
 With `value_normalization: popart`, the 100-candidate reward-calibration phase
 precedes training and is additional overhead for every method. Its candidates
 are not injected into DQN warmup, replay or the training seen-candidate set.
+`gradient_clipping: clipping` uses these same 100 candidates to estimate initial
+gradient caps without optimizer updates. With raw rewards it collects a separate
+100-candidate calibration pilot instead. Both uses remain outside the training
+allowance. The default `gradient_clipping: none` leaves the existing unclipped
+training path unchanged; no fixed threshold or numerical clipping controls are
+public configuration fields. Adaptive controllers keep separate Q/actor/critic
+histories, which participate in exact resume together with the resolved internal
+profile. See [gradient clipping](yaml_config_reference.md#gradient-clipping).
 DQN warmup has no calibration-imposed minimum of 100. Fresh DQN training requires
 at least one warmup candidate to fit its state scaler; the configured warmup plus
 online training consumes `train_budget`, while A2C spends that budget on policy
@@ -173,6 +181,7 @@ parameter definitions. A test checks it for drift.
 | `method` | str | 'a2c' | dqn, reinforce, a2c | Training algorithm; inactive algorithm settings are retained. |
 | `value_normalization` | str | 'none' | none, popart | Use raw RL rewards, or automatic reward calibration and PopArt value targets for DQN and A2C. |
 | `value_normalization_profile` | str | 'popart_v1' | popart_v1 | Versioned PopArt settings shared by DQN and A2C. |
+| `gradient_clipping` | str | 'none' | none, clipping | Disable clipping, or adapt the gradient norm cap from an evaluation-only 100-candidate pilot and subsequent learning gradients. |
 | `eval_seed` | int | 0 | >= 0; <= 4294967295 | Random seed for property evaluation and structure sampling. |
 | `train_seed` | int | eval_seed | >= 0; <= 4294967295 | Training random seed. |
 | `gen_seed` | int | eval_seed | >= 0; <= 4294967295 | Candidate-generation random seed. |
@@ -182,7 +191,7 @@ parameter definitions. A test checks it for drift.
 | `hpo_target_unique` | int | None | >= 1 | HPO target successfully evaluated distinct candidates. |
 | `hpo_ratio_limit` | float | 1.5 | > 1 | Strict HPO attempts/unique upper bound. |
 | `train_count_duplicates` | bool | False | — | Count repeated terminal candidates toward training budgets. |
-| `train_budget` | int | None | >= 1 | Training candidates including DQN warmup, excluding the separate 100-candidate PopArt calibration pilot; derives algorithm episode limits when set. |
+| `train_budget` | int | None | >= 1 | Training candidates including DQN warmup, excluding the separate 100-candidate reward/gradient calibration pilot; derives algorithm episode limits when set. |
 | `train_max_duplicate_attempts` | int | 1000 | >= 1 | Maximum consecutive duplicates in a unique-candidate budget. |
 | `gamma` | float | 0.9 | >= 0; <= 1 | Discount factor used by DQN, REINFORCE and A2C. |
 | `dqn_hidden_dim` | int | 256 | >= 1 | DQN hidden-layer width. |

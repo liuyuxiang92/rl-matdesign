@@ -1,0 +1,103 @@
+checkpoint_version: 3.0.0
+created_at: '2026-11-24T11:39:05.724510+00:00'
+branch: codex/step1-normalization
+base_commit: 160a7dc8f18887277eee8d9020d0e06f84175d08
+phase:
+  current: implementation_verified
+  completed:
+  - adaptive_controller
+  - pilot_gradient_evaluation
+  - learner_integration
+  - configuration_and_docs
+  - exact_resume
+  - regression_validation
+  - reflection
+  next: []
+state:
+  parameters:
+  - name: gradient_clipping
+    value:
+      default: none
+      choices:
+      - none
+      - clipping
+    source: 'Explicit user request: one public toggle and adaptive clipping only'
+    confidence: high
+  - name: calibration_candidates
+    value: 100
+    source: 'Explicit user request: reuse the same outside-budget mean/spread pilot;
+      no network training'
+    confidence: high
+  - name: internal_profile
+    value:
+      name: adaptive_grad_clip_v1
+      percentile: 90
+      history_window: 200
+      min_positive_history: 20
+    source: Versioned implementation recipe from Step 2 design; not public parameters
+    confidence: high
+  experiments:
+  - name: focused_regression_suites
+    status: completed
+    passed_unique_tests: 528
+    details: 60 controller/probe + 64 pilot/restart + 216 config/schema/runtime +
+      9 clipping integration + 91 value/budget/capture + 7 reproducibility + 14 trainer
+      wiring + 67 downstream integration. All passed; source-fingerprint concurrency
+      failures cleared after freezing source.
+    results_paths:
+    - /tmp/step2-integration.log
+    - /tmp/step2-config-tests.log
+    - /tmp/step2-regression-tests.log
+    - /tmp/step2-downstream-tests.log
+    - /tmp/step2-test-collection.log
+  - name: scientific_or_gpu_performance_run
+    status: not_run
+    reason: Implementation verification used CPU dummy predictors; scientific performance
+      validation is separate.
+  decisions:
+  - decision: Measure initial caps on fixed disposable network copies using exactly
+      100 stored pilot trajectories.
+    rationale: Get target-dependent initial gradient scale without optimizer updates,
+      extra oracle calls or training-budget charges.
+  - decision: Use separate online Q, actor and critic controllers; target Q has no
+      optimizer or controller.
+    rationale: Different losses and parameter groups have different gradient scales.
+  - decision: Persist controller state and complete profile in training resume contracts.
+    rationale: A resumed run must retain the same startup threshold and prior-successful-update
+      history without recalibration.
+  - decision: Keep existing actor normalization, losses, rewards, exploration and
+      PopArt floors unchanged.
+    rationale: This task authorizes gradient clipping as the first Step 2 change only.
+  worktree: /Users/liuyuxiang/Dropbox/Macbook_air/aisi/shanghai/reinforcement_learning/rl-matdesign/.worktrees/step1-normalization
+  changes_committed: false
+  preserved_preexisting_changes:
+  - trace.md prior entries
+  - .Codex/checkpoints/codex-step1-normalization-20261120.yaml
+  - scripts/run_step1_replicates.sh
+blockers: []
+artifacts:
+- path: src/rl_matdesign/gradient_clipping.py
+  role: Adaptive controller, global norm, checkpoint validation
+- path: src/rl_matdesign/gradient_calibration.py
+  role: Isolated pilot gradient diagnostics and initial cap report
+- path: src/rl_matdesign/calibration_run.py
+  role: 100-trajectory pilot collection/reuse and independent accounting
+- path: src/rl_matdesign/training.py
+  role: MC/bootstrap/PG clipping and exact-resume histories
+- path: docs/yaml_config_reference.md
+  role: Public toggle and internal protocol documentation
+resume_instructions:
+- Use the named .worktrees/step1-normalization worktree, not the unrelated outer checkout.
+  Confirm git branch --show-current equals codex/step1-normalization.
+- Review git diff and the new gradient modules/tests; preserve the existing replicate
+  launcher, trace history and older checkpoint.
+- 'Enable with gradient_clipping: clipping or --gradient-clipping clipping; omit it
+  or use none for the previous update path.'
+- Start a fresh output directory for the new learning protocol. Exact continuation
+  uses a checkpoint produced by the same code, mode and saved adaptive profile.
+- Inspect gradient_calibration.json, reward_calibration_budget.json and the training-log
+  clipping diagnostics. Pilot gradient reports record 100 candidates and zero optimizer
+  updates.
+- No implementation or regression work remains. Repeat tests only for new changes
+  or unresolved concerns; scientific performance comparisons have not been run.
+- No commit, merge or push has been performed for this task.

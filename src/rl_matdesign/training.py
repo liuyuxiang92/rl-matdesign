@@ -494,28 +494,30 @@ def _compute_td_target(
     return float(row["reward"]) + gamma * max_q
 
 
-def _dqn_gradient_step(
+def _dqn_loss_terms(
     qnet: torch.nn.Module,
     batch: list,
     target_net: torch.nn.Module | None,
     s_mat_scaler: StandardScaler,
     elem_feats_scaled: np.ndarray,
     action_values: List[str],
-    optimizer: torch.optim.Optimizer,
     loss_fn: torch.nn.Module,
     device: torch.device,
     gamma: float,
     target_mode: str = "bootstrap",
     target_cache=None,
-    diagnostics: dict | None = None,
-) -> float:
+    update_normalization: bool = True,
+    target_values=None,
+):
     """Fit one minibatch of raw returns in the selected value coordinates.
 
     ``target_mode='bootstrap'`` (default) uses the one-step TD target
     ``r + gamma*max_a' Q_target(s',a')``. ``target_mode='mc'`` regresses to the
     fixed discounted Monte-Carlo return stored on each row (no bootstrap).
     """
-    if target_mode == "mc":
+    if target_values is not None:
+        y = target_values
+    elif target_mode == "mc":
         y = [float(r["mc_return"]) for r in batch]
     else:
         y = [
@@ -547,17 +549,80 @@ def _dqn_gradient_step(
         prediction = qnet(*inputs)
     else:
         raw_targets = torch.tensor(y, dtype=torch.float64, device=device).reshape(-1, 1)
-        targets = qnet.update_value_normalization(raw_targets)
+        targets = (qnet.update_value_normalization(raw_targets) if update_normalization
+                   else normalizer.normalize(raw_targets, dtype=next(qnet.parameters()).dtype))
         prediction = qnet.forward_normalized(*inputs)
     loss = loss_fn(prediction, targets)
+    return loss, prediction, targets, raw_targets if normalizer is not None else targets
+
+
+def _dqn_gradient_step(
+    qnet, batch, target_net, s_mat_scaler, elem_feats_scaled, action_values,
+    optimizer, loss_fn, device, gamma, target_mode="bootstrap", target_cache=None,
+    diagnostics=None, gradient_clipper=None,
+) -> float:
+    loss, prediction, targets, raw_targets = _dqn_loss_terms(
+        qnet, batch, target_net, s_mat_scaler, elem_feats_scaled, action_values,
+        loss_fn, device, gamma, target_mode=target_mode, target_cache=target_cache,
+    )
     optimizer.zero_grad(set_to_none=True)
+    if gradient_clipper is not None:
+        _require_finite_loss(loss)
     loss.backward()
+    clip_info = None
+    before = None
+    if gradient_clipper is not None:
+        clip_info = _prepare_gradient_clipping(gradient_clipper, qnet)
+        before = [p.detach().clone() for p in qnet.parameters()]
     optimizer.step()
+    if gradient_clipper is not None:
+        _require_finite_optimizer(qnet, optimizer)
+        gradient_clipper.commit(clip_info)
+        if diagnostics is not None:
+            diagnostics.update(_clip_diagnostics("q", clip_info, qnet, before))
+    normalizer = getattr(qnet, "value_normalizer", None)
     if diagnostics is not None and normalizer is not None:
         raw_error = (normalizer.decode(prediction.detach()) - raw_targets).abs().mean()
         loss_value, diagnostics["value_raw_mae"] = torch.stack((loss.detach(), raw_error)).tolist()
         return loss_value
     return float(loss.item())
+
+
+def _prepare_gradient_clipping(controller, model):
+    from .gradient_clipping import NonfiniteGradientError
+    from .utils.candidate_budget import NumericalTrainingError
+    try:
+        return controller.prepare(model.parameters())
+    except NonfiniteGradientError as exc:
+        raise NumericalTrainingError(str(exc)) from exc
+
+
+def _require_finite_loss(*losses):
+    from .utils.candidate_budget import NumericalTrainingError
+    if any(not torch.isfinite(loss.detach()).all().item() for loss in losses):
+        raise NumericalTrainingError("Nonfinite loss before gradient clipping; incomplete update")
+
+
+def _require_finite_optimizer(model, optimizer):
+    from .utils.candidate_budget import NumericalTrainingError
+    tensors = [p.detach() for p in model.parameters()]
+    tensors += [v for state in optimizer.state.values() for v in state.values()
+                if isinstance(v, torch.Tensor)]
+    if any(not torch.isfinite(v).all().item() for v in tensors):
+        raise NumericalTrainingError("Nonfinite optimizer result; retain the last complete checkpoint")
+
+
+def _clip_diagnostics(prefix, info, model, before):
+    displacement = sum(float((p.detach().double() - old.double()).square().sum().item())
+                       for p, old in zip(model.parameters(), before)) ** .5
+    return {f"{prefix}_grad_norm": info["raw_norm"],
+            f"{prefix}_grad_cap": info["cap"],
+            f"{prefix}_grad_factor": info["coefficient"],
+            f"{prefix}_grad_clipped": int(info["clipped"]),
+            f"{prefix}_grad_history": info["history_count"],
+            f"{prefix}_grad_threshold_source": info["threshold_source"],
+            f"{prefix}_grad_provisional_startup": int(info["provisional_startup"]),
+            f"{prefix}_optimizer_update_norm": displacement}
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +657,8 @@ def train_dqn_online(
     training_samples=None,
     value_normalization: str = "none",
     value_normalization_profile: str = POPART_PROFILE,
+    gradient_clipping: str = "none",
+    gradient_calibration_episodes=None,
 ) -> Tuple[torch.nn.Module, StandardScaler, List[dict]]:
     """Classical online DQN with FIFO replay buffer and TD targets.
 
@@ -641,6 +708,11 @@ def train_dqn_online(
     if resume_state is None and n_warmup_eps < 1:
         raise ValueError("Fresh DQN training requires dqn_warmup_eps >= 1 to fit the state scaler")
     from .model import QRegressor
+    if gradient_clipping not in ("none", "clipping"):
+        raise ValueError("gradient_clipping must be none or clipping")
+    if gradient_clipping == "clipping" and resume_state is None:
+        from .gradient_calibration import _pilot
+        _pilot(gradient_calibration_episodes)
 
     budget_state = resume_state.get("training_budget_state") if resume_state else None
     if resume_state is not None and budget_state is None and not train_count_duplicates:
@@ -791,6 +863,25 @@ def train_dqn_online(
         train_attempts = 0
         eps = 1.0
 
+    gradient_clipper = None
+    if gradient_clipping == "clipping":
+        from .gradient_clipping import AdaptiveGradientClipper
+        if resume_state is not None:
+            saved_clip = resume_state.get("gradient_clipping_state")
+            if saved_clip is None:
+                raise ValueError("Exact clipping resume requires gradient_clipping_state")
+            gradient_clipper = AdaptiveGradientClipper.from_state_dict(saved_clip, network="q")
+        else:
+            from .gradient_calibration import calibrate_dqn_gradients, write_gradient_report
+            gradient_clipper, report = calibrate_dqn_gradients(
+                qnet=qnet, target_net=target_net, episodes=gradient_calibration_episodes,
+                scaler=scaler, elem_feats_scaled=elem_feats_scaled, action_values=action_values,
+                loss_fn=loss_fn, device=device, gamma=gamma, target_mode=dqn_target_mode,
+            )
+            write_gradient_report(checkpoint_cfg, report)
+    elif gradient_clipping != "none":
+        raise ValueError("gradient_clipping must be none or clipping")
+
     ckpt_path: Optional[str] = None
     ckpt_freq: int = 0
     if checkpoint_cfg:
@@ -815,6 +906,7 @@ def train_dqn_online(
         recorder.partial_checkpoint_factory = lambda: {
             "type": "dqn", "qnet_state": qnet.state_dict(),
             "target_net_state": target_net.state_dict() if target_net is not None else None, "opt_state": optimizer.state_dict(),
+            "gradient_clipping_state": gradient_clipper.state_dict() if gradient_clipper else None,
             "buffer": list(buffer), "scaler": scaler,
             "training_budget_state": budget.state_dict(),
         }
@@ -887,6 +979,7 @@ def train_dqn_online(
         mean_loss = float("nan")
         optimizer_steps = 0
         fit_diagnostics = {}
+        clip_updates = []
         value_normalizer = getattr(qnet, "value_normalizer", None)
         if len(buffer) >= batch_size:
             buf_list = list(buffer)
@@ -899,8 +992,11 @@ def train_dqn_online(
                     elem_feats_scaled, action_values, optimizer, loss_fn, device, gamma,
                     target_mode=dqn_target_mode,
                     target_cache=target_cache,
-                    diagnostics=fit_diagnostics if value_normalizer is not None else None,
+                    diagnostics=fit_diagnostics if value_normalizer is not None or gradient_clipper else None,
+                    gradient_clipper=gradient_clipper,
                 ))
+                if gradient_clipper is not None:
+                    clip_updates.append(dict(fit_diagnostics))
                 if value_normalizer is not None:
                     raw_errors.append(fit_diagnostics["value_raw_mae"])
             _check_hpo_numerical(env, *losses, models=(qnet,))
@@ -940,8 +1036,20 @@ def train_dqn_online(
             "buffer_rows": len(buffer),
             **_episode_timing_row(episode, update_s),
         }
+        if gradient_clipper is not None and clip_updates:
+            for field in ("q_grad_norm", "q_grad_cap", "q_grad_factor", "q_optimizer_update_norm"):
+                values = [item[field] for item in clip_updates if item[field] is not None]
+                _row[field + "_mean"] = float(np.mean(values)) if values else None
+                _row[field + "_max"] = max(values) if values else None
+            _row["q_grad_clipped_count"] = sum(item["q_grad_clipped"] for item in clip_updates)
+            _row["q_grad_clipped_fraction"] = _row["q_grad_clipped_count"] / len(clip_updates)
+            _row["q_grad_provisional_startup_count"] = sum(
+                item["q_grad_provisional_startup"] for item in clip_updates
+            )
+            _row["q_grad_threshold_source_last"] = clip_updates[-1]["q_grad_threshold_source"]
+            _row["q_grad_history_last"] = clip_updates[-1]["q_grad_history"]
         if value_normalizer is not None:
-            _row.update(fit_diagnostics)
+            _row.update({key: value for key, value in fit_diagnostics.items() if not key.startswith("q_")})
             _row.update(value_normalizer.diagnostics("value_popart"))
             if target_cache is not None:
                 _row.update(target_net.value_normalizer.diagnostics("target_popart"))
@@ -983,6 +1091,7 @@ def train_dqn_online(
                     "qnet_state": qnet.state_dict(),
                     "target_net_state": target_net.state_dict() if target_net is not None else None,
                     "opt_state": optimizer.state_dict(),
+                    "gradient_clipping_state": gradient_clipper.state_dict() if gradient_clipper else None,
                     "buffer": list(buffer),
                     "dqn_buffer_size": dqn_buffer_size,
                     "eps": eps,
@@ -1364,6 +1473,8 @@ def train_pg(
     checkpoint_cfg: Optional[dict] = None,
     timer: Optional[object] = None,
     training_samples=None,
+    gradient_clipping: str = "none",
+    gradient_calibration_episodes=None,
 ) -> List[dict]:
     """Batched REINFORCE / A2C training loop (matches feat/classical-dqn).
 
@@ -1410,6 +1521,11 @@ def train_pg(
         or checkpoint_cfg.get("start_episode", 0)
         or checkpoint_cfg.get("opt_actor_state") is not None
     ))
+    if gradient_clipping not in ("none", "clipping"):
+        raise ValueError("gradient_clipping must be none or clipping")
+    if gradient_clipping == "clipping" and not resuming:
+        from .gradient_calibration import _pilot
+        _pilot(gradient_calibration_episodes)
     if not train_count_duplicates and resuming and budget_state is None:
         raise ValueError(
             "Cannot resume with train_count_duplicates=false: this checkpoint "
@@ -1464,12 +1580,14 @@ def train_pg(
         if opt_critic is not None and checkpoint_cfg.get("opt_critic_state") is not None:
             opt_critic.load_state_dict(checkpoint_cfg["opt_critic_state"])
 
+    gradient_clippers = {}
     recorder = getattr(env, "hpo_recorder", None)
     if recorder is not None:
         recorder.partial_checkpoint_factory = lambda: {
             "type": "pg", "policy_state": policy.state_dict(),
             "value_net_state": value_net.state_dict() if value_net is not None else None,
             "opt_actor_state": opt_actor.state_dict(),
+            "gradient_clipping_state": {name: ctl.state_dict() for name, ctl in gradient_clippers.items()},
             "opt_critic_state": opt_critic.state_dict() if opt_critic is not None else None,
             "scaler": scaler, "training_budget_state": budget.state_dict(),
         }
@@ -1484,6 +1602,27 @@ def train_pg(
     coef_eff = float(pg_entropy_coef)
     if checkpoint_cfg and checkpoint_cfg.get("entropy_coef_eff") is not None:
         coef_eff = float(checkpoint_cfg["entropy_coef_eff"])
+
+    if gradient_clipping == "clipping":
+        from .gradient_clipping import AdaptiveGradientClipper
+        if resuming:
+            saved_clippers = (checkpoint_cfg or {}).get("gradient_clipping_state")
+            expected = {"actor", "critic"} if value_net is not None else {"actor"}
+            if not isinstance(saved_clippers, dict) or set(saved_clippers) != expected:
+                raise ValueError("Exact clipping resume requires actor/critic gradient_clipping_state")
+            gradient_clippers = {name: AdaptiveGradientClipper.from_state_dict(state, network=name)
+                                 for name, state in saved_clippers.items()}
+        else:
+            from .gradient_calibration import calibrate_pg_gradients, write_gradient_report
+            gradient_clippers, report = calibrate_pg_gradients(
+                policy=policy, value_net=value_net, episodes=gradient_calibration_episodes,
+                scaler=scaler, elem_feats_scaled=elem_feats_scaled, action_values=action_values,
+                device=device, gamma=gamma, entropy_coef=pg_entropy_coef,
+                entropy_min=pg_entropy_min,
+            )
+            write_gradient_report(checkpoint_cfg, report)
+    elif gradient_clipping != "none":
+        raise ValueError("gradient_clipping must be none or clipping")
 
     accepted = int(checkpoint_cfg.get("start_episode", 0)) if checkpoint_cfg else 0
     attempted = 0
@@ -1701,19 +1840,50 @@ def train_pg(
                                        pg_entropy_coef, pg_entropy_min)
         total_actor_loss = actor_loss - coef_eff * entropy_bonus
 
-        _check_hpo_numerical(env, total_actor_loss.item())
-        opt_actor.zero_grad(set_to_none=True)
-        total_actor_loss.backward()
-        opt_actor.step()
-
+        clip_diagnostics = {}
         critic_loss_val: float | str = ""
-        if opt_critic is not None and all_critic:
-            critic_loss = torch.stack(all_critic).mean()
-            _check_hpo_numerical(env, critic_loss.item())
-            opt_critic.zero_grad(set_to_none=True)
-            critic_loss.backward()
-            opt_critic.step()
-            critic_loss_val = float(critic_loss.item())
+        if gradient_clippers:
+            # Check both independent gradient paths before either Adam step.
+            critic_loss = torch.stack(all_critic).mean() if opt_critic is not None and all_critic else None
+            _require_finite_loss(total_actor_loss, *([critic_loss] if critic_loss is not None else []))
+            opt_actor.zero_grad(set_to_none=True)
+            if opt_critic is not None:
+                opt_critic.zero_grad(set_to_none=True)
+            total_actor_loss.backward()
+            if critic_loss is not None:
+                critic_loss.backward()
+            actor_info = _prepare_gradient_clipping(gradient_clippers["actor"], policy)
+            actor_before = [p.detach().clone() for p in policy.parameters()]
+            critic_info = (_prepare_gradient_clipping(gradient_clippers["critic"], value_net)
+                           if critic_loss is not None else None)
+            critic_before = ([p.detach().clone() for p in value_net.parameters()]
+                             if critic_info is not None else None)
+            opt_actor.step()
+            if critic_loss is not None:
+                opt_critic.step()
+                critic_loss_val = float(critic_loss.item())
+            _require_finite_optimizer(policy, opt_actor)
+            if critic_loss is not None:
+                _require_finite_optimizer(value_net, opt_critic)
+            gradient_clippers["actor"].commit(actor_info)
+            clip_diagnostics.update(_clip_diagnostics("actor", actor_info, policy, actor_before))
+            if critic_info is not None:
+                gradient_clippers["critic"].commit(critic_info)
+                clip_diagnostics.update(_clip_diagnostics("critic", critic_info, value_net, critic_before))
+        else:
+            _check_hpo_numerical(env, total_actor_loss.item())
+            opt_actor.zero_grad(set_to_none=True)
+            total_actor_loss.backward()
+            opt_actor.step()
+
+            critic_loss_val: float | str = ""
+            if opt_critic is not None and all_critic:
+                critic_loss = torch.stack(all_critic).mean()
+                _check_hpo_numerical(env, critic_loss.item())
+                opt_critic.zero_grad(set_to_none=True)
+                critic_loss.backward()
+                opt_critic.step()
+                critic_loss_val = float(critic_loss.item())
 
         _check_hpo_numerical(env, models=(policy, value_net))
         _sync_training_device(device)
@@ -1765,6 +1935,7 @@ def train_pg(
             **budget.snapshot(),
             "training_budget_history_complete": budget_history_complete,
         }
+        _row.update(clip_diagnostics)
         if value_normalizer is not None:
             _row.update(value_normalizer.diagnostics("value_popart"))
             _row["value_raw_mae"] = float(np.mean(np.abs(all_adv_raw)))
@@ -1806,6 +1977,7 @@ def train_pg(
                     "policy_state": policy.state_dict(),
                     "value_net_state": value_net.state_dict() if value_net is not None else None,
                     "opt_actor_state": opt_actor.state_dict(),
+                    "gradient_clipping_state": {name: ctl.state_dict() for name, ctl in gradient_clippers.items()},
                     "opt_critic_state": opt_critic.state_dict() if opt_critic is not None else None,
                     "visit_counts": dict(visit_counts),
                     "entropy_coef_eff": coef_eff,

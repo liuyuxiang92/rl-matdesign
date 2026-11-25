@@ -600,7 +600,9 @@
     permit resume/stop before the first training attempt. The experiment setting
     value_normalization selects the whole recipe. PopArt mode calibrates weighted-sum
     and gated rewards from exactly 100 distinct valid candidates on a fresh run.
-    Raw mode skips calibration and uses raw learner targets. Preserve raw GlassNet
+    Raw mode skips scientific reward calibration and uses raw learner targets;
+    optional gradient_clipping=clipping still collects its separate diagnostic pilot.
+    Preserve raw GlassNet
     T3 in kelvin on pass and its native-unit CTE/Tg penalties on failure.
   alternatives_considered:
   - Updating scientific scales online would alter objective weights or failure severity
@@ -620,3 +622,40 @@
   - calibration
   - exact-resume
   - scientific-rewards
+
+- id: decision-gradient-clipping-001
+  date: '2026-11-24'
+  expires: '2027-05-24'
+  title: Initialize adaptive clipping from the existing outside-budget pilot
+  choice: >-
+    Keep one public gradient_clipping parameter with none (default) or clipping.
+    Reuse the same 100 distinct, successfully evaluated reward-pilot trajectories
+    to initialize separate Q, actor and critic caps; raw-reward mode collects one
+    diagnostic pilot without changing scientific rewards. Evaluate mean trajectory
+    gradients on fixed disposable network copies with no optimizer steps, replay
+    insertion, training sample export or RL/HPO budget charges. Set startup to the
+    90th percentile of positive pilot norms. Use prior successful raw gradient norms
+    from a 200-update window once it has 20 positive observations. An all-zero pilot
+    waits for the first positive learning gradient to establish a provisional cap.
+    Keep these constants in a versioned internal profile, not public parameters.
+    Preserve live weights, PopArt buffers, gradients and RNG during probes. Save
+    independent controller histories in exact-resume checkpoints and bind the full
+    clipping recipe to the learning execution contract.
+  alternatives_considered:
+  - Fixed threshold configuration or a universal numerical Cstart was explicitly rejected by the user.
+  - Training the disposable copies would measure a changing learner and violate calibration-only intent.
+  - Re-evaluating the 100 candidates duplicates oracle cost; reuse verified trajectories and finalized rewards.
+  trade_off: >-
+    Per-candidate mean-loss gradients estimate startup scale, whereas subsequent
+    updates use actual minibatch gradients. Clipping bounds the norm sent to Adam,
+    not Adam parameter displacement. The pilot remains real overhead reported
+    separately. Dummy validation verifies isolation and resume, not scientific
+    discovery improvements or GPU performance. New actor scaling, exploration,
+    reward changes and additional normalization safeguards remain outside scope.
+  files:
+  - src/rl_matdesign/gradient_clipping.py
+  - src/rl_matdesign/gradient_calibration.py
+  - src/rl_matdesign/calibration_run.py
+  - src/rl_matdesign/training.py
+  - src/rl_matdesign/utils/execution_contract.py
+  tags: [adaptive-gradient-clipping, calibration, exact-resume, training-budgets]

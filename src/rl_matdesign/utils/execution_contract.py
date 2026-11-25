@@ -86,8 +86,15 @@ def execution_contract(config, predictor, manifest_path, device) -> dict:
     adjustable_budgets = {"dqn_num_train_eps", "pg_num_iters"}
     learning = {key: value for key, value in config.items()
                 if key in {"method", "gamma", "train_seed", "train_count_duplicates", "train_max_duplicate_attempts",
-                           "value_normalization", "value_normalization_profile"}
+                           "value_normalization", "value_normalization_profile", "gradient_clipping"}
                 or (key.startswith(active_prefix) and key not in adjustable_budgets)}
+    # Global learning controls need explicit ownership here: adding a parameter
+    # to PARAMETERS alone would otherwise remove it from scientific identity
+    # without including it in the active algorithm's learning identity.
+    learning["gradient_clipping"] = config.get("gradient_clipping", "none")
+    if learning["gradient_clipping"] == "clipping":
+        from ..gradient_clipping import gradient_clipping_profile
+        learning["gradient_clipping_profile"] = gradient_clipping_profile()
     # Saving limits DQN candidate prefetch waves. Changing this frequency
     # changes when the policy is updated relative to subsequent sampling.
     learning["checkpoint_frequency"] = manifest.get("runtime_args", {}).get("save_checkpoint_freq", 0)
