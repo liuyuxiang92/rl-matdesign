@@ -140,12 +140,56 @@ evaluation. Fixed seeds support repeatability within the recorded
 code/input/software/hardware environment;
 they do not guarantee bitwise agreement across different environments.
 
+Each seed field also accepts a YAML list for repeated runs:
+
+```yaml
+eval_seed: 0
+train_seed: [101, 102, 103, 104]
+gen_seed: [201, 202, 203, 204]
+parallel_jobs: 2
+```
+
+This launches four runs, pairing entries by position: `(0, 101, 201)`,
+`(0, 102, 202)`, and so on, with at most two runs active. A scalar is reused
+across all runs. `eval_seed` can also be a list. Every explicit list must be
+nonempty and have the same length; lists are never multiplied together.
+Missing/null `train_seed` or `gen_seed` inherits that run's `eval_seed`.
+`--eval-seed`, `--train-seed`, and `--gen-seed` replace the corresponding YAML
+value before expansion; `--parallel-jobs N` overrides `parallel_jobs` (default 1).
+
+```bash
+rl-matdesign run --config my_config.yaml --out runs/my_repeats
+```
+
+Each child runs in a separate Python process and writes its scalar `config.yaml`,
+`run.log`, checkpoints, and results under
+`runs/my_repeats/run_001_eval_0_train_101_gen_201/`, etc.
+`seed_runs.json` retains every seed's status and return code; a failed or
+infeasible run makes the batch exit nonzero after the other runs finish.
+Use an empty output directory for a new batch. To resume one seed or generate
+from its trained model, pass that child's scalar `config.yaml` and output
+directory with the existing resume/generation flags. Bulk seed-list invocations
+reject artifact-loading flags. A scalar-only config retains the existing output
+layout. The optional `run` word also works with `scripts/run_experiment.py`.
+
+`parallel_jobs` counts independent seed runs, each with its own model and
+predictor memory. It does not assign GPUs; all runs inherit the requested device
+and any predictor-level parallelism. Select a value that fits the available memory.
+
+The [nine full HPO repeat configs](configs/hpo_20seed_training_20261126/README.txt)
+cover A2C, DQN MC, and DQN bootstrap for baseline, Step 1, and Steps 1+2, with
+20 paired training seeds in each file. They include the full domain, predictor,
+reward, and HPO-selected learner settings, ready for `rl-matdesign run`.
+
 Validate and print effective settings before loading a predictor:
 
 ```bash
 python scripts/run_experiment.py --config configs/test_dummy.yaml \
     --method dqn --dqn-target-mode mc --validate-config
 ```
+
+For a seed-list config, `--validate-config` prints all expanded scalar configs
+and the concurrency limit without starting training or creating output directories.
 
 Shared defaults and validation now come from one [configuration contract](docs/configuration_schema.md).
 A single YAML can keep both DQN and A2C settings. Duplicate keys, retired

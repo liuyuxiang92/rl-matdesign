@@ -429,6 +429,63 @@ class ResolvedConfig:
     sources: dict[str, str]
 
 
+@dataclass(frozen=True)
+class ResolvedRunConfigs:
+    """Scalar runs and orchestration settings for one direct-run request."""
+
+    runs: tuple[ResolvedConfig, ...]
+    parallel_jobs: int
+    seed_list_keys: tuple[str, ...]
+
+
+def resolve_run_configs(raw: Mapping, overrides: Mapping | None = None) -> ResolvedRunConfigs:
+    """Expand paired seed lists before resolving each independent experiment.
+
+    Explicit seed lists must be nonempty and have the same length. Scalars
+    broadcast; scalar null training/generation seeds retain the usual fallback
+    to that run's evaluation seed. List elements are non-null uint32 integers.
+    Non-None overrides replace authored values before deciding the run count.
+    ``parallel_jobs`` belongs only to the run request and never enters a scalar
+    scientific configuration or its provenance.
+    """
+    cfg = _mapping(raw, "Configuration")
+    override_values = {} if overrides is None else _mapping(overrides, "Overrides")
+    cli = {key: value for key, value in override_values.items() if value is not None}
+    effective = {**cfg, **cli}
+    parallel_jobs = Parameter(int, 1, "Concurrent independent runs.", minimum=1).normalize(
+        "parallel_jobs", effective.get("parallel_jobs", 1),
+    )
+    seed_list_keys = []
+    lengths = {}
+    for key in ("eval_seed", "train_seed", "gen_seed"):
+        if key not in effective:
+            continue
+        value = effective[key]
+        if isinstance(value, list):
+            if not value:
+                raise ConfigError(f"{key} must be a nonempty seed list")
+            for index, seed in enumerate(value):
+                # The evaluation-seed specification also rejects null elements.
+                PARAMETERS["eval_seed"].normalize(f"{key}[{index}]", seed)
+            seed_list_keys.append(key)
+            lengths[key] = len(value)
+        else:
+            PARAMETERS[key].normalize(key, value)
+    if len(set(lengths.values())) > 1:
+        detail = ", ".join(f"{key}={length}" for key, length in lengths.items())
+        raise ConfigError(f"Seed lists must have the same length; got {detail}. Use a scalar to broadcast.")
+
+    runs = []
+    for index in range(next(iter(lengths.values()), 1)):
+        run_raw = {key: value for key, value in cfg.items() if key != "parallel_jobs"}
+        run_overrides = {key: value for key, value in cli.items() if key != "parallel_jobs"}
+        for key in seed_list_keys:
+            source = run_overrides if key in cli else run_raw
+            source[key] = source[key][index]
+        runs.append(resolve_config(run_raw, run_overrides))
+    return ResolvedRunConfigs(tuple(runs), parallel_jobs, tuple(seed_list_keys))
+
+
 def resolve_config(raw: Mapping, overrides: Mapping | None = None) -> ResolvedConfig:
     """Resolve explicit overrides over YAML, then fill fallbacks/defaults.
 

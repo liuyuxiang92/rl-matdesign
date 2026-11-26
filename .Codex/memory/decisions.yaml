@@ -719,3 +719,32 @@
   - exploration-compatibility
   - hpo-reproduction
   - exact-resume
+
+- id: decision-paired-seed-runs-001
+  date: '2026-11-26'
+  expires: '2027-05-26'
+  title: Direct-run seed lists are paired outside scientific configuration resolution
+  choice: Expand eval_seed, train_seed and gen_seed lists by index in resolve_run_configs, broadcast scalars,
+    and apply scalar CLI overrides before expansion. Require equal nonempty list lengths; null train/gen
+    seeds inherit each evaluation seed. parallel_jobs limits fresh independent subprocesses and never
+    enters scalar scientific config or identity. Preserve scalar CLI behavior and support optional run
+    subcommand.
+  alternatives_considered:
+  - Cartesian-product seeds would turn 20 requested repeats into up to 8000 runs.
+  - Threaded training shares Python, NumPy and Torch RNG state.
+  - Bulk resume or shared artifact paths lack per-seed model identity; use saved child scalar configs
+    instead.
+  trade_off: Fresh batch output must be empty; bulk artifact loading/resume is rejected. Individual seeds
+    retain existing resume support. Each process has independent predictor/model memory and inherits the
+    requested device.
+  files:
+  - src/rl_matdesign/config_schema.py
+  - src/rl_matdesign/experiment.py
+  - src/rl_matdesign/seed_sweep.py
+  - tests/test_run_config_schema.py
+  - tests/test_seed_sweep_cli.py
+  - tests/test_seed_sweep_scheduler.py
+  tags:
+  - seed-repetition
+  - configuration-contracts
+  - process-isolation

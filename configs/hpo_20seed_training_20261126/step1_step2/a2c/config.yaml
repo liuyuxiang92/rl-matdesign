@@ -1,0 +1,173 @@
+# step1_step2_a2c: full standalone training configuration, 20 paired seed runs.
+# Requires the built-in paired seed-list and parallel_jobs runner.
+# parallel_jobs is the maximum simultaneous runs for this YAML; edit for your machine.
+# Historical HPO learner settings, physical gates and budgets are preserved.
+parallel_jobs: 4
+eval_seed: 0
+train_seed:
+- 2026112601
+- 2026112602
+- 2026112603
+- 2026112604
+- 2026112605
+- 2026112606
+- 2026112607
+- 2026112608
+- 2026112609
+- 2026112610
+- 2026112611
+- 2026112612
+- 2026112613
+- 2026112614
+- 2026112615
+- 2026112616
+- 2026112617
+- 2026112618
+- 2026112619
+- 2026112620
+gen_seed:
+- 2026112601
+- 2026112602
+- 2026112603
+- 2026112604
+- 2026112605
+- 2026112606
+- 2026112607
+- 2026112608
+- 2026112609
+- 2026112610
+- 2026112611
+- 2026112612
+- 2026112613
+- 2026112614
+- 2026112615
+- 2026112616
+- 2026112617
+- 2026112618
+- 2026112619
+- 2026112620
+groups:
+- name: glass
+  kind: composition
+  species_set:
+  - SiO2
+  - B2O3
+  - Al2O3
+  - Na2O
+  - K2O
+  - CaO
+  - MgO
+  amount_set:
+    min: 0.0
+    max: 1.0
+    step: 0.02
+  n_steps: 7
+  total: 1
+  unique: true
+  element_bounds:
+    SiO2:
+    - 0.5
+    - 0.85
+    B2O3:
+    - 0.05
+    - 0.25
+    Al2O3:
+    - 0.0
+    - 0.15
+    Na2O:
+    - 0.0
+    - 0.2
+    K2O:
+    - 0.0
+    - 0.1
+    CaO:
+    - 0.0
+    - 0.15
+    MgO:
+    - 0.0
+    - 0.1
+properties:
+- name: forming_temperature
+  predictor: glassnet
+  output: T3
+  unit: K
+  representation: physical
+  direction: min
+  objective: mean
+- name: thermal_expansion
+  predictor: glassnet
+  output: CTEbelowTg
+  unit: K^-1
+  representation: physical
+  direction: min
+  objective: mean
+- name: glass_transition
+  predictor: glassnet
+  output: Tg
+  unit: K
+  representation: physical
+  direction: max
+  objective: mean
+reward:
+  type: gated
+  objective:
+    terms:
+      forming_temperature: 1.0
+  gates:
+  - name: low_expansion
+    score:
+      terms:
+        thermal_expansion: 1.0
+    min: 0.0
+    max: 4.9e-06
+    penalty_weight: 1000000
+  - name: sufficient_transition_temperature
+    score:
+      terms:
+        glass_transition: 1.0
+    min: 838.15
+    penalty_weight: 0.001
+  - name: forming_temperature_protocol_range
+    score:
+      terms:
+        forming_temperature: 1.0
+    min: 0.0
+    max: 2000.0
+    penalty_weight: 0.001
+  failure:
+    reward: -10.0
+gamma: 1.0
+train_count_duplicates: false
+train_max_duplicate_attempts: 9160
+num_gen_eps: 0
+dqn_warmup_eps: 0
+pg_warmup_eps: 100
+pg_batch_eps: 32
+pg_lr_actor: 0.007064884325832442
+pg_lr_critic: 0.0029044829333725775
+train_budget: 916
+method: a2c
+value_normalization: popart
+gradient_clipping: clipping
+value_normalization_profile: popart_v1
+hpo_recording: true
+hpo_resume_generation: false
+hpo_phase: train
+hpo_target_unique: 916
+hpo_ratio_limit: 1.5
+dqn_hidden_dim: 256
+dqn_lr: 0.001
+dqn_buffer_size: 50000
+dqn_batch_size: 256
+dqn_grad_steps_per_ep: 5
+dqn_target_update_freq: 100
+dqn_loss: smoothl1
+dqn_target_mode: bootstrap
+dqn_augment_permutations: 0
+k: 1.0
+max_gen_attempts: 0
+exploration_adaptive: false
+pg_entropy_coef: 0.011154722964812078
+pg_entropy_min: 0.2851091084366486
+pg_repeat_penalty_coef: 0.0
+pg_repeat_penalty_shape: log

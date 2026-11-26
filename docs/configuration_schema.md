@@ -35,6 +35,23 @@ and `pg_warmup_eps` defaults to 200. HPO applies sampled/fixed values before
 materializing defaults.
 
 `train_seed` and `gen_seed` fall back to `eval_seed`. Seeds are integers in `[0, 2**32 - 1]`, compatible with NumPy's seed range.
+The run CLI additionally accepts a nonempty list of those integers in any of the
+three seed fields, and a positive integer `parallel_jobs` (default 1).
+`resolve_run_configs(raw, overrides)` expands these operational settings into
+`ResolvedRunConfigs(runs, parallel_jobs, seed_list_keys)`. Lists must have equal
+length and are paired by index; scalars broadcast and null/missing train/gen
+seeds inherit the corresponding evaluation seed. Scalar CLI overrides apply
+before expansion. `runs` contains ordinary `ResolvedConfig` objects, each with
+scalar seeds and no `parallel_jobs` field. This keeps scheduling out of scientific
+execution identities. `resolve_config` and `validate_config` remain scalar-only
+contracts for individual experiments and HPO jobs.
+
+`rl-matdesign run --config ... --out ...` schedules list entries in independent
+subprocesses, bounded by `parallel_jobs` or `--parallel-jobs`. An explicit
+one-item list still uses a batch output directory. Validation prints every
+expanded run without constructing a predictor or writing outputs. See the
+[seed execution examples](../README.md#seeds) for output paths and per-seed resume.
+
 This naming change does not itself change a predictor's seed-to-structure
 algorithm. Runtime determinism and complete experiment archives are separate
 requirements; configuration resolution alone does not certify repeatability.

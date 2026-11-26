@@ -11,6 +11,26 @@ structure sources, property `source` selectors and `sweep` are removed. They are
 not compatibility interfaces. Update an old scenario explicitly and retrain;
 old artifacts cannot be resumed through a schema rename.
 
+## Repeated seeds
+
+`rl-matdesign run` accepts scalar seeds or lists in `eval_seed`, `train_seed`,
+and `gen_seed`. Lists have equal lengths and pair by position; a scalar is fixed
+for all runs. For example, this adds three training repeats to any full scenario:
+
+```yaml
+eval_seed: 0
+train_seed: [101, 102, 103]
+gen_seed: [101, 102, 103]
+parallel_jobs: 2
+```
+
+At most two independent processes run simultaneously. `parallel_jobs` defaults
+to 1 and can be overridden by `--parallel-jobs`. The correctly spelled evaluation
+field is `eval_seed`. Use 20 entries for 20 runs, without a Cartesian product.
+Keep `eval_seed` fixed when comparing training randomness against the same
+evaluation protocol. Generation seeds have no effect when generation is skipped.
+See [seeds](../README.md#seeds) for validation, output folders, and resume behavior.
+
 ## Chemical groups
 
 ```yaml

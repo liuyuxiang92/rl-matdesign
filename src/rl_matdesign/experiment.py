@@ -49,7 +49,7 @@ from rl_matdesign.configuration import (
     load_config,
 )
 from rl_matdesign.calibration_run import CALIBRATION_ARTIFACT, CALIBRATION_STATE, prepare_reward_calibration
-from rl_matdesign.config_schema import load_yaml_config, resolve_config
+from rl_matdesign.config_schema import load_yaml_config, resolve_run_configs
 from rl_matdesign.utils.provenance import write_run_manifest
 from rl_matdesign.utils.model_contract import load_artifact, save_weights, validate_scaler
 from rl_matdesign.action_features import value_alphabet
@@ -91,6 +91,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Shared paid training-candidate budget, including rewarded warmup.")
     p.add_argument("--gen-seed", type=int, default=None,
                    help="Generation RNG seed; overrides YAML, otherwise falls back to eval_seed.")
+    p.add_argument("--parallel-jobs", type=int, default=None,
+                   help="Maximum simultaneous seed runs; overrides YAML parallel_jobs (default 1).")
     p.add_argument("--device", default=None, help="torch device (default: auto)")
     p.add_argument("--save-checkpoint-freq", type=int, default=0, metavar="N",
                    dest="save_checkpoint_freq",
@@ -150,6 +152,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--gradient-clipping", choices=["none", "clipping"], default=None,
                    help="Adaptive gradient clipping initialized from the separate 100-candidate pilot; none disables it.")
     p.add_argument("--load-reward-calibration", help="Load a compatible frozen reward calibration JSON.")
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "run":
+        argv = argv[1:]
     args = p.parse_args(argv)
     if not args.out and not args.validate_config:
         p.error("--out is required unless --validate-config is used")
@@ -226,12 +231,27 @@ def _run_experiment(resources: ExitStack) -> None:
         "dqn_augment_permutations", "dqn_target_mode", "max_gen_attempts",
         "train_count_duplicates", "train_max_duplicate_attempts",
         "value_normalization", "value_normalization_profile", "gradient_clipping",
+        "parallel_jobs",
     )
-    resolved = resolve_config(raw_cfg, {key: getattr(args, key) for key in override_keys})
-    cfg = resolved.config
+    run_configs = resolve_run_configs(raw_cfg, {key: getattr(args, key) for key in override_keys})
     if args.validate_config:
-        print(json.dumps({"config": cfg, "sources": resolved.sources}, indent=2))
+        if run_configs.seed_list_keys:
+            report = {"run_count": len(run_configs.runs), "parallel_jobs": run_configs.parallel_jobs,
+                      "runs": [{"index": index, "config": run.config, "sources": run.sources}
+                               for index, run in enumerate(run_configs.runs, 1)]}
+        else:
+            resolved = run_configs.runs[0]
+            report = {"config": resolved.config, "sources": resolved.sources}
+        print(json.dumps(report, indent=2))
         return
+    if run_configs.seed_list_keys:
+        from .seed_sweep import run_seed_sweep
+        code = run_seed_sweep(args, run_configs)
+        if code:
+            raise SystemExit(code)
+        return
+    resolved = run_configs.runs[0]
+    cfg = resolved.config
     train_count_duplicates = cfg["train_count_duplicates"]
     train_max_duplicate_attempts = cfg["train_max_duplicate_attempts"]
     TrainingBudget(count_duplicates=train_count_duplicates,

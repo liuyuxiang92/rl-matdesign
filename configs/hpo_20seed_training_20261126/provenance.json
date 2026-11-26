@@ -1,0 +1,532 @@
+{
+  "schema_version": 1,
+  "prepared_date": "2026-11-26",
+  "purpose": "Nine full standalone experiment YAMLs, each expanding to20 paired training runs",
+  "framework_base_commit": "8a9b1304963008739c1458fe9613ffdbf9664281",
+  "requires": "Built-in paired seed-list and parallel_jobs support prepared after the base commit; the base commit alone does not support these lists",
+  "seed_pairing": {
+    "eval_seed": 0,
+    "train_seed": [
+      2026112601,
+      2026112602,
+      2026112603,
+      2026112604,
+      2026112605,
+      2026112606,
+      2026112607,
+      2026112608,
+      2026112609,
+      2026112610,
+      2026112611,
+      2026112612,
+      2026112613,
+      2026112614,
+      2026112615,
+      2026112616,
+      2026112617,
+      2026112618,
+      2026112619,
+      2026112620
+    ],
+    "gen_seed": [
+      2026112601,
+      2026112602,
+      2026112603,
+      2026112604,
+      2026112605,
+      2026112606,
+      2026112607,
+      2026112608,
+      2026112609,
+      2026112610,
+      2026112611,
+      2026112612,
+      2026112613,
+      2026112614,
+      2026112615,
+      2026112616,
+      2026112617,
+      2026112618,
+      2026112619,
+      2026112620
+    ],
+    "list_semantics": "pair by index; scalar eval_seed broadcasts",
+    "parallel_jobs": 4
+  },
+  "differences_from_verified_templates": [
+    "train_seed and gen_seed become paired20-element lists",
+    "parallel_jobs:4 added"
+  ],
+  "preserved": [
+    "full domain and species bounds",
+    "physical property outputs and gates",
+    "historical best HPO learner/exploration values",
+    "training budgets and strict accounting",
+    "baseline forming_temperature.scale=1000",
+    "normalization and clipping arms",
+    "generation disabled"
+  ],
+  "scientific_assets": "GlassPy/GlassNet runtime and its pretrained assets are external, as in the original HPO; no model weights are bundled",
+  "scientific_training_started": false,
+  "configurations": [
+    {
+      "id": "baseline_a2c",
+      "config": "baseline/a2c/config.yaml",
+      "config_sha256": "e41d40642cb67873dcb50683748ab4b6b72d8d2101b5f586ff8266878de35d36",
+      "source_template": "outputs/hpo_20seed_training_20261126/configs/baseline/a2c.yaml",
+      "source_template_sha256": "eae2303690dfb9748bd940055b5377286dcf9f6ab5c305bf2e61e5d6d298011b",
+      "historical_selection": "outputs/hpo_20seed_training_20261126/historical_selections/baseline/a2c_coarse/best_training.yaml",
+      "historical_selection_sha256": "27c50b3a97c241596d3d303f890172272cb04bfde7260189da63966cd55a2065",
+      "source_job": "artifacts/coarse_hpo_comparison_20261116/extracted/a2c_coarse/jobs/829f223ad861a44167908eca",
+      "source_job_config_sha256": "a705eb8e4fafc936804c32e4cff567516c7ad651cfae827970ce284a0743247b",
+      "historical_best_training": {
+        "method": "a2c",
+        "train_budget": 916,
+        "parameters": {
+          "pg_batch_eps": 32,
+          "pg_entropy_coef": 0.03430250729588482,
+          "pg_entropy_min": 0.6185688993892955,
+          "pg_lr_actor": 0.009454027557346582,
+          "pg_lr_critic": 0.001458571505804945
+        },
+        "convergence_status": "BUDGET_LIMIT_REACHED"
+      },
+      "active_historical_exploration": {
+        "pg_entropy_coef": 0.03430250729588482,
+        "pg_entropy_min": 0.6185688993892955
+      },
+      "hpo_budget_ratios_resolved_to_runtime_counts": {},
+      "train_budget": 916,
+      "dqn_warmup_eps": 0,
+      "value_normalization": "none",
+      "gradient_clipping": "none"
+    },
+    {
+      "id": "baseline_dqn_mc",
+      "config": "baseline/dqn_mc/config.yaml",
+      "config_sha256": "8f7d0862ae01eef6402c06f305a6fb348db6c61222e82a50efb0e88fbb82e816",
+      "source_template": "outputs/hpo_20seed_training_20261126/configs/baseline/dqn_mc.yaml",
+      "source_template_sha256": "173d8b2ad12509b6a911031550b23fb40ab135e1145039caf0167cbc48d6e7db",
+      "historical_selection": "outputs/hpo_20seed_training_20261126/historical_selections/baseline/dqn_mc_coarse/best_training.yaml",
+      "historical_selection_sha256": "e7ed62ba31b150db4c928960524b9c99da3bb7474634f0e3609f345665b9db1a",
+      "source_job": "artifacts/coarse_hpo_comparison_20261116/extracted/dqn_mc_coarse/jobs/2ffe1e2d4871d16966da7fd4",
+      "source_job_config_sha256": "cdc5df82dfd4b31ac60f2686dc585a3fa7a915681bee0b004f4884f296c8aeb0",
+      "historical_best_training": {
+        "method": "dqn-mc",
+        "train_budget": 115,
+        "parameters": {
+          "dqn_batch_size": 128,
+          "dqn_eps_min": 0.3749351379880277,
+          "dqn_lr": 1.3576748471690754e-05,
+          "epsilon_anneal_budget_ratio": 1.3918220358627869,
+          "warmup_budget_fraction": 0.10263883230317021
+        },
+        "convergence_status": "BUDGET_DEGRADATION"
+      },
+      "active_historical_exploration": {
+        "dqn_eps_min": 0.3749351379880277,
+        "dqn_eps_anneal_eps": 143
+      },
+      "hpo_budget_ratios_resolved_to_runtime_counts": {
+        "epsilon_anneal_budget_ratio": 1.3918220358627869,
+        "warmup_budget_fraction": 0.10263883230317021
+      },
+      "train_budget": 115,
+      "dqn_warmup_eps": 12,
+      "value_normalization": "none",
+      "gradient_clipping": "none"
+    },
+    {
+      "id": "baseline_dqn_bootstrap",
+      "config": "baseline/dqn_bootstrap/config.yaml",
+      "config_sha256": "4c6ec67947358789d5ccb32c9adbc1204c71278722c7d0c5dc9644951b2299e8",
+      "source_template": "outputs/hpo_20seed_training_20261126/configs/baseline/dqn_bootstrap.yaml",
+      "source_template_sha256": "6bc7a296cca48c4234e1bf2999e603303071d934316b9270574d1855c8905bf5",
+      "historical_selection": "outputs/hpo_20seed_training_20261126/historical_selections/baseline/dqn_bootstrap_coarse/best_training.yaml",
+      "historical_selection_sha256": "4142177cd7815e50ac10f6e3ebadc4a1c9f04e773f146bff1e67d92aec6681aa",
+      "source_job": "artifacts/coarse_hpo_comparison_20261116/extracted/dqn_bootstrap_coarse/jobs/d2c4cbfb44bb7bffefeea6c5",
+      "source_job_config_sha256": "d75c6f85dee1a00a93a13be37b5a0c3b8b276d25f8bee0168fe28efb19810316",
+      "historical_best_training": {
+        "method": "dqn-bootstrap",
+        "train_budget": 458,
+        "parameters": {
+          "dqn_batch_size": 256,
+          "dqn_eps_min": 0.3391643803805721,
+          "dqn_lr": 0.00021609316069545398,
+          "dqn_target_update_freq": 100,
+          "epsilon_anneal_budget_ratio": 1.6899975432792926,
+          "warmup_budget_fraction": 0.15284408691191873
+        },
+        "convergence_status": "BUDGET_DEGRADATION"
+      },
+      "active_historical_exploration": {
+        "dqn_eps_min": 0.3391643803805721,
+        "dqn_eps_anneal_eps": 656
+      },
+      "hpo_budget_ratios_resolved_to_runtime_counts": {
+        "epsilon_anneal_budget_ratio": 1.6899975432792926,
+        "warmup_budget_fraction": 0.15284408691191873
+      },
+      "train_budget": 458,
+      "dqn_warmup_eps": 70,
+      "value_normalization": "none",
+      "gradient_clipping": "none"
+    },
+    {
+      "id": "step1_a2c",
+      "config": "step1/a2c/config.yaml",
+      "config_sha256": "27e4e3c8c7da671c0d62abf9bf6fe65270673f20eb95643e47ea1495ad426bd5",
+      "source_template": "outputs/hpo_20seed_training_20261126/configs/step1/a2c.yaml",
+      "source_template_sha256": "3ccd60a12546f9aa6c5344daefd039685410b896419dad0cbe8f4ea075e8a4aa",
+      "historical_selection": "outputs/hpo_20seed_training_20261126/historical_selections/step1/a2c/best_training.yaml",
+      "historical_selection_sha256": "3f26bb4254c668709cc17d081d9b5e4c23c4027ed372965ebb0b9e48f6bf8ea1",
+      "source_job": "outputs/popart_hpo_analysis_20261126/source/popart_hpo/a2c_coarse_popart/jobs/0d07da2de4834b399ae30907",
+      "source_job_config_sha256": "4ef6fe70f1254e538c16e3e779dd4e683a699b69ec7957cc58f06e7eef774901",
+      "historical_best_training": {
+        "method": "a2c",
+        "train_budget": 916,
+        "parameters": {
+          "pg_batch_eps": 16,
+          "pg_entropy_coef": 0.0001,
+          "pg_entropy_min": 0.4,
+          "pg_lr_actor": 0.00031622776601683794,
+          "pg_lr_critic": 0.00031622776601683794
+        },
+        "convergence_status": "BUDGET_LIMIT_REACHED"
+      },
+      "active_historical_exploration": {
+        "pg_entropy_coef": 0.0001,
+        "pg_entropy_min": 0.4
+      },
+      "hpo_budget_ratios_resolved_to_runtime_counts": {},
+      "train_budget": 916,
+      "dqn_warmup_eps": 0,
+      "value_normalization": "popart",
+      "gradient_clipping": "none"
+    },
+    {
+      "id": "step1_dqn_mc",
+      "config": "step1/dqn_mc/config.yaml",
+      "config_sha256": "218ee9542dc33d0edca21ff731a3e4f58e2716abc779ef6daaaf35d990bec2c9",
+      "source_template": "outputs/hpo_20seed_training_20261126/configs/step1/dqn_mc.yaml",
+      "source_template_sha256": "bc36819774689ba27c5b0ac2df321a24d34701596ac27bbe4c3a137f240921a9",
+      "historical_selection": "outputs/hpo_20seed_training_20261126/historical_selections/step1/dqn_mc/best_training.yaml",
+      "historical_selection_sha256": "c9ed631947bd2773098b7c7a5aae0e2f0a30b451129fe00ddd442f5b6954f238",
+      "source_job": "outputs/popart_hpo_analysis_20261126/source/popart_hpo/dqn_mc_coarse_popart/jobs/8c2f810e6d24b4ed9e385bda",
+      "source_job_config_sha256": "ce594212e19ab9f6ce4ae11b074039468c99c6f5a80584d6acb40a2be76fdf7c",
+      "historical_best_training": {
+        "method": "dqn-mc",
+        "train_budget": 115,
+        "parameters": {
+          "dqn_batch_size": 128,
+          "dqn_eps_min": 0.21670269354992716,
+          "dqn_lr": 2.505888932528253e-05,
+          "epsilon_anneal_budget_ratio": 1.2186911255456891,
+          "warmup_budget_fraction": 0.0501063456161949
+        },
+        "convergence_status": "BUDGET_LIMIT_REACHED"
+      },
+      "active_historical_exploration": {
+        "dqn_eps_min": 0.21670269354992716,
+        "dqn_eps_anneal_eps": 133
+      },
+      "hpo_budget_ratios_resolved_to_runtime_counts": {
+        "epsilon_anneal_budget_ratio": 1.2186911255456891,
+        "warmup_budget_fraction": 0.0501063456161949
+      },
+      "train_budget": 115,
+      "dqn_warmup_eps": 6,
+      "value_normalization": "popart",
+      "gradient_clipping": "none"
+    },
+    {
+      "id": "step1_dqn_bootstrap",
+      "config": "step1/dqn_bootstrap/config.yaml",
+      "config_sha256": "c8dce28ae576c13ba5a800ab14957432bd838e706107c0c1978410683b4efb23",
+      "source_template": "outputs/hpo_20seed_training_20261126/configs/step1/dqn_bootstrap.yaml",
+      "source_template_sha256": "f19f41fc8422e3178b12bf1d6026c0c1c04ebd324fb55078d05a741dacfbf0ab",
+      "historical_selection": "outputs/hpo_20seed_training_20261126/historical_selections/step1/dqn_bootstrap/best_training.yaml",
+      "historical_selection_sha256": "c5f8361f98be47e1bd1b2fb68d2e6fd69e04fdab548b3f402da8d41a87c1746b",
+      "source_job": "outputs/popart_hpo_analysis_20261126/source/popart_hpo/dqn_bootstrap_coarse_popart/jobs/7b95118059f4b8bc312aae52",
+      "source_job_config_sha256": "25a2c3dad8671cc6c6f6a83f9b50025052a6ea086776d17340fe10f4248659af",
+      "historical_best_training": {
+        "method": "dqn-bootstrap",
+        "train_budget": 458,
+        "parameters": {
+          "dqn_batch_size": 128,
+          "dqn_eps_min": 0.4,
+          "dqn_lr": 0.00031622776601683794,
+          "dqn_target_update_freq": 10,
+          "epsilon_anneal_budget_ratio": 0.7071067811865476,
+          "warmup_budget_fraction": 0.11
+        },
+        "convergence_status": "BUDGET_LIMIT_REACHED"
+      },
+      "active_historical_exploration": {
+        "dqn_eps_min": 0.4,
+        "dqn_eps_anneal_eps": 288
+      },
+      "hpo_budget_ratios_resolved_to_runtime_counts": {
+        "epsilon_anneal_budget_ratio": 0.7071067811865476,
+        "warmup_budget_fraction": 0.11
+      },
+      "train_budget": 458,
+      "dqn_warmup_eps": 50,
+      "value_normalization": "popart",
+      "gradient_clipping": "none"
+    },
+    {
+      "id": "step1_step2_a2c",
+      "config": "step1_step2/a2c/config.yaml",
+      "config_sha256": "1f88464f6c98bee77754380b4d4f095e08e822941c9369c5567e02760761510b",
+      "source_template": "outputs/hpo_20seed_training_20261126/configs/step1_step2/a2c.yaml",
+      "source_template_sha256": "cbd8297d0fe63190ddb8ec038503183501132724c78ade203e3f8cf6b5321511",
+      "historical_selection": "outputs/hpo_20seed_training_20261126/historical_selections/step1_step2/a2c/best_training.yaml",
+      "historical_selection_sha256": "fa55e8d35859d7cb2d00a22eb375878f898a93cb51ce7c37d8380eaf6f123fe4",
+      "source_job": "outputs/popart_hpo_analysis_20261126/source/popart_clipping_hpo/a2c_coarse_popart_clipping/jobs/925186981e13d98c723f0e10",
+      "source_job_config_sha256": "6e5a624b5efc49d627e234ab5f188dff859f280abee5ddb1417f71f65295bf23",
+      "historical_best_training": {
+        "method": "a2c",
+        "train_budget": 916,
+        "parameters": {
+          "pg_batch_eps": 32,
+          "pg_entropy_coef": 0.011154722964812078,
+          "pg_entropy_min": 0.2851091084366486,
+          "pg_lr_actor": 0.007064884325832442,
+          "pg_lr_critic": 0.0029044829333725775
+        },
+        "convergence_status": "BUDGET_LIMIT_REACHED"
+      },
+      "active_historical_exploration": {
+        "pg_entropy_coef": 0.011154722964812078,
+        "pg_entropy_min": 0.2851091084366486
+      },
+      "hpo_budget_ratios_resolved_to_runtime_counts": {},
+      "train_budget": 916,
+      "dqn_warmup_eps": 0,
+      "value_normalization": "popart",
+      "gradient_clipping": "clipping"
+    },
+    {
+      "id": "step1_step2_dqn_mc",
+      "config": "step1_step2/dqn_mc/config.yaml",
+      "config_sha256": "9d92d1e1135bc701d40542d530b64e5f2dba7afce1502c35886e0c558289103d",
+      "source_template": "outputs/hpo_20seed_training_20261126/configs/step1_step2/dqn_mc.yaml",
+      "source_template_sha256": "b64c97fe95a8dacc5cb950aca521693cf11c23bada16e77ba1f18739624235b0",
+      "historical_selection": "outputs/hpo_20seed_training_20261126/historical_selections/step1_step2/dqn_mc/best_training.yaml",
+      "historical_selection_sha256": "4a56068c812c18151b6de1de679841854f5311afe3118cdd6a83c36bb1b4c1c4",
+      "source_job": "outputs/popart_hpo_analysis_20261126/source/popart_clipping_hpo/dqn_mc_coarse_popart_clipping/jobs/0e51fc09338c1666d2cccb43",
+      "source_job_config_sha256": "ab84e0d20da04490ff54fb14be5a288efab93e43c38d44d053e6ff72de24cfe0",
+      "historical_best_training": {
+        "method": "dqn-mc",
+        "train_budget": 115,
+        "parameters": {
+          "dqn_batch_size": 512,
+          "dqn_eps_min": 0.2958275846670747,
+          "dqn_lr": 1.321735756608669e-05,
+          "epsilon_anneal_budget_ratio": 1.5357162222438288,
+          "warmup_budget_fraction": 0.08412606818764433
+        },
+        "convergence_status": "BUDGET_LIMIT_REACHED"
+      },
+      "active_historical_exploration": {
+        "dqn_eps_min": 0.2958275846670747,
+        "dqn_eps_anneal_eps": 161
+      },
+      "hpo_budget_ratios_resolved_to_runtime_counts": {
+        "epsilon_anneal_budget_ratio": 1.5357162222438288,
+        "warmup_budget_fraction": 0.08412606818764433
+      },
+      "train_budget": 115,
+      "dqn_warmup_eps": 10,
+      "value_normalization": "popart",
+      "gradient_clipping": "clipping"
+    },
+    {
+      "id": "step1_step2_dqn_bootstrap",
+      "config": "step1_step2/dqn_bootstrap/config.yaml",
+      "config_sha256": "f0f96670bdc110848641b8fcb459f8027c156be3edf818d1358aaf70953c117f",
+      "source_template": "outputs/hpo_20seed_training_20261126/configs/step1_step2/dqn_bootstrap.yaml",
+      "source_template_sha256": "df889307e60ec4f2c4f84c50111b22e8fbbdc397990656540d73d3324e678646",
+      "historical_selection": "outputs/hpo_20seed_training_20261126/historical_selections/step1_step2/dqn_bootstrap/best_training.yaml",
+      "historical_selection_sha256": "32bc5bda20ebf546c11563f35339121b4e2e863dd7cd0ac629c67d9f45262e82",
+      "source_job": "outputs/popart_hpo_analysis_20261126/source/popart_clipping_hpo/dqn_bootstrap_coarse_popart_clipping/jobs/7101aee72b7517074dc4b223",
+      "source_job_config_sha256": "87b01157626fde848ea59068824d4c8bd3447ac0753f9c5bd191c44e69722714",
+      "historical_best_training": {
+        "method": "dqn-bootstrap",
+        "train_budget": 458,
+        "parameters": {
+          "dqn_batch_size": 64,
+          "dqn_eps_min": 0.3989626677543481,
+          "dqn_lr": 0.0025397183754570884,
+          "dqn_target_update_freq": 200,
+          "epsilon_anneal_budget_ratio": 1.8714850594014394,
+          "warmup_budget_fraction": 0.15599634965229509
+        },
+        "convergence_status": "BUDGET_LIMIT_REACHED"
+      },
+      "active_historical_exploration": {
+        "dqn_eps_min": 0.3989626677543481,
+        "dqn_eps_anneal_eps": 724
+      },
+      "hpo_budget_ratios_resolved_to_runtime_counts": {
+        "epsilon_anneal_budget_ratio": 1.8714850594014394,
+        "warmup_budget_fraction": 0.15599634965229509
+      },
+      "train_budget": 458,
+      "dqn_warmup_eps": 71,
+      "value_normalization": "popart",
+      "gradient_clipping": "clipping"
+    }
+  ],
+  "validation": {
+    "seed_configs_resolved": 180,
+    "full_yaml_files": 9,
+    "parallel_jobs_per_config": 4,
+    "all_scalar_child_configs_equal_previous_templates_with_seed_override": true,
+    "all_domains": {
+      "status": "exact",
+      "size": 143096,
+      "episode_steps": 7
+    },
+    "predictor_evaluated": false,
+    "cli_checks": [
+      {
+        "id": "baseline_a2c",
+        "command": [
+          "python",
+          "scripts/run_experiment.py",
+          "run",
+          "--config",
+          "configs/hpo_20seed_training_20261126/baseline/a2c/config.yaml",
+          "--validate-config"
+        ],
+        "returncode": 0,
+        "run_count": 20,
+        "parallel_jobs": 4,
+        "all_child_configs_match_previous_templates": true
+      },
+      {
+        "id": "baseline_dqn_mc",
+        "command": [
+          "python",
+          "scripts/run_experiment.py",
+          "run",
+          "--config",
+          "configs/hpo_20seed_training_20261126/baseline/dqn_mc/config.yaml",
+          "--validate-config"
+        ],
+        "returncode": 0,
+        "run_count": 20,
+        "parallel_jobs": 4,
+        "all_child_configs_match_previous_templates": true
+      },
+      {
+        "id": "baseline_dqn_bootstrap",
+        "command": [
+          "python",
+          "scripts/run_experiment.py",
+          "run",
+          "--config",
+          "configs/hpo_20seed_training_20261126/baseline/dqn_bootstrap/config.yaml",
+          "--validate-config"
+        ],
+        "returncode": 0,
+        "run_count": 20,
+        "parallel_jobs": 4,
+        "all_child_configs_match_previous_templates": true
+      },
+      {
+        "id": "step1_a2c",
+        "command": [
+          "python",
+          "scripts/run_experiment.py",
+          "run",
+          "--config",
+          "configs/hpo_20seed_training_20261126/step1/a2c/config.yaml",
+          "--validate-config"
+        ],
+        "returncode": 0,
+        "run_count": 20,
+        "parallel_jobs": 4,
+        "all_child_configs_match_previous_templates": true
+      },
+      {
+        "id": "step1_dqn_mc",
+        "command": [
+          "python",
+          "scripts/run_experiment.py",
+          "run",
+          "--config",
+          "configs/hpo_20seed_training_20261126/step1/dqn_mc/config.yaml",
+          "--validate-config"
+        ],
+        "returncode": 0,
+        "run_count": 20,
+        "parallel_jobs": 4,
+        "all_child_configs_match_previous_templates": true
+      },
+      {
+        "id": "step1_dqn_bootstrap",
+        "command": [
+          "python",
+          "scripts/run_experiment.py",
+          "run",
+          "--config",
+          "configs/hpo_20seed_training_20261126/step1/dqn_bootstrap/config.yaml",
+          "--validate-config"
+        ],
+        "returncode": 0,
+        "run_count": 20,
+        "parallel_jobs": 4,
+        "all_child_configs_match_previous_templates": true
+      },
+      {
+        "id": "step1_step2_a2c",
+        "command": [
+          "python",
+          "scripts/run_experiment.py",
+          "run",
+          "--config",
+          "configs/hpo_20seed_training_20261126/step1_step2/a2c/config.yaml",
+          "--validate-config"
+        ],
+        "returncode": 0,
+        "run_count": 20,
+        "parallel_jobs": 4,
+        "all_child_configs_match_previous_templates": true
+      },
+      {
+        "id": "step1_step2_dqn_mc",
+        "command": [
+          "python",
+          "scripts/run_experiment.py",
+          "run",
+          "--config",
+          "configs/hpo_20seed_training_20261126/step1_step2/dqn_mc/config.yaml",
+          "--validate-config"
+        ],
+        "returncode": 0,
+        "run_count": 20,
+        "parallel_jobs": 4,
+        "all_child_configs_match_previous_templates": true
+      },
+      {
+        "id": "step1_step2_dqn_bootstrap",
+        "command": [
+          "python",
+          "scripts/run_experiment.py",
+          "run",
+          "--config",
+          "configs/hpo_20seed_training_20261126/step1_step2/dqn_bootstrap/config.yaml",
+          "--validate-config"
+        ],
+        "returncode": 0,
+        "run_count": 20,
+        "parallel_jobs": 4,
+        "all_child_configs_match_previous_templates": true
+      }
+    ],
+    "scientific_training_started": false
+  }
+}
