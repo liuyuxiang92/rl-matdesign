@@ -173,19 +173,19 @@ def _budget(raw, objective):
 
 def _search_settings(raw, generation=False):
     if generation:
-        defaults = {"parameter": "gen_exploration_target", "initial_values": [0, .25, .5, .7, .9, 1],
+        defaults = {"parameter": "gen_exploration_target", "gen_exploration_target": [0, .25, .5, .7, .9, 1],
                     "max_extra_values_per_direction": 2,
                     "paired_seeds": [401, 503, 607]}
         raw = _mapping(raw, "generation_search", defaults)
         cfg = {**deepcopy(defaults), **raw}
         if cfg["parameter"] != "gen_exploration_target":
             raise ConfigError("generation_search.parameter must be gen_exploration_target")
-        if not isinstance(cfg["initial_values"], list) or not cfg["initial_values"]:
-            raise ConfigError("generation_search.initial_values must be a nonempty list")
-        cfg["initial_values"] = [_number(v, "generation_search.initial_values", 0, 1) for v in cfg["initial_values"]]
-        if len(set(cfg["initial_values"])) != len(cfg["initial_values"]):
-            raise ConfigError("generation_search.initial_values requires distinct values")
-        cfg["initial_values"].sort()
+        if not isinstance(cfg["gen_exploration_target"], list) or not cfg["gen_exploration_target"]:
+            raise ConfigError("generation_search.gen_exploration_target must be a nonempty list")
+        cfg["gen_exploration_target"] = [_number(v, "generation_search.gen_exploration_target", 0, 1) for v in cfg["gen_exploration_target"]]
+        if len(set(cfg["gen_exploration_target"])) != len(cfg["gen_exploration_target"]):
+            raise ConfigError("generation_search.gen_exploration_target requires distinct values")
+        cfg["gen_exploration_target"].sort()
         cfg["paired_seeds"] = _seeds(cfg["paired_seeds"], "generation_search.paired_seeds")
         cfg["max_extra_values_per_direction"] = _integer(cfg["max_extra_values_per_direction"], "generation_search.max_extra_values_per_direction")
         return cfg

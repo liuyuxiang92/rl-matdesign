@@ -235,20 +235,28 @@ def test_invalid_or_redundant_public_settings_rejected(tmp_path, extra, match):
         load_plan(write_plan(tmp_path, extra))
 
 
-@pytest.mark.parametrize('values', [[0], [0, .1, 1], [.25, .7]])
+@pytest.mark.parametrize('values', [[0], [0, .1, 1], [.7, .25]])
 def test_generation_search_uses_bounded_entropy_target(tmp_path, values):
     scene = {'properties': [{'name': 'quality', 'direction': 'max'}],
              'gen_exploration_target': .7}
-    plan = load_plan(write_plan(tmp_path, {'generation': {'initial_values': values}}, scene))
+    plan = load_plan(write_plan(tmp_path, {'generation': {'gen_exploration_target': values}}, scene))
     assert plan['generation_search']['parameter'] == 'gen_exploration_target'
-    assert plan['generation_search']['initial_values'] == values
+    assert plan['generation_search']['gen_exploration_target'] == sorted(values)
     assert 'fixed' not in plan['generation_search']
 
 
-@pytest.mark.parametrize('values', [[-1, 1], [0, 1.01], [0, float('inf')], [0, 0]])
+@pytest.mark.parametrize('values', [
+    [], None, .7, [True], ['not-a-number'], [-1, 1], [0, 1.01],
+    [0, float('inf')], [float('nan')], [0, 0],
+])
 def test_generation_parameter_domains(tmp_path, values):
-    with pytest.raises(ConfigError):
-        load_plan(write_plan(tmp_path, {'generation': {'initial_values': values}}))
+    with pytest.raises(ConfigError, match=r'generation\.gen_exploration_target'):
+        load_plan(write_plan(tmp_path, {'generation': {'gen_exploration_target': values}}))
+
+
+def test_former_generation_list_key_is_rejected(tmp_path):
+    with pytest.raises(ConfigError, match='Unknown fields.*initial_values'):
+        load_plan(write_plan(tmp_path, {'generation': {'initial_values': [.23, .61]}}))
 
 
 def test_explicit_ranges_override_profiles_and_fixed_dqn_steps_remain(tmp_path):
@@ -299,8 +307,8 @@ def test_templates_resolve_shared_rules_using_dummy_scene(tmp_path, name):
 def test_generation_defaults_have_bounded_entropy_domain(tmp_path):
     plan = load_plan(write_plan(tmp_path))
     assert plan['generation_search']['parameter'] == 'gen_exploration_target'
-    assert len(plan['generation_search']['initial_values']) > 1
-    assert all(0 <= value <= 1 for value in plan['generation_search']['initial_values'])
+    assert len(plan['generation_search']['gen_exploration_target']) > 1
+    assert all(0 <= value <= 1 for value in plan['generation_search']['gen_exploration_target'])
 
 
 def test_legacy_compatibility_warns_about_preserved_semantics(tmp_path):

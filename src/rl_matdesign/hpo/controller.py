@@ -449,7 +449,7 @@ class Campaign:
         models = trained["models"]
         settings = self.plan["generation_search"]
         parameter = settings["parameter"]
-        values = sorted(set(settings["initial_values"]))
+        values = sorted(set(settings["gen_exploration_target"]))
         seeds, paired_models, pairings = self.generation_pairs(models)
         extensions = {"low": 0, "high": 0}
         results = []

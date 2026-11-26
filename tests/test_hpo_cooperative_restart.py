@@ -52,7 +52,7 @@ def _plan(path, method, *, repeats=1, parallel=1):
         'evaluation':{'threshold':.5,'max_attempts_per_unique':1.5},
         'training':{'repeats':repeats,'budget':budget,'parameter_ranges':{
             name:{'type':'categorical','choices':[value]} for name,value in parameters.items()}},
-        'generation':{'repeats':1,'budget':budget,'initial_values':[1.]},
+        'generation':{'repeats':1,'budget':budget,'gen_exploration_target':[1.]},
     }, sort_keys=False))
     return load_plan(source), parameters
 

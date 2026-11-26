@@ -32,7 +32,7 @@ def public_plan_path(tmp_path, generation_parameter="gen_exploration_target", th
         "evaluation": {"threshold": threshold},
         "training": {"repeats": 2, "budget": budget,
                      "parameter_ranges": {"pg_batch_eps": {"type": "categorical", "choices": [2]}}},
-        "generation": {"repeats": 2, "budget": budget, "initial_values": [0, .5, 1]},
+        "generation": {"repeats": 2, "budget": budget, "gen_exploration_target": [0, .5, 1]},
     }, sort_keys=False))
     return source
 

@@ -25,4 +25,4 @@ generation:
   repeats: 3
   score_weights: {qualified_fraction: 0.5, best_fraction_quality: 0.4, best_value_quality: 0.1}
   budget: {mode: absolute_unique, min_unique: 8, initial_unique: 16, max_unique: 32}
-  initial_values: [0, 0.25, 0.5, 0.7, 0.9, 1]
+  gen_exploration_target: [0, 0.25, 0.5, 0.7, 0.9, 1]

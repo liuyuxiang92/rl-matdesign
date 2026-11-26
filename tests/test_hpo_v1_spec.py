@@ -29,6 +29,7 @@ def test_defaults_are_complete_and_paths_use_scenario_directory(tmp_path):
     assert phase_efficiency(plan, "generation")["max_attempts_per_unique"] == 1.5
     assert "fixed" not in plan["generation_search"]
     assert plan["generation_search"]["parameter"] == "gen_exploration_target"
+    assert plan["generation_search"]["gen_exploration_target"] == [0, .25, .5, .7, .9, 1]
     assert plan["sources"]["efficiency"] == "default"
 
 
@@ -51,8 +52,7 @@ def test_method_cli_can_supply_but_cannot_silently_override(tmp_path):
     ({"range_search": {"confirmation_seed": 11}}, "fresh"),
     ({"generation_search": {"parameter": "gen_temp"}}, "gen_exploration_target"),
     ({"generation_search": {"fixed": {"gen_epsilon": .1}}}, "Unknown fields"),
-    ({"generation_search": {"initial_values": [0, 1.1]}}, "<= 1"),
-    ({"generation_search": {"initial_values": [0, 1, 1]}}, "distinct"),
+    ({"generation_search": {"initial_values": [0, .5, 1]}}, "Unknown fields.*initial_values"),
     ({"search_space": {"dqn_grad_steps_per_ep": {"type": "int", "low": 1, "high": 10}}}, "not active"),
     ({"search_space": {"pg_lr_actor": {"type": "float", "low": 0, "high": 1}}}, "> 0"),
     ({"search_space": {"pg_batch_eps": {"type": "categorical", "choices": [1, 1]}}}, "duplicates"),
@@ -71,6 +71,24 @@ def test_duplicate_yaml_keys_rejected_recursively(tmp_path):
     path.write_text(path.read_text() + "efficiency: {max_attempts_per_unique: 1.5, max_attempts_per_unique: 1.8}\n")
     with pytest.raises(ConfigError, match="Duplicate YAML"):
         load_plan(path)
+
+
+def test_legacy_generation_target_list_overrides_defaults(tmp_path):
+    plan = load_plan(write_plan(tmp_path, {"generation_search": {
+        "gen_exploration_target": [.61, .23],
+    }}))
+    assert plan["generation_search"]["gen_exploration_target"] == [.23, .61]
+
+
+@pytest.mark.parametrize("values", [
+    [], None, .7, [True], ["not-a-number"], [-.01, 1], [0, 1.01],
+    [0, float("inf")], [float("nan")], [0, 0],
+])
+def test_legacy_generation_target_list_validation(tmp_path, values):
+    with pytest.raises(ConfigError, match="generation_search.gen_exploration_target"):
+        load_plan(write_plan(tmp_path, {"generation_search": {
+            "gen_exploration_target": values,
+        }}))
 
 
 @pytest.mark.parametrize("objective,match", [

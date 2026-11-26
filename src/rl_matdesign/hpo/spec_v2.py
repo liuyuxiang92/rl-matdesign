@@ -125,7 +125,7 @@ def load_simplified_plan(path: Path, value, method=None) -> dict:
     training = _mapping(raw.get("training", {}), "training",
                         {"repeats", "parameter_ranges", "score_weights", "budget", "search"})
     generation = _mapping(raw.get("generation", {}), "generation",
-                          {"repeats", "score_weights", "initial_values", "budget"})
+                          {"repeats", "score_weights", "gen_exploration_target", "budget"})
     repeats = _integer(training.get("repeats", 3), "training.repeats", 1)
     schedule = _seed_schedule(master, repeats)
     profile = get_profile(method)
@@ -141,13 +141,13 @@ def load_simplified_plan(path: Path, value, method=None) -> dict:
         raise ConfigError("training.search.startup_random_trials must not exceed trials_per_round")
 
     parameter = "gen_exploration_target"
-    initial_values = generation.get("initial_values", _GENERATION_DEFAULTS)
-    if not isinstance(initial_values, list) or not initial_values:
-        raise ConfigError("generation.initial_values must be a nonempty list")
-    initial_values = [_number(value, "generation.initial_values", 0,
-                             1) for value in initial_values]
-    if len(set(initial_values)) != len(initial_values):
-        raise ConfigError("generation.initial_values must contain distinct values")
+    gen_exploration_target = generation.get("gen_exploration_target", _GENERATION_DEFAULTS)
+    if not isinstance(gen_exploration_target, list) or not gen_exploration_target:
+        raise ConfigError("generation.gen_exploration_target must be a nonempty list")
+    gen_exploration_target = [_number(value, "generation.gen_exploration_target", 0,
+                                     1) for value in gen_exploration_target]
+    if len(set(gen_exploration_target)) != len(gen_exploration_target):
+        raise ConfigError("generation.gen_exploration_target must contain distinct values")
     train_budget = _phase_budget(training.get("budget", {}), "training.budget")
     gen_budget = _phase_budget(generation.get("budget", {}), "generation.budget")
     budget_mode = train_budget["mode"] if train_budget["mode"] == gen_budget["mode"] else "per_phase"
@@ -176,7 +176,7 @@ def load_simplified_plan(path: Path, value, method=None) -> dict:
                          "score_improvement": tolerance},
         "search_space": space, "extension_choices": profile["extension_choices"],
         "training_search": training_search,
-        "generation_search": {"parameter": parameter, "initial_values": sorted(initial_values),
+        "generation_search": {"parameter": parameter, "gen_exploration_target": sorted(gen_exploration_target),
                               "max_extra_values_per_direction": _GENERATION_MAX_EXTRA_VALUES_PER_DIRECTION,
                               "repeats_per_model": _integer(generation.get("repeats", 3), "generation.repeats", 1),
                               "master_seed": master},

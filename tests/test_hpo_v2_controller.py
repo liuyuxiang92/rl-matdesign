@@ -35,7 +35,7 @@ def internal_plan(tmp_path, parameter="gen_exploration_target"):
     plan["training_search"]["seeds"] = [11, 29, 47]
     plan["training_search"]["validation_seeds"] = [101, 211, 307]
     plan["generation_search"] = {
-        "parameter": parameter, "initial_values": [.2, .8],
+        "parameter": parameter, "gen_exploration_target": [.2, .8],
         "max_extra_values_per_direction": 1, "repeats_per_model": 2, "master_seed": 42,
     }
     return plan
@@ -141,6 +141,44 @@ def test_bounded_generation_search_selects_and_exports_only_active_method(
     assert "exploration_gen_eps" not in exported
 
 
+@pytest.mark.parametrize("protocol", ["legacy", "simplified"])
+def test_authored_generation_targets_drive_candidate_selection_and_export(
+        tmp_path, campaign_environment, protocol):
+    plan = (internal_plan if protocol == "legacy" else public_plan)(tmp_path)
+    source = tmp_path / "hpo.yaml"
+    authored = yaml.safe_load(source.read_text())
+    section = "generation_search" if protocol == "legacy" else "generation"
+    requested_targets = [.23, .61]
+    authored.setdefault(section, {})["gen_exploration_target"] = requested_targets
+    source.write_text(yaml.safe_dump(authored))
+    plan = load_plan(source)
+    assert plan["generation_search"]["gen_exploration_target"] == requested_targets
+
+    runner = ReusableRunner()
+
+    def score_requested_target(parameters, budget, seed, phase, model=None):
+        result = runner(parameters, budget, seed, phase, model)
+        if phase == "generation":
+            result["score"] = .9 if parameters["gen_exploration_target"] == .61 else .4
+        return result
+
+    run = campaign(plan, tmp_path / "run", score_requested_target)
+    models = [runner({"pg_batch_eps": 2}, 16, seed, "train")
+              for seed in plan["training_search"]["validation_seeds"]]
+    atomic_json(run.stage_path("train-search"), {
+        "status": "COMPLETED", "models": models,
+        "selection": {"selected": {"parameters": {"pg_batch_eps": 2}}}})
+
+    result = run.run_generation()
+    assert result["status"] == "COMPLETED"
+    evaluated_targets = {call["parameters"]["gen_exploration_target"]
+                         for call in runner.calls if call["phase"] == "generation"}
+    assert set(requested_targets) <= evaluated_targets
+    assert result["selection"]["selected"]["parameters"]["gen_exploration_target"] == .61
+    exported = yaml.safe_load((run.out / "best_generation.yaml").read_text())
+    assert exported["gen_exploration_target"] == .61
+
+
 def test_near_tie_ranking_does_not_use_component_metrics(tmp_path):
     plan = internal_plan(tmp_path)
     rows = [
@@ -227,7 +265,7 @@ def public_plan(tmp_path, generation_repeats=2):
         "reward": {"objective": {"terms": {"working_temperature": 1}}},
     }, sort_keys=False))
     budget = {"mode": "absolute_unique", "min_unique": 4, "initial_unique": 16, "max_unique": 32}
-    generation = {"initial_values": [0, .1, 1], "budget": budget}
+    generation = {"gen_exploration_target": [0, .1, 1], "budget": budget}
     if generation_repeats is not None:
         generation["repeats"] = generation_repeats
     source = tmp_path / "hpo.yaml"

@@ -53,7 +53,7 @@ generation:
     qualified_fraction: 0.50
     best_fraction_quality: 0.40
     best_value_quality: 0.10
-  # initial_values 可省略，默认搜索 [0, 0.25, 0.5, 0.7, 0.9, 1] 熵目标。
+  gen_exploration_target: [0, 0.25, 0.5, 0.7, 0.9, 1]
   budget: {mode: absolute_unique, min_unique: 100, initial_unique: 400, max_unique: 1600}
 ```
 
@@ -154,8 +154,20 @@ gen_exploration_target: 0.7
 exploration_adaptive: true
 ```
 
-`generation.initial_values` 搜索初始熵目标，可省略以采用
-`[0, 0.25, 0.5, 0.7, 0.9, 1]`。数量仍由 `generation.budget` 控制。
+HPO 文件中的 `generation.gen_exploration_target` 是要搜索的初始熵目标列表，
+必须非空、取值互不重复，且每个值都在 `[0,1]` 内；省略时采用
+`[0, 0.25, 0.5, 0.7, 0.9, 1]`。它与上面场景 YAML 顶层的
+`gen_exploration_target: 0.7` 不同：场景填写单个数值，HPO 填写候选列表。
+数量仍由 `generation.budget` 控制。
+
+```yaml
+generation:
+  gen_exploration_target: [0, 0.25, 0.5, 0.7, 0.9, 1]
+```
+
+显式旧协议的 `generation_search` 节也使用 `gen_exploration_target` 列表键。
+旧 HPO 列表字段不作为兼容别名接受。使用更新后的代码启动实验前，应修改
+工作副本并使用新的 campaign 输出目录；不要改写已归档的历史配置来恢复旧实验。
 范围搜索只能扩展到合法边界 0 或 1；不再搜索原始分数温度、epsilon 或 top fraction。
 目标 0 在最高分并列动作中采样，目标 1 为均匀采样；相同分数不能强制达到低熵。
 目标值不是随机动作百分比。控制器会记录实际熵以及目标是否可达。

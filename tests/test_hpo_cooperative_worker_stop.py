@@ -248,7 +248,7 @@ def test_serial_coordinator_interrupt_after_last_sample_can_finalize_without_reb
         "evaluation": {"threshold": .5, "max_attempts_per_unique": 20},
         "training": {"repeats": 1, "budget": budget, "parameter_ranges": {
             "pg_batch_eps": {"type": "categorical", "choices": [4]}}},
-        "generation": {"repeats": 1, "budget": budget, "initial_values": [1.]},
+        "generation": {"repeats": 1, "budget": budget, "gen_exploration_target": [1.]},
     }
     source = tmp_path / "hpo.yaml"
     source.write_text(yaml.safe_dump(hpo))

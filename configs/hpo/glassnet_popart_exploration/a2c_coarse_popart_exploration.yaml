@@ -65,7 +65,7 @@ generation:
     qualified_fraction: 0.5
     best_fraction_quality: 0.4
     best_value_quality: 0.1
-  initial_values:
+  gen_exploration_target:
   - 0.0
   - 0.25
   - 0.5

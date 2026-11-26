@@ -30,7 +30,7 @@ def small_plan(tmp_path):
         "range_search": {"max_extra_values_per_direction": 0},
         "training_search": {"trials": 3, "startup_random_trials": 1, "finalists": 1,
                             "max_budget_revisions": 1, "additional_trials_per_revision": 2, "additional_random_trials": 1},
-        "generation_search": {"initial_values": [0, .1, 1], "max_extra_values_per_direction": 1},
+        "generation_search": {"gen_exploration_target": [0, .1, 1], "max_extra_values_per_direction": 1},
     }
     path = tmp_path / "hpo.yaml"
     path.write_text(yaml.safe_dump(data))
