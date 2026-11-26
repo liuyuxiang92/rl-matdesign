@@ -63,9 +63,50 @@ generation:
 
 ## 目标继承与评分
 
-程序解析场景 reward，要求它有且只有一个非零优化目标，并通过该目标的 `properties[].name` 获取性质、`direction: min/max` 和单位。约束项不自动成为优化目标。性质名称可以不同于模型的 `output`：例如 `name: working_temperature`、`output: T3` 时，HPO 使用 `working_temperature`。多目标、目标方向不明确或 reward 系数与方向矛盾时直接报告配置问题，不猜测第一个性质。
+默认 `evaluation.metric: property`（可省略）解析场景 reward，要求它有且只有一个非零优化目标，并通过该目标的 `properties[].name` 获取性质、`direction: min/max` 和单位。约束项不自动成为优化目标。性质名称可以不同于模型的 `output`：例如 `name: working_temperature`、`output: T3` 时，HPO 使用 `working_temperature`。在 property 模式下，多目标、目标方向不明确或 reward 系数与方向矛盾时直接报告配置问题，不猜测第一个性质。
 
-HPO 只填写 `evaluation.threshold`。最小化使用 `性质值 <= 阈值`，最大化使用 `性质值 >= 阈值`，等于阈值也达标。阈值在整个实验固定，不按每组材料重新求中位数，也不自动加入训练 reward。GlassNet 模板保留 `threshold: null`，执行前必须填写；如采用训练数据中位数，应先核实数据版本、对应列和单位。Tg、CTE 条件只来自场景配置，HPO 不自动添加或复制它们。
+### 按候选 reward 评分
+
+设置 `evaluation.metric: reward` 后，HPO 直接读取每个候选完成评价时保存的
+`candidate_records.jsonl` 中的 `prediction_record.reward`，总是按最大化方向评分：
+
+```yaml
+evaluation:
+  metric: reward
+  threshold: null  # 填写 reward 单位的达标阈值；reward >= threshold 为达标。
+  best_fraction: 0.10
+  score_tolerance: 0.01
+  max_attempts_per_unique: 1.5
+```
+
+这支持场景已经定义的多性质加权、方向、尺度、uncertainty 和门控 reward。
+例如未校准的 sinter+calcine 场景可以使用 `reward = -sinter - calcine`，
+peptide 场景使用实际的 `mean - k*std`，ACTMOF 基线使用 `q/100000`。
+阈值需要用对应的 reward 单位填写；程序不会把物理阈值自动转换为 reward 阈值。
+缺失、布尔值或非有限 reward 会被明确拒绝，不回退到同名物理性质，也不重新调用预测器。
+
+该选项更换的是现有 HPO 公式中的被评分标量，并不把 HPO 改为简单的平均 episode return。
+训练与生成仍分别使用达标比例、最优子集、极值以及原有训练效率权重；
+约束失败的候选保留在分母中，不能占据可行候选的最优子集，所有已评价 reward
+（包括门控失败的 penalty）参与固定参考质量尺度的校准。训练和生成预算搜索保持原规则。
+这里读取候选评价 reward，不读取折扣后的 MC return、Q/V 预测、entropy bonus 或重复惩罚。
+
+reward 模式忠实使用场景实际输出。若场景启用了自动 reward 校准，保存的 reward
+也包含该校准；不会把它改回未经校准的科学目标。不同校准或不同 reward 定义的实验，
+不能把数值直接当作同一物理量比较。`reward_objective` 不是此选项，也不是其回退字段。
+
+对于 GlassNet 基线，只有在评分与参考校准都使用 `R=-T3/1000`、阈值转换为
+`-threshold_T3/1000`、质量尺度转换为 `scale_T3/1000`，并保持约束、权重和候选集合一致时，
+reward 评分与 T3 评分才数学等价。完整门控 reward 的失败惩罚、非线性校准或 uncertainty 项
+可能破坏此等价；固定随机种子本身不能消除这些差异。
+
+省略 metric 时保留原有 property 解析、评分和质量尺度契约。
+reward 指标身份写入解析计划及质量尺度文件，不能与名为 reward 的物理性质混用。
+更换 metric 或阈值应使用新的 campaign 输出目录；已有结果不会被自动重新解释。
+
+### 通用评分规则
+
+`evaluation.threshold` 使用所选指标的单位：property 模式是原始物理性质，reward 模式是实际 reward。最小化使用 `目标值 <= 阈值`，最大化使用 `目标值 >= 阈值`，等于阈值也达标。阈值在整个实验固定，不按每组材料重新求中位数，也不自动加入训练 reward。GlassNet 模板保留 `threshold: null`，执行前必须填写；如采用训练数据中位数，应先核实数据版本、对应列和单位。Tg、CTE 条件只来自场景配置，HPO 不自动添加或复制它们。
 
 | 评分项 | 含义 |
 |---|---|

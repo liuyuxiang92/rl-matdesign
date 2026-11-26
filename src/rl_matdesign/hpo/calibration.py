@@ -8,15 +8,21 @@ import statistics
 import sys
 
 from .artifacts import atomic_json, file_digest, read_json
+from .objective_value import objective_value
 from .scoring import _identity, score_records
 
 
 class QualityCalibrationError(ValueError):
-    """Reference observations cannot determine a meaningful physical scale."""
+    """Reference observations cannot determine a meaningful fixed quality scale."""
 
 
 def _objective_contract(objective):
-    return {name: objective.get(name) for name in ("field", "direction", "threshold", "unit")}
+    contract = {name: objective.get(name) for name in ("field", "direction", "threshold", "unit")}
+    # Keep existing property artifacts unchanged, while separating an actual
+    # recorded reward from a physical property that happens to be named reward.
+    if objective.get("metric", "property") != "property":
+        contract["metric"] = objective["metric"]
+    return contract
 
 
 def _quantile(values, fraction):
@@ -39,9 +45,10 @@ def fit_quality_scale(records, objective):
         status = str(row.get("evaluation_status", row.get("status", "evaluated"))).lower()
         if status in {"failed", "invalid", "preparation_only", "evaluation_failed", "rollout_failed"}:
             continue
-        value = row.get("properties", {}).get(objective["field"])
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-            raise QualityCalibrationError("Reference archive has a missing or nonfinite objective property")
+        try:
+            value = objective_value(row, objective)
+        except (ValueError, TypeError, KeyError, OverflowError) as exc:
+            raise QualityCalibrationError(f"Reference archive has an invalid objective value: {exc}") from exc
         key = _identity(row.get("identity"))
         if key in distinct and distinct[key] != value:
             raise QualityCalibrationError("Reference archive has conflicting duplicate predictions")

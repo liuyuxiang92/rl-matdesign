@@ -26,8 +26,10 @@ _VALIDATION_TOP_CONFIGS = 3
 _GENERATION_DEFAULTS = [0, .25, .5, .7, .9, 1]
 
 
-def infer_objective(base: Mapping, threshold: float) -> dict:
-    """Resolve a single named physical target, excluding constraint-only terms."""
+def infer_objective(base: Mapping, threshold: float, metric: str = "property") -> dict:
+    """Resolve a physical target or the exact scalar reward of each evaluation."""
+    if metric not in ("property", "reward"):
+        raise ConfigError("evaluation.metric must be property or reward")
     props = base.get("properties")
     if not isinstance(props, list) or not props:
         raise ConfigError("HPO requires named properties in base_config to infer its physical objective")
@@ -43,6 +45,14 @@ def infer_objective(base: Mapping, threshold: float) -> dict:
         combiner = RewardCombiner.from_config(base, list(named))
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"Cannot infer HPO objective from base_config: {exc}") from exc
+    if metric == "reward":
+        # This is the completed evaluation's reward, including the scene's
+        # direction, uncertainty, scaling, combination and gate penalties.
+        # Tag the source separately: a physical property may also be named
+        # 'reward'. Do not reconstruct it from means or from learner targets.
+        return {"field": "reward", "metric": "reward", "direction": "maximize",
+                "threshold": threshold, "threshold_inclusive": True, "unit": None,
+                "normalization": {"kind": "sigmoid", "scale": None, "calibration": "reference"}}
     active = [(name, coefficient) for name, coefficient in combiner.objective_terms.items() if coefficient != 0]
     if len(active) != 1:
         raise ConfigError("HPO requires exactly one nonzero reward objective property; "
@@ -118,10 +128,10 @@ def load_simplified_plan(path: Path, value, method=None) -> dict:
         raise ConfigError("random_seed must be < 2**32")
 
     evaluation = _mapping(raw.get("evaluation", {}), "evaluation",
-                          {"threshold", "best_fraction", "score_tolerance", "max_attempts_per_unique"})
+                          {"metric", "threshold", "best_fraction", "score_tolerance", "max_attempts_per_unique"})
     threshold = _number(evaluation.get("threshold"), "evaluation.threshold")
     tolerance = _number(evaluation.get("score_tolerance", .01), "evaluation.score_tolerance", 0)
-    objective = infer_objective(base, threshold)
+    objective = infer_objective(base, threshold, evaluation.get("metric", "property"))
     training = _mapping(raw.get("training", {}), "training",
                         {"repeats", "parameter_ranges", "score_weights", "budget", "search"})
     parameter = selected_generation_parameter(base)

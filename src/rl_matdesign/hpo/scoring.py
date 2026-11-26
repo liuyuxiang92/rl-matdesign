@@ -6,6 +6,7 @@ from decimal import Decimal
 import math
 
 from .spec import phase_efficiency
+from .objective_value import objective_value
 
 
 def quality(value: float, objective: Mapping) -> float:
@@ -89,12 +90,7 @@ def score_records(records, ledger: Mapping, plan: Mapping, phase: str) -> dict:
             if str(evaluation_status).lower() in {"failed", "invalid", "preparation_only", "evaluation_failed", "rollout_failed"}:
                 continue
             key = _identity(record.get("identity"))
-            properties = record.get("properties")
-            if not isinstance(properties, Mapping) or field not in properties:
-                raise ValueError(f"Evaluated candidate lacks objective property {field!r}")
-            value = properties[field]
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-                raise ValueError(f"Objective property {field!r} must be finite numeric data")
+            value = objective_value(record, objective)
             if objective["normalization"]["kind"] == "positive_threshold_ratio" and value <= 0:
                 raise ValueError("positive_threshold_ratio requires positive property values; choose sigmoid for this domain")
             passed = record.get("constraint_passed")
