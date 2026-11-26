@@ -112,7 +112,6 @@ def run_dqn(env, tmp_path, **overrides):
         device=torch.device("cpu"), hidden_dim=4, n_warmup_eps=2,
         dqn_num_train_eps=3, dqn_buffer_size=100, batch_size=1,
         dqn_grad_steps_per_ep=1, dqn_target_update_freq=2,
-        dqn_eps_anneal_eps=10,
         checkpoint_cfg={"path": str(tmp_path / "checkpoint.pt"), "freq": 2},
     )
     kwargs.update(overrides)
@@ -138,7 +137,7 @@ def test_dqn_waves_keep_duplicates_failures_order_and_checkpoints(tmp_path, mode
     assert [r["terminal_reward"] for r in rows] == [1, 1, 2, 1, 3, 3, 4, 5]
     online = [r for r in rows if r["phase"] == "dqn_train"]
     assert [r["budget_counted"] for r in online] == [False, True, False, True, True]
-    assert [r["epsilon_used"] for r in online] == pytest.approx([1, 1, .9, .9, .7])
+    assert [r["exploration_target_used"] for r in online] == pytest.approx([.7] * 5)
     state = saved(tmp_path)
     assert state["episodes_completed"] == 3
     assert state["training_episodes_completed"] == 5
@@ -180,7 +179,7 @@ def test_dqn_resume_preserves_actual_updates_and_seen_budget(tmp_path):
         buffer=collections.deque(state["buffer"], maxlen=100),
         start_ep=state["episodes_completed"],
         training_episodes_completed=state["training_episodes_completed"],
-        training_budget_state=state["training_budget_state"], eps=state["eps"],
+        training_budget_state=state["training_budget_state"], exploration_state=state["exploration_state"],
     )
     _, _, rows = run_dqn(ScriptedEnv(["C", "D"], predictor), tmp_path,
                          dqn_num_train_eps=2, train_count_duplicates=False, resume_state=resume)
@@ -249,7 +248,7 @@ def pg_setup(monkeypatch, sequence, size=4, method="reinforce"):
         policy=policy, value_net=Value() if method == "a2c" else None, env=env,
         scaler=StandardScaler().fit([env.current_state_features()]), elem_feats_scaled=np.eye(4),
         action_values=value_alphabet(env), device=torch.device("cpu"), num_iters=1, batch_eps=4,
-        pg_repeat_penalty_coef=.2, rl_method=method,
+        rl_method=method,
     )
 
 
@@ -262,7 +261,7 @@ def test_pg_preserves_onpolicy_batches_and_duplicate_learning(monkeypatch, metho
     assert [r["batch_eps_actual"] for r in updates] == [4, 3]
     assert predictor.waves == [["A", "A", "B", "B"], ["C", "C"], ["D"]]
     assert [r["terminal_reward"] for r in episodes] == [1, 1, 2, 2, 3, 3, 4]
-    assert episodes[1]["visit_count_before"] == 1
+    assert episodes[1]["budget_counted"] is False
     assert all(torch.equal(sampled[0], p) for p in sampled[:4])
     assert all(torch.equal(sampled[4], p) for p in sampled[4:])
     assert not torch.equal(sampled[0], sampled[4])

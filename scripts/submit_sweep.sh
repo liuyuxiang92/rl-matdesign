@@ -43,35 +43,23 @@
 #   FORCE=1                redo completed runs
 #
 # ---------------------------------------------------------------------------
-# CHECK THREE KEYS IN EACH YAML BEFORE THE FIRST BUDGET. All three silently
-# invalidate the short-budget arms if left at their 50,000-episode defaults:
+# Configure each scenario's budgets and exploration before comparing runs:
 #
-#   dqn_eps_anneal_eps   Ships at 30000. At budget 2500 epsilon only falls to
-#                        1 - 2500/30000 = 0.92, so the agent is ~92% random for the
-#                        whole run and the "DQN" arm is really random search. The
-#                        archived 2,500-episode runs ended at epsilon=0.950. Use
-#                        ~60% of dqn_num_train_eps (the reference ratio 30000/50000):
-#                            budget   dqn_num_train_eps   dqn_eps_anneal_eps
-#                             2500          1500                  900
-#                             7500          6500                 3900
-#                            22500         21500                12900
-#                            45000         44000                26400
-#                        (dqn_num_train_eps = budget - dqn_warmup_eps, warmup=1000)
+#   train_budget             Shared training budget, including rewarded DQN warmup.
+#   num_gen_eps              Distinct generated candidates requested per run.
+#   exploration_target       Initial training entropy target, default 0.7.
+#   gen_exploration_target   Initial generation entropy target, default 0.7.
+#   exploration_adaptive     Outcome-based target adaptation, default true.
 #
-#   gen_epsilon          Ships at 0.0. At 45k the trained Q-net produced THREE
-#                        unique candidates from 1000 generation episodes (calcine:
-#                        one). A budget comparison read through a 3-sample readout
-#                        is noise. Set 0.2 in all three configs — same value at
-#                        every budget, since a probability cannot confound the
-#                        budget axis.
+# Keep the exploration settings and pg_batch_eps fixed across budget arms. The
+# controller uses the same rules at every budget; this launcher never changes
+# sampling settings or translates retired YAML fields.
 #
-#   pg_batch_eps         Keep FIXED at 15; vary only pg_num_iters
-#                        (= budget / 15 -> 167 / 500 / 1500 / 3000). Changing both
-#                        confounds budget with collapse rate.
-#
-# Note budget means PREDICTOR CALLS, not episodes:
-#   DQN: dqn_warmup_eps + dqn_num_train_eps  (warmup pays a real call per episode)
-#   PG:  pg_num_iters * pg_batch_eps         (PG warmup is free)
+# The default training budget counts distinct successfully evaluated candidates,
+# not predictor calls. Duplicates and failures still cost sampling attempts, and
+# any reward/gradient calibration pilot is accounted for separately. If using
+# the algorithm-specific limits instead of train_budget, DQN uses rewarded
+# warmup plus online episodes, and PG uses pg_num_iters * pg_batch_eps.
 # ---------------------------------------------------------------------------
 
 set -euo pipefail

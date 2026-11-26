@@ -9,7 +9,7 @@ from rl_matdesign.hpo.controller import Campaign, CampaignError, rank_results
 from rl_matdesign.hpo.spec import load_plan
 
 
-def internal_plan(tmp_path, parameter="gen_temperature"):
+def internal_plan(tmp_path, parameter="gen_exploration_target"):
     """Keep orchestration tests independent of the public-schema migration."""
     (tmp_path / "scenario.yaml").write_text(yaml.safe_dump({
         "pg_warmup_eps": 0, "properties": [{"name": "x", "unit": "u"}],
@@ -35,14 +35,14 @@ def internal_plan(tmp_path, parameter="gen_temperature"):
     plan["training_search"]["seeds"] = [11, 29, 47]
     plan["training_search"]["validation_seeds"] = [101, 211, 307]
     plan["generation_search"] = {
-        "parameter": parameter, "initial_values": [0, .1, 1] if parameter == "gen_temperature" else [.2, .8],
+        "parameter": parameter, "initial_values": [.2, .8],
         "max_extra_values_per_direction": 1, "repeats_per_model": 2, "master_seed": 42,
     }
     return plan
 
 
 class ReusableRunner:
-    def __init__(self, parameter="gen_temperature", prefer="high"):
+    def __init__(self, parameter="gen_exploration_target", prefer=None):
         self.parameter, self.prefer = parameter, prefer
         self.calls, self.cache = [], {}
 
@@ -57,7 +57,7 @@ class ReusableRunner:
         score = .8 - (.1 if budget < 8 else 0)
         if phase == "generation":
             value = parameters[self.parameter]
-            if self.parameter == "gen_temperature":
+            if self.prefer is None:
                 score -= 0 if value == 1 else .15
             else:
                 score = .4 + .3 * (value if self.prefer == "high" else 1 - value)
@@ -116,7 +116,7 @@ def test_shared_training_repeats_and_generation_cartesian_repeats_resume(tmp_pat
     assert read_json(run.out / "manifest.json")["protocol"] == "hpo_v2"
 
 
-@pytest.mark.parametrize("parameter", ["gen_epsilon", "gen_top_frac"])
+@pytest.mark.parametrize("parameter", ["gen_exploration_target"])
 @pytest.mark.parametrize("prefer,expected", [("high", 1), ("low", 0)])
 def test_bounded_generation_search_selects_and_exports_only_active_method(
         tmp_path, campaign_environment, parameter, prefer, expected):
@@ -137,7 +137,7 @@ def test_bounded_generation_search_selects_and_exports_only_active_method(
     assert all(call["phase"] == "generation" for call in runner.calls[initial_calls:])
     exported = yaml.safe_load((run.out / "best_generation.yaml").read_text())
     assert exported[parameter] == expected
-    assert not (set(exported) & ({"gen_temperature", "gen_top_frac", "gen_epsilon"} - {parameter}))
+    assert not (set(exported) & {"gen_temperature", "gen_top_frac", "gen_epsilon"})
     assert "exploration_gen_eps" not in exported
 
 
@@ -192,8 +192,8 @@ def test_generation_measurement_identity_includes_frozen_model(tmp_path, campaig
     seeds_b, models_b, pairings_b = run.generation_pairs([source_b])
     assert seeds_a == seeds_b  # Same reproducible RNG pairing, different model.
     assert pairings_a[0]["model_id"] != pairings_b[0]["model_id"]
-    first = run.evaluate({"gen_temperature": 1}, 8, seeds_a, "generation", models_a, pairings_a)
-    second = run.evaluate({"gen_temperature": 1}, 8, seeds_b, "generation", models_b, pairings_b)
+    first = run.evaluate({"gen_exploration_target": 1}, 8, seeds_a, "generation", models_a, pairings_a)
+    second = run.evaluate({"gen_exploration_target": 1}, 8, seeds_b, "generation", models_b, pairings_b)
     assert first["seed_results"][0]["model_id"] != second["seed_results"][0]["model_id"]
     assert len(list((run.out / "measurements").glob("*.json"))) == 2
 
@@ -213,7 +213,7 @@ def test_one_failed_generation_repeat_invalidates_aggregate(tmp_path, campaign_e
         return row
 
     run.runner = one_failure
-    result = run.evaluate({"gen_temperature": 1}, 8, seeds, "generation", models, pairings)
+    result = run.evaluate({"gen_exploration_target": 1}, 8, seeds, "generation", models, pairings)
     assert not result["eligible_for_selection"]
     assert not result["model_results"][0]["eligible_for_selection"]
     assert result["score"] == -1
@@ -221,7 +221,7 @@ def test_one_failed_generation_repeat_invalidates_aggregate(tmp_path, campaign_e
 
 def public_plan(tmp_path, generation_repeats=2):
     (tmp_path / "scenario.yaml").write_text(yaml.safe_dump({
-        "pg_warmup_eps": 0, "gen_temperature": 1,
+        "pg_warmup_eps": 0, "gen_exploration_target": 1,
         "properties": [{"name": "working_temperature", "output": "T3",
                         "predictor": "dummy", "direction": "min", "unit": "K"}],
         "reward": {"objective": {"terms": {"working_temperature": 1}}},

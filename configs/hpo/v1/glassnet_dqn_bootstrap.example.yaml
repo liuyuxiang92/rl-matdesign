@@ -4,8 +4,6 @@
 # For medium/fine, change base_config only. Defaults are unvalidated starting values.
 # training.repeats controls all four training stages; validation gets fresh seeds.
 # generation.repeats controls sampling repeats for each frozen model.
-# The last authored gen_temperature/gen_top_frac/gen_epsilon in base_config
-# chooses the generation method. Omitting initial_values uses method defaults.
 base_config: /aisi/yxliu/rl-matdesign/glasspy/glassnet_benchmark_nodes_20261106/configs/coarse/dqn_bootstrap.yaml
 method: dqn-bootstrap
 random_seed: 42
@@ -20,8 +18,6 @@ training:
       type: categorical
       choices: [64, 128, 256, 512]
     warmup_budget_fraction: {type: float, low: 0.02, high: 0.2}
-    dqn_eps_min: {type: float, low: 0.02, high: 0.4}
-    epsilon_anneal_budget_ratio: {type: float, low: 0.25, high: 2.0, log: true}
     dqn_target_update_freq:
       type: categorical
       choices: [10, 25, 50, 100, 200]

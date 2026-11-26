@@ -83,7 +83,7 @@ def run(family, rare, method, mode, multiplier, seed):
         qnet, scaler, rows = train_dqn_online(
             **common, hidden_dim=8, n_warmup_eps=4, dqn_num_train_eps=20,
             dqn_buffer_size=32, batch_size=4, dqn_grad_steps_per_ep=1,
-            dqn_target_update_freq=4, dqn_eps_anneal_eps=16,
+            dqn_target_update_freq=4, exploration_target=.7, exploration_adaptive=False,
             train_count_duplicates=True, dqn_target_mode=method,
             value_normalization=mode,
         )
@@ -93,7 +93,7 @@ def run(family, rare, method, mode, multiplier, seed):
     set_global_seed(seed + 1000, deterministic=True)
     generated = generate_candidates(
         **common, scaler=scaler, qnet=qnet, policy=policy, predictor=oracle,
-        num_gen_eps=4, max_attempts=48, gen_temperature=0, gen_epsilon=.35,
+        num_gen_eps=4, max_attempts=48, gen_exploration_target=.7, exploration_adaptive=False,
     )
     qualities = []
     for row in generated:

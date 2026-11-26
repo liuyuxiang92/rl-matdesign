@@ -6,7 +6,7 @@ import pytest
 import yaml
 
 from rl_matdesign.config_schema import (
-    GENERATION_PARAMETERS, load_yaml_config, resolve_config, selected_generation_parameter,
+    load_yaml_config, resolve_config,
 )
 from rl_matdesign.hpo.artifacts import (
     REWARD_CALIBRATION, atomic_json, file_digest, read_json, reward_calibration_requested,
@@ -16,17 +16,13 @@ from rl_matdesign.hpo.job_runner import JobError, JobRunner
 from rl_matdesign.hpo.spec import load_plan
 
 
-def public_plan_path(tmp_path, generation_parameter="gen_temperature", threshold=0):
+def public_plan_path(tmp_path, generation_parameter="gen_exploration_target", threshold=0):
     scene = {
         "pg_warmup_eps": 0,
         "properties": [{"name": "energy", "output": "raw_model_energy",
                         "predictor": "dummy", "direction": "min", "unit": "eV"}],
         "reward": {"objective": {"terms": {"energy": 1}}},
     }
-    # Exercise author-order selection from a scene containing all three keys.
-    for parameter in GENERATION_PARAMETERS:
-        if parameter != generation_parameter:
-            scene[parameter] = .25
     scene[generation_parameter] = .5
     (tmp_path / "scene.yaml").write_text(yaml.safe_dump(scene, sort_keys=False))
     budget = {"mode": "absolute_unique", "min_unique": 4, "initial_unique": 8, "max_unique": 16}
@@ -121,7 +117,7 @@ def test_training_calibrates_once_and_restores_same_scale_on_new_runner(tmp_path
     assert file_digest(calibration_path) == original_hash
 
 
-@pytest.mark.parametrize("parameter", GENERATION_PARAMETERS)
+@pytest.mark.parametrize("parameter", ["gen_exploration_target"])
 @pytest.mark.parametrize("value", [0, .25])
 def test_selected_generation_method_survives_zero_sorted_export_and_cache(
         tmp_path, monkeypatch, parameter, value):
@@ -136,9 +132,8 @@ def test_selected_generation_method_survives_zero_sorted_export_and_cache(
     assert len(worker.calls) == 2
     call = worker.calls[-1]
     cfg = call["config"]
-    assert selected_generation_parameter(cfg) == parameter
     assert cfg[parameter] == value
-    assert all(cfg[key] == 0 for key in GENERATION_PARAMETERS if key != parameter)
+    assert "generation_selection" not in cfg
     assert "exploration_gen_eps" not in cfg
     assert cfg["hpo_phase"] == "generation"
     assert cfg["train_budget"] == 8
@@ -150,9 +145,8 @@ def test_selected_generation_method_survives_zero_sorted_export_and_cache(
     sorted_export = tmp_path / "sorted-runtime.yaml"
     sorted_export.write_text(yaml.safe_dump(cfg, sort_keys=True))
     reloaded = resolve_config(load_yaml_config(sorted_export)).config
-    assert selected_generation_parameter(reloaded) == parameter
     assert reloaded[parameter] == value
-    assert all(reloaded[key] == 0 for key in GENERATION_PARAMETERS if key != parameter)
+    assert "generation_selection" not in reloaded
     assert input_hashes == {path: file_digest(path) for path in trained["checkpoint_paths"].values()}
     assert runner({"pg_batch_eps": 2, parameter: value}, 4, 401, "generation", trained) == generated
     assert len(worker.calls) == 2
@@ -163,7 +157,7 @@ def test_training_seen_candidates_count_in_independent_generation_budget(tmp_pat
     worker = FakeWorker(monkeypatch)
     runner = JobRunner(load_plan(source), tmp_path / "campaign")
     trained = runner({"pg_batch_eps": 2}, 8, 11, "train")
-    generated = runner({"pg_batch_eps": 2, "gen_temperature": 1}, 4, 401, "generation", trained)
+    generated = runner({"pg_batch_eps": 2, "gen_exploration_target": 1}, 4, 401, "generation", trained)
     train_rows = [json.loads(line) for line in Path(trained["records_path"]).read_text().splitlines()]
     gen_rows = [json.loads(line) for line in Path(generated["records_path"]).read_text().splitlines()]
     assert {row["identity"] for row in gen_rows} <= {row["identity"] for row in train_rows}
@@ -188,13 +182,13 @@ def test_reward_calibration_is_fingerprinted_and_forwarded_to_generation(tmp_pat
     calibration_path = trained["checkpoint_paths"][REWARD_CALIBRATION]
     checksum = file_digest(calibration_path)
     assert trained["artifact_hashes"][calibration_path] == checksum
-    generated = runner({"pg_batch_eps": 2, "gen_temperature": 1}, 4, 401, "generation", trained)
+    generated = runner({"pg_batch_eps": 2, "gen_exploration_target": 1}, 4, 401, "generation", trained)
     assert generated["input_models"][REWARD_CALIBRATION] == checksum
     args = worker.calls[-1]["args"]
     assert args[args.index("--load-reward-calibration") + 1] == calibration_path
     Path(calibration_path).write_text("{}")
     with pytest.raises(JobError, match="artifact changed"):
-        runner({"pg_batch_eps": 2, "gen_temperature": 1}, 4, 401, "generation", trained)
+        runner({"pg_batch_eps": 2, "gen_exploration_target": 1}, 4, 401, "generation", trained)
     assert len(worker.calls) == 2
 
 
@@ -228,8 +222,8 @@ def test_generation_models_are_part_of_job_cache_identity(tmp_path, monkeypatch)
     runner = JobRunner(load_plan(source), tmp_path / "campaign")
     model_a = runner({"pg_batch_eps": 2}, 8, 11, "train")
     model_b = runner({"pg_batch_eps": 2}, 8, 29, "train")
-    generation_a = runner({"pg_batch_eps": 2, "gen_temperature": 1}, 4, 401, "generation", model_a)
-    generation_b = runner({"pg_batch_eps": 2, "gen_temperature": 1}, 4, 401, "generation", model_b)
+    generation_a = runner({"pg_batch_eps": 2, "gen_exploration_target": 1}, 4, 401, "generation", model_a)
+    generation_b = runner({"pg_batch_eps": 2, "gen_exploration_target": 1}, 4, 401, "generation", model_b)
     assert generation_a["job_id"] != generation_b["job_id"]
     assert generation_a["input_models"] != generation_b["input_models"]
     assert len(worker.calls) == 4

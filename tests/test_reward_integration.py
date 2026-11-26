@@ -220,7 +220,7 @@ def test_gated_reward_reaches_training_and_generated_csv(tmp_path, method):
                      'objective': 'mean'} for name in ['delta', 'pure']],
         reward=_cfg()['reward'],
         pg_warmup_eps=4, pg_num_iters=2, pg_batch_eps=2,
-        pg_repeat_penalty_coef=0.0, dqn_warmup_eps=4, dqn_num_train_eps=6,
+        dqn_warmup_eps=4, dqn_num_train_eps=6,
         dqn_grad_steps_per_ep=1, dqn_batch_size=4, num_gen_eps=6,
     )
     cfg['reward']['objective']['terms'] = {'delta': 1.0}

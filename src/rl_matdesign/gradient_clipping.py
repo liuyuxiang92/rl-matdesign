@@ -47,7 +47,6 @@ def gradient_clipping_profile() -> dict[str, Any]:
         "probe_value_coordinates": "single_pooled_target_update_when_enabled",
         "probe_actor_scaling": "pilot_wide_advantage_standardization",
         "probe_actor_entropy": "initial_controller_coefficient",
-        "probe_repeat_penalty": "zero_distinct_candidates",
     }
 
 

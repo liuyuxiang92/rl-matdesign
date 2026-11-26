@@ -1,148 +1,131 @@
-"""A2C/REINFORCE scale invariance: advantage standardisation + entropy floor.
-
-These pin the fix for the entropy collapse observed on the oxide benchmark, where
-A2C got *worse* with more episodes: raw sintering-temperature returns of 400-700
-made the actor term O(hundreds) while the entropy bonus was O(0.5), so the policy
-went deterministic (entropy 0.00, one composition sampled 31,843 times out of
-45,200 episodes) and the best candidate froze at ~20% of the run.
-
-The invariant worth protecting is that ``pg_entropy_coef`` and
-``pg_repeat_penalty_coef`` mean the same thing whatever units the property is in.
-"""
+"""Exercise normalized entropy and reward-unit invariance through real PG code."""
 from __future__ import annotations
 
 import math
 
 import numpy as np
 import pytest
+from sklearn.preprocessing import StandardScaler
+import torch
 
-torch = pytest.importorskip("torch")
-
-from rl_matdesign.training import (  # noqa: E402
-    _ENTROPY_CTRL_MAX,
-    entropy_coef_update,
-)
-
-
-# ---------------------------------------------------------------------------
-# Advantage standardisation
-# ---------------------------------------------------------------------------
-
-def _standardise(adv_raw):
-    """Mirror of the train_pg batch step, kept minimal so the test pins maths."""
-    t = torch.tensor(adv_raw, dtype=torch.float32)
-    std = float(t.std(unbiased=False).item())
-    if std > 1e-8:
-        return (t - t.mean()) / std
-    return torch.zeros_like(t)
+from rl_matdesign.domain_runtime import EpisodeStep
+from rl_matdesign.training import _episode_pg_terms, train_pg
+from tests.test_pg_duplicate_budget import _setup
 
 
-def test_standardised_advantages_are_zero_mean_unit_std():
-    adv = _standardise([-663.8, -520.1, -436.4, -770.4, -500.2])
-    assert float(adv.mean().item()) == pytest.approx(0.0, abs=1e-5)
-    assert float(adv.std(unbiased=False).item()) == pytest.approx(1.0, abs=1e-5)
+class LogitPolicy(torch.nn.Module):
+    def __init__(self, logits):
+        super().__init__()
+        self.logits = torch.nn.Parameter(torch.tensor(logits, dtype=torch.float32))
+
+    def forward(self, state, step, elements, fractions):
+        return elements @ self.logits
 
 
-def test_standardisation_is_invariant_to_reward_units():
-    """Kelvin vs Celsius vs eV must produce the same policy gradient direction."""
-    kelvin = [700.0, 650.0, 600.0, 550.0]
-    celsius = [k - 273.15 for k in kelvin]          # shift
-    scaled = [k * 0.001 for k in kelvin]            # scale
-
-    a, b, c = _standardise(kelvin), _standardise(celsius), _standardise(scaled)
-    assert torch.allclose(a, b, atol=1e-5)
-    assert torch.allclose(a, c, atol=1e-4)
-
-
-def test_zero_variance_batch_does_not_explode():
-    """Every episode scoring identically carries no signal — emit a zero update.
-
-    Dividing by an epsilon here would turn float dust into a full-magnitude
-    gradient. Reachable in practice: the 45k runs collapsed to a single
-    composition, so whole batches scored the same.
-    """
-    adv = _standardise([-530.574] * 8)
-    assert torch.all(adv == 0.0)
-    assert not torch.any(torch.isnan(adv))
+def _terms(logits, *, selected=0, allowed_indices=None):
+    policy = LogitPolicy(logits)
+    allowed_indices = list(range(len(logits))) if allowed_indices is None else allowed_indices
+    elements = np.eye(len(logits))
+    actions = [(elements[i], np.ones(1)) for i in allowed_indices]
+    action = actions[selected]
+    step = EpisodeStep(
+        state_material_features=np.zeros(1), state_step_onehot=np.ones(1),
+        action_elem_onehot=action[0], action_comp_onehot=action[1], reward=2.,
+        allowed_actions=actions,
+    )
+    terms = _episode_pg_terms(
+        path=[step], returns=[2.], policy=policy, value_net=None,
+        scaler=StandardScaler().fit([[0.], [1.]]), elem_feats_scaled=elements,
+        action_values=['1.0'], device=torch.device('cpu'),
+    )
+    return policy, terms
 
 
-def test_repeat_penalty_is_in_sigma_units():
-    """A 0.1 penalty must shift the advantage by 0.1σ, not by 0.1 kelvin."""
-    adv = _standardise([700.0, 650.0, 600.0, 550.0])
-    penalised = adv - torch.tensor([0.1, 0.0, 0.0, 0.0])
-    assert float((adv[0] - penalised[0]).item()) == pytest.approx(0.1, abs=1e-6)
+@pytest.mark.parametrize('size', [2, 4, 20])
+def test_actor_loss_entropy_is_normalized_for_actual_legal_count(size):
+    _, (logp, advantages, entropies, critic) = _terms([0.] * size)
+    assert len(entropies) == 1
+    assert entropies[0].item() == pytest.approx(1.)
+    assert logp[0].item() == pytest.approx(-math.log(size))
+    assert advantages == [2.]
+    assert critic == []
 
 
-# ---------------------------------------------------------------------------
-# Entropy floor controller
-# ---------------------------------------------------------------------------
-
-def test_controller_raises_coef_below_floor():
-    base, floor = 0.1, 0.3
-    assert entropy_coef_update(base, entropy_norm=0.05, base_coef=base, floor=floor) > base
-
-
-def test_controller_decays_back_to_base_above_floor():
-    base, floor = 0.1, 0.3
-    raised = entropy_coef_update(base * 10, entropy_norm=0.9, base_coef=base, floor=floor)
-    assert raised < base * 10
-    # base_coef is the lower clamp: the controller only ever adds exploration
-    # pressure, never removes the weight the user configured.
-    assert raised >= base
+def test_actor_entropy_and_log_probability_use_identical_mask():
+    # Invalid action's enormous logit must not influence either calculation.
+    policy, (logp, _, entropies, _) = _terms([0., math.log(3.), 100.], allowed_indices=[0, 1])
+    assert logp[0].item() == pytest.approx(math.log(.25))
+    expected = -(.25 * math.log(.25) + .75 * math.log(.75)) / math.log(2.)
+    assert entropies[0].item() == pytest.approx(expected)
+    (-entropies[0]).backward()
+    assert policy.logits.grad[2].item() == 0.
+    assert policy.logits.grad[0].item() < 0 < policy.logits.grad[1].item()
 
 
-def test_controller_is_clamped():
-    base, floor = 0.1, 0.5
-    coef = base
-    for _ in range(500):  # sustained total collapse
-        coef = entropy_coef_update(coef, entropy_norm=0.0, base_coef=base, floor=floor)
-    assert coef == pytest.approx(base * _ENTROPY_CTRL_MAX)
+def test_forced_decisions_have_no_entropy_observation_or_bonus():
+    policy, (logp, _, entropies, _) = _terms([3.])
+    assert entropies == []
+    assert logp[0].item() == 0.
+    (-logp[0]).backward()
+    assert policy.logits.grad.item() == 0.
 
 
-def test_floor_of_zero_disables_the_controller():
-    assert entropy_coef_update(5.0, entropy_norm=0.0, base_coef=0.1, floor=0.0) == 0.1
+@pytest.mark.parametrize('scale,offset', [(1., 0.), (.001, 0.), (100., 0.), (1., 273.15)])
+def test_actual_one_step_actor_updates_ignore_positive_reward_unit_changes(monkeypatch, scale, offset):
+    def run(factor, shift):
+        kwargs, _, _ = _setup(monkeypatch, [0, 1, 2, 3])
+        kwargs['env'].reward_fn = lambda formula: factor * len(formula) + shift
+        kwargs.update(num_iters=1, batch_eps=4)
+        rows = train_pg(**kwargs, train_count_duplicates=True)
+        return kwargs['policy'].logits.detach(), rows
+    reference, _ = run(1., 0.)
+    actual, rows = run(scale, offset)
+    torch.testing.assert_close(actual, reference, atol=1e-6, rtol=1e-5)
+    assert all('repeat_penalty' not in row and 'return_shaped' not in row for row in rows)
 
 
-def _simulate_collapse(floor: float, n_updates: int = 200) -> float:
-    """Toy closed loop: entropy decays under gradient pressure, the weight pushes back.
-
-    The dynamics are a stand-in, not a model of the real optimiser — the point is
-    the *comparison* between a live floor and a disabled one under identical
-    pressure, which is exactly the old-vs-new contrast.
-    """
-    base = 0.1
-    coef, entropy_norm = base, 0.95
-    for _ in range(n_updates):
-        coef = entropy_coef_update(coef, entropy_norm, base_coef=base, floor=floor)
-        entropy_norm = max(0.0, entropy_norm - 0.05 + 0.4 * (coef - base))
-    return entropy_norm
+def test_uniform_actor_with_constant_rewards_remains_finite_without_shaping(monkeypatch):
+    kwargs, _, _ = _setup(monkeypatch, [0, 0, 0, 0])
+    kwargs['env'].reward_fn = lambda _: -530.574
+    with torch.no_grad():
+        kwargs['policy'].logits.zero_()
+    rows = train_pg(**kwargs, train_count_duplicates=True)
+    assert torch.equal(kwargs['policy'].logits, torch.zeros(4))
+    assert all(np.isfinite(row['actor_loss']) for row in rows if row['phase'] == 'pg_train')
+    assert all(row['adv_std_raw'] == 0 for row in rows if row['phase'] == 'pg_train')
 
 
-def test_controller_arrests_a_collapse_that_otherwise_completes():
-    """The regression this whole change exists to prevent.
+@pytest.mark.parametrize('record,expected', [
+    ({'gate_passed': True, 'primary_ok': False}, False),
+    ({'gate_passed': True, 'constraint_passed': False}, False),
+    ({'gate_passed': True, 'gate_custom_passed': False}, False),
+    ({'gate_passed': None}, None),
+    ({'prediction_record_error': 'diagnostics unavailable'}, None),
+    ({}, True),
+])
+def test_exploration_observation_combines_known_scientific_constraints(record, expected):
+    from types import SimpleNamespace
+    from rl_matdesign.training import _exploration_observation
+    episode = SimpleNamespace(prediction_record=record, terminal_key=('sample', 1),
+                              path=[SimpleNamespace(reward=5.)])
+    observation = _exploration_observation(episode)
+    assert observation['feasible'] is expected
+    assert observation['quality'] == 5.
 
-    With the floor disabled the policy goes fully deterministic, reproducing the
-    observed failure (calcine_a2c_45000 ended at entropy 0.00). With the floor on,
-    entropy settles at a non-degenerate level under identical pressure.
-    """
-    without = _simulate_collapse(floor=0.0)
-    with_floor = _simulate_collapse(floor=0.3)
 
-    assert without == 0.0, "baseline should collapse completely"
-    assert with_floor > 0.15, f"controller failed to arrest collapse (h={with_floor})"
+def test_extreme_finite_logits_have_finite_entropy_and_gradients():
+    policy, (logp, _, entropies, _) = _terms([3e38, -3e38])
+    loss = -logp[0] - entropies[0]
+    assert torch.isfinite(loss).item()
+    loss.backward()
+    assert torch.isfinite(policy.logits.grad).all().item()
+    assert entropies[0].item() == 0.
 
 
-# ---------------------------------------------------------------------------
-# Normalised entropy
-# ---------------------------------------------------------------------------
-
-def test_normalised_entropy_is_comparable_across_action_set_sizes():
-    """The floor is a fraction of ln|A| precisely so it ports across scenarios.
-
-    |A| is ~268 for the 80-element oxide env but far smaller for OOH; an absolute
-    nats floor would mean different things in each.
-    """
-    for n in (10, 28, 268):
-        uniform = np.full(n, 1.0 / n)
-        h = float(-(uniform * np.log(uniform)).sum())
-        assert h / math.log(n) == pytest.approx(1.0, abs=1e-6)
+def test_hpo_postconstraint_result_prevents_controller_feasibility_credit():
+    from types import SimpleNamespace
+    from rl_matdesign.training import _exploration_observation
+    episode = SimpleNamespace(prediction_record={'gate_passed': True},
+                              metadata={'post_constraint_passed': False},
+                              terminal_key=('sample', 1), path=[SimpleNamespace(reward=5.)])
+    assert _exploration_observation(episode)['feasible'] is False

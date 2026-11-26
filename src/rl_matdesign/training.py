@@ -16,7 +16,6 @@ import json
 import math
 import random
 import time
-from collections import Counter
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -28,6 +27,7 @@ from .env_multigroup import MultiGroupEnv
 from .action_features import value_features, value_feature_dim
 from .predictors.base import PropertyPredictor
 from .value_normalization import POPART_PROFILE
+from .exploration import ExplorationController, entropy_probabilities, normalized_entropy
 from .utils.training_budget import TrainingBudget
 from .utils.stage_timing import checkpoint_stage, checkpoint_prepared, record_checkpoint
 from .utils.checkpoint_serialization import save_checkpoint_payload
@@ -59,6 +59,76 @@ from .utils.episode_batch import (
 # amount of retrying will fix — better to fail loudly than spend the rest of
 # the training budget on candidates that never get scored.
 _MAX_CANDIDATE_RETRIES = 10
+
+
+def _exploration_observation(episode) -> dict:
+    """Read fixed scientific utility from the completed evaluation snapshot only."""
+    record = episode.prediction_record or {}
+    constraints = [value for name, value in record.items()
+                   if name in {"gate_passed", "primary_ok", "constraint_passed"}
+                   or (name.startswith("gate_") and name.endswith("_passed"))]
+    if "post_constraint_passed" in getattr(episode, "metadata", {}):
+        constraints.append(episode.metadata["post_constraint_passed"])
+    if any(isinstance(value, (bool, np.bool_)) and not value for value in constraints):
+        feasible = False
+    elif record.get("prediction_record_error") or any(
+            not isinstance(value, (bool, np.bool_)) for value in constraints):
+        feasible = None
+    else:
+        feasible = True  # An ungated scalar reward has no feasibility constraint.
+    quality = next((record[name] for name in
+                    ("reward_standardized_utility", "reward_objective", "reward")
+                    if record.get(name) is not None),
+                   float(episode.path[-1].reward) if episode.path else None)
+    return {"key": repr(episode.terminal_key), "quality": quality,
+            "feasible": feasible, "successful": True}
+
+
+def _flush_exploration(controller, pending, env) -> dict:
+    """Apply outcome feedback after the behavior collection block has completed."""
+    diagnostics = controller.observe_block(pending) if pending else controller.diagnostics()
+    pending.clear()
+    env.exploration_state = controller.state_dict()
+    env.exploration_seen_keys = list(controller.seen_keys)
+    return diagnostics
+
+
+def _exploration_metrics(controller):
+    return {"exploration_" + key: value for key, value in controller.diagnostics().items()}
+
+
+def _exploration_failure(pending):
+    def record(_failure, _phase):
+        pending.append({"key": None, "quality": None, "feasible": None,
+                        "successful": False})
+    return record
+
+
+def _restore_exploration(initial_target, adaptive, state, *, resuming=False):
+    controller = ExplorationController(initial_target=initial_target, adaptive=adaptive)
+    if resuming and state is None:
+        raise ValueError("Exact resume requires exploration_state; old exploration checkpoints cannot be resumed")
+    if state is not None:
+        controller.load_state_dict(state)
+    return controller
+
+
+def _record_sampling_entropy(diagnostics, stage, probabilities):
+    if diagnostics is None:
+        return
+    per_stage = diagnostics.setdefault("exploration_entropy_by_stage", {})
+    per_stage[str(stage)] = normalized_entropy(probabilities)
+    observed = [value for value in per_stage.values() if value is not None]
+    diagnostics["exploration_entropy"] = float(np.mean(observed)) if observed else None
+
+
+def _sampler_probabilities(scores, target, model=None):
+    if not np.isfinite(scores).all():
+        from .utils.candidate_budget import NumericalTrainingError
+        raise NumericalTrainingError("Nonfinite network scores during action selection")
+    normalizer = getattr(model, "value_normalizer", None)
+    scale = float(normalizer.scale) if normalizer is not None else None
+    return entropy_probabilities(scores, target, scale=scale)
 
 
 def _sync_training_device(device) -> None:
@@ -642,8 +712,8 @@ def train_dqn_online(
     batch_size: int = 256,
     dqn_grad_steps_per_ep: int = 5,
     dqn_target_update_freq: int = 100,
-    dqn_eps_anneal_eps: int = 10000,
-    dqn_eps_min: float = 0.05,
+    exploration_target: float = 0.7,
+    exploration_adaptive: bool = True,
     gamma: float = 0.9,
     lr: float = 1e-3,
     loss_name: str = "smoothl1",
@@ -660,50 +730,13 @@ def train_dqn_online(
     gradient_clipping: str = "none",
     gradient_calibration_episodes=None,
 ) -> Tuple[torch.nn.Module, StandardScaler, List[dict]]:
-    """Classical online DQN with FIFO replay buffer and TD targets.
+    """Online MC/bootstrap DQN with entropy-controlled legal-action sampling.
 
-    Phase 0 — Warmup (skipped when ``resume_state`` is provided):
-        Roll out ``n_warmup_eps`` random episodes with real rewards to pre-fill
-        the buffer and fit the s_mat StandardScaler. Any prior reward-calibration
-        observations are outside this learner's budget and replay buffer.
-
-    Phase 1 — Training loop (``dqn_num_train_eps`` episodes):
-        Each episode:
-        1. ε-greedy rollout → 5 new buffer rows.
-        2. ``dqn_grad_steps_per_ep`` gradient steps, each sampling ``batch_size``
-           rows from the full buffer (SmoothL1 loss on TD targets).
-        3. Hard-copy qnet → target_net every ``dqn_target_update_freq`` episodes.
-        4. Linear epsilon anneal: ε = max(dqn_eps_min, 1 − ep / dqn_eps_anneal_eps).
-
-    Resume:
-        Pass ``resume_state`` with pre-built ``{scaler, qnet, target_net,
-        optimizer, buffer, start_ep, eps}`` to skip warmup and continue from
-        a prior run. The loop iterates over ``range(start_ep, dqn_num_train_eps)``
-        so the ε schedule (function of ``ep``) resumes correctly.
-
-    Returns
-    -------
-    (qnet, scaler, metrics):
-        Trained Q-network, fitted s_mat scaler, and list of per-episode metric
-        dicts (phase="dqn_train").
-
-    ``timer``:
-        Optional :class:`~rl_matdesign.utils.timing.PredictorTimer`. When given,
-        every per-episode row also carries cumulative wall-clock and
-        predictor-call counters, which is what makes a best-reward-vs-time curve
-        plottable after the run.
-
-    ``train_count_duplicates=False`` counts new terminal candidate keys only,
-    sharing a seen set across the rewarded warmup and online training phases.
-    Repeated trajectories still enter replay and trigger the normal gradient
-    steps. Epsilon, target-copy and checkpoint schedules follow actual sampled
-    online episodes. The duplicate guard bounds consecutive repeats; the
-    budget state and actual episode counter are stored separately on resume.
-
-    Opt-in cross-candidate evaluation collects a wave under the current Q-network
-    and epsilon, then preserves one replay insertion and gradient group per
-    successful episode. This delays behavior-policy refresh relative to scalar
-    online DQN; ``epsilon_used`` records the collection wave's exploration rate.
+    Random rewarded warmup fits the feature scaler and fills replay. Online
+    episodes retain the selected MC/TD target, replay and target-copy schedules.
+    The exploration controller observes completed scientific outcomes only after
+    each prefetched wave drains, and is restored exactly with optimizer/replay.
+    Unique budgets still learn from repeated episodes; attempts remain observable.
     """
     if resume_state is None and n_warmup_eps < 1:
         raise ValueError("Fresh DQN training requires dqn_warmup_eps >= 1 to fit the state scaler")
@@ -751,14 +784,24 @@ def train_dqn_online(
                 "mc comparison run."
             )
 
+    exploration = _restore_exploration(
+        exploration_target, exploration_adaptive,
+        (resume_state or {}).get("exploration_state"),
+        resuming=resume_state is not None and resume_state.get("exact_resume", True),
+    )
+    if resume_state is None or not resume_state.get("exact_resume", True):
+        exploration.seed_seen(repr(ep.terminal_key) for ep in gradient_calibration_episodes or ())
+        exploration.seed_seen(getattr(env, "exploration_seen_keys", ()))
+
     if training_samples is not None:
         training_samples.start(
             budget.counted, history_complete=budget_history_complete,
             session_id=resume_state.get("training_sample_session_id") if resume_state else None,
         )
+    exploration_pending = []
     evaluator = EpisodeBatchEvaluator(
         env, max_retries=_MAX_CANDIDATE_RETRIES, timer=timer,
-        capture_predictions=training_samples is not None,
+        capture_predictions=True, failure_callback=_exploration_failure(exploration_pending),
     )
 
     # Warmup pays one real predictor call per episode (see below), so those
@@ -774,12 +817,9 @@ def train_dqn_online(
         buffer     = resume_state["buffer"]
         start_ep   = int(resume_state.get("start_ep", 0))
         train_attempts = int(resume_state.get("training_episodes_completed", start_ep))
-        eps        = float(resume_state.get(
-            "eps", max(dqn_eps_min, 1.0 - start_ep / dqn_eps_anneal_eps),
-        ))
         loss_fn    = _make_loss_fn(loss_name)
         print(
-            f"[INFO] DQN resume: start_ep={start_ep}, eps={eps:.4f}, "
+            f"[INFO] DQN resume: start_ep={start_ep}, entropy_target={exploration.target:.4f}, "
             f"buffer_rows={len(buffer)}",
             flush=True,
         )
@@ -814,7 +854,7 @@ def train_dqn_online(
                     "episode": warmup_attempts,
                     "return": float(episode.path[-1].reward),
                     "terminal_reward": float(episode.path[-1].reward),
-                    "epsilon": 1.0,          # warmup is uniformly random by definition
+                    "exploration_target_used": 1.0,
                     "terminal_comp_key": str(episode.terminal_key),
                     "budget_counted": counted,
                     "training_budget_history_complete": budget_history_complete,
@@ -861,7 +901,9 @@ def train_dqn_online(
         loss_fn = _make_loss_fn(loss_name)
         start_ep = 0
         train_attempts = 0
-        eps = 1.0
+        # Random warmup is an archive seed, not an adaptive-policy observation.
+        exploration.seed_seen(repr(key) for key in budget.state_dict()["seen_keys"])
+        exploration_pending.clear()
 
     gradient_clipper = None
     if gradient_clipping == "clipping":
@@ -893,6 +935,7 @@ def train_dqn_online(
     metrics: List[dict] = []
     metrics.extend(warmup_rows)
 
+    _flush_exploration(exploration, exploration_pending, env)
     if start_ep >= dqn_num_train_eps:
         print(
             f"[WARN] DQN: start_ep ({start_ep}) >= dqn_num_train_eps ({dqn_num_train_eps}); "
@@ -908,6 +951,7 @@ def train_dqn_online(
             "target_net_state": target_net.state_dict() if target_net is not None else None, "opt_state": optimizer.state_dict(),
             "gradient_clipping_state": gradient_clipper.state_dict() if gradient_clipper else None,
             "buffer": list(buffer), "scaler": scaler,
+            "exploration_state": exploration.state_dict(),
             "training_budget_state": budget.state_dict(),
         }
 
@@ -915,40 +959,26 @@ def train_dqn_online(
     from .utils.td_target_cache import TDTargetCache
     target_cache = TDTargetCache() if dqn_target_mode == "bootstrap" else None
 
-    def _rollout_eps_greedy_episode() -> None:
-        # Collect one episode with epsilon-greedy policy.
-        env.initialize()
-        for _t in _episode_steps(env):
-            _allowed = _legal_actions(env)
-            _s_mat_sc = scaler.transform(
-                env.current_state_features().reshape(1, -1))[0]
-            _s_step = np.zeros(env.max_steps, dtype=float)
-            _s_step[env.counter] = 1.0
-            if float(np.random.rand()) < eps:
-                _a = random.choice(_allowed)
-            else:
-                _a = choose_action(
-                    model=qnet, device=device,
-                    s_material=_s_mat_sc, s_step=_s_step,
-                    allowed_actions=_allowed,
-                    elem_feats_scaled=elem_feats_scaled,
-                    action_values=action_values,
-                )
-            env.step(_a)
+    def _rollout_entropy_episode() -> None:
+        _rollout_policy_episode(
+            env=env, qnet=qnet, scaler=scaler, device=device,
+            elem_feats_scaled=elem_feats_scaled, action_values=action_values,
+            exploration_target=exploration.target,
+        )
 
     completed = start_ep
     while completed < dqn_num_train_eps:
         budget.check_can_sample()
         qnet.eval()
         episode = evaluator.next(
-            _rollout_eps_greedy_episode,
+            _rollout_entropy_episode,
             limit=training_wave_limit(
                 budget, dqn_num_train_eps - completed,
                 checkpoint_freq=ckpt_freq if ckpt_path else 0,
                 completed_attempts=train_attempts,
             ),
             retry_scalar=_rollout_with_retry,
-            metadata={"epsilon_used": eps},
+            metadata={"exploration_target_used": exploration.target},
             phase="dqn_train",
         )
         counted = budget.record(episode.terminal_key)
@@ -1011,8 +1041,9 @@ def train_dqn_online(
             target_net.eval()
             target_cache.clear()
 
-        # 4. Linear epsilon anneal.
-        eps = max(dqn_eps_min, 1.0 - (train_attempts - 1) / dqn_eps_anneal_eps)
+        exploration_pending.append(_exploration_observation(episode))
+        if not evaluator.pending:
+            _flush_exploration(exploration, exploration_pending, env)
         _sync_training_device(device)
         update_s = time.perf_counter() - update_started
 
@@ -1031,8 +1062,10 @@ def train_dqn_online(
             "terminal_reward": episode_reward,
             "train_loss": mean_loss,
             "optimizer_steps": optimizer_steps,
-            "epsilon": eps,
-            "epsilon_used": episode.metadata["epsilon_used"],
+            **_exploration_metrics(exploration),
+            "exploration_target_used": episode.metadata["exploration_target_used"],
+            "exploration_entropy": episode.metadata.get("exploration_entropy"),
+            "exploration_entropy_by_stage": json.dumps(episode.metadata.get("exploration_entropy_by_stage", {}), sort_keys=True),
             "buffer_rows": len(buffer),
             **_episode_timing_row(episode, update_s),
         }
@@ -1059,7 +1092,7 @@ def train_dqn_online(
         _record_episode_timing(timer, _row)
         pbar.update(int(counted))
         pbar.set_postfix(
-            eps=f"{eps:.3f}",
+            target=f"{exploration.target:.3f}",
             loss=f"{mean_loss:.4f}" if not math.isnan(mean_loss) else "warmup",
             ret=f"{episode_reward:.3f}",
         )
@@ -1094,7 +1127,7 @@ def train_dqn_online(
                     "gradient_clipping_state": gradient_clipper.state_dict() if gradient_clipper else None,
                     "buffer": list(buffer),
                     "dqn_buffer_size": dqn_buffer_size,
-                    "eps": eps,
+                    "exploration_state": exploration.state_dict(),
                 }, numbered_path=_numbered)
             tqdm.write(f"[INFO] DQN checkpoint saved at episode {train_attempts} "
                        f"(budget {completed}/{dqn_num_train_eps}) → {_numbered or ckpt_path}")
@@ -1117,30 +1150,13 @@ def choose_action(
     allowed_actions: Sequence[Tuple[Tuple[float, ...], Tuple[float, ...]]],
     elem_feats_scaled: np.ndarray,
     action_values: List[str],
-    gen_epsilon: float = 0.0,
-    gen_top_frac: float = 0.0,
-    gen_temperature: float = 0.0,
+    exploration_target: float = 0.7,
+    sampling_diagnostics: Optional[dict] = None,
 ) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
-    """Select action from Q-network using Magpie encoding.
-
-    Priority: ε-greedy > Boltzmann > top-k > greedy argmax (default).
-
-    Parameters
-    ----------
-    gen_epsilon:
-        ε-greedy probability. Short-circuits before Q computation.
-    gen_temperature:
-        Boltzmann temperature τ > 0. Ignored if gen_epsilon fires.
-    gen_top_frac:
-        Uniform sample from top-k% by Q-value. Ignored if higher-priority
-        strategy fires.
-    """
+    """Sample legal Q actions at the requested normalized entropy."""
     n = len(allowed_actions)
     if not n:
         raise InfeasibleEpisode("Cannot choose an action from an empty legal set")
-
-    if gen_epsilon > 0.0 and float(np.random.rand()) < gen_epsilon:
-        return allowed_actions[int(np.random.randint(n))]
 
     a_elem = np.asarray(
         [elem_feats_scaled[int(np.argmax(a[0]))] for a in allowed_actions], dtype=float
@@ -1157,19 +1173,9 @@ def choose_action(
             torch.tensor(a_comp,   dtype=torch.float32, device=device),
         ).reshape(-1)
 
-    if gen_temperature > 0.0:
-        q_np = q.cpu().numpy().astype(float) / gen_temperature
-        q_np -= q_np.max()
-        probs = np.exp(q_np); probs /= probs.sum()
-        return allowed_actions[int(np.random.choice(n, p=probs))]
-
-    if gen_top_frac > 0.0:
-        k = max(1, int(round(gen_top_frac * n)))
-        topk = torch.argsort(q, descending=True).cpu().tolist()[:k]
-        return allowed_actions[int(np.random.choice(topk))]
-
-    # Pure greedy argmax (default for DQN training rollouts).
-    return allowed_actions[int(torch.argmax(q).item())]
+    probs = _sampler_probabilities(q.cpu().numpy().astype(float), exploration_target, model)
+    _record_sampling_entropy(sampling_diagnostics, int(np.argmax(s_step)), probs)
+    return allowed_actions[int(np.random.choice(n, p=probs))]
 
 
 # ---------------------------------------------------------------------------
@@ -1207,6 +1213,7 @@ def _episode_steps(env):
 def _rollout_random_episode(env: MultiGroupEnv) -> None:
     """Roll out one episode with uniformly random action selection."""
     env.initialize()
+    env.exploration_diagnostics = {}
     for _ in _episode_steps(env):
         _legal_actions(env)
         a = env.sample_random_action()
@@ -1221,12 +1228,11 @@ def _rollout_policy_episode(
     device: torch.device,
     elem_feats_scaled: np.ndarray,
     action_values: List[str],
-    gen_epsilon: float = 0.0,
-    gen_top_frac: float = 0.0,
-    gen_temperature: float = 1.0,
+    exploration_target: float = 0.7,
 ) -> None:
     """Roll out one episode guided by a Q-network (used during generation)."""
     env.initialize()
+    env.exploration_diagnostics = {}
     for _ in _episode_steps(env):
         allowed = _legal_actions(env)
         s_mat = scaler.transform(env.current_state_features().reshape(1, -1))[0]
@@ -1239,9 +1245,8 @@ def _rollout_policy_episode(
             allowed_actions=allowed,
             elem_feats_scaled=elem_feats_scaled,
             action_values=action_values,
-            gen_epsilon=gen_epsilon,
-            gen_top_frac=gen_top_frac,
-            gen_temperature=gen_temperature,
+            exploration_target=exploration_target,
+            sampling_diagnostics=env.exploration_diagnostics,
         )
         env.step(a)
 
@@ -1295,8 +1300,9 @@ def _rollout_pg_episode(
     action_values: List[str],
     device: torch.device,
 ) -> None:
-    """Roll out one episode with pure softmax sampling (on-policy, no pg_epsilon)."""
+    """Roll out the actor distribution exactly as reconstructed by its loss."""
     env.initialize()
+    env.exploration_diagnostics = {}
     for _ in _episode_steps(env):
         allowed = _legal_actions(env)
         s_mat = scaler.transform(env.current_state_features().reshape(1, -1))[0]
@@ -1317,38 +1323,17 @@ def _rollout_pg_episode(
                 torch.tensor(a_elem_batch, dtype=torch.float32, device=device),
                 torch.tensor(a_comp_batch, dtype=torch.float32, device=device),
             ).reshape(-1)
+        if not torch.isfinite(logits).all().item():
+            from .utils.candidate_budget import NumericalTrainingError
+            raise NumericalTrainingError("Nonfinite actor logits during sampling")
         probs = torch.softmax(logits, dim=0).cpu().numpy()
+        _record_sampling_entropy(env.exploration_diagnostics, env.counter, probs)
         env.step(allowed[int(np.random.choice(n, p=probs))])
 
 
 # ---------------------------------------------------------------------------
 # Policy gradient training (REINFORCE / A2C)
 # ---------------------------------------------------------------------------
-
-# Entropy-floor controller. The failure it exists to prevent: with a fixed
-# coefficient, how far the policy collapses is set by the *number of gradient
-# updates*, so the same YAML that behaves at 100 updates goes deterministic at
-# 3000 (observed: entropy 0.00 with one composition sampled 31,843 times out of
-# 45,200 episodes). A proportional controller on normalised entropy removes that
-# dependence on run length, so one setting serves every budget.
-_ENTROPY_CTRL_GAIN = 2.0    # how hard coef_eff reacts to a floor violation
-_ENTROPY_CTRL_MAX  = 100.0  # coef_eff ceiling, as a multiple of pg_entropy_coef
-
-
-def entropy_coef_update(coef_eff: float, entropy_norm: float,
-                        base_coef: float, floor: float) -> float:
-    """One step of the entropy-floor controller.
-
-    ``entropy_norm`` is ``H / ln|A|`` in [0, 1]; ``floor`` is ``pg_entropy_min``.
-    Below the floor the weight grows, above it decays back toward ``base_coef``,
-    which acts as the lower clamp so the controller can only ever *add* pressure
-    to explore. ``floor <= 0`` disables it and pins the weight at ``base_coef``.
-    """
-    if floor <= 0.0:
-        return base_coef
-    coef_eff *= math.exp(_ENTROPY_CTRL_GAIN * (floor - entropy_norm))
-    return min(max(coef_eff, base_coef), base_coef * _ENTROPY_CTRL_MAX)
-
 
 def _episode_pg_terms(
     *,
@@ -1363,20 +1348,18 @@ def _episode_pg_terms(
 ) -> tuple:
     """Build per-step policy-gradient *components* for one episode.
 
-    Returns ``(logp_taken, advantage_raw, entropy, max_entropy, critic_loss)``
+    Returns ``(logp_taken, advantage_raw, normalized_entropy, critic_loss)``
     rather than a finished actor loss. The advantage is deliberately left
     un-scaled and separate from ``logp`` so :func:`train_pg` can standardise it
     across the whole batch before forming ``-logp * adv`` — folding the two
     together here would make batch-level normalisation impossible.
 
-    ``logp_taken`` and ``entropy`` carry autograd state; ``advantage_raw`` and
-    ``max_entropy`` are plain floats (the advantage is a constant w.r.t. the
-    actor by construction — ``G`` is data and ``V`` is detached).
+    Log-probabilities and normalized entropies carry autograd state.
+    Advantages are detached; forced decisions have no entropy term.
     """
     logp_taken: List[torch.Tensor] = []
     advantages_raw: List[float] = []
     entropy_terms: List[torch.Tensor] = []
-    max_entropies: List[float] = []
     critic_losses: List[torch.Tensor] = []
 
     value_normalizer = getattr(value_net, "value_normalizer", None)
@@ -1404,7 +1387,6 @@ def _episode_pg_terms(
 
         logits    = policy(s_mat_t, s_step_t, a_elem_t, a_comp_t).reshape(-1)
         log_probs = torch.log_softmax(logits, dim=0)
-        probs     = torch.softmax(logits, dim=0)
 
         taken_elem = np.asarray(step.action_elem_onehot)
         taken_comp = np.asarray(step.action_comp_onehot)
@@ -1439,13 +1421,15 @@ def _episode_pg_terms(
 
         logp_taken.append(log_probs[taken_idx])
         advantages_raw.append(float(advantage))
-        entropy_terms.append(-(probs * log_probs).sum())
-        # Max entropy of this step's action set. |A| varies per step (the env
-        # prunes infeasible actions), so the floor has to be measured against the
-        # live action count, not a global constant.
-        max_entropies.append(math.log(n) if n > 1 else 0.0)
+        if n > 1:
+            # Compute this small entropy reduction in float64: finite float32
+            # logit differences and H/log(n) gradients can otherwise overflow.
+            entropy_log_probs = torch.log_softmax(logits.double(), dim=0)
+            entropy_probs = torch.softmax(logits.double(), dim=0)
+            safe_logs = entropy_log_probs.clamp_min(torch.finfo(torch.float32).min)
+            entropy_terms.append(-(entropy_probs * safe_logs).sum() / math.log(n))
 
-    return logp_taken, advantages_raw, entropy_terms, max_entropies, critic_losses
+    return logp_taken, advantages_raw, entropy_terms, critic_losses
 
 
 def train_pg(
@@ -1462,11 +1446,9 @@ def train_pg(
     gamma: float = 0.99,
     lr_actor: float = 1e-3,
     lr_critic: float = 1e-3,
-    pg_entropy_coef: float = 0.01,
-    pg_entropy_min: float = 0.3,
+    exploration_target: float = 0.7,
+    exploration_adaptive: bool = True,
     rl_method: str = "a2c",
-    pg_repeat_penalty_coef: float = 0.0,
-    pg_repeat_penalty_shape: str = "log",
     max_train_attempts: Optional[int] = None,
     train_count_duplicates: bool = False,
     train_max_duplicate_attempts: int = 1000,
@@ -1476,44 +1458,13 @@ def train_pg(
     gradient_clipping: str = "none",
     gradient_calibration_episodes=None,
 ) -> List[dict]:
-    """Batched REINFORCE / A2C training loop (matches feat/classical-dqn).
+    """On-policy actor/critic updates with normalized entropy feedback.
 
-    Structure:
-        for it in range(num_iters):
-            collect batch_eps episodes under current policy
-            standardise advantages across the batch
-            one optimizer step over the entire batch
-
-    With ``train_count_duplicates=False``, the budget is instead
-    ``num_iters * batch_eps`` new terminal compositions. Duplicate episodes
-    still participate in the same learning batches and repeat penalties, so
-    the run can perform more updates than ``num_iters``. The final batch may
-    contain fewer than ``batch_eps`` trajectories. A resumed invocation requests
-    this many *additional* budgeted episodes while retaining all previously seen
-    compositions. Prior reward calibration and scaler-only warmup do not consume
-    this budget or enter the learner's seen set.
-
-    Scale invariance
-    ----------------
-    Advantages are **standardised across the batch** before forming the actor
-    loss, unconditionally. Without it the actor term scales with the raw reward
-    (sintering temperatures are 400-700, so |advantage| is O(hundreds)) while the
-    entropy bonus is ``pg_entropy_coef * H`` with ``H <= ln|A| ~ 5.6``. The
-    entropy term is then ~2 orders of magnitude too small to influence the update
-    and the policy collapses to a single composition. After standardisation both
-    ``pg_entropy_coef`` and ``pg_repeat_penalty_coef`` are expressed in standard
-    deviations of batch return, so they mean the same thing in every scenario
-    regardless of the property's units.
-
-    ``pg_entropy_min`` is a floor on *normalised* entropy ``H / ln|A|`` in [0, 1],
-    held by a proportional controller (see ``_ENTROPY_CTRL_GAIN``). Set it to 0 to
-    disable the floor and use the bare ``pg_entropy_coef``.
-
-    .. note::
-       In the metrics rows ``repeat_penalty`` is now in σ, while ``return_shaped``
-       converts it back to the property's units so it stays comparable against
-       ``return_raw``. Logs written before this change are not comparable to
-       either.
+    Duplicate trajectories retain their scientific returns and participate in
+    learning without visit penalties. Fixed or adaptive entropy targets share
+    one controller; outcome feedback changes the target only between batches.
+    The actor samples its own softmax, and its loss uses the identical masked
+    distribution. Forced decisions contribute no entropy observation or bonus.
     """
     budget_state = checkpoint_cfg.get("training_budget_state") if checkpoint_cfg else None
     resuming = bool(checkpoint_cfg and (
@@ -1550,6 +1501,14 @@ def train_pg(
         print("[WARN] Legacy checkpoint has no training budget history: new diagnostic "
               "counters start at this resume; the existing episode schedule is preserved.", flush=True)
 
+    exploration = _restore_exploration(
+        exploration_target, exploration_adaptive,
+        (checkpoint_cfg or {}).get("exploration_state"), resuming=resuming,
+    )
+    if not resuming:
+        exploration.seed_seen(repr(ep.terminal_key) for ep in gradient_calibration_episodes or ())
+        exploration.seed_seen(getattr(env, "exploration_seen_keys", ()))
+
     if training_samples is not None:
         training_samples.start(
             budget.counted, history_complete=budget_history_complete,
@@ -1558,9 +1517,10 @@ def train_pg(
     metrics: List[dict] = []
     budget_start = budget.counted
 
+    exploration_pending = []
     evaluator = EpisodeBatchEvaluator(
         env, max_retries=_MAX_CANDIDATE_RETRIES, timer=timer,
-        capture_predictions=training_samples is not None,
+        capture_predictions=True, failure_callback=_exploration_failure(exploration_pending),
     )
     policy.train()
     opt_actor = torch.optim.Adam(policy.parameters(), lr=lr_actor)
@@ -1590,18 +1550,11 @@ def train_pg(
             "gradient_clipping_state": {name: ctl.state_dict() for name, ctl in gradient_clippers.items()},
             "opt_critic_state": opt_critic.state_dict() if opt_critic is not None else None,
             "scaler": scaler, "training_budget_state": budget.state_dict(),
+            "exploration_state": exploration.state_dict(),
         }
 
-    visit_counts: Counter = Counter()
-    if checkpoint_cfg and checkpoint_cfg.get("visit_counts"):
-        visit_counts = Counter(checkpoint_cfg["visit_counts"])
-
-    # Effective entropy weight, carried across updates by the floor controller.
-    # Restored on resume so a resumed run doesn't snap back to the base weight and
-    # re-collapse the policy it had just re-opened.
-    coef_eff = float(pg_entropy_coef)
-    if checkpoint_cfg and checkpoint_cfg.get("entropy_coef_eff") is not None:
-        coef_eff = float(checkpoint_cfg["entropy_coef_eff"])
+    coef_eff = exploration.coefficient
+    _flush_exploration(exploration, exploration_pending, env)
 
     if gradient_clipping == "clipping":
         from .gradient_clipping import AdaptiveGradientClipper
@@ -1617,8 +1570,8 @@ def train_pg(
             gradient_clippers, report = calibrate_pg_gradients(
                 policy=policy, value_net=value_net, episodes=gradient_calibration_episodes,
                 scaler=scaler, elem_feats_scaled=elem_feats_scaled, action_values=action_values,
-                device=device, gamma=gamma, entropy_coef=pg_entropy_coef,
-                entropy_min=pg_entropy_min,
+                device=device, gamma=gamma, exploration_target=exploration_target,
+                exploration_adaptive=exploration_adaptive,
             )
             write_gradient_report(checkpoint_cfg, report)
     elif gradient_clipping != "none":
@@ -1669,8 +1622,7 @@ def train_pg(
         batch_paths: List[list] = []
         batch_returns: List[List[float]] = []
         batch_terminal_keys: List[tuple] = []
-        batch_repeat_penalties: List[float] = []
-        batch_visits_before: List[int] = []
+        batch_target = exploration.target
         # One record per *sampled episode*, so the PG training-reward distribution is
         # comparable with DQN's (which logs every episode). The pg_train row below
         # only carries the batch mean, which hides the low-temperature tail entirely.
@@ -1722,27 +1674,11 @@ def train_pg(
             budget_counted = budget.record(terminal_key)
             if not train_count_duplicates and budget_counted:
                 outer_pbar.update(1)
-            n_visits_before = visit_counts[terminal_key]
-            if pg_repeat_penalty_coef > 0.0:
-                if pg_repeat_penalty_shape == "log":
-                    repeat_penalty = pg_repeat_penalty_coef * math.log1p(n_visits_before)
-                elif pg_repeat_penalty_shape == "sqrt":
-                    repeat_penalty = pg_repeat_penalty_coef * math.sqrt(n_visits_before)
-                else:
-                    repeat_penalty = pg_repeat_penalty_coef * float(n_visits_before)
-            else:
-                repeat_penalty = 0.0
-            visit_counts[terminal_key] += 1
-            # The penalty is applied *after* advantage standardisation (below), so
-            # the coefficient is in σ of batch return rather than in the property's
-            # own units. Subtracting it from the raw return here would make it a
-            # no-op: 0.1*ln(1+4472) = 0.84 against returns of ~436 is 0.2%.
+            exploration_pending.append(_exploration_observation(episode))
 
             batch_paths.append(path)
             batch_returns.append(returns)
             batch_terminal_keys.append(terminal_key)
-            batch_repeat_penalties.append(repeat_penalty)
-            batch_visits_before.append(n_visits_before)
             collected += 1
             accepted += 1
             batch_ep_rows.append({
@@ -1757,8 +1693,9 @@ def train_pg(
                 # two are NOT comparable without this column. Log it explicitly
                 # rather than making every reader re-derive gamma from run_config.
                 "terminal_reward": float(path[-1].reward),
-                "repeat_penalty": repeat_penalty,
-                "visit_count_before": n_visits_before,
+                "exploration_target_used": batch_target,
+                "exploration_entropy": episode.metadata.get("exploration_entropy"),
+                "exploration_entropy_by_stage": json.dumps(episode.metadata.get("exploration_entropy_by_stage", {}), sort_keys=True),
                 "terminal_comp_key": str(terminal_key),
                 "budget_counted": budget_counted,
                 **budget.snapshot(),
@@ -1786,12 +1723,10 @@ def train_pg(
                 )
         all_logp: List[torch.Tensor] = []
         all_adv_raw: List[float] = []
-        all_penalty: List[float] = []
         all_entropy: List[torch.Tensor] = []
-        all_max_entropy: List[float] = []
         all_critic: List[torch.Tensor] = []
-        for path, returns, penalty in zip(batch_paths, batch_returns, batch_repeat_penalties):
-            lp, adv, e_terms, h_max, c_terms = _episode_pg_terms(
+        for path, returns in zip(batch_paths, batch_returns):
+            lp, adv, e_terms, c_terms = _episode_pg_terms(
                 path=path,
                 returns=returns,
                 policy=policy,
@@ -1803,9 +1738,7 @@ def train_pg(
             )
             all_logp.extend(lp)
             all_adv_raw.extend(adv)
-            all_penalty.extend([penalty] * len(adv))
             all_entropy.extend(e_terms)
-            all_max_entropy.extend(h_max)
             all_critic.extend(c_terms)
 
         if not all_logp:
@@ -1824,20 +1757,13 @@ def train_pg(
             # extract. Dividing by an epsilon here would amplify float noise into a
             # full-magnitude gradient, so emit a zero update instead.
             adv = torch.zeros_like(adv_raw)
-        # Repeat penalty now lives in σ units, applied to the standardised value.
-        adv = adv - torch.tensor(all_penalty, dtype=torch.float32, device=device)
 
-        logp_t        = torch.stack(all_logp)
-        entropy_t     = torch.stack(all_entropy)
-        actor_loss    = -(logp_t * adv).mean()
-        entropy_bonus = entropy_t.mean()
-
-        # --- entropy floor controller ----------------------------------------
-        mean_max_entropy = float(np.mean(all_max_entropy)) if all_max_entropy else 0.0
-        entropy_norm = (float(entropy_bonus.item()) / mean_max_entropy
-                        if mean_max_entropy > 1e-8 else 0.0)
-        coef_eff = entropy_coef_update(coef_eff, entropy_norm,
-                                       pg_entropy_coef, pg_entropy_min)
+        logp_t = torch.stack(all_logp)
+        actor_loss = -(logp_t * adv).mean()
+        entropy_bonus = (torch.stack(all_entropy).mean() if all_entropy
+                         else actor_loss * 0.0)
+        entropy_norm = float(entropy_bonus.detach()) if all_entropy else None
+        coef_eff = exploration.coefficient
         total_actor_loss = actor_loss - coef_eff * entropy_bonus
 
         clip_diagnostics = {}
@@ -1893,6 +1819,9 @@ def train_pg(
             row["episode_wall_share_s"] += row["rl_update_s"]
             _record_episode_timing(timer, row)
 
+        # Coefficient and target changes affect only the next on-policy batch.
+        exploration.update_entropy(entropy_norm)
+        _flush_exploration(exploration, exploration_pending, env)
         update_idx += 1
         ep_actor_loss = float(actor_loss.item())
         ep_entropy    = float(entropy_bonus.item())
@@ -1901,8 +1830,6 @@ def train_pg(
         # column comparable with DQN's `return` (see the pg_episode row above).
         mean_terminal_reward = (float(np.mean([float(p[-1].reward) for p in batch_paths]))
                                 if batch_paths else 0.0)
-        # In σ units now, like the penalty itself — see the class docstring.
-        mean_return_shaped = mean_return_raw - float(np.mean(all_penalty)) * adv_std
 
         _row = {
             "phase": "pg_train",
@@ -1915,19 +1842,16 @@ def train_pg(
             "batch_eps_actual": len(batch_paths),
             "return": mean_return_raw,
             "return_raw": mean_return_raw,
-            "return_shaped": mean_return_shaped,
             "terminal_reward": mean_terminal_reward,
-            "repeat_penalty": float(np.mean(batch_repeat_penalties)) if batch_repeat_penalties else 0.0,
-            "visit_count_before": int(np.max(batch_visits_before)) if batch_visits_before else 0,
-            "unique_comps_seen": len(visit_counts),
-            "max_visit_count": max(visit_counts.values()) if visit_counts else 0,
+            "unique_comps_seen": budget.unique,
+            "exploration_target_used": batch_target,
+            **_exploration_metrics(exploration),
             "terminal_comp_key": str(batch_terminal_keys[-1]) if batch_terminal_keys else "",
             "actor_loss": ep_actor_loss,
             "entropy": ep_entropy,
-            # entropy_norm is directly comparable to pg_entropy_min — this is the
-            # column to watch for collapse, since raw entropy depends on |A|.
             "entropy_norm": entropy_norm,
-            "entropy_coef_eff": coef_eff,
+            "exploration_coefficient_used": coef_eff,
+            "exploration_coefficient": exploration.coefficient,
             "adv_mean_raw": adv_mean,
             "adv_std_raw": adv_std,
             "critic_loss": critic_loss_val,
@@ -1979,8 +1903,7 @@ def train_pg(
                     "opt_actor_state": opt_actor.state_dict(),
                     "gradient_clipping_state": {name: ctl.state_dict() for name, ctl in gradient_clippers.items()},
                     "opt_critic_state": opt_critic.state_dict() if opt_critic is not None else None,
-                    "visit_counts": dict(visit_counts),
-                    "entropy_coef_eff": coef_eff,
+                    "exploration_state": exploration.state_dict(),
                     "training_sample_session_id": training_samples.session_id if training_samples else None,
                     "training_budget_state": budget.state_dict(),
                     "hpo_state": env.hpo_recorder.checkpoint_state() if getattr(env, "hpo_recorder", None) is not None else None,
@@ -2000,7 +1923,7 @@ def train_pg(
 
 
 # ---------------------------------------------------------------------------
-# Candidate generation (dual-phase, unified generation flags)
+# Candidate generation with shared entropy-target sampling
 # ---------------------------------------------------------------------------
 
 def _pg_single_episode_generate(
@@ -2011,16 +1934,11 @@ def _pg_single_episode_generate(
     elem_feats_scaled: np.ndarray,
     action_values: List[str],
     device: torch.device,
-    gen_epsilon: float = 0.0,
-    gen_top_frac: float = 0.0,
-    gen_temperature: float = 1.0,
+    exploration_target: float = 0.7,
 ) -> None:
-    """Single generation episode for PG methods.
-
-    Priority: ε-greedy > Boltzmann > top-k > greedy argmax (default).
-    Default gen_temperature=1.0 prevents pure-greedy composition collapse.
-    """
+    """Generate with a frozen actor and entropy-controlled legal actions."""
     env.initialize()
+    env.exploration_diagnostics = {}
     for _ in _episode_steps(env):
         allowed = _legal_actions(env)
         s_mat = scaler.transform(env.current_state_features().reshape(1, -1))[0]
@@ -2044,20 +1962,9 @@ def _pg_single_episode_generate(
                 torch.tensor(a_comp_batch, dtype=torch.float32, device=device),
             ).reshape(-1)
 
-        if gen_epsilon > 0.0 and float(np.random.rand()) < gen_epsilon:
-            idx = int(np.random.randint(n))
-        elif gen_temperature > 0.0:
-            lg = logits.cpu().numpy().astype(float) / gen_temperature
-            lg -= lg.max()
-            probs = np.exp(lg); probs /= probs.sum()
-            idx = int(np.random.choice(n, p=probs))
-        elif gen_top_frac > 0.0:
-            k = max(1, int(round(gen_top_frac * n)))
-            topk = torch.argsort(logits, descending=True).cpu().tolist()[:k]
-            idx = int(np.random.choice(topk))
-        else:
-            # Pure greedy argmax — default when no gen strategy is set.
-            idx = int(torch.argmax(logits).item())
+        probs = _sampler_probabilities(logits.cpu().numpy().astype(float), exploration_target)
+        _record_sampling_entropy(env.exploration_diagnostics, env.counter, probs)
+        idx = int(np.random.choice(n, p=probs))
         env.step(allowed[idx])
 
 
@@ -2072,39 +1979,18 @@ def generate_candidates(
     policy: Optional[torch.nn.Module] = None,
     qnet: Optional[torch.nn.Module] = None,
     num_gen_eps: int = 200,
-    gen_epsilon: float = 0.0,
-    gen_top_frac: float = 0.0,
-    gen_temperature: float = 1.0,
+    gen_exploration_target: float = 0.7,
+    exploration_adaptive: bool = True,
+    exploration_seen_keys=None,
     k: float = 1.0,
     max_attempts: Optional[int] = None,
     charge_filter: bool = False,
     charge_use_pauling: bool = False,
 ) -> List[dict]:
-    """Generate up to ``num_gen_eps`` unique candidates using one sampling policy.
+    """Generate unique candidates with a resumable entropy-target sampler.
 
-    Generation flags (``gen_temperature``, ``gen_top_frac``, ``gen_epsilon``)
-    apply identically to DQN and PG methods.
-
-    Parameters
-    ----------
-    gen_temperature:
-        Boltzmann temperature τ for action sampling.  Default 1.0 prevents
-        pure-greedy composition collapse.  Set to 0 and use gen_top_frac or
-        gen_epsilon for alternative strategies.
-    gen_top_frac:
-        Uniform sample from top-k% of actions by Q/logit.
-    gen_epsilon:
-        ε-greedy probability (highest priority, short-circuits Q computation).
-
-    Notes
-    -----
-    Raw predictor values are fetched via ``predictor.predict_raw()`` when
-    available (OOHCatalystPredictor exposes this), falling back to
-    ``predictor.predict()`` otherwise.  This ensures ``dp_mean`` stores the
-    raw property value for a single predictor (e.g. overpotential in mV for
-    OOH). The multi-property engine instead records its configured combination
-    without objective std penalties but with the same gates;
-    obj_<name>_mean columns retain physical values.
+    Training-seen identities seed global novelty without removing them from the
+    generation export. Scientific rewards and reporting remain unchanged.
     """
     if policy is None and qnet is None:
         raise ValueError("Provide either policy (PG) or qnet (DQN).")
@@ -2115,22 +2001,27 @@ def generate_candidates(
     else:
         qnet.eval()
 
-    evaluator = EpisodeBatchEvaluator(env, max_retries=_MAX_CANDIDATE_RETRIES, timer=predictor)
+    exploration = ExplorationController(initial_target=gen_exploration_target, adaptive=exploration_adaptive)
+    exploration.seed_seen(exploration_seen_keys if exploration_seen_keys is not None
+                          else getattr(env, "exploration_seen_keys", ()))
+    exploration_pending = []
+    evaluator = EpisodeBatchEvaluator(
+        env, max_retries=_MAX_CANDIDATE_RETRIES, timer=predictor,
+        capture_predictions=True, failure_callback=_exploration_failure(exploration_pending),
+    )
 
     def rollout_generation():
         if use_pg:
             _pg_single_episode_generate(
                 env=env, policy=policy, scaler=scaler,
                 elem_feats_scaled=elem_feats_scaled, action_values=action_values,
-                device=device, gen_epsilon=gen_epsilon,
-                gen_top_frac=gen_top_frac, gen_temperature=gen_temperature,
+                device=device, exploration_target=exploration.target,
             )
         else:
             _rollout_policy_episode(
                 env=env, qnet=qnet, scaler=scaler, device=device,
                 elem_feats_scaled=elem_feats_scaled, action_values=action_values,
-                gen_epsilon=gen_epsilon, gen_top_frac=gen_top_frac,
-                gen_temperature=gen_temperature,
+                exploration_target=exploration.target,
             )
 
     recorder = getattr(env, "hpo_recorder", None)
@@ -2144,6 +2035,9 @@ def generate_candidates(
         resumed = getattr(env, "hpo_generation_resume", None)
         if resumed is not None:
             restore_generation(predictor, resumed, contract)
+            if "exploration_state" not in resumed:
+                raise ValueError("Exact generation resume requires exploration_state")
+            exploration.load_state_dict(resumed["exploration_state"])
         checkpoint_path = str(recorder.path / "generation_checkpoint.pt")
 
         def checkpoint_generation():
@@ -2154,6 +2048,7 @@ def generate_candidates(
                 return  # Direct library callers may not expose a resumable predictor.
             _save_checkpoint(checkpoint_path, {
                 "type": "hpo_generation", "hpo_state": recorder.checkpoint_state(),
+                "exploration_state": exploration.state_dict(),
                 "generation_contract": contract, "predictor_ledger": state["ledger"],
                 "predictor_caches": state["caches"], "predictor_extra": state["extra"],
             })
@@ -2165,19 +2060,29 @@ def generate_candidates(
                 episode = evaluator.next(
                     rollout_generation,
                     limit=max(1, recorder.budget.target_unique - recorder.budget.unique_evaluated),
-                    phase="generate",
+                    phase="generate", metadata={"exploration_target_used": exploration.target},
                 )
             except (CandidateEvaluationFailed, InfeasibleEpisode):
+                if not evaluator.pending:
+                    _flush_exploration(exploration, exploration_pending, env)
                 checkpoint_generation()
                 continue
+            exploration_pending.append(_exploration_observation(episode))
+            if not evaluator.pending:
+                _flush_exploration(exploration, exploration_pending, env)
             _record_episode_timing(predictor, {
                 **_episode_timing_row(episode), "phase": "generate",
                 "episode": recorder.budget.attempts_started,
+                "exploration_target_used": episode.metadata.get("exploration_target_used"),
+                **_exploration_metrics(exploration),
             })
             checkpoint_generation()
         # Reconstruct the export from authoritative unique snapshots. This
         # includes prior invocation rows without resampling or charging twice.
-        return [{"formula": row["formula"], **row["prediction_record"]}
+        return [{"formula": row["formula"], **row["prediction_record"],
+                 **{key: value for key, value in row.items()
+                    if key.startswith("exploration_") or key in
+                    {"constraint_passed", "post_constraint_passed"}}}
                 for row in (json.loads(line) for line in recorder.records_path.read_text().splitlines())]
 
     use_predict_raw = hasattr(predictor, "predict_raw")
@@ -2203,7 +2108,7 @@ def generate_candidates(
             episode = evaluator.next(
                 rollout_generation,
                 limit=min(n_target - accepted, max_att - attempted + 1),
-                phase="generate",
+                phase="generate", metadata={"exploration_target_used": exploration.target},
             )
         except (CandidateEvaluationFailed, InfeasibleEpisode) as exc:
             # Unlike training, generation already has a generous, separate
@@ -2213,6 +2118,8 @@ def generate_candidates(
             # retrying without counting.
             print(f"[WARN] generation candidate failed evaluation, "
                   f"skipping: {exc}")
+            if not evaluator.pending:
+                _flush_exploration(exploration, exploration_pending, env)
             continue
 
         _record_episode_timing(predictor, {
@@ -2224,6 +2131,9 @@ def generate_candidates(
 
         if comp_key in seen_comp_keys:
             dup_rejected += 1
+            exploration_pending.append(_exploration_observation(episode))
+            if not evaluator.pending:
+                _flush_exploration(exploration, exploration_pending, env)
             continue
 
         # Charge-neutrality gate on the WHOLE built formula (covers
@@ -2256,6 +2166,11 @@ def generate_candidates(
             if not neutral:
                 seen_nonneutral.add(comp_key)
                 charge_rejected += 1
+                observation = _exploration_observation(episode)
+                observation["feasible"] = False
+                exploration_pending.append(observation)
+                if not evaluator.pending:
+                    _flush_exploration(exploration, exploration_pending, env)
                 continue
 
         # Reward from the episode (env.reward_fn already called in env.step).
@@ -2288,6 +2203,10 @@ def generate_candidates(
         except Exception as exc:  # noqa: BLE001 - any predictor/builder failure
             print(f"[WARN] generation candidate failed fetching raw stats, "
                   f"skipping: {type(exc).__name__}: {exc}")
+            exploration_pending.append({"key": repr(comp_key), "quality": None,
+                                        "feasible": None, "successful": False})
+            if not evaluator.pending:
+                _flush_exploration(exploration, exploration_pending, env)
             continue
 
         seen_comp_keys.add(comp_key)
@@ -2308,6 +2227,8 @@ def generate_candidates(
         row: dict = {
             "formula": formula,
             "reward": reward,
+            "exploration_target_used": episode.metadata.get("exploration_target_used"),
+            "exploration_entropy": episode.metadata.get("exploration_entropy"),
             "candidate_json": candidate_json,
             **metadata_fields,
             **objective_record(raw_mean, per_stats, details),
@@ -2320,6 +2241,13 @@ def generate_candidates(
             row["primary_ok"] = bool(phase_ok)
             row["primary_label"] = phase_label or ""
 
+        observation = _exploration_observation(episode)
+        if use_check_phase and not row["primary_ok"]:
+            observation["feasible"] = False
+        exploration_pending.append(observation)
+        if not evaluator.pending:
+            _flush_exploration(exploration, exploration_pending, env)
+        row.update(_exploration_metrics(exploration))
         rows.append(row)
         accepted += 1
         pbar.update(1)
@@ -2342,7 +2270,7 @@ def generate_candidates(
             f"non-charge-neutral. "
             + (
                 "Duplication dominates: the policy keeps proposing the same "
-                "few compositions (raise gen_temperature / gen_epsilon, or the "
+                "few compositions (inspect exploration_target diagnostics, or the "
                 "neutral subspace may simply be small)."
                 if dup_rejected >= charge_rejected
                 else "Charge-neutrality dominates: most proposed compositions "

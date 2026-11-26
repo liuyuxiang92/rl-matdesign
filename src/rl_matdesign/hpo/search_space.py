@@ -32,7 +32,6 @@ _INT_TYPED_KEYS: Set[str] = {
     "dqn_batch_size",
     "dqn_grad_steps_per_ep",
     "dqn_target_update_freq",
-    "dqn_eps_anneal_eps",
     "dqn_hidden_dim",
     "dqn_augment_permutations",
     # PG

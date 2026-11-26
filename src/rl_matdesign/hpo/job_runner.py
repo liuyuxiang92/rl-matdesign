@@ -24,7 +24,6 @@ from .scoring import score_records
 from .spec import phase_efficiency
 from .algorithm_profiles import resolve_parameters
 from .calibration import calibrate_quality_scale, restore_quality_scale, QualityCalibrationError
-from ..config_schema import with_generation_selection
 
 
 class JobError(RuntimeError):
@@ -214,7 +213,7 @@ class JobRunner:
         cfg = copy.deepcopy(plan["base_config_data"])
         generation_parameter = plan["generation_search"]["parameter"]
         training_parameters = {name: value for name, value in parameters.items()
-                               if name not in ("gen_temperature", "gen_epsilon", "gen_top_frac")}
+                               if name != "gen_exploration_target"}
         cfg.update(resolve_parameters(plan, training_parameters, train_budget))
         efficiency = phase_efficiency(plan, phase)
         cfg.update(hpo_recording=True, hpo_phase=phase, hpo_target_unique=budget,
@@ -222,14 +221,11 @@ class JobRunner:
                    train_count_duplicates=False,
                    train_max_duplicate_attempts=max(1000, 10 * budget))
         if phase == "generation":
-            cfg.update(num_gen_eps=budget, gen_epsilon=0.0, gen_top_frac=0.0, gen_temperature=0.0,
+            cfg.update(num_gen_eps=budget,
                        max_gen_attempts=max(1000, 10 * budget))
             cfg[generation_parameter] = parameters[generation_parameter]
             if resume:
                 cfg["hpo_resume_generation"] = True
-        # Full runtime configs contain defaults for all three strategies. Carry
-        # the actual selection explicitly so YAML key sorting cannot change it.
-        cfg = with_generation_selection(cfg, generation_parameter)
         config_path = directory / "config.yaml"
         config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
         atomic_json(directory / "job.json", key)

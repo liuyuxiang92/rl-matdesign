@@ -13,15 +13,11 @@ _DQN_SPACE = {
     "dqn_lr": {"type": "float", "low": 1e-5, "high": 1e-2, "log": True},
     "dqn_batch_size": {"type": "categorical", "choices": [64, 128, 256, 512]},
     "warmup_budget_fraction": {"type": "float", "low": 0.02, "high": 0.20},
-    "dqn_eps_min": {"type": "float", "low": 0.02, "high": 0.40},
-    "epsilon_anneal_budget_ratio": {"type": "float", "low": 0.25, "high": 2.0, "log": True},
 }
 _A2C_SPACE = {
     "pg_lr_actor": {"type": "float", "low": 1e-5, "high": 1e-2, "log": True},
     "pg_lr_critic": {"type": "float", "low": 1e-5, "high": 1e-2, "log": True},
     "pg_batch_eps": {"type": "categorical", "choices": [8, 16, 32, 64]},
-    "pg_entropy_coef": {"type": "float", "low": 1e-4, "high": 1e-1, "log": True},
-    "pg_entropy_min": {"type": "float", "low": 0.0, "high": 0.8},
 }
 _EXTENSIONS = {
     "dqn_batch_size": [16, 32, 64, 128, 256, 512, 1024, 2048],
@@ -45,9 +41,9 @@ def get_profile(method: str) -> dict:
 
 def validate_parameter_value(method: str, name: str, value):
     """Check a value's mathematical domain, including proposed outward probes."""
-    if name not in get_profile(method)["search_space"]:
+    if name not in get_profile(method)["search_space"] and name != "exploration_target":
         raise ConfigError(f"search_space parameter {name!r} is not active for {method}; fixed parameters cannot be searched")
-    if name in {"warmup_budget_fraction", "epsilon_anneal_budget_ratio"}:
+    if name == "warmup_budget_fraction":
         if isinstance(value, bool):
             raise ConfigError(f"{name} must be a finite number")
         try:
@@ -67,7 +63,7 @@ def validate_search_space(method: str, space: Mapping) -> dict:
         raise ConfigError("search_space must be a mapping")
     result = {}
     for name, raw in space.items():
-        if name not in get_profile(method)["search_space"]:
+        if name not in get_profile(method)["search_space"] and name != "exploration_target":
             raise ConfigError(f"search_space parameter {name!r} is not active for {method}")
         if not isinstance(raw, Mapping):
             raise ConfigError(f"search_space.{name} must be a mapping")
@@ -152,9 +148,6 @@ def resolve_parameters(plan: Mapping, params: Mapping, budget: int) -> dict:
         "method": "a2c" if method == "a2c" else "dqn",
         "train_budget": budget,
         "train_count_duplicates": False,
-        "pg_repeat_penalty_coef": 0.0,
-        "gen_epsilon": 0.0,
-        "gen_top_frac": 0.0,
         "num_gen_eps": 0,
     })
     if method != "a2c":
@@ -165,7 +158,6 @@ def resolve_parameters(plan: Mapping, params: Mapping, budget: int) -> dict:
             "dqn_target_mode": method.split("-", 1)[1],
             "dqn_warmup_eps": warmup,
             "dqn_num_train_eps": budget - warmup,
-            "dqn_eps_anneal_eps": max(1, round(values["epsilon_anneal_budget_ratio"] * (budget - warmup))),
             "dqn_grad_steps_per_ep": base.get("dqn_grad_steps_per_ep", PARAMETERS["dqn_grad_steps_per_ep"].default),
         })
     else:

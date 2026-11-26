@@ -1,8 +1,6 @@
 # Software smoke test only: tiny budgets/ranges are not scientific recommendations.
 # training.repeats controls all four training stages; validation gets fresh seeds.
 # generation.repeats controls sampling repeats for each frozen model.
-# The last authored gen_temperature/gen_top_frac/gen_epsilon in base_config
-# chooses the generation method. Omitting initial_values uses method defaults.
 base_config: ../scenarios/dummy.yaml
 method: dqn-mc
 random_seed: 42
@@ -21,16 +19,10 @@ training:
     warmup_budget_fraction:
       type: categorical
       choices: [0.25]
-    dqn_eps_min:
-      type: categorical
-      choices: [0.2]
-    epsilon_anneal_budget_ratio:
-      type: categorical
-      choices: [2.0]
   budget: {mode: absolute_unique, min_unique: 48, initial_unique: 64, max_unique: 96}
   search: {max_rounds: 2, trials_per_round: 2, startup_random_trials: 1}
 generation:
   repeats: 3
   score_weights: {qualified_fraction: 0.5, best_fraction_quality: 0.4, best_value_quality: 0.1}
   budget: {mode: absolute_unique, min_unique: 8, initial_unique: 16, max_unique: 32}
-  initial_values: [0, 1, 100]
+  initial_values: [0, 0.25, 0.5, 0.7, 0.9, 1]

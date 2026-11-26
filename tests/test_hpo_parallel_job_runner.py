@@ -122,7 +122,7 @@ def test_parallel_generation_preserves_shared_frozen_model(tmp_path, monkeypatch
     trained = runner({"pg_batch_eps": 2}, 8, 11, "train")
     before = {name: file_digest(path) for name, path in trained["checkpoint_paths"].items()}
     with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = [pool.submit(runner.execute, {"pg_batch_eps": 2, "gen_temperature": 1},
+        futures = [pool.submit(runner.execute, {"pg_batch_eps": 2, "gen_exploration_target": 1},
                                4, seed, "generation", trained) for seed in (401, 402, 403)]
         raw = [future.result(timeout=5) for future in futures]
     results = [runner.finalize(payload) for payload in raw]

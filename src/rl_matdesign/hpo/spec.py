@@ -173,25 +173,19 @@ def _budget(raw, objective):
 
 def _search_settings(raw, generation=False):
     if generation:
-        defaults = {"parameter": "gen_temperature", "initial_values": [0, .001, .01, .1, 1, 10, 100, 1000],
-                    "max_extra_values_per_direction": 2, "fixed": {"gen_epsilon": 0, "gen_top_frac": 0},
+        defaults = {"parameter": "gen_exploration_target", "initial_values": [0, .25, .5, .7, .9, 1],
+                    "max_extra_values_per_direction": 2,
                     "paired_seeds": [401, 503, 607]}
         raw = _mapping(raw, "generation_search", defaults)
         cfg = {**deepcopy(defaults), **raw}
-        if cfg["parameter"] != "gen_temperature":
-            raise ConfigError("generation_search.parameter must be gen_temperature")
+        if cfg["parameter"] != "gen_exploration_target":
+            raise ConfigError("generation_search.parameter must be gen_exploration_target")
         if not isinstance(cfg["initial_values"], list) or not cfg["initial_values"]:
             raise ConfigError("generation_search.initial_values must be a nonempty list")
-        cfg["initial_values"] = [_number(v, "generation_search.initial_values", 0) for v in cfg["initial_values"]]
-        if len(set(cfg["initial_values"])) != len(cfg["initial_values"]) or not any(v > 0 for v in cfg["initial_values"]):
-            raise ConfigError("generation_search.initial_values requires distinct values and at least one positive temperature")
+        cfg["initial_values"] = [_number(v, "generation_search.initial_values", 0, 1) for v in cfg["initial_values"]]
+        if len(set(cfg["initial_values"])) != len(cfg["initial_values"]):
+            raise ConfigError("generation_search.initial_values requires distinct values")
         cfg["initial_values"].sort()
-        fixed = _mapping(cfg["fixed"], "generation_search.fixed", defaults["fixed"])
-        cfg["fixed"] = {**defaults["fixed"], **fixed}
-        for key, value in cfg["fixed"].items():
-            if _number(value, f"generation_search.fixed.{key}") != 0:
-                raise ConfigError(f"generation_search.fixed.{key} must be 0; temperature-only generation")
-            cfg["fixed"][key] = 0
         cfg["paired_seeds"] = _seeds(cfg["paired_seeds"], "generation_search.paired_seeds")
         cfg["max_extra_values_per_direction"] = _integer(cfg["max_extra_values_per_direction"], "generation_search.max_extra_values_per_direction")
         return cfg

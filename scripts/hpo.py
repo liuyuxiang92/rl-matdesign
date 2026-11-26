@@ -104,7 +104,6 @@ def _validate_hpo_config(hpo_cfg: dict, hpo_config_path: str) -> dict:
             "budget_scaling": {
                 "dqn_num_train_eps": 0.25,
                 "dqn_warmup_eps": 0.25,
-                "dqn_eps_anneal_eps": 0.25,
                 "pg_num_iters": 0.25,
                 "pg_warmup_eps": 0.25,
             },
@@ -158,7 +157,7 @@ def _build_trial_yaml(
     # have come from base_cfg, fixed_overrides, or the sampled dict).
     budget_keys = {
         "train_budget",
-        "dqn_num_train_eps", "dqn_warmup_eps", "dqn_eps_anneal_eps",
+        "dqn_num_train_eps", "dqn_warmup_eps",
         "pg_num_iters", "pg_warmup_eps", "num_gen_eps",
         "max_gen_attempts",
     }
@@ -173,11 +172,6 @@ def _build_trial_yaml(
         if base_value is None:
             raise ValueError(f"budget_scaling[{key!r}] requires an explicitly configured budget")
         cfg[key] = max(1, int(round(base_value * mult))) if base_value else 0
-
-    # Defensive clamp: anneal eps cannot exceed train eps.
-    effective = resolve_config(cfg).config
-    if "dqn_eps_anneal_eps" in cfg and ("dqn_num_train_eps" in cfg or effective["train_budget"] is not None):
-        cfg["dqn_eps_anneal_eps"] = max(1, min(cfg["dqn_eps_anneal_eps"], effective["dqn_num_train_eps"]))
 
     effective = resolve_config(cfg).config
     return {key: effective[key] for key in cfg}

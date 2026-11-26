@@ -72,8 +72,7 @@ class Builder(Base):
             env=env, elem_feats_scaled=np.array([[.1, .2]]), action_values=["0.5"],
             device=torch.device("cpu"), hidden_dim=4, n_warmup_eps=2,
             dqn_num_train_eps=2, batch_size=1, dqn_grad_steps_per_ep=1,
-            dqn_target_update_freq=2, dqn_eps_anneal_eps=10,
-            dqn_target_mode=target_mode, timer=predictor, train_count_duplicates=True,
+            dqn_target_update_freq=2, dqn_target_mode=target_mode, timer=predictor, train_count_duplicates=True,
         )
         assert [row["terminal_reward"] for row in rows] == [1, 2, 1, 3]
         assert rows[-1]["training_attempts"] == 4

@@ -24,7 +24,7 @@ def execution():
 def generation():
     return {
         "execution": execution(),
-        "sampling": {"gen_seed": 101, "gen_temperature": .5},
+        "sampling": {"gen_seed": 101, "gen_exploration_target": .5},
         "frozen_artifacts": {"policy.pt": "frozen-model", "std_scaler.bin": "frozen-scaler"},
     }
 
@@ -96,7 +96,7 @@ def test_model_loading_rejects_changed_source_for_hpo_and_normal_runs(tmp_path, 
     (("execution", "evaluation", "numerical_runtime", "platform"), "new-platform"),
     (("execution", "learning", "train_seed"), 43),
     (("sampling", "gen_seed"), 102),
-    (("sampling", "gen_temperature"), .9),
+    (("sampling", "gen_exploration_target"), .9),
     (("frozen_artifacts", "policy.pt"), "new-model"),
     (("frozen_artifacts", "std_scaler.bin"), "new-scaler"),
 ])
@@ -106,7 +106,9 @@ def test_generation_validates_before_restoring_ledger_or_rng(monkeypatch, path, 
     loaded, restored_rng = [], []
     predictor = SimpleNamespace(load_state_dict=loaded.append)
     monkeypatch.setattr(generation_resume, "restore_rng_state", restored_rng.append)
-    saved = {"generation_contract": generation(),
+    from rl_matdesign.exploration import ExplorationController
+    saved = {"exploration_state": ExplorationController(.5).state_dict(),
+             "generation_contract": generation(),
              "predictor_ledger": {"calls": 7}, "rng_state": {"state": "saved"}}
     changed = generation()
     replace(changed, path, value)

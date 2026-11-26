@@ -121,6 +121,7 @@ def save_weights(path, model, env, role: str, *, scaler=None) -> None:
     torch.save({"environment_contract": environment_contract(env),
                 "scaler_fingerprint": scaler_fingerprint(scaler) if scaler is not None else None,
                 "evaluation_contract": getattr(env, "evaluation_contract", None),
+                "exploration_seen_keys": list(getattr(env, "exploration_seen_keys", ())),
                 f"{role}_state": model.state_dict()}, path)
 
 

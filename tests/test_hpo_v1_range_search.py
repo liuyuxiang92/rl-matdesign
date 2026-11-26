@@ -82,10 +82,10 @@ def test_both_endpoints_improve_without_single_peak_assumption():
 
 
 def test_efficiency_failure_does_not_contract_individual_range():
-    config = plan({"dqn_eps_min": {"type": "float", "low": 0.02, "high": 0.4}})
-    outcome = run_range_search(config, evaluator(lambda parameters, seed: (-1, "INFEASIBLE_EFFICIENCY") if parameters["dqn_eps_min"] == 0.02 else (0.5, "COMPLETED")))
+    config = plan({"exploration_target": {"type": "float", "low": 0.02, "high": 0.4}})
+    outcome = run_range_search(config, evaluator(lambda parameters, seed: (-1, "INFEASIBLE_EFFICIENCY") if parameters["exploration_target"] == 0.02 else (0.5, "COMPLETED")))
     assert outcome["ranges"] == config["search_space"]
-    assert outcome["boundary_status"]["dqn_eps_min"]["low"] == "unresolved"
+    assert outcome["boundary_status"]["exploration_target"]["low"] == "unresolved"
 
 
 def test_discrete_extension_uses_declared_adjacent_values():

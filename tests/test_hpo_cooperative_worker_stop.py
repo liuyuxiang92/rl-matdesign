@@ -153,7 +153,7 @@ def test_real_worker_signal_finishes_unit_then_resume_matches_control(tmp_path, 
         species_set=["Ni", "Fe", "Co", "Cr", "Mn", "Cu", "Zn", "Ti"],
         amount_set=[f"{value / 10:.1f}" for value in range(1, 9)], n_steps=3)
     config.update(method=method, dqn_target_mode=target, dqn_warmup_eps=2,
-                  dqn_batch_size=2, dqn_eps_min=1., pg_warmup_eps=2, pg_batch_eps=batch,
+                  dqn_batch_size=2, exploration_target=1., pg_warmup_eps=2, pg_batch_eps=batch,
                   train_count_duplicates=False, train_budget=12,
                   hpo_recording=True, hpo_phase="train", hpo_target_unique=12,
                   hpo_ratio_limit=1.5, num_gen_eps=0)

@@ -193,12 +193,13 @@ parameter definitions. A test checks it for drift.
 | `train_count_duplicates` | bool | False | — | Count repeated terminal candidates toward training budgets. |
 | `train_budget` | int | None | >= 1 | Training candidates including DQN warmup, excluding the separate 100-candidate reward/gradient calibration pilot; derives algorithm episode limits when set. |
 | `train_max_duplicate_attempts` | int | 1000 | >= 1 | Maximum consecutive duplicates in a unique-candidate budget. |
+| `exploration_target` | float | 0.7 | >= 0; <= 1 | Initial normalized action-entropy target for training. |
+| `gen_exploration_target` | float | 0.7 | >= 0; <= 1 | Initial normalized action-entropy target for candidate generation. |
+| `exploration_adaptive` | bool | True | — | Adapt exploration targets from completed candidate outcomes. |
 | `gamma` | float | 0.9 | >= 0; <= 1 | Discount factor used by DQN, REINFORCE and A2C. |
 | `dqn_hidden_dim` | int | 256 | >= 1 | DQN hidden-layer width. |
 | `dqn_lr` | float | 0.001 | > 0 | DQN optimizer learning rate. |
 | `dqn_buffer_size` | int | 50000 | >= 1 | DQN replay capacity in transitions. |
-| `dqn_eps_anneal_eps` | int | 10000 | >= 1 | DQN epsilon annealing episodes. |
-| `dqn_eps_min` | float | 0.05 | >= 0; <= 1 | DQN minimum exploration probability. |
 | `dqn_num_train_eps` | int | 20000 | >= 0 | DQN training episode budget. |
 | `dqn_warmup_eps` | int | 500 | >= 0 | DQN random warmup episodes. |
 | `dqn_batch_size` | int | 256 | >= 1 | DQN replay minibatch size. |
@@ -212,15 +213,8 @@ parameter definitions. A test checks it for drift.
 | `pg_batch_eps` | int | 15 | >= 1 | Episodes per policy-gradient update. |
 | `pg_lr_actor` | float | 0.001 | > 0 | Actor optimizer learning rate. |
 | `pg_lr_critic` | float | 0.001 | > 0 | Critic optimizer learning rate. |
-| `pg_entropy_coef` | float | 0.01 | >= 0 | Normalized-entropy penalty coefficient. |
-| `pg_entropy_min` | float | 0.3 | >= 0; <= 1 | Normalized policy entropy floor. |
-| `pg_repeat_penalty_coef` | float | 0.0 | >= 0 | Repeated-candidate policy penalty coefficient. |
-| `pg_repeat_penalty_shape` | str | 'log' | log, sqrt, linear | Repeated-candidate penalty growth. |
 | `num_gen_eps` | int | 200 | >= 0 | Requested distinct generated candidates. |
 | `max_gen_attempts` | int | 10 * num_gen_eps | >= 0 | Maximum candidate-generation attempts. |
-| `gen_temperature` | float | 1.0 | >= 0 | Generation softmax temperature; zero selects greedy behavior. |
-| `gen_top_frac` | float | 0.0 | >= 0; <= 1 | Generation top-action fraction; zero disables top-fraction sampling. |
-| `gen_epsilon` | float | 0.0 | >= 0; <= 1 | Generation random-action probability. |
 | `k` | float | 1.0 | >= 0 | Default uncertainty coefficient passed to property evaluation. |
 <!-- schema:end -->
 

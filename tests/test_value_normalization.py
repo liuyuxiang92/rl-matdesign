@@ -124,7 +124,7 @@ def test_a2c_uses_raw_baseline_and_normalized_critic_loss():
         action_comp_onehot=allowed[0][1], state_material_features=[0.],
         state_step_onehot=[1.],
     )
-    _, advantage, _, _, losses = _episode_pg_terms(
+    _, advantage, _, losses = _episode_pg_terms(
         path=[step], returns=[8.], policy=actor, value_net=critic,
         scaler=StandardScaler().fit([[0.], [1.]]), elem_feats_scaled=np.eye(2),
         action_values=["1.0"], device=torch.device("cpu"),

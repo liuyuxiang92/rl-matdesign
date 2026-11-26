@@ -48,7 +48,7 @@ class FakeRunner:
         if key in self.cache:
             return deepcopy(self.cache[key])
         self.calls.append({"parameters": deepcopy(parameters), "budget": budget, "seed": seed, "phase": phase, "model": model})
-        temperature = parameters.get("gen_temperature", 1)
+        temperature = parameters.get("gen_exploration_target", 1)
         loss = (.1 if budget < 8 else 0) + (0 if phase == "train" or temperature == 1 else .15)
         eligible = seed != self.fail_seed
         result = {"status": "COMPLETED" if eligible else "INFEASIBLE_EFFICIENCY", "eligible_for_selection": eligible,
@@ -72,7 +72,7 @@ def campaign(plan, out, runner):
     return Campaign(plan, out, runner=runner, domain={"status": "unknown", "size": None, "episode_steps": 1})
 
 
-def test_full_flow_selects_smaller_budget_then_temperature_only(tmp_path, campaign_environment):
+def test_full_flow_selects_smaller_budget_then_exploration_target(tmp_path, campaign_environment):
     plan = small_plan(tmp_path)
     runner = FakeRunner()
     run = campaign(plan, tmp_path / "run", runner)
@@ -81,16 +81,16 @@ def test_full_flow_selects_smaller_budget_then_temperature_only(tmp_path, campai
     generated = read_json(run.stage_path("generation"))
     assert trained["selection"]["selected_budget"] == 8 < 16
     assert generated["selection"]["selected_budget"] == 8
-    assert generated["selection"]["selected"]["parameters"]["gen_temperature"] == 1
+    assert generated["selection"]["selected"]["parameters"]["gen_exploration_target"] == 1
     assert generated["selection"]["convergence_status"] == "OBSERVED_PLATEAU"
-    assert 10 in generated["temperatures"]  # best positive boundary is probed outward
+    assert 1 in generated["parameter_values"]  # bounded search reaches the legal endpoint
     generation_calls = [call for call in runner.calls if call["phase"] == "generation"]
     chosen = trained["selection"]["selected"]["parameters"]
     for call in generation_calls:
-        assert {k: v for k, v in call["parameters"].items() if k != "gen_temperature"} == chosen
+        assert {k: v for k, v in call["parameters"].items() if k != "gen_exploration_target"} == chosen
         assert call["model"] in trained["models"]
-    for temperature in generated["temperatures"]:
-        assert {c["budget"] for c in generation_calls if c["parameters"]["gen_temperature"] == temperature} == {4, 8, 16, 32}
+    for temperature in generated["parameter_values"]:
+        assert {c["budget"] for c in generation_calls if c["parameters"]["gen_exploration_target"] == temperature} == {4, 8, 16, 32}
     assert {c["budget"] for c in runner.calls if c["phase"] == "train"} == {4, 8, 16, 32}
     assert (run.out / "best_training.yaml").is_file()
     assert (run.out / "best_generation.yaml").is_file()
@@ -205,26 +205,26 @@ def fake_worker(monkeypatch):
     return calls
 
 
-def test_job_runner_resolves_generation_temperature_and_reuses_completed_jobs(tmp_path, monkeypatch):
+def test_job_runner_resolves_generation_target_and_reuses_completed_jobs(tmp_path, monkeypatch):
     plan = small_plan(tmp_path)
     calls = fake_worker(monkeypatch)
     runner = JobRunner(plan, tmp_path / "jobs_test")
     trained = runner({}, 16, 101, "train")
-    generated = runner({"gen_temperature": .1}, 8, 401, "generation", trained)
+    generated = runner({"gen_exploration_target": .1}, 8, 401, "generation", trained)
     assert generated["eligible_for_selection"]
     cfg = calls[-1]["config"]
     assert cfg["train_budget"] == 16 and cfg["num_gen_eps"] == 8
-    assert cfg["gen_temperature"] == .1
-    assert cfg["gen_epsilon"] == cfg["gen_top_frac"] == 0
+    assert cfg["gen_exploration_target"] == .1
+    assert "generation_selection" not in cfg
     assert "--only-generate" in calls[-1]["args"]
     assert calls[-1]["env"]["PYTHONPATH"].split(":")[0].endswith("/src")
     count = len(calls)
     assert runner({}, 16, 101, "train") == trained
-    assert runner({"gen_temperature": .1}, 8, 401, "generation", trained) == generated
+    assert runner({"gen_exploration_target": .1}, 8, 401, "generation", trained) == generated
     assert len(calls) == count
     Path(trained["checkpoint_paths"]["policy.pt"]).write_text("mutated")
     with pytest.raises(JobError, match="Frozen model artifact changed"):
-        runner({"gen_temperature": 1}, 8, 401, "generation", trained)
+        runner({"gen_exploration_target": 1}, 8, 401, "generation", trained)
 
 
 def test_zero_attempt_initialization_artifacts_are_not_silently_deleted(tmp_path, monkeypatch):
@@ -265,14 +265,14 @@ def test_generation_resume_requires_checkpoint_and_sets_explicit_mode(tmp_path, 
     calls = fake_worker(monkeypatch)
     runner = JobRunner(plan, tmp_path / "runner")
     trained = runner({}, 16, 101, "train")
-    completed = runner({"gen_temperature": 1}, 8, 401, "generation", trained)
+    completed = runner({"gen_exploration_target": 1}, 8, 401, "generation", trained)
     directory = Path(completed["directory"])
     (directory / "result.json").unlink()
     atomic_json(directory / "candidate_budget.json", {"attempts_started": 1, "unique_evaluated": 1, "target_unique": 8, "status": "INTERRUPTED"})
     with pytest.raises(JobError, match="without a resumable checkpoint"):
-        runner({"gen_temperature": 1}, 8, 401, "generation", trained)
+        runner({"gen_exploration_target": 1}, 8, 401, "generation", trained)
     (directory / "generation_checkpoint.pt").write_text("runtime verifies the real synchronized checkpoint")
-    resumed = runner({"gen_temperature": 1}, 8, 401, "generation", trained)
+    resumed = runner({"gen_exploration_target": 1}, 8, 401, "generation", trained)
     assert resumed["eligible_for_selection"]
     assert calls[-1]["config"]["hpo_resume_generation"] is True
     assert "--only-generate" in calls[-1]["args"]
@@ -365,8 +365,7 @@ def small_dqn_plan(tmp_path, method="dqn-mc"):
         "dqn_lr": {"type": "categorical", "choices": [.001]},
         "dqn_batch_size": {"type": "categorical", "choices": [4, 8]},
         "warmup_budget_fraction": {"type": "categorical", "choices": [.1]},
-        "dqn_eps_min": {"type": "categorical", "choices": [.2]},
-        "epsilon_anneal_budget_ratio": {"type": "categorical", "choices": [1]},
+        "exploration_target": {"type": "categorical", "choices": [.2]},
     }
     if method == "dqn-bootstrap":
         plan["search_space"]["dqn_target_update_freq"] = {"type": "categorical", "choices": [10]}
@@ -431,7 +430,7 @@ def test_range_outward_batch_probe_is_not_mistaken_for_improved_learning(tmp_pat
 def test_generation_budget_does_not_inherit_training_batch_minimum(tmp_path, campaign_environment):
     runner = FakeRunner()
     run = campaign(small_plan(tmp_path), tmp_path / "run", runner)
-    result = run.evaluate({"pg_batch_eps": 64, "gen_temperature": 1}, 1, [401, 503],
+    result = run.evaluate({"pg_batch_eps": 64, "gen_exploration_target": 1}, 1, [401, 503],
                           phase="generation", models=[{"budget": 128}, {"budget": 128}])
     assert result["eligible_for_selection"]
     assert len(runner.calls) == 2

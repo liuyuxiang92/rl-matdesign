@@ -182,16 +182,18 @@ def test_legacy_hpo_restart_obeys_sealed_release_boundary(tmp_path, legacy_sourc
     if not approved_release:
         assert all(evidence is None for evidence in approvals)
         assert checked.returncode == 2, checked.stdout + checked.stderr
-        # Removed authored group syntax now rejects before the source-upgrade
-        # guard. Both are explicit rejection paths; neither may mutate the job.
-        expected_rejection = "Group 'metal' has unused or removed parameters: ['fraction_set', 'n_components']"
-        assert ("exact audited DQN performance release" in checked.stderr
-                or expected_rejection in checked.stderr)
+        # Retired configuration can reject before the source-upgrade guard.
+        # Keep the archived fixture unchanged; every rejection must preserve it.
+        expected_rejections = (
+            "exact audited DQN performance release",
+            "Group 'metal' has unused or removed parameters: ['fraction_set', 'n_components']",
+            "Removed top-level parameters: ['gen_temperature']",
+        )
+        assert any(reason in checked.stderr for reason in expected_rejections)
         assert _snapshot(interrupted) == before
         rejected = _cli(ROOT / "src", tmp_path, "restart", "--out", str(interrupted))
         assert rejected.returncode == 2, rejected.stdout + rejected.stderr
-        assert ("exact audited DQN performance release" in rejected.stderr
-                or expected_rejection in rejected.stderr)
+        assert any(reason in rejected.stderr for reason in expected_rejections)
         assert _snapshot(interrupted) == before
         assert not (interrupted / "source_upgrades").exists()
         return

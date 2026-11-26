@@ -81,21 +81,19 @@ def test_hpo_does_not_invent_a_shared_budget_or_allow_scaled_warmup_to_exceed_it
                              fixed_overrides={}, sampled={}, budget_scaling={"train_budget": .1}, method="a2c")
 
 
-def test_hpo_full_warmup_budget_does_not_make_anneal_zero_invalid():
-    cfg = hpo._build_trial_yaml(base_cfg={"train_budget": 10, "dqn_warmup_eps": 10,
-                                        "dqn_eps_anneal_eps": 50},
+def test_hpo_full_warmup_budget_leaves_no_online_episodes():
+    cfg = hpo._build_trial_yaml(base_cfg={"train_budget": 10, "dqn_warmup_eps": 10},
                               fixed_overrides={}, sampled={}, budget_scaling={}, method="dqn")
-    assert cfg["dqn_eps_anneal_eps"] == 1
     assert hpo.resolve_config(cfg).config["dqn_num_train_eps"] == 0
 
 
 def test_stage_two_replays_fraction_before_integer_validation(tmp_path, monkeypatch):
     stage_one = tmp_path / "stage_one.yaml"
-    stage_one.write_text("dqn_num_train_eps: 25\ndqn_eps_anneal_eps: 12\n")
+    stage_one.write_text("dqn_num_train_eps: 25\ndqn_warmup_eps: 12\n")
     study = optuna.create_study(direction="maximize")
     study.add_trial(optuna.trial.create_trial(
-        value=1.0, params={"dqn_eps_anneal_eps": .5},
-        distributions={"dqn_eps_anneal_eps": optuna.distributions.FloatDistribution(.1, .9)},
+        value=1.0, params={"dqn_warmup_eps": .5},
+        distributions={"dqn_warmup_eps": optuna.distributions.FloatDistribution(.1, .9)},
         user_attrs={"config_path": str(stage_one)},
     ))
     seen = []
@@ -110,13 +108,13 @@ def test_stage_two_replays_fraction_before_integer_validation(tmp_path, monkeypa
         base_cfg={"properties": [{"name": "score", "predictor": "dummy", "direction": "max", "objective": "mean"}], "dqn_num_train_eps": 100},
         hpo_cfg={"method": "dqn", "fixed_overrides": {}, "metric": {"k": 1},
                  "stage2": {"n_top_to_confirm": 1, "seeds_per_trial": 1},
-                 "search_space": {"dqn_eps_anneal_eps": {
+                 "search_space": {"dqn_warmup_eps": {
                      "dist": "frac_of", "base": "dqn_num_train_eps", "low": .1, "high": .9}}},
         gpu_pool=None, timeout_s=None,
     )
     assert len(result) == 1
     assert seen[0]["dqn_num_train_eps"] == 100
-    assert seen[0]["dqn_eps_anneal_eps"] == 50
+    assert seen[0]["dqn_warmup_eps"] == 50
 
 
 @pytest.mark.parametrize("key", [

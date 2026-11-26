@@ -135,15 +135,15 @@ def test_gamma_has_one_default_and_one_override():
 def test_false_zero_and_none_cli_values_have_distinct_meanings():
     result = resolve_config(
         {"method": "dqn", "train_count_duplicates": True,
-         "eval_seed": 9, "gen_epsilon": 0.2},
+         "eval_seed": 9, "gen_exploration_target": 0.2},
         {"method": None, "train_count_duplicates": False,
-         "eval_seed": 0, "gen_epsilon": 0},
+         "eval_seed": 0, "gen_exploration_target": 0},
     )
     assert result.config["method"] == "dqn"
     assert result.sources["method"] == "yaml"
     assert result.config["train_count_duplicates"] is False
     assert result.config["eval_seed"] == 0
-    assert result.config["gen_epsilon"] == 0
+    assert result.config["gen_exploration_target"] == 0
     assert result.sources["train_count_duplicates"] == "override"
 
 
@@ -375,16 +375,16 @@ def test_calibrated_glassnet_examples_use_two_gates_and_maximize_t3():
 
 
 @pytest.mark.parametrize(("method", "mode", "train", "generate", "temperature"), [
-    ("dqn", "bootstrap", 458, 1, 0.0),
-    ("dqn", "mc", 115, 115, 1.0),
-    ("a2c", None, 916, 229, 10.0),
+    ("dqn", "bootstrap", 458, 1, .7),
+    ("dqn", "mc", 115, 115, .7),
+    ("a2c", None, 916, 229, .7),
 ])
 def test_coarse_glassnet_selects_historical_hpo_budgets(method, mode, train, generate, temperature):
     raw = load_yaml_config(Path(__file__).resolve().parents[1] / "configs/glassnet_coarse_2pct.yaml")
     overrides = {"method": method, "dqn_target_mode": mode}
     cfg = resolve_config(raw, overrides).config
-    assert (cfg["train_budget"], cfg["num_gen_eps"], cfg["gen_temperature"]) == (train, generate, temperature)
-    assert cfg["generation_selection"]["parameter"] == "gen_temperature"
+    assert (cfg["train_budget"], cfg["num_gen_eps"], cfg["gen_exploration_target"]) == (train, generate, temperature)
+    assert "generation_selection" not in cfg
     assert cfg["max_gen_attempts"] == 10 * generate
     assert "calibration" not in cfg["reward"]
     assert cfg["value_normalization"] == "popart"
@@ -404,13 +404,13 @@ def test_method_specific_budget_rejects_invalid_entries(values, message):
         resolve_config({"method": "dqn", "num_gen_eps": values})
 
 
-def test_sinter_retains_old_training_allowances_and_temperature_sampling():
+def test_sinter_retains_training_allowances_with_entropy_sampling():
     raw = load_yaml_config(Path(__file__).resolve().parents[1] / "configs/oxides_sinter.yaml")
     cfg = resolve_config(raw).config
     assert cfg["dqn_warmup_eps"] + cfg["dqn_num_train_eps"] == 51000
     assert cfg["pg_num_iters"] * cfg["pg_batch_eps"] == 7500
-    assert (cfg["num_gen_eps"], cfg["max_gen_attempts"], cfg["gen_temperature"]) == (1000, 100000, 3.0)
-    assert cfg["generation_selection"]["parameter"] == "gen_temperature"
+    assert (cfg["num_gen_eps"], cfg["max_gen_attempts"], cfg["gen_exploration_target"]) == (1000, 100000, .7)
+    assert "generation_selection" not in cfg
     assert "calibration" not in cfg["reward"]
     assert "normalization" not in cfg["properties"][0]
     assert cfg["value_normalization"] == "popart"

@@ -12,17 +12,12 @@ traps that silently invalidate a budget sweep:
   ``pg_num_iters * pg_batch_eps``. Matching the two on *episodes* hands one method
   more paid evaluations than the other.
 
-* **epsilon must actually reach dqn_eps_min.** ``eps = max(eps_min, 1 - ep/anneal)``.
-  Reuse a 50,000-episode ``dqn_eps_anneal_eps`` at a 2,500-episode budget and
-  epsilon never drops below ~0.92 — the arm is random search, not DQN. Measured on
-  the archived sweep: the 2,500-episode runs ended at epsilon=0.950.
-
 * **pg_batch_eps must be constant across the sweep.** Varying it changes gradient
   noise *and* updates-per-episode at once, confounding budget with collapse rate.
 
-* **gen_epsilon=0 can collapse generation.** At 45k a trained Q-net produced three
-  unique candidates from 1,000 generation episodes (calcine: one), so the budget
-  comparison is read through a 3-sample readout.
+* **Generation settings must match.** Compare entropy targets and adaptation
+  mode across arms; inspect the controller diagnostics before attributing poor
+  candidate yield to training budget.
 
 Usage
 -----
@@ -131,16 +126,14 @@ def inspect(run: str) -> dict:
         "problems": [],
         "n_candidates": _n_candidates(run),
         "num_gen_eps": cfg.get("num_gen_eps"),
-        "gen_epsilon": cfg.get("gen_epsilon"),
-        "gen_temperature": cfg.get("gen_temperature"),
+        "gen_exploration_target": cfg.get("gen_exploration_target"),
+        "exploration_adaptive": cfg.get("exploration_adaptive"),
         "pg_batch_eps": cfg.get("pg_batch_eps"),
     }
 
     if method == "dqn":
         warm = int(cfg.get("dqn_warmup_eps") or 0)
         train = int(cfg.get("dqn_num_train_eps") or 0)
-        anneal = float(cfg.get("dqn_eps_anneal_eps") or 0)
-        eps_min = float(cfg.get("dqn_eps_min") or 0.0)
         info["configured"] = warm + train
         info["detail"] = f"warmup {warm:,} + train {train:,}"
         info["actual"] = counts["dqn_warmup"] + counts["dqn_train"]
@@ -153,23 +146,6 @@ def inspect(run: str) -> dict:
         else:
             info["expect"] = warm + train
 
-        # eps = max(eps_min, 1 - ep/anneal); it reaches the floor at
-        # ep = anneal * (1 - eps_min).
-        if anneal > 0:
-            eps_end = max(eps_min, 1.0 - train / anneal)
-            hit_at = anneal * (1.0 - eps_min)
-            info["eps_end"] = eps_end
-            info["anneal_frac"] = anneal / train if train else float("nan")
-            info["at_floor_frac"] = max(0.0, (train - hit_at) / train) if train else 0.0
-            if eps_end > eps_min + 1e-9:
-                info["problems"].append(
-                    f"epsilon never reaches dqn_eps_min: ends at {eps_end:.3f} "
-                    f"(min {eps_min}). The agent is {100 * eps_end:.0f}% random for "
-                    f"the whole run -- this arm is random search. Set "
-                    f"dqn_eps_anneal_eps ~= {round(0.6 * train):,} (0.6 x train)."
-                )
-        else:
-            info["problems"].append("dqn_eps_anneal_eps missing or zero")
     else:
         iters = int(cfg.get("pg_num_iters") or 0)
         batch = int(cfg.get("pg_batch_eps") or 0)
@@ -212,14 +188,11 @@ def inspect(run: str) -> dict:
             f"ran. Fixed in run_experiment.py; re-runs record it correctly."
         )
 
-    gen_eps = info["gen_epsilon"]
     n_cand = info["n_candidates"]
-    if gen_eps is not None and float(gen_eps) == 0.0 and n_cand is not None \
-            and info["num_gen_eps"] and n_cand < 0.1 * int(info["num_gen_eps"]):
+    if n_cand is not None and info["num_gen_eps"] and n_cand < 0.1 * int(info["num_gen_eps"]):
         info["problems"].append(
-            f"gen_epsilon=0 and only {n_cand} unique candidates from "
-            f"{info['num_gen_eps']} generation episodes -- the budget comparison is "
-            f"being read through a {n_cand}-sample readout. Set gen_epsilon=0.2."
+            f"Only {n_cand} distinct candidates from {info['num_gen_eps']} requested; "
+            "inspect exploration/feasibility diagnostics and actual proposal counts."
         )
     return info
 
@@ -234,18 +207,16 @@ def main() -> None:
 
     if not args.quiet:
         print(f"{'run':<42} {'arm':<14} {'status':<8} {'paid calls':>11} "
-              f"{'eps_end':>8} {'anneal/train':>12} {'cands':>6}")
+              f"{'gen target':>10} {'adaptive':>9} {'cands':>6}")
         print("-" * 108)
         for i in infos:
-            eps_end = f"{i['eps_end']:.3f}" if "eps_end" in i else "-"
-            frac = f"{i['anneal_frac']:.2f}" if "anneal_frac" in i else "-"
+            target = str(i["gen_exploration_target"])
+            adaptive = str(i["exploration_adaptive"])
             cands = i["n_candidates"] if i["n_candidates"] is not None else "-"
             flag = " !" if i["problems"] else ""
             print(f"{i['run'][:42]:<42} {i['arm']:<14} {i['status']:<8} "
-                  f"{i['configured']:>11,} {eps_end:>8} {frac:>12} {cands:>6}{flag}")
+                  f"{i['configured']:>11,} {target:>10} {adaptive:>9} {cands:>6}{flag}")
         print()
-        print("  eps_end     = epsilon at the last training episode; must equal dqn_eps_min")
-        print("  anneal/train = dqn_eps_anneal_eps / dqn_num_train_eps; target 0.60")
         print()
         for i in infos:
             note = f"   [{i['note']}]" if i.get("note") else ""
@@ -283,11 +254,11 @@ def main() -> None:
                 f"totals, e.g. dqn_num_train_eps = {lo:,} - dqn_warmup_eps."
             )
 
-    gen = {(i["gen_epsilon"], i["gen_temperature"]) for i in infos}
+    gen = {(i["gen_exploration_target"], i["exploration_adaptive"]) for i in infos}
     if len(gen) > 1:
         cross.append(
             f"generation settings differ across runs: "
-            f"{sorted(gen, key=str)} as (gen_epsilon, gen_temperature). Generation is "
+            f"{sorted(gen, key=str)} as (gen_exploration_target, exploration_adaptive). Generation is "
             f"the readout -- keep it identical so it cannot confound the budget axis."
         )
 
@@ -305,7 +276,7 @@ def main() -> None:
               + (f", {len(cross)} cross-run issue(s)" if cross else ""))
         raise SystemExit(1)
 
-    print(f"OK: {len(infos)} run(s), budgets consistent and epsilon anneals fully.")
+    print(f"OK: {len(infos)} run(s), budget and generation settings consistent.")
 
 
 if __name__ == "__main__":

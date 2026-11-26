@@ -10,7 +10,7 @@ from rl_matdesign.hpo.spec import load_plan
 def write_plan(tmp_path, extra=None, scene=None):
     base = scene if scene is not None else {
         'properties': [{'name': 'working_temperature', 'output': 'T3', 'direction': 'min', 'unit': 'K'}],
-        'gen_temperature': 1.0,
+        'gen_exploration_target': 1.0,
     }
     (tmp_path / 'scene.yaml').write_text(yaml.safe_dump(base, sort_keys=False))
     data = {'base_config': 'scene.yaml', 'method': 'a2c', 'evaluation': {'threshold': 0}}
@@ -25,8 +25,8 @@ def test_campaign_method_selects_budgets_from_a_shared_scenario(tmp_path):
     plan = load_plan(write_plan(tmp_path, {'method': 'dqn-mc', 'base_config': str(coarse)}))
     base = plan['base_config_data']
     assert base['method'] == 'dqn' and base['dqn_target_mode'] == 'mc'
-    assert (base['train_budget'], base['num_gen_eps'], base['gen_temperature']) == (115, 115, 1.0)
-    assert plan['generation_search']['parameter'] == 'gen_temperature'
+    assert (base['train_budget'], base['num_gen_eps'], base['gen_exploration_target']) == (115, 115, .7)
+    assert plan['generation_search']['parameter'] == 'gen_exploration_target'
 
 
 @pytest.mark.parametrize('method', ['a2c', 'dqn-mc', 'dqn-bootstrap'])
@@ -50,7 +50,7 @@ def test_simplified_defaults_inherit_named_property_and_fixed_rules(tmp_path, me
     assert plan['budget']['train']['min_unique'] == 1
     assert plan['efficiency']['comparison'] == 'lt'
     assert plan['efficiency']['max_attempts_per_unique'] == 1.5
-    assert plan['generation_search']['parameter'] == 'gen_temperature'
+    assert plan['generation_search']['parameter'] == 'gen_exploration_target'
     assert plan['generation_search']['repeats_per_model'] == 3
 
 
@@ -235,28 +235,20 @@ def test_invalid_or_redundant_public_settings_rejected(tmp_path, extra, match):
         load_plan(write_plan(tmp_path, extra))
 
 
-@pytest.mark.parametrize('parameter,values', [
-    ('gen_temperature', [0, .1, 100]), ('gen_epsilon', [0, .1, 1]), ('gen_top_frac', [0, .1, 1]),
-])
-def test_scene_last_explicit_generation_method_selects_search_dimension(tmp_path, parameter, values):
+@pytest.mark.parametrize('values', [[0], [0, .1, 1], [.25, .7]])
+def test_generation_search_uses_bounded_entropy_target(tmp_path, values):
     scene = {'properties': [{'name': 'quality', 'direction': 'max'}],
-             'gen_temperature': 9, 'gen_epsilon': .2, 'gen_top_frac': .4}
-    scene.pop(parameter)
-    scene[parameter] = 0  # Explicit zero still selects this strategy.
+             'gen_exploration_target': .7}
     plan = load_plan(write_plan(tmp_path, {'generation': {'initial_values': values}}, scene))
-    assert plan['generation_search']['parameter'] == parameter
+    assert plan['generation_search']['parameter'] == 'gen_exploration_target'
     assert plan['generation_search']['initial_values'] == values
-    assert parameter not in plan['generation_search']['fixed']
+    assert 'fixed' not in plan['generation_search']
 
 
-@pytest.mark.parametrize('parameter,values', [
-    ('gen_temperature', [-1, 1]), ('gen_epsilon', [0, 1.01]), ('gen_top_frac', [0, 2]),
-    ('gen_temperature', [0, float('inf')]), ('gen_epsilon', [0, 0]),
-])
-def test_generation_parameter_domains(tmp_path, parameter, values):
+@pytest.mark.parametrize('values', [[-1, 1], [0, 1.01], [0, float('inf')], [0, 0]])
+def test_generation_parameter_domains(tmp_path, values):
     with pytest.raises(ConfigError):
-        load_plan(write_plan(tmp_path, {'generation': {'initial_values': values}},
-                             {'properties': [{'name': 'quality', 'direction': 'max'}], parameter: 0}))
+        load_plan(write_plan(tmp_path, {'generation': {'initial_values': values}}))
 
 
 def test_explicit_ranges_override_profiles_and_fixed_dqn_steps_remain(tmp_path):
@@ -292,7 +284,7 @@ def test_templates_resolve_shared_rules_using_dummy_scene(tmp_path, name):
     assert plan['sources']['parallel_jobs'] == 'yaml'
     assert plan['method'] == data['method']
     assert plan['objective']['field'] == 'quality'
-    assert plan['generation_search']['parameter'] == 'gen_temperature'
+    assert plan['generation_search']['parameter'] == 'gen_exploration_target'
     assert plan['generation_search']['repeats_per_model'] == data['generation']['repeats']
     assert plan['generation_search']['max_extra_values_per_direction'] == 2
     assert plan['training_search']['finalists'] == 3
@@ -304,11 +296,9 @@ def test_templates_resolve_shared_rules_using_dummy_scene(tmp_path, name):
         assert ('dqn_target_update_freq' in plan['search_space']) == (plan['method'] == 'dqn-bootstrap')
 
 
-@pytest.mark.parametrize('parameter', ['gen_epsilon', 'gen_top_frac'])
-def test_strategy_defaults_do_not_inherit_temperature_domain(tmp_path, parameter):
-    scene = {'properties': [{'name': 'quality', 'direction': 'max'}], parameter: .1}
-    plan = load_plan(write_plan(tmp_path, scene=scene))
-    assert plan['generation_search']['parameter'] == parameter
+def test_generation_defaults_have_bounded_entropy_domain(tmp_path):
+    plan = load_plan(write_plan(tmp_path))
+    assert plan['generation_search']['parameter'] == 'gen_exploration_target'
     assert len(plan['generation_search']['initial_values']) > 1
     assert all(0 <= value <= 1 for value in plan['generation_search']['initial_values'])
 

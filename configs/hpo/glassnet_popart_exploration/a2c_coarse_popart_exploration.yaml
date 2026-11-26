@@ -1,0 +1,64 @@
+# GlassNet coarse, all three upgrades: tune exploration only.
+# Keep the six bundle YAMLs together; base_config is relative to this file.
+# Singleton choices are necessary: omitted dimensions retain built-in HPO ranges.
+# They preserve the supplied learner settings; they are not new search dimensions.
+# exploration_target is the initial normalized entropy; adaptation stays enabled.
+# Range diagnosis may expand 0.1--0.9 toward the legal endpoints 0 and 1.
+# Generation searches gen_exploration_target with built-in initial values
+# [0, 0.25, 0.5, 0.7, 0.9, 1]; controller constants stay internal.
+# Existing budgets, scoring, repeats, trial limits and random_seed are preserved.
+# Validation seeds select the final configuration; use fresh seeds for final comparison.
+# Run with: python -m rl_matdesign.hpo run --hpo-config <this-file> --out <new-output>
+base_config: ./a2c_popart_exploration.yaml
+method: a2c
+random_seed: 42
+parallel_jobs: 15
+evaluation:
+  threshold: 1420.15
+  best_fraction: 0.1
+  score_tolerance: 0.01
+  max_attempts_per_unique: 1.5
+training:
+  repeats: 3
+  score_weights:
+    qualified_fraction: 0.45
+    best_fraction_quality: 0.3
+    best_value_quality: 0.1
+    sampling_efficiency: 0.15
+  budget:
+    mode: absolute_unique
+    min_unique: 916
+    initial_unique: 916
+    max_unique: 916
+  parameter_ranges:
+    pg_lr_actor:
+      type: categorical
+      choices:
+      - 0.0003574712922600243
+    pg_lr_critic:
+      type: categorical
+      choices:
+      - 0.0025369990766817706
+    pg_batch_eps:
+      type: categorical
+      choices:
+      - 8
+    exploration_target:
+      type: float
+      low: 0.1
+      high: 0.9
+  search:
+    max_rounds: 3
+    trials_per_round: 30
+    startup_random_trials: 10
+generation:
+  budget:
+    mode: absolute_unique
+    min_unique: 500
+    initial_unique: 500
+    max_unique: 500
+  repeats: 3
+  score_weights:
+    qualified_fraction: 0.5
+    best_fraction_quality: 0.4
+    best_value_quality: 0.1

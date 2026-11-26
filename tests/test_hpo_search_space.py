@@ -63,7 +63,7 @@ def test_categorical_picks_from_list():
 
 def test_frac_of_int_typed_base_rounds_to_int():
     spec = {
-        "dqn_eps_anneal_eps": {
+        "dqn_warmup_eps": {
             "dist": "frac_of",
             "base": "dqn_num_train_eps",
             "low": 0.3,
@@ -73,7 +73,7 @@ def test_frac_of_int_typed_base_rounds_to_int():
     resolved = {"dqn_num_train_eps": 1000}
     for _ in range(20):
         out = sample_from_search_space(_trial(), spec, resolved_values=resolved)
-        val = out["dqn_eps_anneal_eps"]
+        val = out["dqn_warmup_eps"]
         assert isinstance(val, int)
         assert 300 <= val <= 800
 

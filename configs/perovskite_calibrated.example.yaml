@@ -155,9 +155,6 @@ dqn_warmup_eps: 400
 dqn_buffer_size: 5000
 dqn_grad_steps_per_ep: 6
 dqn_target_update_freq: 20
-dqn_eps_anneal_eps: 100
-dqn_eps_min: 0.05
 num_gen_eps: 50
-gen_temperature: 0.1
 value_normalization: popart
 train_budget: 2000

@@ -32,13 +32,7 @@ pg_num_iters: 10
 pg_batch_eps: 5
 pg_lr_actor: 0.001
 pg_lr_critic: 0.001
-pg_entropy_coef: 0.01
-gen_temperature: 1.0
-gen_top_frac: 0.0
-gen_epsilon: 0.0
 gamma: 0.99
-pg_repeat_penalty_coef: 0.1
-pg_repeat_penalty_shape: log
 num_gen_eps: 30
 dqn_lr: 0.001
 dqn_batch_size: 32
@@ -47,5 +41,8 @@ dqn_num_train_eps: 100
 dqn_buffer_size: 1000
 dqn_grad_steps_per_ep: 5
 dqn_target_update_freq: 20
-dqn_eps_anneal_eps: 50
-dqn_eps_min: 0.05
+
+# Shared exploration controls; controller constants are internal.
+exploration_target: 0.7
+gen_exploration_target: 0.7
+exploration_adaptive: true

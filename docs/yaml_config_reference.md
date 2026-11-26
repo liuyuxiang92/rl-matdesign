@@ -331,8 +331,8 @@ warmup budgets are independent. `num_gen_eps` is the entire generation quota.
 Training counts distinct successful candidates by default; set
 `train_count_duplicates: true` or pass `--train-count-duplicates` to count
 repeats too. The [coarse GlassNet scenario](../configs/glassnet_coarse_2pct.yaml) gives
-`train_budget`, `num_gen_eps` and `gen_temperature` a value for each method.
-Each of these three fields also accepts a single value shared by all methods.
+`train_budget` and `num_gen_eps` a value for each method.
+These fields and both exploration targets also accept method maps or a single shared value.
 For DQN the key is `dqn-bootstrap` or `dqn-mc`, selected by `dqn_target_mode`.
 For policy-gradient runs the key is the method name. The runner applies explicit
 CLI overrides after selecting the method's values. Resolved run configs store scalars.
@@ -341,3 +341,62 @@ Scientific output columns and the 200,000-record prediction cache
 limit are fixed by the implementation.
 The fully resolved config and scientific contracts are stored with run artifacts.
 A metadata-only audit does not validate external model weights or template files.
+
+
+## Adaptive exploration
+
+DQN-bootstrap and DQN-MC share entropy-target Q sampling after random warmup.
+A2C and REINFORCE keep on-policy softmax sampling and learn with a normalized
+entropy bonus. The entropy coefficient adapts internally; there is no repeat-visit
+reward or advantage penalty. Scientific gate violations still follow `reward`.
+
+Only three exploration fields are accepted, all optional:
+
+```yaml
+exploration_target: 0.7
+gen_exploration_target: 0.7
+exploration_adaptive: true
+```
+
+Both targets lie in `[0, 1]` and support the same method maps as `train_budget`.
+They are fractions of maximum action entropy, not random-action percentages.
+`exploration_adaptive: false` freezes the targets for a controlled comparison;
+DQN still solves temperature and PG still adjusts its entropy coefficient.
+The shared `adaptive_entropy_v1` profile owns numerical safeguards, response
+rates, observation windows and target-change limits; its complete values are
+persisted in execution contracts rather than exposed as scenario knobs.
+
+DQN and frozen generation solve softmax temperature on each legal action set.
+Target zero samples among tied maximum scores; target one is uniform. Equal or
+numerically indistinguishable scores remain uniform for positive targets. Forced single-action states
+are excluded from entropy statistics. Actual entropy is logged, since ties can
+make a requested target unreachable. These controls do not estimate uncertainty
+or guarantee diverse completed materials.
+
+The slower controller counts attempted proposals, including recoverable failures
+and duplicates, and credits novelty only to newly evaluated canonical identities.
+It observes feasibility and higher-is-better scientific quality. Sustained
+repetition without useful progress can trigger a small increase in the target; a
+more focused trial is retained only after comparison with its prior outcome
+window. Trials are observational: learning and sampling noise can confound their
+comparison. No extra property-evaluation probes or budget optimization are added.
+Changing an A2C target changes subsequent learning pressure, not current action
+probabilities. Returning to a previous target does not undo model updates.
+
+Training and generation maintain separate controllers. Generation seeds its
+novelty archive from training, including when loading newly saved weight artifacts.
+The generation output budget remains phase-local: a training-seen material may
+still be output once, while the exploration controller recognizes it as globally
+seen. Scientific reward values are never rewritten by the controller.
+
+Training and HPO generation checkpoints include the archive, windows, target, entropy
+coefficient and pending trial. Exact resume rejects a missing state or changed
+profile/settings. Old exploration checkpoints require the archived code; there
+is no silent conversion into the new adaptive protocol.
+
+Remove `dqn_eps_anneal_eps`, `dqn_eps_min`, `pg_entropy_coef`, `pg_entropy_min`,
+`pg_repeat_penalty_coef`, `pg_repeat_penalty_shape`, `gen_temperature`,
+`gen_top_frac`, `gen_epsilon`, and `generation_selection` from existing YAMLs.
+They are rejected rather than ignored or translated. The old values have no
+one-to-one mapping to entropy targets. The default profile is a development
+recipe, not evidence that per-scenario HPO is unnecessary.

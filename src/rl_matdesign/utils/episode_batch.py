@@ -56,7 +56,8 @@ def snapshot_episode(env, metadata: dict | None = None) -> EpisodeSnapshot:
         terminal_key=copy.deepcopy(env.terminal_comp_key()),
         composition=copy.deepcopy(composition_fn()) if callable(composition_fn) else None,
         formula=getattr(env, "terminal_formula", ""),
-        metadata=dict(metadata or {}),
+        metadata={**copy.deepcopy(getattr(env, "exploration_diagnostics", {})),
+                  **dict(metadata or {})},
         prediction=copy.deepcopy(predictions[0]) if len(predictions) == 1 else None,
     )
 
@@ -70,7 +71,8 @@ class EpisodeBatchEvaluator:
     counting. Batch size one calls the original rollout directly.
     """
 
-    def __init__(self, env, *, max_retries: int = 10, timer=None, capture_predictions=False):
+    def __init__(self, env, *, max_retries: int = 10, timer=None, capture_predictions=False,
+                 failure_callback=None):
         self.env = env
         self.reward_fn = getattr(env, "reward_fn", None)
         self.size = 1
@@ -79,6 +81,7 @@ class EpisodeBatchEvaluator:
         self.failures = 0
         self.pending = deque()
         self.timer = timer
+        self.failure_callback = failure_callback
         self.wave_id = 0
         self.hpo_recorder = getattr(env, "hpo_recorder", None)
         self.capture_predictions = bool(capture_predictions or self.hpo_recorder is not None)
@@ -86,6 +89,8 @@ class EpisodeBatchEvaluator:
             self.reward_fn.capture_prediction_records = self.capture_predictions
 
     def _record_failure(self, failure, phase):
+        if self.failure_callback is not None:
+            self.failure_callback(failure, phase)
         record = getattr(self.timer, "record_episode", None)
         if callable(record):
             record({

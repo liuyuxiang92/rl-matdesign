@@ -6,6 +6,7 @@ import hashlib
 import math
 import os
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 from .candidate_budget import CandidateBudget, NumericalTrainingError
@@ -44,9 +45,12 @@ def episode_record(episode, phase):
     constraints = [bool(value) for name, value in raw.items()
                    if name in {"gate_passed", "primary_ok", "constraint_passed"}
                    or (name.startswith("gate_") and name.endswith("_passed"))]
+    sampling = {name: deepcopy(value) for name, value in getattr(episode, "metadata", {}).items()
+                if name.startswith("exploration_")}
     return {"identity": candidate_identity(episode.terminal_key), "phase": phase,
             "formula": episode.formula, "properties": properties,
-            "constraint_passed": all(constraints), "prediction_record": raw}
+            "constraint_passed": all(constraints), "prediction_record": raw,
+            **sampling}
 
 
 class CandidateRecorder:
@@ -159,6 +163,10 @@ class CandidateRecorder:
             passed = bool(self.constraint_check(episode))
             record["post_constraint_passed"] = passed
             record["constraint_passed"] = record["constraint_passed"] and passed
+            # The learner consumes this same completed snapshot after the
+            # recorder. Carry the already-computed postfilter result forward;
+            # exploration feedback must not re-run a scientific check/oracle.
+            episode.metadata["post_constraint_passed"] = passed
         fresh = self.budget.settle(record["identity"])
         if fresh:
             record.update(attempts_started=self.budget.attempts_started,

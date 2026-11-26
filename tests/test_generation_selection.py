@@ -1,155 +1,74 @@
-"""A scene's last authored generation policy survives overrides and exports."""
+"""Entropy-target configuration has no order-dependent sampler selection."""
 from copy import deepcopy
-from itertools import permutations
 
 import pytest
 import yaml
 
-from rl_matdesign.config_schema import (
-    ConfigError,
-    GENERATION_PARAMETERS,
-    load_yaml_config,
-    resolve_config,
-    selected_generation_parameter,
-    validate_config,
-    with_generation_selection,
-)
+from rl_matdesign.config_schema import ConfigError, load_yaml_config, resolve_config, validate_config
 
 
-@pytest.mark.parametrize("order", list(permutations(GENERATION_PARAMETERS)))
-def test_last_authored_generation_field_wins_exclusively(order):
-    raw = dict.fromkeys(order, 0.25)
-    resolved = resolve_config(raw)
-    assert selected_generation_parameter(raw) == order[-1]
-    assert selected_generation_parameter(resolved.config) == order[-1]
-    assert resolved.config[order[-1]] == 0.25
-    assert all(resolved.config[key] == 0 for key in order[:-1])
-    assert raw == dict.fromkeys(order, 0.25)
-
-
-@pytest.mark.parametrize("selected", GENERATION_PARAMETERS)
-def test_explicit_zero_is_a_policy_choice_and_defaults_do_not_win(selected):
-    cfg = resolve_config({selected: 0}).config
-    assert selected_generation_parameter(cfg) == selected
-    assert all(cfg[key] == 0 for key in GENERATION_PARAMETERS)
-
-
-def test_no_explicit_policy_keeps_temperature_default():
-    cfg = resolve_config({}).config
-    assert selected_generation_parameter({}) == "gen_temperature"
-    assert cfg["gen_temperature"] == 1
-    assert selected_generation_parameter(cfg) == "gen_temperature"
-    assert cfg["generation_selection"]["source"] == "default"
-
-
-@pytest.mark.parametrize("selected", GENERATION_PARAMETERS)
-@pytest.mark.parametrize("value", [0, 0.25])
+@pytest.mark.parametrize("value", [0, .25, 1])
 @pytest.mark.parametrize("sort_keys", [False, True])
-def test_resolved_export_reload_preserves_selected_policy(tmp_path, selected, value, sort_keys):
-    original = resolve_config({selected: value}).config
+def test_target_export_reload_preserves_explicit_endpoints(tmp_path, value, sort_keys):
+    original = resolve_config({"gen_exploration_target": value, "exploration_adaptive": False}).config
     path = tmp_path / "resolved.yaml"
     path.write_text(yaml.safe_dump(original, sort_keys=sort_keys))
-    reloaded = resolve_config(load_yaml_config(path)).config
-    assert reloaded == original
-    assert selected_generation_parameter(reloaded) == selected
+    assert resolve_config(load_yaml_config(path)).config == original
+    assert "generation_selection" not in original
 
 
-def test_merged_defaults_do_not_override_later_explicit_policy(tmp_path):
+def test_defaults_are_shared_targets_with_adaptation_enabled():
+    cfg = resolve_config({}).config
+    assert cfg["exploration_target"] == cfg["gen_exploration_target"] == .7
+    assert cfg["exploration_adaptive"] is True
+
+
+def test_yaml_merge_and_cli_zero_override_preserve_target(tmp_path):
     path = tmp_path / "scene.yaml"
-    path.write_text("<<: {gen_temperature: 1, gen_epsilon: 0.2}\ngen_temperature: 0\n")
-    raw = load_yaml_config(path)
-    cfg = resolve_config(raw).config
-    assert selected_generation_parameter(raw) == "gen_temperature"
-    assert cfg["gen_epsilon"] == 0
-    assert cfg["gen_temperature"] == 0
+    path.write_text("<<: {gen_exploration_target: 1, exploration_target: 0.2}\ngen_exploration_target: 0\n")
+    cfg = resolve_config(load_yaml_config(path)).config
+    assert cfg["gen_exploration_target"] == 0
+    assert cfg["exploration_target"] == .2
+    cfg = resolve_config(cfg, {"gen_exploration_target": None, "exploration_adaptive": False}).config
+    assert cfg["gen_exploration_target"] == 0 and cfg["exploration_adaptive"] is False
+    assert resolve_config(cfg, {"exploration_target": 0}).config["exploration_target"] == 0
 
 
-@pytest.mark.parametrize("new_parameter", ["gen_epsilon", "gen_top_frac"])
-def test_cli_policy_overrides_saved_yaml_even_when_explicit_zero(new_parameter):
-    saved = resolve_config({"gen_temperature": 1}).config
-    cfg = resolve_config(saved, {new_parameter: 0}).config
-    assert selected_generation_parameter(cfg) == new_parameter
-    assert all(cfg[key] == 0 for key in GENERATION_PARAMETERS)
-    assert cfg["generation_selection"]["source"] == "override"
+@pytest.mark.parametrize("key", ["exploration_target", "gen_exploration_target"])
+@pytest.mark.parametrize("value", [-.1, 1.1, float("nan"), float("inf"), True])
+def test_targets_reject_invalid_domain(key, value):
+    with pytest.raises(ConfigError, match=key):
+        resolve_config({key: value})
 
 
-def test_absent_cli_values_do_not_override_yaml_policy():
-    saved = resolve_config({"gen_top_frac": 0.2}).config
-    cfg = resolve_config(saved, {"gen_temperature": None, "gen_epsilon": None}).config
-    assert selected_generation_parameter(cfg) == "gen_top_frac"
-    assert cfg["gen_top_frac"] == 0.2
+@pytest.mark.parametrize("key", ["gen_temperature", "gen_epsilon", "gen_top_frac", "generation_selection",
+                                  "dqn_eps_min", "dqn_eps_anneal_eps", "pg_entropy_coef", "pg_entropy_min",
+                                  "pg_repeat_penalty_coef", "pg_repeat_penalty_shape"])
+def test_old_sampler_configuration_is_rejected_without_migration(key):
+    with pytest.raises(ConfigError, match=key):
+        resolve_config({key: 0})
 
 
-def test_cli_mapping_order_selects_last_explicit_policy():
-    cfg = resolve_config({"gen_temperature": 1}, {"gen_epsilon": 0.2, "gen_top_frac": 0}).config
-    assert selected_generation_parameter(cfg) == "gen_top_frac"
-    assert cfg["gen_epsilon"] == cfg["gen_temperature"] == 0
+@pytest.mark.parametrize("key", ["exploration_target", "gen_exploration_target"])
+def test_targets_support_method_maps_and_validate_inactive_entries(key):
+    raw = {"method": "dqn", "dqn_target_mode": "mc", key: {"a2c": .2, "dqn-mc": .8}}
+    assert resolve_config(raw).config[key] == .8
+    assert resolve_config(raw, {"method": "a2c"}).config[key] == .2
+    raw[key]["a2c"] = 2
+    with pytest.raises(ConfigError, match=key):
+        resolve_config(raw)
 
 
-def test_edits_to_resolved_config_override_saved_selection():
-    saved = resolve_config({"gen_temperature": 1}).config
-    saved["gen_epsilon"] = 0.3
-    cfg = resolve_config(saved).config
-    assert selected_generation_parameter(cfg) == "gen_epsilon"
-    assert cfg["gen_temperature"] == 0
-    assert cfg["gen_epsilon"] == 0.3
-
-
-def test_last_changed_field_in_resolved_config_wins():
-    saved = resolve_config({"gen_temperature": 1}).config
-    saved["gen_epsilon"] = 0.3
-    # Place the changed temperature after epsilon, including a zero edit.
-    saved.pop("gen_temperature")
-    saved["gen_temperature"] = 0
-    cfg = resolve_config(saved).config
-    assert selected_generation_parameter(cfg) == "gen_temperature"
-    assert all(cfg[key] == 0 for key in GENERATION_PARAMETERS)
-
-
-@pytest.mark.parametrize("change", [
-    {"parameter": "invalid"},
-    {"source": "unknown"},
-    {"values": {"gen_temperature": 1}},
-    {"values": {"gen_temperature": 1, "gen_epsilon": 0.2, "gen_top_frac": 0}},
-    {"values": {"gen_temperature": float("nan"), "gen_epsilon": 0, "gen_top_frac": 0}},
-    {"unexpected": 1},
-])
-def test_malformed_saved_selection_is_rejected(change):
-    cfg = resolve_config({"gen_temperature": 1}).config
-    cfg["generation_selection"].update(change)
-    with pytest.raises(ConfigError, match="generation_selection|finite"):
-        resolve_config(cfg)
-
-
-def test_saved_metadata_requires_complete_effective_fields():
-    cfg = resolve_config({"gen_temperature": 1}).config
-    del cfg["gen_epsilon"]
-    with pytest.raises(ConfigError, match="all three effective"):
-        resolve_config(cfg)
-
-
-@pytest.mark.parametrize("selected", GENERATION_PARAMETERS)
-def test_job_builder_explicit_selection_is_immune_to_stale_metadata(selected):
-    raw = resolve_config({"gen_temperature": 1}).config
-    raw.update(dict.fromkeys(GENERATION_PARAMETERS, 0.25))
-    raw[selected] = 0
+def test_validation_is_read_only_and_targets_leave_horizon_unchanged():
+    raw = {"gen_exploration_target": .3, "num_gen_eps": 17, "max_gen_attempts": 40}
     original = deepcopy(raw)
-    selected_cfg = with_generation_selection(raw, selected)
-    resolved = resolve_config(selected_cfg).config
-    assert selected_generation_parameter(resolved) == selected
-    assert all(resolved[key] == 0 for key in GENERATION_PARAMETERS)
+    validate_config(raw)
     assert raw == original
-
-
-def test_selection_does_not_change_generation_horizon():
-    raw = {"gen_top_frac": 0.3, "num_gen_eps": 17, "max_gen_attempts": 40}
     cfg = resolve_config(raw).config
     assert (cfg["num_gen_eps"], cfg["max_gen_attempts"]) == (17, 40)
 
 
-def test_read_only_validation_accepts_internal_metadata_without_default_materialization():
-    raw = {"gen_epsilon": 0.25}
-    original = deepcopy(raw)
-    validate_config(raw)
-    assert raw == original
-    validate_config(resolve_config(raw).config)
+@pytest.mark.parametrize("value", [0, 1, "true", None])
+def test_adaptation_requires_an_explicit_boolean(value):
+    with pytest.raises(ConfigError, match="exploration_adaptive"):
+        resolve_config({"exploration_adaptive": value})

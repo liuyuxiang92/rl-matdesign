@@ -201,9 +201,17 @@ def _validate_checkpoint(directory, ledger, identities, method):
         raise ValueError("Unsupported checkpoint predictor ledger")
     _require_fields(predictor, ("n_calls", "seen", "t_predict_s", "phase", "phase_costs"),
                     "Checkpoint predictor ledger")
+    if path.name != CALIBRATION_CHECKPOINT:
+        from ..exploration import ExplorationController
+        exploration = _mapping(saved.get("exploration_state"), "Exploration state")
+        settings = _mapping(exploration.get("config"), "Exploration configuration")
+        _require_fields(settings, ("initial_target", "adaptive"), "Exploration configuration")
+        controller = ExplorationController(settings["initial_target"], settings["adaptive"])
+        controller.load_state_dict(exploration)
     if phase == "generation":
         if saved.get("type") != "hpo_generation":
             raise ValueError("Generation checkpoint has an invalid type")
+        _require_fields(saved, ("exploration_state",), "Generation checkpoint")
         contract = _mapping(saved.get("generation_contract"), "Generation sampling contract")
         _require_fields(contract, ("execution", "sampling", "frozen_artifacts"), "Generation contract")
         return
@@ -230,7 +238,7 @@ def _validate_checkpoint(directory, ledger, identities, method):
         raise ValueError("Training checkpoint algorithm differs from campaign method")
     if saved.get("type") == "dqn":
         _require_fields(saved, ("qnet_state", "opt_state", "buffer",
-                                "training_episodes_completed", "eps"), "DQN checkpoint")
+                                "training_episodes_completed", "exploration_state"), "DQN checkpoint")
         learning = saved["execution_contract"].get("learning", {})
         target_mode = learning.get("dqn_target_mode", "mc" if method == "dqn_mc" else "bootstrap")
         networks, optimizers = ("qnet_state",), ("opt_state",)
@@ -238,8 +246,8 @@ def _validate_checkpoint(directory, ledger, identities, method):
             _require_fields(saved, ("target_net_state",), "DQN bootstrap checkpoint")
             networks += ("target_net_state",)
     elif saved.get("type") == "pg":
-        _require_fields(saved, ("policy_state", "opt_actor_state", "iteration", "visit_counts",
-                                "entropy_coef_eff", "rl_method"), "PG checkpoint")
+        _require_fields(saved, ("policy_state", "opt_actor_state", "iteration", "exploration_state",
+                                "rl_method"), "PG checkpoint")
         networks, optimizers = ("policy_state",), ("opt_actor_state",)
         if saved["rl_method"] == "a2c":
             _require_fields(saved, ("value_net_state", "opt_critic_state"), "A2C checkpoint")

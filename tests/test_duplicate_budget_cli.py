@@ -35,10 +35,10 @@ def _config(*, method="dqn", count_duplicates=False, categorical=False):
         "dqn_warmup_eps": 1, "dqn_num_train_eps": 2,
         "dqn_batch_size": 1, "dqn_buffer_size": 1000,
         "dqn_grad_steps_per_ep": 1, "dqn_hidden_dim": 16,
-        "dqn_eps_min": 1.0, "dqn_eps_anneal_eps": 10,
+        "exploration_target": 1.0,
         "dqn_target_update_freq": 2,
         "pg_warmup_eps": 2, "pg_num_iters": 1, "pg_batch_eps": 3,
-        "pg_entropy_min": 0.0, "pg_entropy_coef": 0.01,
+        "exploration_adaptive": False,
         "num_gen_eps": 0,
     }
 

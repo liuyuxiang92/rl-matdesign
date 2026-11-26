@@ -11,7 +11,7 @@ from pathlib import Path
 import random
 
 from ..config_schema import (ConfigError, load_yaml_config, resolve_config,
-                             select_method_values, selected_generation_parameter)
+                             select_method_values)
 from ..rewards import RewardCombiner
 from .algorithm_profiles import METHODS, get_profile, validate_search_space
 from .spec import (_GEN_WEIGHTS, _TRAIN_WEIGHTS, _efficiency, _integer, _mapping,
@@ -23,11 +23,7 @@ _BUDGET_FACTOR = 2.0
 _RANGE_MAX_EXTRA_VALUES_PER_DIRECTION = 2
 _GENERATION_MAX_EXTRA_VALUES_PER_DIRECTION = 2
 _VALIDATION_TOP_CONFIGS = 3
-_GENERATION_DEFAULTS = {
-    "gen_temperature": [0, .001, .01, .1, 1, 10, 100, 1000],
-    "gen_epsilon": [0, .01, .05, .1, .2, .4, .7, 1],
-    "gen_top_frac": [.001, .01, .05, .1, .25, .5, 1],
-}
+_GENERATION_DEFAULTS = [0, .25, .5, .7, .9, 1]
 
 
 def infer_objective(base: Mapping, threshold: float) -> dict:
@@ -144,12 +140,12 @@ def load_simplified_plan(path: Path, value, method=None) -> dict:
     if startup > trials:
         raise ConfigError("training.search.startup_random_trials must not exceed trials_per_round")
 
-    parameter = selected_generation_parameter(base)
-    initial_values = generation.get("initial_values", _GENERATION_DEFAULTS[parameter])
+    parameter = "gen_exploration_target"
+    initial_values = generation.get("initial_values", _GENERATION_DEFAULTS)
     if not isinstance(initial_values, list) or not initial_values:
         raise ConfigError("generation.initial_values must be a nonempty list")
     initial_values = [_number(value, "generation.initial_values", 0,
-                             None if parameter == "gen_temperature" else 1) for value in initial_values]
+                             1) for value in initial_values]
     if len(set(initial_values)) != len(initial_values):
         raise ConfigError("generation.initial_values must contain distinct values")
     train_budget = _phase_budget(training.get("budget", {}), "training.budget")
@@ -182,8 +178,6 @@ def load_simplified_plan(path: Path, value, method=None) -> dict:
         "training_search": training_search,
         "generation_search": {"parameter": parameter, "initial_values": sorted(initial_values),
                               "max_extra_values_per_direction": _GENERATION_MAX_EXTRA_VALUES_PER_DIRECTION,
-                              "fixed": {key: 0 for key in ("gen_epsilon", "gen_top_frac", "gen_temperature")
-                                        if key != parameter},
                               "repeats_per_model": _integer(generation.get("repeats", 3), "generation.repeats", 1),
                               "master_seed": master},
         "authored_config": deepcopy(raw),

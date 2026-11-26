@@ -119,11 +119,9 @@ def _ambiguous(candidate: Mapping[str, Any], reference: Mapping[str, Any]) -> bo
 
 def _domain_bounds(name: str, spec: Mapping[str, Any]) -> tuple[float, float]:
     low, high = -math.inf, math.inf
-    if spec.get("log") or name in {"warmup_budget_fraction", "epsilon_anneal_budget_ratio", "dqn_lr", "pg_lr_actor", "pg_lr_critic"}:
+    if spec.get("log") or name in {"warmup_budget_fraction", "dqn_lr", "pg_lr_actor", "pg_lr_critic"}:
         low = math.nextafter(0.0, math.inf)
-    if name == "pg_entropy_coef":
-        low = 0.0
-    if name in {"dqn_eps_min", "pg_entropy_min", "warmup_budget_fraction"}:
+    if name in {"exploration_target", "warmup_budget_fraction"}:
         low = 0.0 if name != "warmup_budget_fraction" else math.nextafter(0.0, math.inf)
         high = math.nextafter(1.0, 0.0) if name == "warmup_budget_fraction" else 1.0
     if spec["type"] == "int":
@@ -141,7 +139,7 @@ def _outside(name: str, spec: Mapping[str, Any], current: Any, direction: str, i
         return choices[index] if 0 <= index < len(choices) else None
     factor = spec.get("expansion_factor")
     if factor is None:
-        if name in {"warmup_budget_fraction", "epsilon_anneal_budget_ratio"}:
+        if name in {"warmup_budget_fraction"}:
             factor = 2.0
         elif spec.get("log"):
             factor = 10.0

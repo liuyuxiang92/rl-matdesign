@@ -263,12 +263,7 @@ class Campaign:
             reference = ranked[0]["parameters"]
         else:
             return []
-        slow = dict(reference)
-        for name in ("epsilon_anneal_budget_ratio", "pg_entropy_coef"):
-            if name in self.plan["search_space"]:
-                spec = self.plan["search_space"][name]
-                slow[name] = max(spec["choices"]) if spec["type"] == "categorical" else spec["high"]
-        return unique_parameters([reference, *(r["parameters"] for r in ranked[:1]), slow])
+        return unique_parameters([reference, *(r["parameters"] for r in ranked[:1])])
 
     def scan(self, panel, phase, seeds, models=None, pairings=None):
         _, schedule = self.grids(phase)
@@ -406,7 +401,7 @@ class Campaign:
     def generation_pairs(self, models):
         """Build a reproducible model × sampling-repeat experiment, once.
 
-        Pair identities are independent of temperature/epsilon/top-fraction
+        Pair identities are independent of the generation entropy target
         and budget so all settings use the same frozen networks and RNG pairs.
         """
         settings = self.plan["generation_search"]
@@ -442,13 +437,7 @@ class Campaign:
     @staticmethod
     def generation_extensions(parameter, values):
         """Return legal next endpoint probes for a selected sampling method."""
-        if parameter == "gen_temperature":
-            positives = [value for value in values if value > 0]
-            if not positives:
-                return []
-            return [("low", positives[0], positives[0] / 10),
-                    ("high", positives[-1], positives[-1] * 10)]
-        if parameter not in {"gen_epsilon", "gen_top_frac"}:
+        if parameter != "gen_exploration_target":
             raise CampaignError(f"Unsupported generation parameter: {parameter}")
         # These parameters have exact finite domains; reach the legal boundary
         # directly rather than inventing an unbounded multiplicative scale.
@@ -459,7 +448,7 @@ class Campaign:
         params = trained["selection"]["selected"]["parameters"]
         models = trained["models"]
         settings = self.plan["generation_search"]
-        parameter = settings.get("parameter", "gen_temperature")
+        parameter = settings["parameter"]
         values = sorted(set(settings["initial_values"]))
         seeds, paired_models, pairings = self.generation_pairs(models)
         extensions = {"low": 0, "high": 0}
@@ -491,20 +480,11 @@ class Campaign:
         status = "COMPLETED" if selection.get("selected") else selection["convergence_status"]
         if status == "COMPLETED":
             best = selection["selected"]
-            if self.plan.get("protocol") == "hpo_v2":
-                # A standalone export should express the one selected method,
-                # without exposing implementation-only disabled alternatives.
-                output = {"num_gen_eps": best["budget"], parameter: best["parameters"][parameter],
-                          "convergence_status": selection["convergence_status"]}
-            else:
-                output = {"num_gen_eps": best["budget"], "gen_temperature": best["parameters"]["gen_temperature"],
-                          "gen_epsilon": 0., "gen_top_frac": 0.,
-                          "convergence_status": selection["convergence_status"]}
+            output = {"num_gen_eps": best["budget"], parameter: best["parameters"][parameter],
+                      "convergence_status": selection["convergence_status"]}
             (self.out / "best_generation.yaml").write_text(yaml.safe_dump(output, sort_keys=False))
         result = {"status": status, "selection": selection, "results": results,
                   "parameter": parameter, "parameter_values": values}
-        if parameter == "gen_temperature":
-            result["temperatures"] = values  # Preserve readers of v1 reports.
         if pairings is not None:
             result["generation_pairings"] = pairings
         return result

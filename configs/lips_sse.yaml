@@ -393,9 +393,5 @@ pg_num_iters: 500
 pg_batch_eps: 16
 pg_lr_actor: 0.001
 pg_lr_critic: 0.001
-pg_entropy_coef: 0.05
-gen_temperature: 1.0
 gamma: 0.99
-pg_repeat_penalty_coef: 0.5
-pg_repeat_penalty_shape: log
 num_gen_eps: 200

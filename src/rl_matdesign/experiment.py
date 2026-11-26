@@ -103,8 +103,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Load an existing model/checkpoint and continue training. "
                         "For PG: loads std_scaler.bin + checkpoint.pt and continues toward the total budget. "
                         "For DQN: loads std_scaler.bin + checkpoint.pt (qnet, target_net, optimizer, replay "
-                        "buffer, prediction caches, epsilon, episode counter) for exact-state resume; falls back to "
-                        "qnet.pt (weights only — buffer/epsilon/episode reset) when no mid-checkpoint exists. "
+                        "buffer, prediction caches, exploration controller, episode counter) for exact-state resume; falls back to "
+                        "qnet.pt (weights only — buffer/controller/episode reset) when no mid-checkpoint exists. "
                         "Cannot be combined with --only-generate.")
     p.add_argument("--skip-generation", action="store_true",
                    help="Run training but skip candidate generation.")
@@ -191,6 +191,16 @@ def _close_predictor(predictor) -> None:
             print(f"[WARN] predictor.close() failed: {type(exc).__name__}: {exc}")
 
 
+def _validate_exploration_resume(saved, config):
+    """Reject an incompatible controller before restoring any learner/oracle state."""
+    from .exploration import ExplorationController
+    state = saved.get("exploration_state")
+    if state is None:
+        raise ValueError("Exact resume requires exploration controller state")
+    controller = ExplorationController(config["exploration_target"], config["exploration_adaptive"])
+    controller.load_state_dict(state)
+
+
 def _run_experiment(resources: ExitStack) -> None:
     t_start = time.perf_counter()
     phases = PhaseTimer()
@@ -258,7 +268,7 @@ def _run_experiment(resources: ExitStack) -> None:
             if not os.path.exists(source):
                 raise ValueError("Generation resume requires generation_checkpoint.pt")
             hpo_generation_resume = torch.load(source, map_location="cpu", weights_only=False)
-            if not isinstance(hpo_generation_resume, dict) or hpo_generation_resume.get("type") != "hpo_generation" or any(hpo_generation_resume.get(key) is None for key in ("hpo_state", "rng_state", "predictor_ledger", "generation_contract")):
+            if not isinstance(hpo_generation_resume, dict) or hpo_generation_resume.get("type") != "hpo_generation" or any(hpo_generation_resume.get(key) is None for key in ("hpo_state", "rng_state", "predictor_ledger", "generation_contract", "exploration_state")):
                 raise ValueError("Generation checkpoint lacks synchronized accounting, RNG, predictor or sampling identity")
             hpo_resume = hpo_generation_resume["hpo_state"]
         hpo_recorder = CandidateRecorder(args.out, cfg["hpo_target_unique"], cfg["hpo_ratio_limit"], cfg["hpo_phase"], resume_state=hpo_resume)
@@ -396,10 +406,10 @@ def _run_experiment(resources: ExitStack) -> None:
         checkpoint_cfg.update(total_budget=cfg.get("train_budget") or cfg["pg_num_iters"] * cfg["pg_batch_eps"],
                               total_iterations=cfg["pg_num_iters"])
 
-    # Generation strategy (unified across DQN and PG).
-    gen_temperature = float(cfg["gen_temperature"])
-    gen_top_frac    = float(cfg["gen_top_frac"])
-    gen_epsilon_gen = float(cfg["gen_epsilon"])
+    # Shared exploration semantics; training and generation keep separate state.
+    exploration_target = float(cfg["exploration_target"])
+    gen_exploration_target = float(cfg["gen_exploration_target"])
+    exploration_adaptive = cfg["exploration_adaptive"]
 
     # Warn-and-ignore: augmentation only makes sense for off-policy DQN.
     _aug_K_request = cfg["dqn_augment_permutations"]
@@ -434,14 +444,13 @@ def _run_experiment(resources: ExitStack) -> None:
             ).to(device)
             _raw = load_artifact(qnet_path, env, device=device, scaler=scaler)
             qnet.load_state_dict(_raw["qnet_state"])
+            env.exploration_seen_keys = list(_raw.get("exploration_seen_keys", ()))
             print(f"[INFO] Loaded qnet from {qnet_path}", flush=True)
         else:
             # Resolve hyperparameters early so resume + fresh paths share them.
             _hidden       = int(cfg["dqn_hidden_dim"])
             _lr_dqn       = float(cfg["dqn_lr"])
             _buf_size     = int(cfg["dqn_buffer_size"])
-            _eps_anneal   = int(cfg["dqn_eps_anneal_eps"])
-            _eps_min      = float(cfg["dqn_eps_min"])
             _n_train_eps  = train_total - warmup_eps
 
             resume_state = None
@@ -487,6 +496,7 @@ def _run_experiment(resources: ExitStack) -> None:
 
                 if _mid is not None:
                     require_execution_contract(_mid.get("execution_contract"), run_contract)
+                    _validate_exploration_resume(_mid, cfg)
                     if _mid.get("rng_state") is None or _mid.get("predictor_ledger") is None:
                         raise ValueError("Exact resume requires RNG state and predictor ledger")
                     from .utils.generation_resume import restore_predictor_state
@@ -506,10 +516,9 @@ def _run_experiment(resources: ExitStack) -> None:
                             flush=True,
                         )
                     start_ep = int(_mid["episodes_completed"])
-                    eps_val  = float(_mid.get("eps", max(_eps_min, 1.0 - start_ep / _eps_anneal)))
                     print(
                         f"[INFO] DQN resume from {_resume_src}: ep={start_ep}, "
-                        f"eps={eps_val:.4f}, buffer_rows={len(buffer)}, "
+                        f"buffer_rows={len(buffer)}, "
                         f"prediction_cache_rows={sum(len(value) for value in _mid.get('predictor_caches', {}).values())}",
                         flush=True,
                     )
@@ -526,14 +535,14 @@ def _run_experiment(resources: ExitStack) -> None:
                     if target_net is not None:
                         target_net.load_state_dict(qnet.state_dict())
                     start_ep = 0
-                    eps_val  = 1.0
                     print(
                         f"[WARN] DQN resume: no mid-checkpoint; loaded {qnet_path} "
-                        "(weights only) — buffer/eps/episode counter reset.",
+                        "(weights only) — buffer/controller/episode counter reset.",
                         flush=True,
                     )
 
                 resume_state = {
+                    "exact_resume": _mid is not None,
                     "scaler": scaler,
                     "qnet": qnet,
                     "target_net": target_net,
@@ -541,7 +550,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     "gradient_clipping_state": _mid.get("gradient_clipping_state") if _mid else None,
                     "buffer": buffer,
                     "start_ep": start_ep,
-                    "eps": eps_val,
+                    "exploration_state": _mid.get("exploration_state") if _mid else None,
                     "rng_state": _mid.get("rng_state") if _mid else None,
                     "training_episodes_completed": (
                         _mid.get("training_episodes_completed", start_ep) if _mid else start_ep
@@ -573,8 +582,8 @@ def _run_experiment(resources: ExitStack) -> None:
                     batch_size=int(cfg["dqn_batch_size"]),
                     dqn_grad_steps_per_ep=int(cfg["dqn_grad_steps_per_ep"]),
                     dqn_target_update_freq=int(cfg["dqn_target_update_freq"]),
-                    dqn_eps_anneal_eps=_eps_anneal,
-                    dqn_eps_min=_eps_min,
+                    exploration_target=exploration_target,
+                    exploration_adaptive=exploration_adaptive,
                     gamma=float(cfg["gamma"]),
                     hidden_dim=_hidden,
                     lr=_lr_dqn,
@@ -620,9 +629,8 @@ def _run_experiment(resources: ExitStack) -> None:
                     elem_feats_scaled=elem_feats_scaled,
                     action_values=action_values,
                     num_gen_eps=_num_gen_eps,
-                    gen_temperature=gen_temperature,
-                    gen_top_frac=gen_top_frac,
-                    gen_epsilon=gen_epsilon_gen,
+                    gen_exploration_target=gen_exploration_target,
+                    exploration_adaptive=exploration_adaptive,
                     k=float(cfg["k"]),
                     max_attempts=_max_attempts,
                     charge_filter=charge_check_enabled(cfg),
@@ -640,11 +648,7 @@ def _run_experiment(resources: ExitStack) -> None:
         pg_batch_eps         = int(cfg["pg_batch_eps"])
         lr_actor             = float(cfg["pg_lr_actor"])
         lr_critic            = float(cfg["pg_lr_critic"])
-        pg_entropy_coef         = float(cfg["pg_entropy_coef"])
-        pg_entropy_min          = float(cfg["pg_entropy_min"])
         gamma                   = float(cfg["gamma"])
-        pg_repeat_penalty_coef  = float(cfg["pg_repeat_penalty_coef"])
-        pg_repeat_penalty_shape = cfg["pg_repeat_penalty_shape"]
 
         scaler_path  = args.load_scaler    or os.path.join(args.out, "std_scaler.bin")
         policy_path  = args.load_policy    or os.path.join(args.out, "policy.pt")
@@ -665,6 +669,7 @@ def _run_experiment(resources: ExitStack) -> None:
             ).to(device)
             _raw = load_artifact(policy_path, env, device=device, scaler=scaler)
             policy.load_state_dict(_raw["policy_state"])
+            env.exploration_seen_keys = list(_raw.get("exploration_seen_keys", ()))
             print(f"[INFO] Loaded policy from {policy_path}", flush=True)
             value_net = None
 
@@ -690,6 +695,7 @@ def _run_experiment(resources: ExitStack) -> None:
                 if isinstance(_raw, dict) and _raw.get("type") == "pg":
                     _mid_ckpt = _raw
                     require_execution_contract(_raw.get("execution_contract"), run_contract)
+                    _validate_exploration_resume(_raw, cfg)
                     if _raw.get("rng_state") is None or _raw.get("predictor_ledger") is None:
                         raise ValueError("Exact resume requires RNG state and predictor ledger")
                     from .utils.generation_resume import restore_predictor_state
@@ -715,7 +721,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     value_net.load_state_dict(load_artifact(vnet_path, env, device=device, scaler=scaler)["value_net_state"])
                     print(f"[INFO] Loaded value_net from {vnet_path}", flush=True)
 
-            # Build checkpoint_cfg with resume data so train_pg restores optimizer + visit_counts.
+            # Build checkpoint_cfg with resume data so train_pg restores the optimizer and exploration controller.
             checkpoint_cfg = {
                 "path": ckpt_path_pg,
                 "freq": args.save_checkpoint_freq,
@@ -723,8 +729,7 @@ def _run_experiment(resources: ExitStack) -> None:
                 "opt_actor_state": _mid_ckpt.get("opt_actor_state") if _mid_ckpt else None,
                 "gradient_clipping_state": _mid_ckpt.get("gradient_clipping_state") if _mid_ckpt else None,
                 "opt_critic_state": _mid_ckpt.get("opt_critic_state") if _mid_ckpt else None,
-                "visit_counts": _mid_ckpt.get("visit_counts") if _mid_ckpt else None,
-                "entropy_coef_eff": _mid_ckpt.get("entropy_coef_eff") if _mid_ckpt else None,
+                "exploration_state": _mid_ckpt.get("exploration_state") if _mid_ckpt else None,
                 "training_budget_state": _mid_ckpt.get("training_budget_state") if _mid_ckpt else None,
                 "training_sample_session_id": _mid_ckpt.get("training_sample_session_id") if _mid_ckpt else None,
                 "training_budget_history_complete": (
@@ -732,7 +737,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     if _mid_ckpt else False
                 ),
                 "start_iteration": _mid_ckpt.get("iteration", 0) if _mid_ckpt else 0,
-                "is_resume": True,
+                "is_resume": _mid_ckpt is not None,
                 "rng_state": _mid_ckpt.get("rng_state") if _mid_ckpt else None,
                 "execution_contract": run_contract,
                 "total_budget": cfg.get("train_budget") or cfg["pg_num_iters"] * cfg["pg_batch_eps"],
@@ -772,11 +777,9 @@ def _run_experiment(resources: ExitStack) -> None:
                     gamma=gamma,
                     lr_actor=lr_actor,
                     lr_critic=lr_critic,
-                    pg_entropy_coef=pg_entropy_coef,
-                    pg_entropy_min=pg_entropy_min,
+                    exploration_target=exploration_target,
+                    exploration_adaptive=exploration_adaptive,
                     rl_method=method,
-                    pg_repeat_penalty_coef=pg_repeat_penalty_coef,
-                    pg_repeat_penalty_shape=pg_repeat_penalty_shape,
                     gradient_clipping=cfg["gradient_clipping"],
                     gradient_calibration_episodes=gradient_calibration_episodes,
                     checkpoint_cfg=checkpoint_cfg,
@@ -804,9 +807,8 @@ def _run_experiment(resources: ExitStack) -> None:
                     elem_feats_scaled=elem_feats_scaled,
                     action_values=action_values,
                     num_gen_eps=_num_gen_eps,
-                    gen_temperature=gen_temperature,
-                    gen_top_frac=gen_top_frac,
-                    gen_epsilon=gen_epsilon_gen,
+                    gen_exploration_target=gen_exploration_target,
+                    exploration_adaptive=exploration_adaptive,
                     k=float(cfg["k"]),
                     max_attempts=_max_attempts,
                     charge_filter=charge_check_enabled(cfg),

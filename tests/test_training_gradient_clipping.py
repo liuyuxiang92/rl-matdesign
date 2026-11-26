@@ -8,6 +8,7 @@ from sklearn.preprocessing import StandardScaler
 
 from rl_matdesign import training
 from rl_matdesign.gradient_clipping import AdaptiveGradientClipper
+from rl_matdesign.exploration import ExplorationController
 from rl_matdesign.model import QRegressor, ValueNet
 from rl_matdesign.utils.candidate_budget import NumericalTrainingError
 from rl_matdesign.utils.training_budget import TrainingBudget
@@ -188,6 +189,7 @@ def test_a2c_nonfinite_critic_gradient_prevents_both_optimizer_steps(monkeypatch
     policy_before = copy.deepcopy(policy.state_dict())
     checkpoint = {
         "is_resume": True,
+        "exploration_state": ExplorationController(adaptive=False).state_dict(),
         "training_budget_state": TrainingBudget(count_duplicates=True).state_dict(),
         "gradient_clipping_state": {
             name: AdaptiveGradientClipper([1.] * 100, network=name).state_dict()

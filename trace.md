@@ -3053,3 +3053,35 @@ Separate the frozen scientific reward from the adaptive learning scale. Bind the
 ### 2026-11-25 — Publication reflection
 <!-- concepts: adaptive-gradient-clipping, git-publication, worktree-isolation -->
 The user requests publication of the completed clipping work on the existing branch. Prior validation covers 528 unique passing tests; no implementation changed in this publication turn. The existing decision-gradient-clipping-001 records the architecture and isolation rules, so reflection adds no duplicate memory. Preserve the unrelated local launcher, older checkpoint and historical trace edits.
+
+### 2026-11-25 — Implement Step 3 and remove superseded exploration controls
+<!-- concepts: adaptive-exploration, configuration-cleanup, exact-resume -->
+- User authorizes implementation on codex/step1-normalization and complete removal of unused repeat-penalty/epsilon controls. Starting commit381a8c198 includes pilot-based gradient clipping; existing trace changes and untracked checkpoint/replicate script are preserved.
+- Implementation split: shared entropy sampler/controller; DQN/PG learner and generation integration; configuration/HPO migration; runner/checkpoint/provenance/docs and complete validation. Public exploration inputs are initial training/generation entropy targets and fixed/adaptive selection; algorithmic constants are versioned internally. Scientific reward gate penalties retain their meaning.
+
+
+### 2026-11-25 — Implement Step3 adaptive entropy and remove obsolete exploration controls
+<!-- concepts: adaptive-exploration, configuration-ownership, exact-resume -->
+- Implemented on codex/step1-normalization: shared legal-action H/log(N) sampler, on-policy PG entropy coefficient feedback and observational outer target adjustment. Only exploration_target, gen_exploration_target and exploration_adaptive remain public. Epsilon schedules, repeat-visit shaping, raw-temperature/top-fraction generation, selection metadata and associated HPO/checkpoint/launcher paths are removed; retired YAML keys reject explicitly.
+- Outcome updates occur once per complete collection block; no old-target prefetch is credited to new trials. Final postfilter feasibility reaches HPO and normal generation without additional probes. Paid calibration/training identities seed global novelty while learner and output budgets stay phase-local. Controller/profile/history persist through exact resume and frozen weights carry primitive novelty archives.
+- The review found finite entropy could still yield nonfinite backward gradients for extreme float32 logits; entropy reduction now uses float64. Actor sampling and log-probability distributions remain on-policy. Scientific gate penalties retain their configured meaning.
+- Migrated28 tracked YAMLs with unchanged groups/properties/reward/structure. Recovered5 original ActMOF/peptide scenario overlays from the existing unified-material-groups worktree and migrated only exploration fields; source files and chemistry/budgets are unchanged. Updated the existing untracked replicate launcher to remove automatic exploration overrides.
+- Validation: initial full suite2896passed/41failed/18skipped; all41 failures resolved in targeted reruns (3 compatibility fixtures,34 missing-config tests,4 sample/PG API assertions), yielding2937distinct passing tests and18existing private-config/external-asset skips. No production Python source changed after the full run began. Ruff0.14.3, compileall, shell syntax and diff checks pass. Evidence:/private/tmp/step3-final-verification.json. No real scientific training or performance claim.
+- Reflect saved2 actionable pitfalls and1 decision, updated auto-memory, clarified calibration budget-vs-novelty ownership. A local checkpoint records state. No commit, merge or push performed.
+
+
+### 2026-11-26 — Prepare supplied GlassNet configs for all-three-upgrade HPO
+<!-- concepts: adaptive-exploration, hpo-configuration, scientific-comparisons -->
+- User supplied three base and three HPO YAMLs and requests renamed _popart_exploration variants. Added six portable sibling configs under configs/hpo/glassnet_popart_exploration; base references resolve relative to each HPO file. Removed retired exploration fields, enabled PopArt/clipping/adaptive exploration, and retained scientific gate penalties. No runtime code changed.
+- Preserved the supplied T3-minimization objective, three gates, evaluation threshold, fixed HPO budgets (A2C916/MC115/bootstrap458), generation500, scoring, repeats and search allocation. Preserved standalone base budget10000. Pinned every built-in learner search dimension to supplied base values because omitted HPO ranges retain defaults. Only training exploration_target searches (initial0.1..0.9, legal expansion0..1); generation uses built-in entropy targets. These supplied settings are not independently verified as Step1+2 winning artifacts.
+- Fixed DQN warmup fractions100/115 and100/458 retain100 warmup candidates, leaving MC15 and bootstrap358 online. Documented MC's limited outer-adaptation evidence rather than silently raising historical budgets.
+- Validation: all three actual CLI validate commands pass, exact domain143096; runtime resolution/preflight at targets0,.1,.5,.7,.9,1 passes. Structural comparisons confirm unchanged scientific sections and HPO resource/scoring settings. Independent review confirms only exploration is variable. Exported six-file ZIP and validation/plan JSON under outputs/glassnet_popart_exploration_20261126 in the main checkout. No scientific training, commit, merge or push.
+- Reflect: reviewed existing Step3 and clipping decisions; this is a configuration application, so no duplicate architectural memory entry. Applied the singleton-freezing and portable-reference checks across all three methods.
+
+
+### 2026-11-26 — Publish Step3 and GlassNet exploration HPO configs
+<!-- concepts: adaptive-exploration, git-publication, worktree-isolation -->
+- User explicitly requests pushing the completed code and six revised configs to origin/codex/step1-normalization. Remote tip matches the local base381a8c198, so publication can fast-forward without merging another branch.
+- Publication includes the entropy controller, learner/HPO/checkpoint integration, retired-parameter cleanup, migrated examples/launcher, regression tests and portable GlassNet exploration-only HPO/base configs. Existing local checkpoints and pre-Step3 trace edits remain local.
+- The production source digest still exactly matches the implementation covered by2937 distinct passing tests and18 skips; the three new HPO/base pairs passed CLI/schema/domain/budget checks separately. No scientific training ran.
+- Reflect: checked the existing Step3/clipping decisions and worktree-import pitfall. No new architectural finding or duplicate memory entry is needed. Publish this feature branch only.

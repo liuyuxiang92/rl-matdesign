@@ -137,7 +137,7 @@ def test_timing_io_failure_warns_but_preserves_committed_graceful_stop(tmp_path)
 def test_real_training_emits_one_timing_record_per_committed_checkpoint(tmp_path, method, target, phase):
     config = _config()
     config.update(method=method, dqn_target_mode=target,
-                  dqn_warmup_eps=2, dqn_batch_size=1, dqn_eps_min=1., pg_warmup_eps=2,
+                  dqn_warmup_eps=2, dqn_batch_size=1, exploration_target=1., pg_warmup_eps=2,
                   pg_batch_eps=1, train_count_duplicates=False, train_budget=6,
                   hpo_recording=True, hpo_phase='train', hpo_target_unique=6,
                   hpo_ratio_limit=20., num_gen_eps=0)

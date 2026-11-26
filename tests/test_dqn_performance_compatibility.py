@@ -51,7 +51,7 @@ def execution(source):
 
 
 def generation(source):
-    return {"execution": execution(source), "sampling": {"gen_seed": 101, "gen_temperature": 1},
+    return {"execution": execution(source), "sampling": {"gen_seed": 101, "gen_exploration_target": 1},
             "frozen_artifacts": {"qnet.pt": "same-model", "std_scaler.bin": "same-scaler"}}
 
 
@@ -173,7 +173,7 @@ def test_source_upgrade_never_hides_other_execution_changes(release, path, value
 
 @pytest.mark.parametrize("path,value", [
     (("sampling", "gen_seed"), 102),
-    (("sampling", "gen_temperature"), .5),
+    (("sampling", "gen_exploration_target"), .5),
     (("frozen_artifacts", "qnet.pt"), "new-model"),
     (("frozen_artifacts", "std_scaler.bin"), "new-scaler"),
     (("execution", "learning", "train_seed"), 43),
@@ -186,10 +186,13 @@ def test_generation_upgrade_still_freezes_models_seeds_and_sampling(release, pat
 
 
 def test_generation_restore_uses_source_only_comparator(release, monkeypatch):
+    from rl_matdesign.exploration import ExplorationController
     from rl_matdesign.utils import generation_resume
     ledgers, rng = [], []
     monkeypatch.setattr(generation_resume, "restore_rng_state", rng.append)
-    saved = {"generation_contract": generation(release.baseline["execution"]),
+    contract = generation(release.baseline["execution"])
+    controller = ExplorationController(contract["sampling"]["gen_exploration_target"], True)
+    saved = {"generation_contract": contract, "exploration_state": controller.state_dict(),
              "predictor_ledger": {"n_calls": 7}, "rng_state": {"saved": True}}
     generation_resume.restore_generation(SimpleNamespace(load_state_dict=ledgers.append),
         saved, generation(release.target["execution"]))
@@ -238,13 +241,13 @@ def test_upgrade_reuses_cached_training_generation_and_job_ids(campaign, release
     monkeypatch.setattr("rl_matdesign.hpo.controller.package_digest", lambda: release.baseline["package"])
     original = Campaign(campaign.plan, campaign.out)
     trained = original.runner({"pg_batch_eps": 2}, 8, 11, "train")
-    generated = original.runner({"pg_batch_eps": 2, "gen_temperature": 1}, 4, 401, "generation", trained)
+    generated = original.runner({"pg_batch_eps": 2, "gen_exploration_target": 1}, 4, 401, "generation", trained)
     before = {p: p.read_bytes() for p in (campaign.out / "jobs").rglob("*") if p.is_file()}
     monkeypatch.setattr("rl_matdesign.hpo.controller.package_digest", lambda: release.target["package"])
     upgraded = Campaign(campaign.plan, campaign.out)
     assert upgraded.source_upgrade
     assert upgraded.runner({"pg_batch_eps": 2}, 8, 11, "train") == trained
-    assert upgraded.runner({"pg_batch_eps": 2, "gen_temperature": 1}, 4, 401, "generation", trained) == generated
+    assert upgraded.runner({"pg_batch_eps": 2, "gen_exploration_target": 1}, 4, 401, "generation", trained) == generated
     assert len(worker.calls) == 2
     assert {p: p.read_bytes() for p in (campaign.out / "jobs").rglob("*") if p.is_file()} == before
 

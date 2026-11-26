@@ -1,3 +1,5 @@
+> Historical HPO design record. Exploration controls and generation search have been superseded by Step 3; use [the current HPO guide](hpo_v1.md) and [configuration reference](yaml_config_reference.md#adaptive-exploration).
+
 # 通用 HPO 第一版代码计划与 GlassNet 验证
 
 > 历史实现计划：下文保留最初 `hpo_v1` 的设计依据。当前精简 YAML 接口已改为从场景继承目标和生成方式、自动校准通用质量映射、只用总分容差，并以训练/生成两个重复次数控制种子。使用当前模板与命令时请以 [HPO 使用说明](hpo_v1.md) 为准；升级后的配置和评分契约需要新的输出目录。

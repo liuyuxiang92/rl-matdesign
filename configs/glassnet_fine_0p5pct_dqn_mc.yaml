@@ -91,9 +91,7 @@ dqn_grad_steps_per_ep: 1
 dqn_hidden_dim: 128
 dqn_buffer_size: 20000
 dqn_loss: smoothl1
-dqn_eps_anneal_eps: 700
 dqn_lr: 0.0026762686165498857
-dqn_eps_min: 0.06812587684997393
 train_budget: 50000
 method: dqn
 eval_seed: 0

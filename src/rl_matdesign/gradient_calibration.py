@@ -124,8 +124,10 @@ def calibrate_dqn_gradients(*, qnet, target_net, episodes, scaler, elem_feats_sc
 
 
 def calibrate_pg_gradients(*, policy, value_net, episodes, scaler, elem_feats_scaled,
-                           action_values, device, gamma, entropy_coef, entropy_min):
-    from .training import _episode_pg_terms, entropy_coef_update
+                           action_values, device, gamma, exploration_target=.7,
+                           exploration_adaptive=True):
+    from .training import _episode_pg_terms
+    from .exploration import ExplorationController
 
     started = time.perf_counter()
     episodes = _pilot(episodes)
@@ -154,29 +156,31 @@ def calibrate_pg_gradients(*, policy, value_net, episodes, scaler, elem_feats_sc
 
         # One fixed pilot-wide actor scaling, so single-step episodes retain a
         # meaningful advantage instead of centering each candidate to zero.
-        all_adv, all_entropy, all_max_entropy = [], [], []
+        all_adv = []
         with torch.no_grad():
             for episode, values in zip(episodes, returns):
-                _, advantages, entropies, maximum, _ = terms(episode, values)
+                _, advantages, _, _ = terms(episode, values)
                 all_adv.extend(advantages)
-                all_entropy.extend(float(e) for e in entropies)
-                all_max_entropy.extend(maximum)
         adv_tensor = torch.tensor(all_adv, dtype=torch.float32, device=device)
         mean, std = adv_tensor.mean(), adv_tensor.std(unbiased=False)
-        maximum = float(np.mean(all_max_entropy))
-        entropy_norm = float(np.mean(all_entropy)) / maximum if maximum > 1e-8 else 0.0
-        effective_coef = entropy_coef_update(entropy_coef, entropy_norm, entropy_coef, entropy_min)
+        # The first real update uses this coefficient. The disposable probe must
+        # neither advance the learner controller nor use a different loss.
+        effective_coef = ExplorationController(
+            initial_target=exploration_target, adaptive=exploration_adaptive,
+        ).coefficient
         actor_norms, critic_norms = [], []
         for episode, values in zip(episodes, returns):
             actor.zero_grad(set_to_none=True)
             if critic is not None:
                 critic.zero_grad(set_to_none=True)
-            logp, advantages, entropies, _, critic_losses = terms(episode, values)
+            logp, advantages, entropies, critic_losses = terms(episode, values)
             if not logp:
                 raise ValueError("Gradient calibration candidate has no legal policy terms")
             advantages = torch.tensor(advantages, dtype=torch.float32, device=device)
             scaled = (advantages - mean) / std if float(std) > 1e-8 else torch.zeros_like(advantages)
-            loss = -(torch.stack(logp) * scaled).mean() - effective_coef * torch.stack(entropies).mean()
+            loss = -(torch.stack(logp) * scaled).mean()
+            if entropies:
+                loss = loss - effective_coef * torch.stack(entropies).mean()
             if not torch.isfinite(loss).item():
                 raise NumericalTrainingError("Nonfinite actor gradient-calibration loss")
             loss.backward()

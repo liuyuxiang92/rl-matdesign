@@ -1,0 +1,217 @@
+# Chemical amounts and categorical assignments; see docs/design_groups.md.
+groups:
+- name: n_terminal
+  kind: categorical
+  choices:
+  - name: treatment
+    values:
+    - H
+    - Ac
+- name: peptide
+  kind: categorical
+  labels:
+  - A
+  - F
+  - K
+  - V
+  - W
+  - W
+  - A
+  - P
+  - R
+  values:
+  - BB2
+  - p
+  - BB4
+  - BB5
+  - BB7
+  - BB8
+  - BB9
+  - H
+  - BB11
+  - BB12
+  - BB13
+  - BB14
+  - BB15
+  - BB16
+  - BB17
+  - BB18
+  - BB19
+  - BB20
+  - BB21
+  - BB22
+  - BB23
+  - BB24
+  - 5-Cl-Trp
+  - BB26
+  - BB27
+  - BB28
+  - BB29
+  - Q
+  - N
+  - Tle
+  - BB33
+  - BB34
+  - BB35
+  - BB36
+  - BB37
+  - BB38
+  - BB39
+  - BB40
+  - BB41
+  - BB42
+  - BB43
+  - BB44
+  - W
+  - BB46
+  - BB47
+  - R
+  - BB49
+  - BB50
+  - BB51
+  - BB52
+  - BB53
+  - w
+  - BB57
+  - BB58
+  - BB59
+  - BB60
+  - BB61
+  - BB62
+  - BB63
+  - BB64
+  - BB65
+  - BB66
+  - BB67
+  - BB68
+  - BB69
+  - BB70
+  - BB71
+  - BB72
+  - BB73
+  - BB74
+  - BB75
+  - BB76
+  - BB77
+  - BB78
+  - BB79
+  - BB80
+  - BB81
+  - BB82
+  - BB83
+  - BB84
+  - BB85
+  - BB86
+  - BB87
+  - BB88
+  - BB89
+  - G
+  - F
+  - BB92
+  - BB93
+  - BB94
+  - BB95
+  - A
+  - L
+  - BB98
+  - BB99
+  - BB100
+  - 3-Cl-Tyr
+  - BB102
+  - BB104
+  - V
+  - BB106
+  - BB107
+  - I
+  - K
+  - M
+  - P
+  - BB112
+  - T
+  - Y
+  - BB115
+  - BB116
+  - a
+  - BB118
+  - BB119
+  - BB120
+  - v
+  - BB122
+  - BB123
+  - BB124
+  - BB125
+  - f
+  - BB127
+  - BB128
+  - BB129
+  - BB130
+  - BB131
+  - BB132
+  - BB133
+  - k
+  - BB135
+  - BB136
+  - Aib
+  n_steps: 5
+- name: thiols
+  kind: categorical
+  labels:
+  - HCys
+  - b-HCys
+  values:
+  - D-HCys
+  - C
+  - c
+  - HCys
+  - BB103
+  - BB137
+  n_steps: 2
+structure:
+  builder: peptide
+  parent:
+  - A
+  - HCys
+  - F
+  - K
+  - V
+  - W
+  - W
+  - A
+  - P
+  - R
+  - b-HCys
+  require_change:
+  - peptide
+properties:
+- name: pIC50
+  predictor: gp_physchem.api:PeptidePredictor
+  direction: max
+  objective: mean_minus_kstd
+  uncertainty: native_uncertainty
+reward:
+  type: weighted_sum
+k: 1.0
+method: dqn
+pg_warmup_eps: 100
+pg_num_iters: 100
+pg_batch_eps: 16
+pg_lr_actor: 0.001
+pg_lr_critic: 0.001
+dqn_warmup_eps: 1000
+dqn_num_train_eps: 8000
+dqn_buffer_size: 50000
+dqn_batch_size: 128
+dqn_grad_steps_per_ep: 1
+dqn_target_update_freq: 100
+dqn_augment_permutations: 0
+gamma: 1.0
+num_gen_eps: 200
+dqn_target_mode: mc
+dqn_lr: 0.001
+dqn_hidden_dim: 256
+dqn_loss: smoothl1
+
+# Shared exploration controls; controller constants are internal.
+exploration_target: 0.7
+gen_exploration_target: 0.7
+exploration_adaptive: true

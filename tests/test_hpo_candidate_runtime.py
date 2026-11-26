@@ -69,7 +69,7 @@ def test_actual_retries_duplicates_raw_gates_and_no_reprediction(tmp_path, size)
     assert [r["constraint_passed"] for r in records] == [True, False, True]
     assert records[1]["properties"] == {"T3": 1202., "Tg": 702., "dp_mean": 2.}
     assert not pred.raw
-    # Failed evaluation never advances epsilon's successful-episode clock.
+    # Failed evaluation advances proposal feedback without consuming a successful-episode budget slot.
     assert [row["episode"] for row in rows if row["phase"] == "dqn_train"] == [1, 2, 3]
 
 
@@ -112,7 +112,7 @@ def test_generation_starts_fresh_and_keeps_failed_scientific_gates(tmp_path, mon
     qnet = torch.nn.Linear(1, 1)
     rows = training.generate_candidates(env=env, predictor=pred, scaler=None,
         device=torch.device("cpu"), elem_feats_scaled=np.zeros((1, 1)), action_values=["1"],
-        qnet=qnet, num_gen_eps=3, gen_temperature=.1)
+        qnet=qnet, num_gen_eps=3, gen_exploration_target=.1)
     env.hpo_recorder.close()
     assert len(rows) == 3
     assert rows[1]["gate_passed"] is False
@@ -220,7 +220,8 @@ def test_generation_resume_preserves_candidates_cost_rng_and_predictor(tmp_path,
     from contextlib import ExitStack
     from rl_matdesign.utils.timing import PredictorTimer
     from rl_matdesign.utils.seeding import capture_rng_state, restore_rng_state
-    contract = {"weights": "immutable-hash", "temperature": .1}
+    contract = {"weights": "immutable-hash", "sampling": {"gen_exploration_target": .1,
+                                                              "exploration_adaptive": True}}
     inner = SnapshotPredictor(batch_size)
     predictor = PredictorTimer(inner)
     predictor.set_phase("generate")
@@ -244,7 +245,7 @@ def test_generation_resume_preserves_candidates_cost_rng_and_predictor(tmp_path,
             stack.callback(env.hpo_recorder.close)
             training.generate_candidates(env=env, predictor=predictor, scaler=None,
                 device=torch.device("cpu"), elem_feats_scaled=np.zeros((1, 1)),
-                action_values=["1"], qnet=qnet, num_gen_eps=3, gen_temperature=.1)
+                action_values=["1"], qnet=qnet, num_gen_eps=3, gen_exploration_target=.1)
     state = torch.load(tmp_path / "generation_checkpoint.pt", weights_only=False)
     assert state["hpo_state"]["budget"]["attempts_started"] == batch_size
     restore_rng_state(state["rng_state"])
@@ -259,7 +260,7 @@ def test_generation_resume_preserves_candidates_cost_rng_and_predictor(tmp_path,
     monkeypatch.setattr(training, "_save_checkpoint", original_save)
     rows = training.generate_candidates(env=resumed_env, predictor=resumed_predictor, scaler=None,
         device=torch.device("cpu"), elem_feats_scaled=np.zeros((1, 1)),
-        action_values=["1"], qnet=qnet, num_gen_eps=3, gen_temperature=.1)
+        action_values=["1"], qnet=qnet, num_gen_eps=3, gen_exploration_target=.1)
     resumed_env.hpo_recorder.close()
     assert draws[batch_size] == expected_next_draw
     assert [row["formula"] for row in rows] == ["A1", "B1", "C1"]
@@ -285,7 +286,7 @@ def test_generation_cli_checkpoint_can_finish_reporting_after_interruption(tmp_p
     assert trained.returncode == 0, trained.stderr
     weight_before = (training_out / "qnet.pt").read_bytes()
     config.update(hpo_recording=True, hpo_phase="generation", hpo_target_unique=2,
-                  hpo_ratio_limit=20., num_gen_eps=2, gen_temperature=1.)
+                  hpo_ratio_limit=20., num_gen_eps=2, gen_exploration_target=1.)
     config_path = tmp_path / "generation.yaml"
     config_path.write_text(yaml.safe_dump(config))
     generated_out = tmp_path / "generation"

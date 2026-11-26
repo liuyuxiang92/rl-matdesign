@@ -70,7 +70,7 @@ def run(env, tmp_path, **overrides):
         batch_size=1,
         dqn_grad_steps_per_ep=1,
         dqn_target_update_freq=2,
-        dqn_eps_anneal_eps=10,
+        exploration_adaptive=False,
         checkpoint_cfg={"path": str(tmp_path / "checkpoint.pt"), "freq": 1},
     )
     kwargs.update(overrides)
@@ -142,7 +142,7 @@ def reconstruct_resume(state, qnet, scaler):
         "start_ep": state["episodes_completed"],
         "training_episodes_completed": state["training_episodes_completed"],
         "training_budget_state": state["training_budget_state"],
-        "eps": state["eps"],
+        "exploration_state": state["exploration_state"],
     }
 
 
@@ -158,7 +158,7 @@ def test_default_unique_budget_trains_and_buffers_all_duplicate_rollouts(tmp_pat
     assert rows[-1]["training_unique_candidates"] == 4
     assert rows[-1]["training_duplicate_episodes"] == 3
     assert [row["iteration"] for row in rows[3:]] == [1, 2, 3, 4]
-    assert rows[-1]["epsilon"] == pytest.approx(0.7)
+    assert rows[-1]["exploration_target"] == pytest.approx(0.7)
     assert all(np.isfinite(row["train_loss"]) for row in rows[3:])
     state = checkpoint(tmp_path)
     assert len(state["buffer"]) == 14
@@ -205,7 +205,7 @@ def test_resume_restores_seen_candidates_and_actual_optimizer_schedule(tmp_path,
     assert [row["iteration"] for row in rows] == [3, 4, 5]
     assert rows[-1]["training_attempts"] == 8
     assert rows[-1]["training_budget_used"] == 4
-    assert rows[-1]["epsilon"] == pytest.approx(0.6)
+    assert rows[-1]["exploration_target"] == pytest.approx(0.7)
     resumed = checkpoint(tmp_path)
     assert len(resumed["buffer"]) == 16
     assert optimizer_steps(resumed) == {5}
@@ -249,6 +249,7 @@ def test_failed_evaluations_do_not_enter_budget_buffer_or_optimizer(tmp_path):
     assert len(state["buffer"]) == 8
     assert optimizer_steps(state) == {2}
     assert all("failed" not in str(key) for key in state["training_budget_state"]["seen_keys"])
+    assert state["exploration_state"]["attempts"] == 3
 
 
 def test_duplicate_guard_preserves_last_allowed_duplicate_update_and_checkpoint(tmp_path):
@@ -270,3 +271,16 @@ def test_duplicate_guard_preserves_last_allowed_duplicate_update_and_checkpoint(
 def test_legacy_checkpoint_cannot_resume_unique_mode_without_seen_history(tmp_path):
     with pytest.raises(ValueError, match="checkpoint has no training_budget_state"):
         run(ScriptedEnv([]), tmp_path, train_count_duplicates=False, resume_state={})
+
+
+def test_paid_pilot_seeds_novelty_without_entering_learning_budget(tmp_path):
+    from types import SimpleNamespace
+    pilot_key = (("group", (("Z", 1),)),)
+    env = ScriptedEnv(["A", "B", "C", "D"])
+    run(env, tmp_path, gradient_calibration_episodes=[SimpleNamespace(terminal_key=pilot_key)])
+    state = checkpoint(tmp_path)
+    assert state["training_budget_state"]["counted"] == 4
+    assert pilot_key not in state["training_budget_state"]["seen_keys"]
+    assert repr(pilot_key) in state["exploration_state"]["seen_keys"]
+    assert state["exploration_state"]["attempts"] == 2
+    assert len(state["exploration_state"]["seen_keys"]) == 5

@@ -37,11 +37,11 @@ def _plan(path, method, *, repeats=1, parallel=1):
                     'amount_set':[i/10 for i in range(1,9)],'n_steps':3,'total':1,'unique':True}],
         'eval_seed':13, 'pg_warmup_eps':2, 'pg_batch_eps':2,
         'dqn_hidden_dim':16, 'dqn_buffer_size':100, 'dqn_grad_steps_per_ep':2,
-        'gen_temperature':1., 'num_gen_eps':0,
+        'gen_exploration_target':1., 'num_gen_eps':0,
     }
     parameters = ({'pg_batch_eps':2} if method == 'a2c' else
-                  {'dqn_batch_size':2, 'dqn_lr':.001, 'dqn_eps_min':.2,
-                   'warmup_budget_fraction':.2, 'epsilon_anneal_budget_ratio':1.})
+                  {'dqn_batch_size':2, 'dqn_lr':.001, 'exploration_target':.2,
+                   'warmup_budget_fraction':.2})
     if method == 'dqn-bootstrap':
         parameters['dqn_target_update_freq'] = 2
     budget = {'mode':'absolute_unique','min_unique':12,'initial_unique':12,'max_unique':12}
@@ -151,8 +151,8 @@ def test_paid_sample_signal_then_native_restart_matches_uninterrupted(tmp_path,m
     control_path = _completed(control,control.runner(parameters,12,17,'train'))
     actual,expected = _checkpoint(path),_checkpoint(control_path)
     keys = (['policy_state','value_net_state','opt_actor_state','opt_critic_state','iteration']
-            if method=='a2c' else ['qnet_state','target_net_state','opt_state','buffer','eps','training_episodes_completed'])
-    for key in keys+['rng_state','training_budget_state','hpo_state','episodes_completed']:
+            if method=='a2c' else ['qnet_state','target_net_state','opt_state','buffer','training_episodes_completed'])
+    for key in keys+['exploration_state','rng_state','training_budget_state','hpo_state','episodes_completed']:
         _assert_nested_equal(actual[key],expected[key])
     assert (path/'candidate_records.jsonl').read_bytes()==(control_path/'candidate_records.jsonl').read_bytes()
     assert json.loads((path/'candidate_budget.json').read_text())==json.loads((control_path/'candidate_budget.json').read_text())
@@ -166,7 +166,7 @@ def test_generation_signal_native_restart_and_terminal_export(tmp_path,monkeypat
     training_campaign = Campaign(plan,tmp_path/'training')
     model = training_campaign.runner(parameters,12,17,'train')
     _completed(training_campaign,model)
-    generation_parameters = {**parameters,'gen_temperature':1.}
+    generation_parameters = {**parameters,'gen_exploration_target':1.}
     control = _generation_campaign(plan,tmp_path/'generation-control',training_campaign)
     control_path = _completed(control,control.runner(generation_parameters,12,101,'generation',model=model))
     expected = _checkpoint(control_path,'generation_checkpoint.pt')
@@ -183,7 +183,7 @@ def test_generation_signal_native_restart_and_terminal_export(tmp_path,monkeypat
     assert paid['unique_evaluated']==1
     _completed(interrupted,interrupted.runner(generation_parameters,12,101,'generation',model=model))
     actual = _checkpoint(path,'generation_checkpoint.pt')
-    for key in ['rng_state','hpo_state']:
+    for key in ['exploration_state','rng_state','hpo_state']:
         _assert_nested_equal(actual[key],expected[key])
     assert (path/'candidate_records.jsonl').read_bytes().startswith(prefix)
     assert (path/'candidate_records.jsonl').read_bytes()==(control_path/'candidate_records.jsonl').read_bytes()

@@ -592,7 +592,7 @@
   choice: Checkpoint each settled pilot observation without a scalar reward, freeze
     calibration by content hash, and finalize stored observations once. Bind learner
     and generation artifacts to that hash. Per the revised protocol, exclude the
-    100 pilot candidates from RL budgets, replay, training seen sets and HPO scoring
+    100 pilot candidates from RL budgets, replay, training budget seen sets and HPO scoring
     or efficiency. Report their attempts and evaluations separately, including
     interrupted jobs. DQN collects its configured warmup inside the subsequent RL
     allowance, with a minimum of one for scaler fitting; A2C retains its full policy
@@ -659,3 +659,35 @@
   - src/rl_matdesign/training.py
   - src/rl_matdesign/utils/execution_contract.py
   tags: [adaptive-gradient-clipping, calibration, exact-resume, training-budgets]
+
+- id: decision-step3-adaptive-exploration-001
+  date: '2026-11-25'
+  expires: '2027-05-25'
+  title: Use normalized entropy with a versioned outcome controller and three public fields
+  choice: Keep only exploration_target, gen_exploration_target and exploration_adaptive. DQN and
+    frozen generation solve masked softmax temperature; PG remains on-policy with normalized entropy
+    and an internal bounded coefficient. Remove epsilon schedules, repeat penalties, top-fraction/raw-temperature
+    controls and order-dependent generation selection. Reject retired YAML fields explicitly. Persist
+    the full adaptive_entropy_v1 profile and controller state; seed global novelty from paid calibration
+    and training candidates while keeping their RL/HPO budgets phase-local. Apply final scientific
+    feasibility and fixed higher-is-better quality without changing rewards or adding evaluation
+    probes.
+  alternatives_considered:
+  - Keeping aliases or ignored knobs contradicts the requested complete removal.
+  - Exposing controller thresholds would recreate scenario tuning knobs.
+  - Using a causal paired policy comparison would require additional evaluator cost and learner snapshots.
+  trade_off: The default 0.7 targets and profile constants are an experimental recipe, not established
+    discovery improvements. Fixed mode freezes the outer targets but retains inner entropy matching/coefficient
+    feedback. Outer trials are observational; reverting a PG target does not revert its learned weights.
+    Exact resume requires the current controller and matching profile; old exploration checkpoints
+    require archived code.
+  files:
+  - src/rl_matdesign/exploration.py
+  - src/rl_matdesign/training.py
+  - src/rl_matdesign/config_schema.py
+  - src/rl_matdesign/utils/execution_contract.py
+  - docs/yaml_config_reference.md
+  tags:
+  - adaptive-exploration
+  - configuration-ownership
+  - exact-resume

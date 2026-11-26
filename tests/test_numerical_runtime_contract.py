@@ -90,12 +90,12 @@ def test_manifest_runtime_propagates_to_execution_contract(tmp_path):
 
 
 @pytest.mark.parametrize('first,second,sampling_matches', [
-    ({}, {'gen_temperature': 1}, True),
-    ({'gen_temperature': 1}, {'gen_epsilon': .2}, False),
-    ({'gen_temperature': 0}, {'gen_epsilon': 0}, False),
-    ({'gen_top_frac': .2}, {'gen_top_frac': .8}, False),
+    ({}, {'gen_exploration_target': .7}, True),
+    ({'gen_exploration_target': 1}, {'gen_exploration_target': .2}, False),
+    ({'gen_exploration_target': 0}, {'gen_exploration_target': 1}, False),
+    ({'gen_exploration_target': .2}, {'gen_exploration_target': .8}, False),
 ])
-def test_generation_selection_is_not_part_of_the_oracle_or_learning_contract(
+def test_generation_target_is_not_part_of_the_oracle_or_learning_contract(
         tmp_path, first, second, sampling_matches):
     from rl_matdesign.config_schema import resolve_config
     from rl_matdesign.utils.execution_contract import generation_sampling_contract
@@ -118,9 +118,8 @@ def test_generation_selection_is_not_part_of_the_oracle_or_learning_contract(
 def test_generation_sampling_contract_ignores_source_provenance():
     from rl_matdesign.config_schema import resolve_config
     from rl_matdesign.utils.execution_contract import generation_sampling_contract
-    authored = resolve_config({'gen_epsilon': .2}).config
-    overridden = resolve_config({}, {'gen_epsilon': .2}).config
-    assert authored['generation_selection']['source'] != overridden['generation_selection']['source']
+    authored = resolve_config({'gen_exploration_target': .2}).config
+    overridden = resolve_config({}, {'gen_exploration_target': .2}).config
     assert generation_sampling_contract(authored) == generation_sampling_contract(overridden)
 
 

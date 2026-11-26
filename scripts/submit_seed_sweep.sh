@@ -38,18 +38,17 @@
 # once. MAX_JOBS defaults to 4 for that reason — raise it only after checking
 # `nvidia-smi` headroom for YOUR config's model count.
 #
-# BUDGET: predictor calls, not episodes.
-#     DQN: dqn_warmup_eps + dqn_num_train_eps   (warmup pays a real call/episode)
-#     PG:  pg_num_iters * pg_batch_eps          (PG warmup is free)
-#     BO/GA: --budget directly
-# The RL budgets live in the YAML by this repo's convention (a generator would
-# hide the two traps below); --budget is passed through to BO/GA only, and is
-# used as the default run-name label. Before changing budget, check:
-#     dqn_eps_anneal_eps  ~60% of dqn_num_train_eps, or epsilon never anneals and
-#                         the "DQN" arm is random search for the whole run.
-#     pg_batch_eps        hold FIXED across budgets; vary only pg_num_iters, or
-#                         budget is confounded with A2C's entropy-collapse rate.
-# Both configs' budget tables sit next to those keys in the YAML.
+# BUDGET: RL budgets come from the YAML. Prefer train_budget for the shared
+# distinct-candidate allowance (including rewarded DQN warmup). Otherwise DQN
+# uses dqn_warmup_eps + dqn_num_train_eps and PG uses pg_num_iters * pg_batch_eps.
+# Duplicate and failed proposals consume attempts; calibration has its own ledger.
+# --budget is passed through to BO/GA only and supplies the default run-name label.
+# Keep pg_batch_eps fixed when comparing budgets.
+#
+# EXPLORATION: the scenario controls exploration_target, gen_exploration_target
+# (both default 0.7), and exploration_adaptive (default true). The launcher
+# preserves these settings, including method-specific target maps. It does not
+# override sampling or translate retired exploration fields.
 #
 # Env overrides:
 #   OUT=runs/<config-stem>   output root (seeded run dirs are created inside)
@@ -155,8 +154,7 @@ echo "seeds  : $SEEDS  (${n_seeds} x ${n_arms} arms = $((n_seeds * n_arms)) runs
 echo "out    : $OUT" >&2
 case "$ARMS_TO_RUN" in
     *dqn*|*a2c*)
-        echo "Reminder: the RL episode budgets come from $CONFIG" \
-             "(dqn_warmup_eps + dqn_num_train_eps, pg_num_iters * pg_batch_eps)," \
+        echo "Reminder: RL train_budget or algorithm-specific limits come from $CONFIG," \
              "not from --budget — see this script's header." >&2 ;;
 esac
 

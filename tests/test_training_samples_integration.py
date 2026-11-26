@@ -103,7 +103,7 @@ def test_cli_material_export_preserves_structured_candidates(tmp_path, domain):
 @pytest.mark.parametrize("method", ["dqn", "reinforce", "a2c"])
 def test_only_generate_preserves_samples_and_uses_the_same_property_columns(tmp_path, method):
     cfg = _config(method=method, count_duplicates=True)
-    cfg.update(num_gen_eps=1, gen_temperature=0.0)
+    cfg.update(num_gen_eps=1, gen_exploration_target=0.0)
     proc, out = _run(tmp_path, cfg)
     _successful_rows(proc, out)
     sample_path = out / "training_samples.csv"
@@ -123,7 +123,8 @@ def test_only_generate_preserves_samples_and_uses_the_same_property_columns(tmp_
     assert len(generated_rows) == 1
     assert {"formula", "reward", "dp_mean", "obj_score_mean", "obj_score_std"} <= fields
     assert not {"dp_std", "dp_mean_minus_std"} & fields
-    assert fields <= set(_samples(out)[0])
+    property_fields = {field for field in fields if not field.startswith("exploration_")}
+    assert property_fields <= set(_samples(out)[0])
 
 
 def test_dqn_resume_appends_budgeted_samples_without_repeating_warmup(tmp_path):
@@ -372,7 +373,7 @@ def test_scientific_training_and_generation_export_matching_gated_properties(tmp
         reward={"type": "gated", "gates": [{"name": "synthesis", "score": {
             "type": "weighted_sum", "terms": {"synthesis_probability": 1.0}}, "min": .8}],
             "objective": {"type": "weighted_sum", "terms": {"delta": 1.0}}, "failure": {"reward": -10.0}},
-        num_gen_eps=1, gen_temperature=0.0,
+        num_gen_eps=1, gen_exploration_target=0.0,
     )
     proc, out = _run(tmp_path, cfg)
     _successful_rows(proc, out)

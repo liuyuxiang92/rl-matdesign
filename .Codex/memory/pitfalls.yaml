@@ -421,3 +421,46 @@
   impact: A resumed run could silently change the return or bootstrap target definition.
   files: [src/rl_matdesign/utils/execution_contract.py, tests/test_resume_contracts.py]
   tags: [checkpointing, configuration-ownership, scientific-contracts]
+
+- id: pitfall-exploration-block-attribution-001
+  date: '2026-11-25'
+  expires: '2027-02-25'
+  title: Apply exploration changes only after a complete behavior collection block
+  wrong: Replaying prefetched outcomes one by one through an adaptive controller can switch the target
+    midway and credit old-policy outcomes to the new trial. Counting evaluation success before postfilters
+    also overstates feasible discovery.
+  right: Accumulate the full DQN evaluation wave or on-policy PG batch and call ExplorationController.observe_block
+    once at its boundary. Close at most one window per block. Forward the already-computed postconstraint
+    result from CandidateRecorder metadata and distinguish failed evaluation, infeasibility, global
+    novelty and phase-local output deduplication. Check both serial and prefetched paths.
+  impact: A target change could appear beneficial before any candidate was sampled under it, or receive
+    credit for scientifically rejected candidates.
+  files:
+  - src/rl_matdesign/exploration.py
+  - src/rl_matdesign/training.py
+  - src/rl_matdesign/utils/candidate_records.py
+  - tests/test_candidate_records_exploration.py
+  tags:
+  - adaptive-exploration
+  - batching
+  - scientific-feasibility
+
+- id: pitfall-policy-entropy-extreme-logits-001
+  date: '2026-11-25'
+  expires: '2027-02-25'
+  title: Finite entropy values do not guarantee finite policy gradients
+  wrong: Computing normalized entropy from extreme finite float32 logits can produce zero times negative
+    infinity or overflow during backward even after clamping log probabilities.
+  right: Compute the entropy-only log-softmax and probability product in float64, exclude forced
+    decisions and test actual backward gradients on extreme finite logits. Keep the on-policy sampling
+    and actor log-probability distribution consistent.
+  impact: The entropy loss can look finite while silently injecting NaN gradients into the actor
+    or its calibration probe.
+  files:
+  - src/rl_matdesign/training.py
+  - src/rl_matdesign/gradient_calibration.py
+  - tests/test_pg_advantage.py
+  tags:
+  - numerical-stability
+  - entropy
+  - policy-gradients

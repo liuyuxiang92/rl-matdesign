@@ -96,8 +96,8 @@ un-discounts legacy PG logs via `gamma`/`n_components` from `run_config.json`,
 printing the correction it applied.
 
 `train_pg` therefore also emits one `phase="pg_episode"` row per sampled episode,
-reusing existing column names (`return`, `return_raw`, `repeat_penalty`,
-`visit_count_before`, `terminal_comp_key`) so `RunMetrics.to_csv`'s key-union needs
+reusing existing column names (`return`, `return_raw`, `exploration_target_used`,
+`terminal_comp_key`) so `RunMetrics.to_csv`'s key-union needs
 no new columns and readers that filter on `phase` are unaffected.
 
 **`warmup_eps` costs completely different amounts in the two methods.** DQN's warmup
@@ -106,7 +106,7 @@ predictor: one **real predictor call per warmup episode**. PG's warmup is free �
 `_fit_scaler_from_warmup` (`training.py:846`) temporarily replaces `reward_fn` with a
 no-op, so it pays nothing and produces no rewards to log. Only DQN's warmup belongs
 on the reward axis, and `train_dqn_online` emits it as `phase="dqn_warmup"`
-(`return`, `terminal_reward`, `epsilon: 1.0`, `terminal_comp_key`). Before this,
+(`return`, `terminal_reward`, `exploration_target_used: 1.0`, `terminal_comp_key`). Before this,
 1,000 warmup episodes at a 2,500-episode budget meant 40% of the run was invisible.
 
 `compare_training_rewards.py` prepends those rows to `dqn_train` on a **re-indexed
@@ -287,7 +287,7 @@ Run the regression suite with `python -m pytest`. Build the package with
 
 **DQN path (`--rl-method dqn`, default), `train_dqn_online`:**
 1. **Warmup** — Roll out `--dqn-warmup-eps` random episodes with real rewards to pre-fill an in-memory FIFO replay buffer (`collections.deque(maxlen=dqn_buffer_size)`) and fit the `StandardScaler` on raw state features. Each env step becomes one transition row: `{s_mat_raw, s_step, a_elem_idx, a_comp_val, reward, s_mat_next_raw, s_step_next, next_allowed_idx, done}` (see `add_episode_to_buffer`).
-2. **Online training** — For `--dqn-num-train-eps` episodes: ε-greedy rollout → new rows, then `--dqn-grad-steps-per-ep` minibatch SGD steps minimizing SmoothL1 on the one-step TD target `r + γ·max_{a'∈next_allowed} Q_target(s',a')`. A target network is hard-copied every `--dqn-target-update-freq` episodes; ε anneals linearly. The buffer is checkpointed to `checkpoint.pt` (key `"buffer"`) for exact-state resume — there is no `random_dataset.npz`.
+2. **Online training** — For `--dqn-num-train-eps` episodes: entropy-target rollout → new rows, then `--dqn-grad-steps-per-ep` minibatch SGD steps minimizing SmoothL1 on the one-step TD target `r + γ·max_{a'∈next_allowed} Q_target(s',a')`. A target network is hard-copied every `--dqn-target-update-freq` episodes; the exploration target adapts from discovery outcomes. The buffer is checkpointed to `checkpoint.pt` (key `"buffer"`) for exact-state resume — there is no `random_dataset.npz`.
 3. **Candidate generation** — Boltzmann-sampled (or greedy) action selection via trained Q-network, deduplicate, optionally filter by phase, write `generated.csv`
 
 **PG path (`--rl-method reinforce` or `a2c`):**
@@ -295,35 +295,29 @@ Run the regression suite with `python -m pytest`. Build the package with
 2. **Online training** — Each episode: roll out using `PolicyNet` (softmax sampling), compute MC returns, update actor with REINFORCE gradient; A2C additionally updates `ValueNet` critic to reduce variance
 3. **Candidate generation** — Greedy argmax (default) or stochastic sampling (`--pg-gen-stochastic`) via trained `PolicyNet`
 
-**Advantage standardisation and the entropy floor (PG only).** Advantages are
-standardised across each batch in `train_pg` — unconditionally, no flag. Without
-it the actor term scales with the raw reward (sintering temperatures are 400–700)
-while the entropy bonus is at most `pg_entropy_coef · ln|A| ≈ 0.5`, so the entropy
-term cannot influence the update and the policy collapses to a single composition.
-The observed failure: A2C got *worse* with more episodes (best 632 → 670 → 649 as
-the budget went 2.7k → 7.7k → 45.2k), because mean return kept improving while the
-best candidate froze ~20% in and `unique_comps_seen` stopped growing.
+**Advantage standardization and adaptive exploration.** PG advantages remain
+standardized per batch. The actor loss uses `H/log(number of legal actions)`;
+forced decisions are excluded from entropy feedback. Its coefficient is an
+internal adaptive state, not a YAML parameter. DQN solves temperature to achieve
+an entropy target over legal Q scores; frozen PG generation uses the same sampler
+over logits. No repeat-visit advantage penalty or epsilon schedule remains.
 
-Consequences to keep straight:
+Only `exploration_target`, `gen_exploration_target`, and `exploration_adaptive`
+configure this behavior. The versioned internal profile owns controller constants.
+Targets change at consumed collection-block boundaries using canonical novelty,
+feasible yield and scientific quality. These sequential comparisons are heuristic,
+not causal or guaranteed optimal. Exact resume needs the complete
+`exploration_state`; new weight artifacts also carry the training novelty archive.
+See `docs/yaml_config_reference.md#adaptive-exploration`.
 
-- `pg_entropy_coef` and `pg_repeat_penalty_coef` are in **σ of batch return**, not
-  the property's units, as is the `repeat_penalty` log column. `return_shaped`
-  converts the penalty back to the property's units so it stays comparable against
-  `return_raw`. Logs from before this change match neither convention.
-- `pg_entropy_min` (default 0.3) floors **normalised** entropy `H / ln|A|`, not
-  nats, so it ports between the 80-element oxide env and OOH. `entropy_norm` and
-  `entropy_coef_eff` in `training_log.csv` are the diagnostic columns.
-- DQN is unaffected — ε-greedy is exogenous exploration and the replay buffer keeps
-  diverse transitions alive, so it does not have this failure mode.
-- When sweeping budgets, hold `pg_batch_eps` fixed and vary only `pg_num_iters`.
-  Batch size changes gradient noise *and* updates-per-episode, so varying both
-  confounds budget with collapse rate.
+When sweeping budgets, hold `pg_batch_eps` fixed; changing it also changes update
+density and the cadence at which exploration feedback can take effect.
 
 ### Output files (under `--out`)
 
 | File | DQN | REINFORCE | A2C | Description |
 |---|---|---|---|---|
-| `checkpoint.pt` | ✓ | ✓ | ✓ | Periodic mid-run checkpoint. For DQN (`type=="dqn"`) it holds the replay `buffer` (list of transition-row dicts), `qnet_state`, `target_net_state`, `opt_state`, `eps`, `episodes_completed`, `dp_cache`. Enables `--resume-training`. (Replaces the old `random_dataset.npz`.) |
+| `checkpoint.pt` | ✓ | ✓ | ✓ | Periodic mid-run checkpoint. For DQN (`type=="dqn"`) it holds the replay `buffer` (list of transition-row dicts), `qnet_state`, `target_net_state`, `opt_state`, `exploration_state`, `episodes_completed`, prediction caches. Enables `--resume-training`. (Replaces the old `random_dataset.npz`.) |
 | `std_scaler.bin` | ✓ | ✓ | ✓ | Serialized `StandardScaler` (joblib) |
 | `qnet.pt` | ✓ | — | — | Q-network state dict (PyTorch) |
 | `policy.pt` | — | ✓ | ✓ | PolicyNet state dict (PyTorch) |

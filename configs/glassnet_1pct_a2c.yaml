@@ -89,8 +89,6 @@ pg_warmup_eps: 100
 pg_batch_eps: 8
 pg_lr_actor: 0.0003574712922600243
 pg_lr_critic: 0.0025369990766817706
-pg_entropy_coef: 0.029106359131330698
-pg_entropy_min: 0.3
 train_budget: 20000
 method: a2c
 eval_seed: 0

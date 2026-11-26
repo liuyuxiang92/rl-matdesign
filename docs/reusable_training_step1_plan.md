@@ -1,5 +1,8 @@
 # Step 1 normalization upgrade review plan
 
+Historical Step 1 scope: Step 3 now replaces the exploration mechanisms described
+below. See [the current exploration contract](yaml_config_reference.md#adaptive-exploration).
+
 Status: implementation on `codex/step1-normalization`, starting from `codex/unified-material-groups` at `c76614665`. The GlassNet task maximizes T3 with expansion and glass-transition gates. This document records the design and evaluation protocol.
 
 The experiment has one switch. With `value_normalization: none`, the learner uses the configured raw reward and raw value targets. With `value_normalization: popart`, the runner first calibrates a weighted-sum or gated reward on 100 distinct candidates, then the learner applies adaptive PopArt normalization to its value targets. The two calculations are tested separately.

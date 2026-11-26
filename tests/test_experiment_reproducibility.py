@@ -25,9 +25,9 @@ def _config():
         "dqn_warmup_eps": 4, "dqn_num_train_eps": 4,
         "dqn_batch_size": 2, "dqn_buffer_size": 100,
         "dqn_grad_steps_per_ep": 1, "dqn_hidden_dim": 16,
-        "dqn_target_update_freq": 2, "dqn_eps_anneal_eps": 4,
+        "dqn_target_update_freq": 2,
         "pg_warmup_eps": 4, "pg_num_iters": 2, "pg_batch_eps": 2,
-        "pg_entropy_min": 0.0, "num_gen_eps": 3, "max_gen_attempts": 100,
+        "exploration_adaptive": False, "num_gen_eps": 3, "max_gen_attempts": 100,
     }
 
 
@@ -52,7 +52,7 @@ def _scientific_rows(path):
     with path.open() as stream:
         return [{key: value for key, value in row.items()
                  if key in {"formula", "reward", "dp_mean", "dp_std", "phase", "return",
-                            "terminal_reward", "terminal_comp_key", "epsilon_used"}}
+                            "terminal_reward", "terminal_comp_key", "exploration_target_used"}}
                 for row in csv.DictReader(stream)]
 
 

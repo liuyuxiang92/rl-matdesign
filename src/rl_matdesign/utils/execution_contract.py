@@ -67,11 +67,6 @@ def execution_contract(config, predictor, manifest_path, device) -> dict:
     source_identity = getattr(predictor, "source_identity", None)
     scientific = {key: value for key, value in config.items()
                   if key not in PARAMETERS or key in {"eval_seed", "k"}}
-    # This is resolved sampling provenance, not a predictor input. In
-    # particular, choosing another generation policy must not invalidate a
-    # frozen model's oracle contract. Exact generation resume locks the actual
-    # selected policy and values separately in generation_sampling_contract.
-    scientific.pop("generation_selection", None)
     evaluation = {"schema_version": 1, "source_sha256": digest.hexdigest(),
                   "configuration": scientific, "assets": assets,
                   "adapter_identity": describe() if callable(describe) else None,
@@ -86,11 +81,16 @@ def execution_contract(config, predictor, manifest_path, device) -> dict:
     adjustable_budgets = {"dqn_num_train_eps", "pg_num_iters"}
     learning = {key: value for key, value in config.items()
                 if key in {"method", "gamma", "train_seed", "train_count_duplicates", "train_max_duplicate_attempts",
-                           "value_normalization", "value_normalization_profile", "gradient_clipping"}
+                           "value_normalization", "value_normalization_profile", "gradient_clipping",
+                           "exploration_target", "exploration_adaptive"}
                 or (key.startswith(active_prefix) and key not in adjustable_budgets)}
     # Global learning controls need explicit ownership here: adding a parameter
     # to PARAMETERS alone would otherwise remove it from scientific identity
     # without including it in the active algorithm's learning identity.
+    from ..exploration import exploration_profile
+    learning["exploration_target"] = config.get("exploration_target", 0.7)
+    learning["exploration_adaptive"] = config.get("exploration_adaptive", True)
+    learning["exploration_profile"] = exploration_profile()
     learning["gradient_clipping"] = config.get("gradient_clipping", "none")
     if learning["gradient_clipping"] == "clipping":
         from ..gradient_clipping import gradient_clipping_profile
@@ -104,18 +104,15 @@ def execution_contract(config, predictor, manifest_path, device) -> dict:
 
 
 def generation_sampling_contract(config) -> dict:
-    """Freeze effective sampling semantics without binding their source spelling.
-
-    The strategy identity remains explicit even when every numeric policy value
-    is zero. The snapshot's YAML/override provenance is deliberately omitted:
-    saving and reloading the same effective policy must remain compatible.
-    """
-    from ..config_schema import selected_generation_parameter
+    """Freeze the entropy sampler and all adaptive-controller semantics."""
+    from ..exploration import exploration_profile
     return {
-        "parameter": selected_generation_parameter(config),
-        **{key: config[key] for key in (
-            "gen_seed", "gen_temperature", "gen_top_frac", "gen_epsilon",
-            "num_gen_eps")},
+        "sampler": "entropy_target",
+        "gen_exploration_target": config.get("gen_exploration_target", 0.7),
+        "exploration_adaptive": config.get("exploration_adaptive", True),
+        "exploration_profile": exploration_profile(),
+        "gen_seed": config["gen_seed"],
+        "num_gen_eps": config["num_gen_eps"],
     }
 
 

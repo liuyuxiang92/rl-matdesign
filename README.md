@@ -122,7 +122,7 @@ python scripts/run_experiment.py \
     --eval-seed 321 --train-seed 123 --gen-seed 213
 ```
 
-All hyperparameters (`pg_num_iters`, `pg_batch_eps`, `pg_entropy_coef`, `num_gen_eps`, etc.)
+All hyperparameters (`pg_num_iters`, `pg_batch_eps`, `exploration_target`, `num_gen_eps`, etc.)
 come from the YAML. Override them by editing the config or creating a copy for each experiment.
 
 ---
@@ -178,18 +178,18 @@ explicitly selects REINFORCE. Example policy-gradient settings for that override
 pg_warmup_eps: 1000          # random episodes to fit the StandardScaler
 pg_num_iters: 1000           # outer training iterations
 pg_batch_eps: 21             # episodes per batch; one gradient step per batch
-pg_entropy_coef: 0.15        # entropy bonus weight, in σ of batch return
-pg_entropy_min: 0.3          # floor on normalised entropy H/ln|A|; 0 disables
-pg_repeat_penalty_coef: 10   # penalises revisiting the same composition, in σ
-gen_temperature: 3.0         # Boltzmann T for generation diversity
+exploration_target: 0.7      # initial normalized entropy target for training
+gen_exploration_target: 0.7  # independent initial target for generation
+exploration_adaptive: true  # adapt targets from terminal discovery outcomes
 num_gen_eps: 2000            # unique compositions to generate
 ```
 
-PG advantages are standardised per batch (no flag), so `pg_entropy_coef` and
-`pg_repeat_penalty_coef` are in standard deviations of batch return rather than in
-the property's own units. `pg_entropy_min` floors the policy's normalised entropy
-so it keeps exploring for the whole budget instead of going deterministic partway
-through — see [`docs/yaml_config_reference.md`](docs/yaml_config_reference.md).
+PG advantages are standardized per batch. The actor uses normalized entropy
+`H / log(number of legal actions)` with an automatically adjusted coefficient.
+Forced decisions do not enter entropy feedback. A slower controller observes
+canonical novelty, feasible discoveries and quality progress. Repeated candidates
+still train, but no repeat-visit penalty is added. See
+[the exploration contract](docs/yaml_config_reference.md#adaptive-exploration).
 
 When sweeping budgets, hold `pg_batch_eps` fixed and vary only `pg_num_iters`;
 changing both confounds episode budget with update density.
@@ -230,8 +230,8 @@ dqn_num_train_eps: 20000      # total online training episodes
 dqn_buffer_size: 50000        # replay buffer capacity (FIFO)
 dqn_grad_steps_per_ep: 5      # gradient updates per training episode
 dqn_target_update_freq: 100   # hard-copy Q-net → target-net every N episodes
-dqn_eps_anneal_eps: 10000     # linear ε annealing: reaches dqn_eps_min after N episodes
-dqn_eps_min: 0.05
+exploration_target: 0.7      # Q-directed entropy sampling after random warmup
+exploration_adaptive: true
 dqn_lr: 0.001
 dqn_batch_size: 256
 ```
@@ -713,7 +713,7 @@ parameter belongs to:
 Examples (already correctly prefixed): `dqn_lr`, `dqn_batch_size`,
 `dqn_warmup_eps`, `dqn_hidden_dim`, `pg_warmup_eps`, `pg_num_iters`,
 `pg_batch_eps`, `pg_lr_actor`, `pg_lr_critic`. Shared: `method`, `gamma`,
-`num_gen_eps`, `gen_temperature`, env keys, predictor keys.
+`num_gen_eps`, `gen_exploration_target`, env keys, predictor keys.
 
 Only canonical parameter names are accepted. `gamma` is the discount factor
 for every method. DQN and PG warmup budgets are independent: use

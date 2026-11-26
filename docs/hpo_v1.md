@@ -53,7 +53,7 @@ generation:
     qualified_fraction: 0.50
     best_fraction_quality: 0.40
     best_value_quality: 0.10
-  # initial_values 可省略，按场景选中的采样方式提供初始值。
+  # initial_values 可省略，默认搜索 [0, 0.25, 0.5, 0.7, 0.9, 1] 熵目标。
   budget: {mode: absolute_unique, min_unique: 100, initial_unique: 400, max_unique: 1600}
 ```
 
@@ -143,22 +143,26 @@ parallel_jobs: 3
 
 预算可向更小或更大改变。结果中的 `selected_budget` 与 `convergence_status` 分开：前者是已测范围内推荐的较小预算，后者说明是否有总分平台证据。平台仍要求足够的更大预算观测，当前内部固定至少两个更大档位。到达上界仍改善、较大预算明显恶化、效率失败或证据缺失均如实报告；不能把推荐某一预算写成已证明全局收敛。预算修订轮数耗尽仍未稳定时报告 `BUDGET_UNRESOLVED`。
 
-## 生成方式从场景继承
+## 基于熵目标的生成
 
-场景中 `gen_temperature`、`gen_top_frac`、`gen_epsilon` **最后显式出现的字段**选择一种生成方式；0 也属于显式选择，程序补充的默认值不能覆盖它。例如：
+生成统一使用熵目标采样。场景中的 `gen_exploration_target` 是初始目标，
+范围为 `[0,1]`；`exploration_adaptive` 决定是否按候选发现结果缓慢调整目标。
+HPO 保留这一设置，不会在作业内切换成另一种采样器。
 
 ```yaml
-gen_temperature: 1.0
-gen_epsilon: 0.1  # 最后出现：使用 epsilon，温度在内部关闭
+gen_exploration_target: 0.7
+exploration_adaptive: true
 ```
 
-HPO 只优化被选中的参数。`generation.initial_values` 是该参数的初始候选值，可省略以使用对应方式的内置值；epsilon 与 top fraction 限于 `[0,1]`，temperature 非负。数量来自 `generation.budget`，不会将 `initial_values` 当作生成个数。
+`generation.initial_values` 搜索初始熵目标，可省略以采用
+`[0, 0.25, 0.5, 0.7, 0.9, 1]`。数量仍由 `generation.budget` 控制。
+范围搜索只能扩展到合法边界 0 或 1；不再搜索原始分数温度、epsilon 或 top fraction。
+目标 0 在最高分并列动作中采样，目标 1 为均匀采样；相同分数不能强制达到低熵。
+目标值不是随机动作百分比。控制器会记录实际熵以及目标是否可达。
 
-生成参数范围搜索在初始候选值之外，向较小、较大的方向各最多增加两个生成参数取值；这个上限内部固定为 2，与训练范围诊断一致，不向用户开放。它控制测试哪些参数值，生成预算与每个模型的重复次数仍分别由 `generation.budget` 和 `generation.repeats` 控制。程序先测试初始候选值；某个预算下的最佳结果落在当前取值范围的边界时，才尝试向对应方向扩大范围。温度向下测试最小正温度的十分之一，向上测试最大正温度的十倍。例如初始正温度为 `[0.1, 1, 10]`，若下边界持续最优，可依次补测 `0.01`、`0.001`；若上边界持续最优，可依次补测 `100`、`1000`。每个新取值都按相同预算网格和模型重复规则评价。如果当前所有结果都不符合条件，程序也可在上限内向更大值补测。epsilon 和 top fraction 的范围有限，向外补测直接到合法边界 0 或 1，不会越界。解析后的执行计划仍会显示每侧补测上限 2。
-
-温度 0 是贪心，较小正温度集中于高网络分数动作，较大温度使采样更分散；它不是探索百分比，A2C 与 DQN 的分数尺度也可能不同。epsilon 调节随机动作概率，top fraction 调节保留的高分动作比例。HPO 内部关闭未选中的方式及额外随机生成批次，用户不需要填写三个 `fixed: 0`。
-
-普通场景解析器也执行最后显式字段优先。生效配置中的内部 `generation_selection` 快照保存选中的方法和有效值，防止导出时排序、补全默认字段或重新加载改变选择。显式覆盖优先于场景；编辑已解析配置的策略值时会识别变化。普通用户编辑原始场景即可，无需手工维护快照。
+旧的生成策略选择顺序和 `generation_selection` 快照已移除。配置中应删除
+旧采样字段；未知或废弃字段会明确报错。训练搜索空间也不再包含 epsilon
+衰减、固定熵系数或重复惩罚。控制器内部参数由固定版本的共享 profile 管理。
 
 训练与生成分别记账：生成第一次遇到训练中出现过的材料，仍计入生成预算；同一阶段再次重复只增加尝试。成功评价但不满足材料约束仍消耗有效预算；失败、无效候选和重新采样也消耗尝试。
 
@@ -166,7 +170,7 @@ Reward 校准采用单独记账，不属于上述两个评分阶段。`reward_ca
 
 HPO 的 `trials.csv` 分别列出 `calibration_attempts`、`calibration_evaluations`、`calibration_valid_candidates`，`selection.json` 的 `physical_cost.calibration` 汇总完成及未完成作业的校准开销。同一作业复用时不重复累计。校准耗时已经包含在训练作业的 `wall_seconds` 中，不再加一次。
 
-效率统一要求 `尝试次数 / 有效不同候选数 < evaluation.max_attempts_per_unique`，默认严格小于 1.5。目标 1000 个不同候选最多允许 1499 次尝试。不会仅因早期比例偏高就停止；待已启动结果结算后，若即使余下每次都成功也无法在上限内完成，标记 `INFEASIBLE_EFFICIENCY` 并停止。已消耗成本保留，不自动放宽上限、提高温度或重置预算。
+效率统一要求 `尝试次数 / 有效不同候选数 < evaluation.max_attempts_per_unique`，默认严格小于 1.5。目标 1000 个不同候选最多允许 1499 次尝试。不会仅因早期比例偏高就停止；待已启动结果结算后，若即使余下每次都成功也无法在上限内完成，标记 `INFEASIBLE_EFFICIENCY` 并停止。已消耗成本保留，不会放宽上限或重置预算；已声明的探索控制器按其固定协议工作。
 
 ## 分阶段执行、输出与恢复
 

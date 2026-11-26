@@ -10,6 +10,7 @@ import torch
 
 from rl_matdesign.hpo.artifacts import CALIBRATION_CHECKPOINT, REWARD_CALIBRATION_BUDGET, file_digest
 from rl_matdesign.hpo.restart import inspect_restart
+from rl_matdesign.exploration import ExplorationController
 from rl_matdesign.utils.candidate_records import CandidateRecorder
 from rl_matdesign.utils.seeding import capture_rng_state
 from rl_matdesign.utils.training_budget import TrainingBudget
@@ -39,6 +40,7 @@ def _job(tmp_path, kind="a2c", phase="train", *, terminal=False):
         "execution_contract": {"test": True}, "environment_contract": {"test": True},
         "scaler_fingerprint": "test", "episodes_completed": 1,
         "training_budget_state": training_budget.state_dict(),
+        "exploration_state": ExplorationController().state_dict(),
     }
     if phase == "generation":
         checkpoint.update(type="hpo_generation", generation_contract={"execution": {}, "sampling": {}, "frozen_artifacts": {}})
@@ -46,13 +48,13 @@ def _job(tmp_path, kind="a2c", phase="train", *, terminal=False):
     elif kind == "a2c":
         checkpoint.update(type="pg", policy_state={"w": torch.tensor([1.])},
                           value_net_state={"w": torch.tensor([2.])}, opt_actor_state=optimizer,
-                          opt_critic_state=optimizer, iteration=1, visit_counts={"A": 1},
-                          entropy_coef_eff=0.01, rl_method="a2c")
+                          opt_critic_state=optimizer, iteration=1,
+                          rl_method="a2c")
         name = "checkpoint.pt"
     else:
         checkpoint.update(type="dqn", qnet_state={"w": torch.tensor([1.])},
                           target_net_state=None if kind == "dqn_mc" else {"w": torch.tensor([2.])},
-                          opt_state=optimizer, buffer=[], training_episodes_completed=1, eps=0.9)
+                          opt_state=optimizer, buffer=[], training_episodes_completed=1)
         name = "checkpoint.pt"
     torch.save(checkpoint, directory / name)
     (directory / "std_scaler.bin").write_bytes(b"original scaler")
@@ -326,3 +328,18 @@ def test_cached_campaign_fatal_status_blocks_restart(tmp_path, status):
     report = inspect_restart(tmp_path)
     assert not report["ready"]
     assert status in report["jobs"][0]["reason"]
+
+
+@pytest.mark.parametrize("phase", ["train", "generation"])
+@pytest.mark.parametrize("corruption", ["missing", "invalid"])
+def test_restart_requires_complete_exploration_state(tmp_path, phase, corruption):
+    directory, checkpoint = _job(tmp_path, phase=phase)
+    if corruption == "missing":
+        checkpoint.pop("exploration_state")
+    else:
+        checkpoint["exploration_state"]["target"] = 2
+    name = "generation_checkpoint.pt" if phase == "generation" else "checkpoint.pt"
+    torch.save(checkpoint, directory / name)
+    report = inspect_restart(tmp_path)
+    assert not report["ready"]
+    assert report["jobs"][0]["classification"] == "BLOCKED"

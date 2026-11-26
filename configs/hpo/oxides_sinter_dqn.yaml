@@ -21,8 +21,6 @@ stage1:
   budget_scaling:
     dqn_num_train_eps: 0.3
     dqn_warmup_eps: 0.3
-    dqn_eps_anneal_eps: 0.3
-
 stage2:
   n_top_to_confirm: 3
   seeds_per_trial: 3
@@ -38,6 +36,4 @@ search_space:
   dqn_grad_steps_per_ep:  { dist: int, low: 1, high: 8 }
   dqn_target_update_freq: { dist: categorical, choices: [10, 50, 100, 200, 500] }
   dqn_hidden_dim:         { dist: categorical, choices: [128, 256, 512] }
-  dqn_eps_min:            { dist: uniform, low: 0.01, high: 0.20 }
-  dqn_eps_anneal_eps:     { dist: frac_of, base: dqn_num_train_eps, low: 0.3, high: 0.8 }
   gamma:                  { dist: uniform, low: 0.85, high: 0.99 }

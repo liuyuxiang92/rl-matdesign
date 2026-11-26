@@ -175,7 +175,7 @@ def test_generation_keeps_nine_model_repeat_pairs_and_frozen_artifacts(tmp_path,
     if failed_repeat is not None:
         runner.fail_seed = seeds[failed_repeat]
     results = run.evaluate_many([
-        dict(parameters={"pg_batch_eps": 2, "gen_temperature": temperature}, budget=8,
+        dict(parameters={"pg_batch_eps": 2, "gen_exploration_target": temperature}, budget=8,
              seeds=seeds, phase="generation", models=paired_models, pairings=pairings)
         for temperature in (.1, 1)
     ])

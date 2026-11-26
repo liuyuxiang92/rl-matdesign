@@ -77,6 +77,7 @@ def test_interrupted_runner_matches_uninterrupted_training(
     assert right['predictor_caches']['_stats_cache']
     assert set(left['predictor_caches']['_stats_cache']) == set(right['predictor_caches']['_stats_cache'])
     assert left['training_budget_state'] == right['training_budget_state']
+    assert left['exploration_state'] == right['exploration_state']
     assert left['predictor_ledger']['phase_costs'] == right['predictor_ledger']['phase_costs']
     assert torch.equal(left['rng_state']['torch_cpu'], right['rng_state']['torch_cpu'])
 

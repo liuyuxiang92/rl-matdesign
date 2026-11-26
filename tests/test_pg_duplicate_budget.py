@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import csv
-import math
 
 import numpy as np
 from rl_matdesign.action_features import value_alphabet
@@ -20,7 +19,7 @@ from rl_matdesign.utils.training_samples import TrainingSampleWriter
 class _Policy(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.logits = torch.nn.Parameter(torch.zeros(4))
+        self.logits = torch.nn.Parameter(torch.tensor([1., 0., 0., 0.]))
 
     def forward(self, _state, _step, elements, _fractions):
         return elements @ self.logits
@@ -66,7 +65,7 @@ def _setup(monkeypatch, sequence, *, method="reinforce"):
         scaler=StandardScaler().fit([env.current_state_features()]),
         elem_feats_scaled=np.eye(4), action_values=value_alphabet(env),
         device=torch.device("cpu"), num_iters=2, batch_eps=2,
-        pg_repeat_penalty_coef=0.2, rl_method=method,
+        exploration_adaptive=False, rl_method=method,
     )
     return kwargs, sampled, learned
 
@@ -93,9 +92,9 @@ def test_duplicates_keep_learning_with_optional_budget(monkeypatch, method, coun
     assert [r["budget_counted"] for r in episodes] == (
         [True] * 4 if count_duplicates else [True, False, True, False, True, False, True]
     )
-    assert episodes[1]["visit_count_before"] == 1
-    assert episodes[1]["repeat_penalty"] == pytest.approx(0.2 * math.log(2))
-    assert not torch.equal(kwargs["policy"].logits.detach(), torch.zeros(4))
+    assert episodes[1]["return_raw"] == episodes[0]["return_raw"]
+    assert all("repeat_penalty" not in row and "return_shaped" not in row for row in rows)
+    assert not torch.equal(kwargs["policy"].logits.detach(), torch.tensor([1., 0., 0., 0.]))
     if method == "a2c":
         assert kwargs["value_net"].value.item() > 0
 
@@ -131,7 +130,6 @@ def test_popart_a2c_uses_full_budget_after_prior_property_observations(monkeypat
     episodes = [r for r in rows if r["phase"] == "pg_episode"]
     assert [r["budget_counted"] for r in episodes] == [True, False, True, True, True]
     assert [r["training_budget_used"] for r in episodes] == [1, 1, 2, 3, 4]
-    assert [r["visit_count_before"] for r in episodes] == [0, 1, 0, 0, 0]
     updates = [r for r in rows if r["phase"] == "pg_train"]
     assert [r["episode"] for r in updates] == [2, 4, 5]
     assert updates[-1]["training_budget_used"] == 4
@@ -157,7 +155,7 @@ def test_limit_trains_and_checkpoints_partial_batch_before_raising(monkeypatch, 
         )
     expected_attempts = 3 if stop == "duplicate_limit" else 2
     assert sampled == learned == [0] * expected_attempts
-    assert not torch.equal(kwargs["policy"].logits.detach(), torch.zeros(4))
+    assert not torch.equal(kwargs["policy"].logits.detach(), torch.tensor([1., 0., 0., 0.]))
     saved = torch.load(checkpoint, weights_only=False)
     assert saved["training_budget_used"] == 1
     assert saved["training_attempts"] == expected_attempts
@@ -200,8 +198,7 @@ def test_resume_keeps_seen_compositions_and_adds_requested_budget(monkeypatch, t
             "start_iteration": saved["iteration"],
             "training_budget_state": saved["training_budget_state"],
             "opt_actor_state": saved["opt_actor_state"],
-            "visit_counts": saved["visit_counts"],
-            "entropy_coef_eff": saved["entropy_coef_eff"],
+            "exploration_state": saved["exploration_state"],
         },
     )
     assert sampled == learned == [0, 1, 2]
@@ -210,7 +207,6 @@ def test_resume_keeps_seen_compositions_and_adds_requested_budget(monkeypatch, t
     assert [r["training_budget_used"] for r in episodes] == [2, 2, 3]
     assert [r["iteration"] for r in episodes] == [2, 3, 4]
     assert [r["episode"] for r in episodes] == [3, 4, 5]
-    assert episodes[0]["visit_count_before"] == 1
     resumed = torch.load(checkpoint, weights_only=False)
     assert resumed["training_attempts"] == 5
     assert resumed["training_budget_used"] == 3
@@ -226,10 +222,26 @@ def test_legacy_checkpoint_cannot_enable_unique_budget(monkeypatch, resume_field
     assert sampled == learned == []
 
 
-def test_legacy_checkpoint_requires_explicit_duplicate_counting(monkeypatch, capsys):
+def test_legacy_checkpoint_without_exploration_state_is_rejected(monkeypatch):
     kwargs, sampled, learned = _setup(monkeypatch, [0, 0, 0, 0])
-    rows = training.train_pg(**kwargs, train_count_duplicates=True, checkpoint_cfg={"start_episode": 10})
-    assert sampled == learned == [0, 0, 0, 0]
-    assert rows[-1]["episode"] == 14
-    assert rows[-1]["training_budget_history_complete"] is False
-    assert "counters start at this resume" in capsys.readouterr().out
+    with pytest.raises(ValueError, match="Exact resume requires exploration_state"):
+        training.train_pg(**kwargs, train_count_duplicates=True,
+                          checkpoint_cfg={"start_episode": 10})
+    assert sampled == learned == []
+
+
+def test_paid_pilot_is_known_to_controller_but_new_to_learner_budget(monkeypatch):
+    from types import SimpleNamespace
+    kwargs, _, _ = _setup(monkeypatch, [0, 1])
+    kwargs.update(num_iters=1, batch_eps=2)
+    env = kwargs["env"]
+    env.initialize()
+    env.step(next(a for a in env.allowed_actions() if int(np.argmax(a[0])) == 0))
+    pilot_key = env.terminal_comp_key()
+    rows = training.train_pg(
+        **kwargs, gradient_calibration_episodes=[SimpleNamespace(terminal_key=pilot_key)],
+    )
+    assert rows[-1]["training_budget_used"] == 2
+    assert env.exploration_state["attempts"] == 2
+    assert env.exploration_state["window"]["unique"] == 1
+    assert repr(pilot_key) in env.exploration_state["seen_keys"]

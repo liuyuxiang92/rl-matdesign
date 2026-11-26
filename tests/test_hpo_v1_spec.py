@@ -24,10 +24,11 @@ def test_defaults_are_complete_and_paths_use_scenario_directory(tmp_path):
     assert plan["base_config"] == str(tmp_path / "scenario.yaml")
     assert plan["base_config_data"]["properties"][0]["models"] == [
         str(tmp_path / "assets/net.pt"), str(tmp_path / "assets/net2.pt")]
-    assert len(plan["search_space"]) == 5
+    assert len(plan["search_space"]) == 3
     assert plan["budget"]["train"]["min_fraction"] < plan["budget"]["train"]["initial_fraction"]
     assert phase_efficiency(plan, "generation")["max_attempts_per_unique"] == 1.5
-    assert plan["generation_search"]["fixed"] == {"gen_epsilon": 0, "gen_top_frac": 0}
+    assert "fixed" not in plan["generation_search"]
+    assert plan["generation_search"]["parameter"] == "gen_exploration_target"
     assert plan["sources"]["efficiency"] == "default"
 
 
@@ -48,14 +49,14 @@ def test_method_cli_can_supply_but_cannot_silently_override(tmp_path):
     ({"efficiency": {"max_attempts_per_unique": float("inf")}}, "finite"),
     ({"efficiency": {"comparison": "le"}}, "lt"),
     ({"range_search": {"confirmation_seed": 11}}, "fresh"),
-    ({"generation_search": {"parameter": "gen_temp"}}, "gen_temperature"),
-    ({"generation_search": {"fixed": {"gen_epsilon": .1}}}, "temperature-only"),
-    ({"generation_search": {"initial_values": [0]}}, "positive"),
+    ({"generation_search": {"parameter": "gen_temp"}}, "gen_exploration_target"),
+    ({"generation_search": {"fixed": {"gen_epsilon": .1}}}, "Unknown fields"),
+    ({"generation_search": {"initial_values": [0, 1.1]}}, "<= 1"),
     ({"generation_search": {"initial_values": [0, 1, 1]}}, "distinct"),
     ({"search_space": {"dqn_grad_steps_per_ep": {"type": "int", "low": 1, "high": 10}}}, "not active"),
     ({"search_space": {"pg_lr_actor": {"type": "float", "low": 0, "high": 1}}}, "> 0"),
     ({"search_space": {"pg_batch_eps": {"type": "categorical", "choices": [1, 1]}}}, "duplicates"),
-    ({"search_space": {"pg_entropy_min": {"type": "float", "low": 0, "high": 2}}}, "<= 1"),
+    ({"search_space": {"exploration_target": {"type": "float", "low": 0, "high": 2}}}, "<= 1"),
     ({"metrics": {"generation_weights": {"qualified_fraction": 1}}}, "sum to 1"),
     ({"training_search": {"validation_seeds": [11, 211, 307]}}, "disjoint"),
     ({"training_search": {"trials": 2}}, "trial counts"),
@@ -100,7 +101,7 @@ def test_other_application_negative_maximize_yaml_only(tmp_path):
     assert plan["base_config_data"]["dqn_grad_steps_per_ep"] == 17
 
 
-@pytest.mark.parametrize("method,count", [("dqn-bootstrap", 6), ("dqn-mc", 5), ("a2c", 5)])
+@pytest.mark.parametrize("method,count", [("dqn-bootstrap", 4), ("dqn-mc", 3), ("a2c", 3)])
 def test_profiles_active_parameters_only(method, count):
     profile = get_profile(method)
     assert len(profile["search_space"]) == count
@@ -115,16 +116,15 @@ def test_mc_inert_target_update_cannot_be_searched_but_can_remain_in_base(tmp_pa
         load_plan(write_plan(tmp_path, {"method": "dqn-mc", "search_space": {"dqn_target_update_freq": {"type": "categorical", "choices": [10, 20]}}}))
 
 
-def test_midpoint_and_budget_derivations_do_not_clip_anneal(tmp_path):
+def test_midpoint_and_budget_derivations_preserve_fixed_updates(tmp_path):
     plan = load_plan(write_plan(tmp_path, {"method": "dqn-bootstrap"}, base={"dqn_grad_steps_per_ep": 9}))
     reference = initial_parameters(plan)
     assert reference["dqn_lr"] == pytest.approx((1e-5 * 1e-2)**.5)
     assert reference["dqn_batch_size"] == 128
     before = deepcopy(plan)
-    overrides = resolve_parameters(plan, {"warmup_budget_fraction": .1, "epsilon_anneal_budget_ratio": 2}, 100)
+    overrides = resolve_parameters(plan, {"warmup_budget_fraction": .1}, 100)
     assert overrides["dqn_warmup_eps"] == 10
     assert overrides["dqn_num_train_eps"] == 90
-    assert overrides["dqn_eps_anneal_eps"] == 180
     assert overrides["dqn_grad_steps_per_ep"] == 9
     assert not overrides["train_count_duplicates"]
     assert resolve_config(plan["base_config_data"], overrides).config["train_budget"] == 100
@@ -145,7 +145,7 @@ def test_custom_profile_and_partial_hpo_range_overrides(tmp_path):
     profile = tmp_path / "profile.yaml"
     profile.write_text(yaml.safe_dump({"method": "a2c", "search_space": {"pg_batch_eps": {"type": "categorical", "choices": [2, 4]}}, "extension_choices": {"pg_batch_eps": [1, 2, 4, 8]}}))
     plan = load_plan(write_plan(tmp_path, {"parameter_profile": "profile.yaml", "search_space": {"pg_lr_actor": {"type": "float", "low": 1e-6, "high": 1e-4, "log": True}}}))
-    assert len(plan["search_space"]) == 5
+    assert len(plan["search_space"]) == 3
     assert plan["search_space"]["pg_batch_eps"]["choices"] == [2, 4]
     assert plan["extension_choices"]["pg_batch_eps"] == [1, 2, 4, 8]
 
@@ -158,3 +158,24 @@ def test_fraction_and_absolute_budget_fields_cannot_mix(tmp_path):
 def test_bounds_allow_bidirectional_search_and_validate_order(tmp_path):
     with pytest.raises(ConfigError, match="min <= initial <= max"):
         load_plan(write_plan(tmp_path, {"budget": {"generation": {"min_fraction": .001}}}))
+
+
+@pytest.mark.parametrize("method", ["a2c", "dqn-mc", "dqn-bootstrap"])
+def test_exploration_is_not_a_default_training_hpo_dimension_but_can_be_explicit(tmp_path, method):
+    plan = load_plan(write_plan(tmp_path, {"method": method}))
+    assert "exploration_target" not in plan["search_space"]
+    plan = load_plan(write_plan(tmp_path, {"method": method, "search_space": {
+        "exploration_target": {"type": "float", "low": .2, "high": .9},
+    }}))
+    assert plan["search_space"]["exploration_target"]["high"] == .9
+    overrides = resolve_parameters(plan, {"exploration_target": .4}, 1000)
+    assert overrides["exploration_target"] == .4
+    assert plan["base_config_data"]["exploration_adaptive"] is True
+
+
+@pytest.mark.parametrize("key", ["dqn_eps_min", "epsilon_anneal_budget_ratio", "pg_entropy_coef", "pg_entropy_min"])
+def test_removed_training_exploration_hpo_dimensions_rejected(tmp_path, key):
+    with pytest.raises(ConfigError, match="not active"):
+        load_plan(write_plan(tmp_path, {"search_space": {key: {
+            "type": "float", "low": .1, "high": .9,
+        }}}))

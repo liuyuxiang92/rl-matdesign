@@ -172,7 +172,7 @@ def test_a2c_probe_preserves_both_learners_and_pilot_wide_scaling(monkeypatch, m
     rng_before = capture_rng_state()
     controllers, report = calibrate_pg_gradients(
         policy=policy, value_net=critic, episodes=episodes,
-        entropy_coef=.01, entropy_min=.5, **_inputs(),
+        exploration_target=.5, **_inputs(),
     )
     _assert_equal(capture_rng_state(), rng_before)
     for model, saved in zip((policy, critic), before):
@@ -204,7 +204,7 @@ def test_zero_signal_pilot_stays_unresolved_without_fabricated_cap():
                 parameter.zero_()
     controllers, report = calibrate_pg_gradients(
         policy=policy, value_net=critic, episodes=_episodes(reward=0.),
-        entropy_coef=0., entropy_min=0., **_inputs(),
+        exploration_target=0., exploration_adaptive=False, **_inputs(),
     )
     for controller in controllers.values():
         assert controller.calibration_norms == [0.] * 100
@@ -268,7 +268,7 @@ def test_finite_rewards_with_overflowing_computed_returns_are_numerical(method):
                                    loss_fn=torch.nn.MSELoss(), target_mode="mc", **_inputs())
         else:
             calibrate_pg_gradients(policy=policy, value_net=critic, episodes=episodes,
-                                   entropy_coef=.01, entropy_min=.5, **_inputs())
+                                   exploration_target=.5, **_inputs())
     for model, saved in zip(models, before):
         _assert_equal(_live_state(model), saved)
     _assert_equal(capture_rng_state(), rng_before)
@@ -340,7 +340,7 @@ def test_a2c_nonfinite_losses_are_classified_as_numerical(monkeypatch, failure):
     rng_before = capture_rng_state()
     with pytest.raises(NumericalTrainingError, match=f"Nonfinite {failure}.*loss"):
         calibrate_pg_gradients(policy=policy, value_net=critic, episodes=_episodes(),
-                               entropy_coef=.01, entropy_min=.5, **_inputs())
+                               exploration_target=.5, **_inputs())
     for model, saved in zip((policy, critic), before):
         _assert_equal(_live_state(model), saved)
     _assert_equal(capture_rng_state(), rng_before)
