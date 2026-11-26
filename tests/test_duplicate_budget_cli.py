@@ -38,7 +38,7 @@ def _config(*, method="dqn", count_duplicates=False, categorical=False):
         "exploration_target": 1.0,
         "dqn_target_update_freq": 2,
         "pg_warmup_eps": 2, "pg_num_iters": 1, "pg_batch_eps": 3,
-        "exploration_adaptive": False,
+        "exploration_adaptive": True,
         "num_gen_eps": 0,
     }
 

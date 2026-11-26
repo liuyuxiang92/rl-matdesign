@@ -21,7 +21,14 @@ class ConfigError(ValueError):
     """A configuration is ambiguous, malformed, or outside its contract."""
 
 
-_METHOD_VALUE_FIELDS = ("train_budget", "num_gen_eps", "exploration_target", "gen_exploration_target")
+GENERATION_PARAMETERS = ("gen_temperature", "gen_top_frac", "gen_epsilon")
+_GENERATION_METADATA = "generation_selection"
+LEGACY_EXPLORATION_KEYS = frozenset({
+    "dqn_eps_anneal_eps", "dqn_eps_min", "pg_entropy_coef", "pg_entropy_min",
+    "pg_repeat_penalty_coef", "pg_repeat_penalty_shape", *GENERATION_PARAMETERS,
+})
+ADAPTIVE_EXPLORATION_KEYS = frozenset({"exploration_target", "gen_exploration_target"})
+_METHOD_VALUE_FIELDS = ("train_budget", "num_gen_eps", "exploration_target", "gen_exploration_target", "gen_temperature")
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -42,7 +49,13 @@ class _UniqueKeyLoader(yaml.SafeLoader):
                 seen[key] = key_node.start_mark
             except TypeError as exc:
                 raise ConfigError(f"Unhashable YAML key at {key_node.start_mark}") from exc
-        return super().construct_mapping(node, deep=deep)
+        result = super().construct_mapping(node, deep=deep)
+        # Preserve legacy authored-order selection across YAML merged defaults.
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in GENERATION_PARAMETERS:
+                result[key] = result.pop(key)
+        return result
 
 
 def _mapping(value: Any, context: str) -> dict:
@@ -129,7 +142,16 @@ PARAMETERS: dict[str, Parameter] = {
     "train_max_duplicate_attempts": Parameter(int, 1000, "Maximum consecutive duplicates in a unique-candidate budget.", minimum=1),
     "exploration_target": Parameter(float, 0.7, "Initial normalized action-entropy target for training.", minimum=0, maximum=1),
     "gen_exploration_target": Parameter(float, 0.7, "Initial normalized action-entropy target for candidate generation.", minimum=0, maximum=1),
-    "exploration_adaptive": Parameter(bool, True, "Adapt exploration targets from completed candidate outcomes."),
+    "exploration_adaptive": Parameter(bool, True, "Use Step3 adaptive entropy exploration; false restores historical epsilon/entropy controls."),
+    "dqn_eps_anneal_eps": Parameter(int, 10000, "Legacy DQN epsilon annealing episodes; requires exploration_adaptive=false.", minimum=1),
+    "dqn_eps_min": Parameter(float, 0.05, "Legacy DQN minimum random-action probability.", minimum=0, maximum=1),
+    "pg_entropy_coef": Parameter(float, 0.01, "Legacy policy entropy coefficient.", minimum=0),
+    "pg_entropy_min": Parameter(float, 0.3, "Legacy normalized policy entropy floor.", minimum=0, maximum=1),
+    "pg_repeat_penalty_coef": Parameter(float, 0.0, "Legacy repeated-candidate policy penalty coefficient.", minimum=0),
+    "pg_repeat_penalty_shape": Parameter(str, "log", "Legacy repeated-candidate penalty growth.", choices=("log", "sqrt", "linear")),
+    "gen_temperature": Parameter(float, 1.0, "Legacy generation softmax temperature; zero selects greedy behavior.", minimum=0),
+    "gen_top_frac": Parameter(float, 0.0, "Legacy generation top-action fraction.", minimum=0, maximum=1),
+    "gen_epsilon": Parameter(float, 0.0, "Legacy generation random-action probability.", minimum=0, maximum=1),
     "gamma": Parameter(float, 0.9, "Discount factor used by DQN, REINFORCE and A2C.", minimum=0, maximum=1),
     "dqn_hidden_dim": Parameter(int, 256, "DQN hidden-layer width.", minimum=1),
     "dqn_lr": Parameter(float, 1e-3, "DQN optimizer learning rate.", minimum=0, exclusive_minimum=True),
@@ -172,9 +194,6 @@ _RETIRED_KEYS = frozenset({
     "required_elements", "nonzero_ratio_at_last", "reserve_for_last", "phase_patterns", "target_phases",
     "n_random_configs", "geo_opt", "geo_opt_model", "structure_parallel", "ads_height", "ads_dz", "adsorbates",
     "application", "applications", "md", "opt", "constrain_training",
-    "dqn_eps_anneal_eps", "dqn_eps_min", "pg_entropy_coef", "pg_entropy_min",
-    "pg_repeat_penalty_coef", "pg_repeat_penalty_shape", "gen_temperature",
-    "gen_top_frac", "gen_epsilon", "generation_selection",
 })
 _DELEGATED_NAMES = frozenset().union(*DELEGATED_KEYS.values())
 
@@ -211,6 +230,80 @@ def select_method_values(raw: Mapping, *, method: str | None = None) -> dict:
     return cfg
 
 
+def _generation_selection(raw: Mapping, source: str = "yaml") -> tuple[str, str]:
+    """Select before defaults, respecting a saved effective-value snapshot.
+
+    Resolved configs contain all three policy fields and may be exported with
+    alphabetically sorted keys. The snapshot preserves their original selection;
+    an explicitly edited field supersedes it, including a newly supplied zero.
+    """
+    authored = [key for key in raw if key in GENERATION_PARAMETERS]
+    for key in authored:
+        PARAMETERS[key].normalize(key, raw[key])
+    if _GENERATION_METADATA not in raw:
+        return (authored[-1], source) if authored else ("gen_temperature", "default")
+
+    metadata = _mapping(raw[_GENERATION_METADATA], _GENERATION_METADATA)
+    if set(metadata) != {"parameter", "values", "source"}:
+        raise ConfigError("generation_selection requires exactly parameter, values and source")
+    selected = metadata["parameter"]
+    if selected not in GENERATION_PARAMETERS:
+        raise ConfigError(f"generation_selection.parameter must be one of {GENERATION_PARAMETERS}")
+    if metadata["source"] not in ("yaml", "override", "default"):
+        raise ConfigError("generation_selection.source must be yaml, override or default")
+    values = _mapping(metadata["values"], "generation_selection.values")
+    if set(values) != set(GENERATION_PARAMETERS):
+        raise ConfigError("generation_selection.values must contain all three generation parameters")
+    values = {key: PARAMETERS[key].normalize(key, values[key]) for key in GENERATION_PARAMETERS}
+    if any(values[key] != 0 for key in GENERATION_PARAMETERS if key != selected):
+        raise ConfigError("generation_selection.values must disable both unselected generation parameters")
+    if not set(GENERATION_PARAMETERS).issubset(raw):
+        raise ConfigError("generation_selection metadata requires all three effective generation fields")
+    changed = [key for key in authored if PARAMETERS[key].normalize(key, raw[key]) != values[key]]
+    return (changed[-1], source) if changed else (selected, metadata["source"])
+
+
+def selected_generation_parameter(raw: Mapping) -> str:
+    """Return the selected canonical generation field without adding defaults.
+
+    In an authored YAML mapping the last explicit generation field wins. A
+    resolved config's selection survives serialization and key sorting. Later
+    value edits are treated as new explicit choices. When no field is authored,
+    the existing temperature default is selected.
+    """
+    cfg = select_method_values(_mapping(raw, "Configuration"))
+    if cfg.get("exploration_adaptive", True):
+        return "gen_exploration_target"
+    return _generation_selection(cfg)[0]
+
+
+def with_generation_selection(raw: Mapping, parameter: str) -> dict:
+    """Return an exclusive, persistable selection for a synthesized run config.
+
+    Unlike authored-order discovery, a job builder already knows which policy
+    it intends to run. Its value is taken from ``raw`` (or its normal default),
+    while both inactive values are set to zero before capturing the snapshot.
+    """
+    if parameter == "gen_exploration_target":
+        if not raw.get("exploration_adaptive", True):
+            raise ConfigError("gen_exploration_target requires exploration_adaptive=true")
+        return _mapping(raw, "Configuration")
+    if raw.get("exploration_adaptive", True):
+        raise ConfigError("Legacy generation parameters require exploration_adaptive=false")
+    if parameter not in GENERATION_PARAMETERS:
+        raise ConfigError(f"Generation parameter must be one of {GENERATION_PARAMETERS}")
+    cfg = select_method_values(_mapping(raw, "Configuration"))
+    for key in GENERATION_PARAMETERS:
+        cfg[key] = (PARAMETERS[key].normalize(key, cfg.get(key, PARAMETERS[key].default))
+                    if key == parameter else 0.0)
+    cfg[_GENERATION_METADATA] = {
+        "parameter": parameter,
+        "values": {key: cfg[key] for key in GENERATION_PARAMETERS},
+        "source": "override",
+    }
+    return cfg
+
+
 def validate_config(raw: Mapping) -> None:
     """Validate core values and ownership without materializing any defaults.
 
@@ -222,6 +315,14 @@ def validate_config(raw: Mapping) -> None:
             PARAMETERS[key].normalize(key, value)
     if cfg.get("method") == "reinforce" and cfg.get("value_normalization") == "popart":
         raise ConfigError("value_normalization=popart requires DQN or A2C. REINFORCE has no value network")
+    adaptive = cfg.get("exploration_adaptive", True)
+    inactive = ((LEGACY_EXPLORATION_KEYS | {_GENERATION_METADATA}) if adaptive
+                else ADAPTIVE_EXPLORATION_KEYS)
+    if set(cfg) & inactive:
+        required = "false" if adaptive else "true"
+        raise ConfigError(f"Exploration parameters {sorted(set(cfg) & inactive)} require exploration_adaptive={required}")
+    if not adaptive:
+        _generation_selection(cfg)
     retired = set(cfg) & (_RETIRED_KEYS | _PROPERTY_OWNED_KEYS)
     if retired:
         raise ConfigError(f"Removed top-level parameters: {sorted(retired)}; use current configuration keys")
@@ -310,7 +411,7 @@ def validate_config(raw: Mapping) -> None:
                 RewardCalibration(combiner, properties)
         except (TypeError, ValueError) as exc:
             raise ConfigError(str(exc)) from exc
-    known = set(PARAMETERS) | set(_DELEGATED_NAMES)
+    known = set(PARAMETERS) | set(_DELEGATED_NAMES) | {_GENERATION_METADATA}
     for key in cfg:
         if key in known:
             continue
@@ -349,7 +450,15 @@ def resolve_config(raw: Mapping, overrides: Mapping | None = None) -> ResolvedCo
     sources.update(dict.fromkeys(cli, "override"))
     validate_config(cfg)
     authored_keys = set(cfg)
+    adaptive = cfg.get("exploration_adaptive", True)
+    inactive = LEGACY_EXPLORATION_KEYS if adaptive else ADAPTIVE_EXPLORATION_KEYS
+    if not adaptive:
+        selected, selection_source = _generation_selection(cfg)
+        if any(key in cli for key in GENERATION_PARAMETERS) or _GENERATION_METADATA in cli:
+            selected, selection_source = _generation_selection(cli, "override")
     for key, spec in PARAMETERS.items():
+        if key in inactive:
+            continue
         if key not in cfg and (spec.default is not None or spec.nullable):
             cfg[key] = deepcopy(spec.default)
             sources[key] = "default"
@@ -375,7 +484,18 @@ def resolve_config(raw: Mapping, overrides: Mapping | None = None) -> ResolvedCo
         cfg["max_gen_attempts"] = 10 * cfg["num_gen_eps"]
         sources["max_gen_attempts"] = "derived:10*num_gen_eps"
     for key, spec in PARAMETERS.items():
-        cfg[key] = spec.normalize(key, cfg[key])
+        if key in cfg:
+            cfg[key] = spec.normalize(key, cfg[key])
+    if not adaptive:
+        for key in GENERATION_PARAMETERS:
+            if key != selected:
+                cfg[key] = 0.0
+                sources[key] = f"disabled:selection:{selected}"
+        cfg[_GENERATION_METADATA] = {
+            "parameter": selected, "values": {key: cfg[key] for key in GENERATION_PARAMETERS},
+            "source": selection_source,
+        }
+        sources[_GENERATION_METADATA] = "derived:generation-selection"
     return ResolvedConfig(cfg, sources)
 
 

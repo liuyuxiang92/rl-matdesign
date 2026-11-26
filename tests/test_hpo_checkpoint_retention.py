@@ -81,7 +81,7 @@ def _assert_nested_equal(left, right):
 ])
 def test_hpo_latest_checkpoint_retains_exact_resume(tmp_path, method, target):
     config = _config()
-    config.update(method=method, dqn_target_mode=target,
+    config.update(method=method, dqn_target_mode=target, exploration_adaptive=True,
                   dqn_warmup_eps=2, dqn_batch_size=1, exploration_target=1., pg_warmup_eps=2,
                   pg_batch_eps=1, train_count_duplicates=False, train_budget=6,
                   hpo_recording=True, hpo_phase="train", hpo_target_unique=6,

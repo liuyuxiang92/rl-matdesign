@@ -38,7 +38,7 @@ def configuration():
         "dqn_grad_steps_per_ep": 1, "dqn_hidden_dim": 16,
         "dqn_target_update_freq": 2,
         "pg_warmup_eps": 3, "pg_num_iters": 1, "pg_batch_eps": 3,
-        "exploration_adaptive": False, "num_gen_eps": 3, "max_gen_attempts": 40,
+        "exploration_adaptive": True, "num_gen_eps": 3, "max_gen_attempts": 40,
     }
 
 

@@ -11,7 +11,7 @@ from pathlib import Path
 import random
 
 from ..config_schema import (ConfigError, load_yaml_config, resolve_config,
-                             select_method_values)
+                             select_method_values, selected_generation_parameter)
 from ..rewards import RewardCombiner
 from .algorithm_profiles import METHODS, get_profile, validate_search_space
 from .spec import (_GEN_WEIGHTS, _TRAIN_WEIGHTS, _efficiency, _integer, _mapping,
@@ -124,15 +124,18 @@ def load_simplified_plan(path: Path, value, method=None) -> dict:
     objective = infer_objective(base, threshold)
     training = _mapping(raw.get("training", {}), "training",
                         {"repeats", "parameter_ranges", "score_weights", "budget", "search"})
+    parameter = selected_generation_parameter(base)
+    values_key = "gen_exploration_target" if base["exploration_adaptive"] else "initial_values"
     generation = _mapping(raw.get("generation", {}), "generation",
-                          {"repeats", "score_weights", "gen_exploration_target", "budget"})
+                          {"repeats", "score_weights", values_key, "budget"})
     repeats = _integer(training.get("repeats", 3), "training.repeats", 1)
     schedule = _seed_schedule(master, repeats)
-    profile = get_profile(method)
+    profile = get_profile(method, exploration_adaptive=base["exploration_adaptive"])
     overrides = training.get("parameter_ranges", {})
     if not isinstance(overrides, Mapping):
         raise ConfigError("training.parameter_ranges must be a mapping")
-    space = validate_search_space(method, {**profile["search_space"], **overrides})
+    space = validate_search_space(method, {**profile["search_space"], **overrides},
+                                  exploration_adaptive=base["exploration_adaptive"])
     search = _mapping(training.get("search", {}), "training.search", {"max_rounds", "trials_per_round", "startup_random_trials"})
     rounds = _integer(search.get("max_rounds", 3), "training.search.max_rounds", 1)
     trials = _integer(search.get("trials_per_round", 30), "training.search.trials_per_round", 1)
@@ -140,14 +143,18 @@ def load_simplified_plan(path: Path, value, method=None) -> dict:
     if startup > trials:
         raise ConfigError("training.search.startup_random_trials must not exceed trials_per_round")
 
-    parameter = "gen_exploration_target"
-    gen_exploration_target = generation.get("gen_exploration_target", _GENERATION_DEFAULTS)
-    if not isinstance(gen_exploration_target, list) or not gen_exploration_target:
-        raise ConfigError("generation.gen_exploration_target must be a nonempty list")
-    gen_exploration_target = [_number(value, "generation.gen_exploration_target", 0,
-                                     1) for value in gen_exploration_target]
-    if len(set(gen_exploration_target)) != len(gen_exploration_target):
-        raise ConfigError("generation.gen_exploration_target must contain distinct values")
+    generation_defaults = (_GENERATION_DEFAULTS if base["exploration_adaptive"] else
+                           [0, .001, .01, .1, 1, 10, 100, 1000] if parameter == "gen_temperature"
+                           else [0, .01, .05, .1, .2, .4, .7, 1] if parameter == "gen_epsilon"
+                           else [.001, .01, .05, .1, .25, .5, 1])
+    generation_values = generation.get(values_key, generation_defaults)
+    if not isinstance(generation_values, list) or not generation_values:
+        raise ConfigError(f"generation.{values_key} must be a nonempty list")
+    generation_values = [_number(value, f"generation.{values_key}", 0,
+                                 None if parameter == "gen_temperature" else 1)
+                         for value in generation_values]
+    if len(set(generation_values)) != len(generation_values):
+        raise ConfigError(f"generation.{values_key} must contain distinct values")
     train_budget = _phase_budget(training.get("budget", {}), "training.budget")
     gen_budget = _phase_budget(generation.get("budget", {}), "generation.budget")
     budget_mode = train_budget["mode"] if train_budget["mode"] == gen_budget["mode"] else "per_phase"
@@ -176,7 +183,7 @@ def load_simplified_plan(path: Path, value, method=None) -> dict:
                          "score_improvement": tolerance},
         "search_space": space, "extension_choices": profile["extension_choices"],
         "training_search": training_search,
-        "generation_search": {"parameter": parameter, "gen_exploration_target": sorted(gen_exploration_target),
+        "generation_search": {"parameter": parameter, values_key: sorted(generation_values),
                               "max_extra_values_per_direction": _GENERATION_MAX_EXTRA_VALUES_PER_DIRECTION,
                               "repeats_per_model": _integer(generation.get("repeats", 3), "generation.repeats", 1),
                               "master_seed": master},

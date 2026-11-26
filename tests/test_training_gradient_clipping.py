@@ -189,7 +189,7 @@ def test_a2c_nonfinite_critic_gradient_prevents_both_optimizer_steps(monkeypatch
     policy_before = copy.deepcopy(policy.state_dict())
     checkpoint = {
         "is_resume": True,
-        "exploration_state": ExplorationController(adaptive=False).state_dict(),
+        "exploration_state": ExplorationController(adaptive=True).state_dict(),
         "training_budget_state": TrainingBudget(count_duplicates=True).state_dict(),
         "gradient_clipping_state": {
             name: AdaptiveGradientClipper([1.] * 100, network=name).state_dict()

@@ -691,3 +691,31 @@
   - adaptive-exploration
   - configuration-ownership
   - exact-resume
+
+- id: decision-legacy-exploration-compatibility-001
+  date: '2026-11-26'
+  expires: '2027-05-26'
+  title: Use the existing boolean to retain historical HPO exploration temporarily
+  choice: exploration_adaptive true selects Step3 adaptive entropy exploration; false restores pre-Step3
+    DQN epsilon-greedy, episode-clock annealing, PG raw-entropy floor feedback and legacy generation/repeat
+    controls. No new mode field and no fixed-target public mode. Legacy knobs only work under false; target
+    knobs only work under true. Keep this compatibility until the user decides multi-scenario Step1-3
+    evidence justifies removal. This supersedes the removal and false=fixed behavior in decision-step3-adaptive-exploration-001.
+  alternatives_considered:
+  - An exploration_mode selector was explicitly rejected by the user.
+  - Setting false with a shared target0.7 changes the historical HPO behavior and was explicitly superseded.
+  trade_off: Two algorithm paths must remain tested. Conditional defaults must omit inactive knobs to
+    preserve roundtrip validation. Legacy generation_selection snapshots preserve selection under YAML
+    key sorting and stay outside scientific identity. Exact resumes require epsilon or entropy coefficient/visits
+    at both CLI and direct training API; old false=fixed controller state cannot be resumed as legacy.
+  files:
+  - src/rl_matdesign/config_schema.py
+  - src/rl_matdesign/training.py
+  - src/rl_matdesign/gradient_calibration.py
+  - src/rl_matdesign/experiment.py
+  - src/rl_matdesign/utils/execution_contract.py
+  - src/rl_matdesign/hpo/algorithm_profiles.py
+  tags:
+  - exploration-compatibility
+  - hpo-reproduction
+  - exact-resume

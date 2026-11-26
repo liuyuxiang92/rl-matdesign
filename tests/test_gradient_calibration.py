@@ -204,7 +204,7 @@ def test_zero_signal_pilot_stays_unresolved_without_fabricated_cap():
                 parameter.zero_()
     controllers, report = calibrate_pg_gradients(
         policy=policy, value_net=critic, episodes=_episodes(reward=0.),
-        exploration_target=0., exploration_adaptive=False, **_inputs(),
+        exploration_target=0., exploration_adaptive=True, **_inputs(),
     )
     for controller in controllers.values():
         assert controller.calibration_norms == [0.] * 100

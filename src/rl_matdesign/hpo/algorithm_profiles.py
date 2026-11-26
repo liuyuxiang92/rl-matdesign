@@ -26,10 +26,18 @@ _EXTENSIONS = {
 }
 
 
-def get_profile(method: str) -> dict:
+def get_profile(method: str, *, exploration_adaptive: bool = True) -> dict:
     if method not in METHODS:
         raise ConfigError(f"method must be one of {METHODS}, got {method!r}")
     space = deepcopy(_A2C_SPACE if method == "a2c" else _DQN_SPACE)
+    if not exploration_adaptive:
+        space.update({
+            "pg_entropy_coef": {"type": "float", "low": 1e-4, "high": 1e-1, "log": True},
+            "pg_entropy_min": {"type": "float", "low": 0.0, "high": 0.8},
+        } if method == "a2c" else {
+            "dqn_eps_min": {"type": "float", "low": 0.02, "high": 0.40},
+            "epsilon_anneal_budget_ratio": {"type": "float", "low": 0.25, "high": 2.0, "log": True},
+        })
     if method == "dqn-bootstrap":
         space["dqn_target_update_freq"] = {"type": "categorical", "choices": [10, 25, 50, 100, 200]}
     return {
@@ -39,11 +47,11 @@ def get_profile(method: str) -> dict:
     }
 
 
-def validate_parameter_value(method: str, name: str, value):
+def validate_parameter_value(method: str, name: str, value, *, exploration_adaptive: bool = True):
     """Check a value's mathematical domain, including proposed outward probes."""
-    if name not in get_profile(method)["search_space"] and name != "exploration_target":
+    if name not in get_profile(method, exploration_adaptive=exploration_adaptive)["search_space"] and not (exploration_adaptive and name == "exploration_target"):
         raise ConfigError(f"search_space parameter {name!r} is not active for {method}; fixed parameters cannot be searched")
-    if name == "warmup_budget_fraction":
+    if name in {"warmup_budget_fraction", "epsilon_anneal_budget_ratio"}:
         if isinstance(value, bool):
             raise ConfigError(f"{name} must be a finite number")
         try:
@@ -58,12 +66,12 @@ def validate_parameter_value(method: str, name: str, value):
     return PARAMETERS[name].normalize(name, value)
 
 
-def validate_search_space(method: str, space: Mapping) -> dict:
+def validate_search_space(method: str, space: Mapping, *, exploration_adaptive: bool = True) -> dict:
     if not isinstance(space, Mapping):
         raise ConfigError("search_space must be a mapping")
     result = {}
     for name, raw in space.items():
-        if name not in get_profile(method)["search_space"] and name != "exploration_target":
+        if name not in get_profile(method, exploration_adaptive=exploration_adaptive)["search_space"] and not (exploration_adaptive and name == "exploration_target"):
             raise ConfigError(f"search_space parameter {name!r} is not active for {method}")
         if not isinstance(raw, Mapping):
             raise ConfigError(f"search_space.{name} must be a mapping")
@@ -76,7 +84,7 @@ def validate_search_space(method: str, space: Mapping) -> dict:
             choices = entry.get("choices")
             if not isinstance(choices, list) or not choices:
                 raise ConfigError(f"search_space.{name}.choices must be a nonempty list")
-            choices = [validate_parameter_value(method, name, value) for value in choices]
+            choices = [validate_parameter_value(method, name, value, exploration_adaptive=exploration_adaptive) for value in choices]
             if len(set(choices)) != len(choices):
                 raise ConfigError(f"search_space.{name}.choices contains duplicates")
             result[name] = {"type": kind, "choices": sorted(choices)}
@@ -85,8 +93,8 @@ def validate_search_space(method: str, space: Mapping) -> dict:
             raise ConfigError(f"search_space.{name}.type must be float, int or categorical")
         if "low" not in entry or "high" not in entry:
             raise ConfigError(f"search_space.{name} requires low and high")
-        low = validate_parameter_value(method, name, entry["low"])
-        high = validate_parameter_value(method, name, entry["high"])
+        low = validate_parameter_value(method, name, entry["low"], exploration_adaptive=exploration_adaptive)
+        high = validate_parameter_value(method, name, entry["high"], exploration_adaptive=exploration_adaptive)
         if kind == "int" and (isinstance(low, bool) or not isinstance(low, int) or not isinstance(high, int)):
             raise ConfigError(f"search_space.{name} integer bounds must be integers")
         if name in PARAMETERS and PARAMETERS[name].kind is int and kind != "int":
@@ -139,9 +147,11 @@ def resolve_parameters(plan: Mapping, params: Mapping, budget: int) -> dict:
     if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
         raise ConfigError("budget must be a positive integer")
     method = plan["method"]
+    base = plan.get("base_config_data", {})
+    exploration_adaptive = base.get("exploration_adaptive", True)
     values = initial_parameters(plan)
     for name, value in params.items():
-        values[name] = validate_parameter_value(method, name, value)
+        values[name] = validate_parameter_value(method, name, value, exploration_adaptive=exploration_adaptive)
     base = plan.get("base_config_data", {})
     overrides = {name: value for name, value in values.items() if name in PARAMETERS}
     overrides.update({
@@ -150,6 +160,8 @@ def resolve_parameters(plan: Mapping, params: Mapping, budget: int) -> dict:
         "train_count_duplicates": False,
         "num_gen_eps": 0,
     })
+    if not exploration_adaptive:
+        overrides["pg_repeat_penalty_coef"] = 0.0
     if method != "a2c":
         warmup = max(1, round(values["warmup_budget_fraction"] * budget))
         if warmup >= budget:
@@ -160,6 +172,8 @@ def resolve_parameters(plan: Mapping, params: Mapping, budget: int) -> dict:
             "dqn_num_train_eps": budget - warmup,
             "dqn_grad_steps_per_ep": base.get("dqn_grad_steps_per_ep", PARAMETERS["dqn_grad_steps_per_ep"].default),
         })
+        if not exploration_adaptive:
+            overrides["dqn_eps_anneal_eps"] = max(1, round(values["epsilon_anneal_budget_ratio"] * (budget - warmup)))
     else:
         # The common runtime validates dormant DQN totals too. Zeroing these
         # inactive counters prevents an irrelevant default warmup rejecting B.

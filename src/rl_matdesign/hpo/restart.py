@@ -201,19 +201,12 @@ def _validate_checkpoint(directory, ledger, identities, method):
         raise ValueError("Unsupported checkpoint predictor ledger")
     _require_fields(predictor, ("n_calls", "seen", "t_predict_s", "phase", "phase_costs"),
                     "Checkpoint predictor ledger")
-    if path.name != CALIBRATION_CHECKPOINT:
-        from ..exploration import ExplorationController
-        exploration = _mapping(saved.get("exploration_state"), "Exploration state")
-        settings = _mapping(exploration.get("config"), "Exploration configuration")
-        _require_fields(settings, ("initial_target", "adaptive"), "Exploration configuration")
-        controller = ExplorationController(settings["initial_target"], settings["adaptive"])
-        controller.load_state_dict(exploration)
     if phase == "generation":
         if saved.get("type") != "hpo_generation":
             raise ValueError("Generation checkpoint has an invalid type")
-        _require_fields(saved, ("exploration_state",), "Generation checkpoint")
         contract = _mapping(saved.get("generation_contract"), "Generation sampling contract")
         _require_fields(contract, ("execution", "sampling", "frozen_artifacts"), "Generation contract")
+        _validate_exploration_state(saved, contract["sampling"])
         return
     if path.name == CALIBRATION_CHECKPOINT:
         _validate_pilot_checkpoint(directory, saved, ledger, identities)
@@ -223,6 +216,8 @@ def _validate_checkpoint(directory, ledger, identities, method):
         raise ValueError(f"Training restart requires the original scaler: {scaler}")
     _require_fields(saved, ("training_budget_state", "execution_contract", "environment_contract",
                             "scaler_fingerprint", "episodes_completed"), "Training checkpoint")
+    learning = _mapping(saved["execution_contract"].get("learning"), "Learning contract")
+    adaptive = _validate_exploration_state(saved, learning)
     from ..utils.training_budget import TrainingBudget
     training_budget = _mapping(saved["training_budget_state"], "Training budget state")
     restored_budget = TrainingBudget(count_duplicates=False,
@@ -238,7 +233,9 @@ def _validate_checkpoint(directory, ledger, identities, method):
         raise ValueError("Training checkpoint algorithm differs from campaign method")
     if saved.get("type") == "dqn":
         _require_fields(saved, ("qnet_state", "opt_state", "buffer",
-                                "training_episodes_completed", "exploration_state"), "DQN checkpoint")
+                                "training_episodes_completed"), "DQN checkpoint")
+        if not adaptive:
+            _require_fields(saved, ("eps",), "Legacy DQN checkpoint")
         learning = saved["execution_contract"].get("learning", {})
         target_mode = learning.get("dqn_target_mode", "mc" if method == "dqn_mc" else "bootstrap")
         networks, optimizers = ("qnet_state",), ("opt_state",)
@@ -246,8 +243,10 @@ def _validate_checkpoint(directory, ledger, identities, method):
             _require_fields(saved, ("target_net_state",), "DQN bootstrap checkpoint")
             networks += ("target_net_state",)
     elif saved.get("type") == "pg":
-        _require_fields(saved, ("policy_state", "opt_actor_state", "iteration", "exploration_state",
+        _require_fields(saved, ("policy_state", "opt_actor_state", "iteration",
                                 "rl_method"), "PG checkpoint")
+        if not adaptive:
+            _require_fields(saved, ("entropy_coef_eff", "visit_counts"), "Legacy PG checkpoint")
         networks, optimizers = ("policy_state",), ("opt_actor_state",)
         if saved["rl_method"] == "a2c":
             _require_fields(saved, ("value_net_state", "opt_critic_state"), "A2C checkpoint")
@@ -261,6 +260,28 @@ def _validate_checkpoint(directory, ledger, identities, method):
     for name in optimizers:
         optimizer = _mapping(saved[name], name)
         _require_fields(optimizer, ("state", "param_groups"), name)
+
+
+def _validate_exploration_state(saved, contract):
+    """Validate the selected public algorithm before accepting a synchronized restart."""
+    adaptive = contract.get("exploration_adaptive", True)
+    if not isinstance(adaptive, bool):
+        raise ValueError("Exploration contract must contain a boolean exploration_adaptive")
+    if "exploration_adaptive" in saved and saved["exploration_adaptive"] is not adaptive:
+        raise ValueError("Checkpoint exploration_adaptive differs from its contract")
+    state = saved.get("exploration_state")
+    if not adaptive:
+        if state is not None:
+            raise ValueError("Legacy exploration checkpoint cannot contain adaptive controller state")
+        return False
+    from ..exploration import ExplorationController
+    exploration = _mapping(state, "Exploration state")
+    settings = _mapping(exploration.get("config"), "Exploration configuration")
+    _require_fields(settings, ("initial_target", "adaptive"), "Exploration configuration")
+    target = contract.get("exploration_target", contract.get("gen_exploration_target", settings["initial_target"]))
+    controller = ExplorationController(target, True)
+    controller.load_state_dict(exploration)
+    return True
 
 
 def _inspect_job(directory, method):

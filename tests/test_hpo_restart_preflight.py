@@ -37,7 +37,9 @@ def _job(tmp_path, kind="a2c", phase="train", *, terminal=False):
         "hpo_state": state, "rng_state": capture_rng_state(),
         "predictor_ledger": {"schema_version": 1, "n_calls": 1, "seen": ["A"],
                              "t_predict_s": 0.1, "phase": phase, "phase_costs": {}},
-        "execution_contract": {"test": True}, "environment_contract": {"test": True},
+        "execution_contract": {"test": True, "learning": {"exploration_adaptive": True,
+                                                            "exploration_target": .7}},
+        "environment_contract": {"test": True},
         "scaler_fingerprint": "test", "episodes_completed": 1,
         "training_budget_state": training_budget.state_dict(),
         "exploration_state": ExplorationController().state_dict(),
@@ -66,6 +68,30 @@ def _job(tmp_path, kind="a2c", phase="train", *, terminal=False):
 def _snapshot(directory):
     return {str(path.relative_to(directory)): (path.read_bytes(), path.stat().st_mtime_ns)
             for path in directory.rglob("*") if path.is_file()}
+
+
+@pytest.mark.parametrize("kind,phase", [("a2c", "train"), ("dqn_mc", "train"),
+    ("dqn_bootstrap", "train"), ("a2c", "generation")])
+def test_legacy_checkpoint_audit_preserves_saved_state(tmp_path, kind, phase):
+    directory, checkpoint = _job(tmp_path, kind, phase)
+    checkpoint.update(exploration_adaptive=False, exploration_state=None)
+    if phase == "generation":
+        checkpoint["generation_contract"]["sampling"] = {"exploration_adaptive": False}
+        name = "generation_checkpoint.pt"
+    else:
+        checkpoint["execution_contract"]["learning"] = {"exploration_adaptive": False}
+        checkpoint.update({"entropy_coef_eff": .023, "visit_counts": {"A": 1}} if kind == "a2c" else {"eps": .42})
+        name = "checkpoint.pt"
+    torch.save(checkpoint, directory / name)
+    before = _snapshot(tmp_path)
+    report = inspect_restart(tmp_path)
+    assert report["ready"], report
+    assert _snapshot(tmp_path) == before
+    checkpoint["exploration_state"] = ExplorationController(.7, False).state_dict()
+    torch.save(checkpoint, directory / name)
+    report = inspect_restart(tmp_path)
+    assert not report["ready"]
+    assert "Legacy exploration" in report["jobs"][0]["reason"]
 
 
 @pytest.mark.parametrize("kind,phase", [("a2c", "train"), ("dqn_mc", "train"),

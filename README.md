@@ -191,6 +191,12 @@ canonical novelty, feasible discoveries and quality progress. Repeated candidate
 still train, but no repeat-visit penalty is added. See
 [the exploration contract](docs/yaml_config_reference.md#adaptive-exploration).
 
+Set `exploration_adaptive: false` to restore the historical algorithms: DQN
+epsilon annealing and policy-gradient raw entropy with its entropy-floor
+coefficient adjustment. This accepts the original epsilon, entropy, repeat-penalty
+and generation sampling settings. Omit both entropy-target fields in that mode;
+`false` does not freeze the Step3 targets.
+
 When sweeping budgets, hold `pg_batch_eps` fixed and vary only `pg_num_iters`;
 changing both confounds episode budget with update density.
 

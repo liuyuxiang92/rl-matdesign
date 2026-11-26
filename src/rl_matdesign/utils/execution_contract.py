@@ -66,7 +66,7 @@ def execution_contract(config, predictor, manifest_path, device) -> dict:
     describe = getattr(predictor, "oracle_identity", None)
     source_identity = getattr(predictor, "source_identity", None)
     scientific = {key: value for key, value in config.items()
-                  if key not in PARAMETERS or key in {"eval_seed", "k"}}
+                  if (key not in PARAMETERS and key != "generation_selection") or key in {"eval_seed", "k"}}
     evaluation = {"schema_version": 1, "source_sha256": digest.hexdigest(),
                   "configuration": scientific, "assets": assets,
                   "adapter_identity": describe() if callable(describe) else None,
@@ -88,9 +88,18 @@ def execution_contract(config, predictor, manifest_path, device) -> dict:
     # to PARAMETERS alone would otherwise remove it from scientific identity
     # without including it in the active algorithm's learning identity.
     from ..exploration import exploration_profile
-    learning["exploration_target"] = config.get("exploration_target", 0.7)
     learning["exploration_adaptive"] = config.get("exploration_adaptive", True)
-    learning["exploration_profile"] = exploration_profile()
+    if learning["exploration_adaptive"]:
+        learning["exploration_target"] = config.get("exploration_target", 0.7)
+        learning["exploration_profile"] = exploration_profile()
+    else:
+        learning.pop("exploration_target", None)
+        learning["exploration_profile"] = {"name": "legacy_pre_step3", "version": 1}
+        # Direct callers may provide unresolved configs. Freeze the effective
+        # defaults as well as explicitly authored legacy controls.
+        names = (("dqn_eps_min", "dqn_eps_anneal_eps") if config["method"] == "dqn"
+                 else ("pg_entropy_coef", "pg_entropy_min", "pg_repeat_penalty_coef", "pg_repeat_penalty_shape"))
+        learning.update({key: config.get(key, PARAMETERS[key].default) for key in names})
     learning["gradient_clipping"] = config.get("gradient_clipping", "none")
     if learning["gradient_clipping"] == "clipping":
         from ..gradient_clipping import gradient_clipping_profile
@@ -104,8 +113,16 @@ def execution_contract(config, predictor, manifest_path, device) -> dict:
 
 
 def generation_sampling_contract(config) -> dict:
-    """Freeze the entropy sampler and all adaptive-controller semantics."""
+    """Freeze the selected sampler and its active settings."""
     from ..exploration import exploration_profile
+    if not config.get("exploration_adaptive", True):
+        from ..config_schema import resolve_config, selected_generation_parameter
+        resolved = resolve_config(config).config
+        return {
+            "sampler": "legacy_pre_step3", "exploration_adaptive": False,
+            "parameter": selected_generation_parameter(resolved),
+            **{key: resolved[key] for key in ("gen_temperature", "gen_epsilon", "gen_top_frac", "gen_seed", "num_gen_eps")},
+        }
     return {
         "sampler": "entropy_target",
         "gen_exploration_target": config.get("gen_exploration_target", 0.7),

@@ -76,7 +76,8 @@ def training_budget_preflight(plan: dict, parameters: dict, budget: int, domain:
 
     values = initial_parameters(plan)
     for name, value in parameters.items():
-        values[name] = validate_parameter_value(plan["method"], name, value)
+        values[name] = validate_parameter_value(plan["method"], name, value,
+                                                exploration_adaptive=plan.get("base_config_data", {}).get("exploration_adaptive", True))
     specific_plan = {**plan, "search_space": {
         name: {"type": "categorical", "choices": [value]} for name, value in values.items()}}
     required = minimum_training_budget(specific_plan, domain)

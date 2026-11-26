@@ -188,6 +188,7 @@ def test_legacy_hpo_restart_obeys_sealed_release_boundary(tmp_path, legacy_sourc
             "exact audited DQN performance release",
             "Group 'metal' has unused or removed parameters: ['fraction_set', 'n_components']",
             "Removed top-level parameters: ['gen_temperature']",
+            "Exploration parameters ['gen_temperature'] require exploration_adaptive=false",
         )
         assert any(reason in checked.stderr for reason in expected_rejections)
         assert _snapshot(interrupted) == before

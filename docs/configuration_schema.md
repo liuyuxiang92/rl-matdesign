@@ -195,7 +195,16 @@ parameter definitions. A test checks it for drift.
 | `train_max_duplicate_attempts` | int | 1000 | >= 1 | Maximum consecutive duplicates in a unique-candidate budget. |
 | `exploration_target` | float | 0.7 | >= 0; <= 1 | Initial normalized action-entropy target for training. |
 | `gen_exploration_target` | float | 0.7 | >= 0; <= 1 | Initial normalized action-entropy target for candidate generation. |
-| `exploration_adaptive` | bool | True | — | Adapt exploration targets from completed candidate outcomes. |
+| `exploration_adaptive` | bool | True | — | Use Step3 adaptive entropy exploration; false restores historical epsilon/entropy controls. |
+| `dqn_eps_anneal_eps` | int | 10000 | >= 1 | Legacy DQN epsilon annealing episodes; requires exploration_adaptive=false. |
+| `dqn_eps_min` | float | 0.05 | >= 0; <= 1 | Legacy DQN minimum random-action probability. |
+| `pg_entropy_coef` | float | 0.01 | >= 0 | Legacy policy entropy coefficient. |
+| `pg_entropy_min` | float | 0.3 | >= 0; <= 1 | Legacy normalized policy entropy floor. |
+| `pg_repeat_penalty_coef` | float | 0.0 | >= 0 | Legacy repeated-candidate policy penalty coefficient. |
+| `pg_repeat_penalty_shape` | str | 'log' | log, sqrt, linear | Legacy repeated-candidate penalty growth. |
+| `gen_temperature` | float | 1.0 | >= 0 | Legacy generation softmax temperature; zero selects greedy behavior. |
+| `gen_top_frac` | float | 0.0 | >= 0; <= 1 | Legacy generation top-action fraction. |
+| `gen_epsilon` | float | 0.0 | >= 0; <= 1 | Legacy generation random-action probability. |
 | `gamma` | float | 0.9 | >= 0; <= 1 | Discount factor used by DQN, REINFORCE and A2C. |
 | `dqn_hidden_dim` | int | 256 | >= 1 | DQN hidden-layer width. |
 | `dqn_lr` | float | 0.001 | > 0 | DQN optimizer learning rate. |

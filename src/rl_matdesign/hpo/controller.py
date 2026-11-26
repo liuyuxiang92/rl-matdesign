@@ -437,7 +437,13 @@ class Campaign:
     @staticmethod
     def generation_extensions(parameter, values):
         """Return legal next endpoint probes for a selected sampling method."""
-        if parameter != "gen_exploration_target":
+        if parameter == "gen_temperature":
+            positives = [value for value in values if value > 0]
+            if not positives:
+                return []
+            return [("low", positives[0], positives[0] / 10),
+                    ("high", positives[-1], positives[-1] * 10)]
+        if parameter not in {"gen_exploration_target", "gen_top_frac", "gen_epsilon"}:
             raise CampaignError(f"Unsupported generation parameter: {parameter}")
         # These parameters have exact finite domains; reach the legal boundary
         # directly rather than inventing an unbounded multiplicative scale.
@@ -449,7 +455,7 @@ class Campaign:
         models = trained["models"]
         settings = self.plan["generation_search"]
         parameter = settings["parameter"]
-        values = sorted(set(settings["gen_exploration_target"]))
+        values = sorted(set(settings["gen_exploration_target" if parameter == "gen_exploration_target" else "initial_values"]))
         seeds, paired_models, pairings = self.generation_pairs(models)
         extensions = {"low": 0, "high": 0}
         results = []

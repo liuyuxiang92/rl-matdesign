@@ -171,7 +171,30 @@ def _budget(raw, objective):
     return result
 
 
-def _search_settings(raw, generation=False):
+def _search_settings(raw, generation=False, exploration_adaptive=True):
+    if generation and not exploration_adaptive:
+        defaults = {"parameter": "gen_temperature", "initial_values": [0, .001, .01, .1, 1, 10, 100, 1000],
+                    "max_extra_values_per_direction": 2, "fixed": {"gen_epsilon": 0, "gen_top_frac": 0},
+                    "paired_seeds": [401, 503, 607]}
+        raw = _mapping(raw, "generation_search", defaults)
+        cfg = {**deepcopy(defaults), **raw}
+        if cfg["parameter"] != "gen_temperature":
+            raise ConfigError("generation_search.parameter must be gen_temperature")
+        if not isinstance(cfg["initial_values"], list) or not cfg["initial_values"]:
+            raise ConfigError("generation_search.initial_values must be a nonempty list")
+        cfg["initial_values"] = [_number(v, "generation_search.initial_values", 0) for v in cfg["initial_values"]]
+        if len(set(cfg["initial_values"])) != len(cfg["initial_values"]) or not any(v > 0 for v in cfg["initial_values"]):
+            raise ConfigError("generation_search.initial_values requires distinct values and at least one positive temperature")
+        cfg["initial_values"].sort()
+        fixed = _mapping(cfg["fixed"], "generation_search.fixed", defaults["fixed"])
+        cfg["fixed"] = {**defaults["fixed"], **fixed}
+        for key, value in cfg["fixed"].items():
+            if _number(value, f"generation_search.fixed.{key}") != 0:
+                raise ConfigError(f"generation_search.fixed.{key} must be 0; temperature-only generation")
+            cfg["fixed"][key] = 0
+        cfg["paired_seeds"] = _seeds(cfg["paired_seeds"], "generation_search.paired_seeds")
+        cfg["max_extra_values_per_direction"] = _integer(cfg["max_extra_values_per_direction"], "generation_search.max_extra_values_per_direction")
+        return cfg
     if generation:
         defaults = {"parameter": "gen_exploration_target", "gen_exploration_target": [0, .25, .5, .7, .9, 1],
                     "max_extra_values_per_direction": 2,
@@ -253,7 +276,7 @@ def _load_legacy_plan(path: str | Path, method: str | None = None) -> dict:
     profile_ref = raw.get("parameter_profile", f"builtin:{method}")
     if not isinstance(profile_ref, str):
         raise ConfigError("parameter_profile must be a builtin name or YAML path")
-    profile = get_profile(method)
+    profile = get_profile(method, exploration_adaptive=base["exploration_adaptive"])
     if profile_ref.startswith("builtin:"):
         if profile_ref != f"builtin:{method}":
             raise ConfigError("parameter_profile must match the selected method")
@@ -270,7 +293,7 @@ def _load_legacy_plan(path: str | Path, method: str | None = None) -> dict:
         for name, choices in extensions.items():
             if not isinstance(choices, list) or not choices:
                 raise ConfigError(f"parameter_profile.extension_choices.{name} must be a nonempty list")
-            choices = [validate_parameter_value(method, name, v) for v in choices]
+            choices = [validate_parameter_value(method, name, v, exploration_adaptive=base["exploration_adaptive"]) for v in choices]
             if len(set(choices)) != len(choices):
                 raise ConfigError(f"parameter_profile.extension_choices.{name} contains duplicates")
             profile["extension_choices"][name] = sorted(choices)
@@ -278,7 +301,8 @@ def _load_legacy_plan(path: str | Path, method: str | None = None) -> dict:
     override_space = raw.get("search_space", {})
     if not isinstance(override_space, Mapping):
         raise ConfigError("search_space must be a mapping")
-    space = validate_search_space(method, {**profile["search_space"], **override_space})
+    space = validate_search_space(method, {**profile["search_space"], **override_space},
+                                  exploration_adaptive=base["exploration_adaptive"])
     objective = _objective(raw.get("objective", {}), base)
     metrics = _mapping(raw.get("metrics", {}), "metrics", {"best_fraction", "training_weights", "generation_weights"})
     metrics = {"best_fraction": _number(metrics.get("best_fraction", .10), "metrics.best_fraction", 0, 1, exclusive=True),
@@ -296,7 +320,8 @@ def _load_legacy_plan(path: str | Path, method: str | None = None) -> dict:
     training_search = _search_settings(raw.get("training_search", {}))
     if set(training_search["validation_seeds"]) & (set(ranges["seeds"]) | {ranges["confirmation_seed"]}):
         raise ConfigError("training_search.validation_seeds must be disjoint from range-search seeds")
-    generation_search = _search_settings(raw.get("generation_search", {}), generation=True)
+    generation_search = _search_settings(raw.get("generation_search", {}), generation=True,
+                                         exploration_adaptive=base["exploration_adaptive"])
     if len(generation_search["paired_seeds"]) != len(training_search["validation_seeds"]):
         raise ConfigError("generation_search.paired_seeds must pair one-to-one with training_search.validation_seeds")
     return {"protocol": "hpo_v1", "method": method, "parameter_profile": profile_ref,

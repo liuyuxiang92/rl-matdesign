@@ -65,7 +65,7 @@ def _setup(monkeypatch, sequence, *, method="reinforce"):
         scaler=StandardScaler().fit([env.current_state_features()]),
         elem_feats_scaled=np.eye(4), action_values=value_alphabet(env),
         device=torch.device("cpu"), num_iters=2, batch_eps=2,
-        exploration_adaptive=False, rl_method=method,
+        exploration_adaptive=True, rl_method=method,
     )
     return kwargs, sampled, learned
 

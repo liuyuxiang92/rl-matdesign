@@ -32,16 +32,21 @@ def test_inference_cannot_consume_training_rng_or_depend_on_query_order():
 
 
 @pytest.mark.parametrize('value_normalization', ['none', 'popart'])
+@pytest.mark.parametrize('exploration_adaptive', [True, False])
 @pytest.mark.parametrize('method,target,weights,mid', [
     ('dqn', 'mc', 'qnet.pt', 'checkpoint-ep2.pt'),
     ('dqn', 'bootstrap', 'qnet.pt', 'checkpoint-ep2.pt'),
     ('a2c', 'bootstrap', 'policy.pt', 'checkpoint-iter1.pt'),
 ])
 def test_interrupted_runner_matches_uninterrupted_training(
-    tmp_path, method, target, weights, mid, value_normalization,
+    tmp_path, method, target, weights, mid, value_normalization, exploration_adaptive,
 ):
     cfg = _popart_config() if value_normalization == 'popart' else _config()
     cfg['value_normalization'] = value_normalization
+    cfg['exploration_adaptive'] = exploration_adaptive
+    if not exploration_adaptive:
+        cfg.update({'dqn_eps_anneal_eps': 5, 'dqn_eps_min': .2} if method == 'dqn'
+                   else {'pg_entropy_coef': .03, 'pg_entropy_min': .6})
     config = tmp_path / 'config.yaml'
     config.write_text(yaml.safe_dump(cfg))
     full, resumed = tmp_path / 'full', tmp_path / 'resumed'
@@ -78,6 +83,11 @@ def test_interrupted_runner_matches_uninterrupted_training(
     assert set(left['predictor_caches']['_stats_cache']) == set(right['predictor_caches']['_stats_cache'])
     assert left['training_budget_state'] == right['training_budget_state']
     assert left['exploration_state'] == right['exploration_state']
+    assert left['exploration_adaptive'] is right['exploration_adaptive'] is exploration_adaptive
+    if not exploration_adaptive:
+        assert left['exploration_state'] is None
+        for key in (('eps',) if method == 'dqn' else ('entropy_coef_eff', 'visit_counts')):
+            assert left[key] == right[key]
     assert left['predictor_ledger']['phase_costs'] == right['predictor_ledger']['phase_costs']
     assert torch.equal(left['rng_state']['torch_cpu'], right['rng_state']['torch_cpu'])
 

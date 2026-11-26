@@ -70,7 +70,7 @@ def run(env, tmp_path, **overrides):
         batch_size=1,
         dqn_grad_steps_per_ep=1,
         dqn_target_update_freq=2,
-        exploration_adaptive=False,
+        exploration_adaptive=True,
         checkpoint_cfg={"path": str(tmp_path / "checkpoint.pt"), "freq": 1},
     )
     kwargs.update(overrides)

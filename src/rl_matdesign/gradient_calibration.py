@@ -125,8 +125,8 @@ def calibrate_dqn_gradients(*, qnet, target_net, episodes, scaler, elem_feats_sc
 
 def calibrate_pg_gradients(*, policy, value_net, episodes, scaler, elem_feats_scaled,
                            action_values, device, gamma, exploration_target=.7,
-                           exploration_adaptive=True):
-    from .training import _episode_pg_terms
+                           exploration_adaptive=True, entropy_coef=.01, entropy_min=.3):
+    from .training import _episode_pg_terms, entropy_coef_update
     from .exploration import ExplorationController
 
     started = time.perf_counter()
@@ -152,28 +152,42 @@ def calibrate_pg_gradients(*, policy, value_net, episodes, scaler, elem_feats_sc
         def terms(episode, values):
             return _episode_pg_terms(path=episode.path, returns=values, policy=actor,
                                      value_net=critic, scaler=scaler, elem_feats_scaled=elem_feats_scaled,
-                                     action_values=action_values, device=device)
+                                     action_values=action_values, device=device,
+                                     exploration_adaptive=exploration_adaptive)
 
         # One fixed pilot-wide actor scaling, so single-step episodes retain a
         # meaningful advantage instead of centering each candidate to zero.
-        all_adv = []
+        all_adv, all_entropy, all_max_entropy = [], [], []
         with torch.no_grad():
             for episode, values in zip(episodes, returns):
-                _, advantages, _, _ = terms(episode, values)
+                result = terms(episode, values)
+                if exploration_adaptive:
+                    _, advantages, _, _ = result
+                else:
+                    _, advantages, entropies, maximum, _ = result
+                    all_entropy.extend(float(e) for e in entropies)
+                    all_max_entropy.extend(maximum)
                 all_adv.extend(advantages)
         adv_tensor = torch.tensor(all_adv, dtype=torch.float32, device=device)
         mean, std = adv_tensor.mean(), adv_tensor.std(unbiased=False)
         # The first real update uses this coefficient. The disposable probe must
         # neither advance the learner controller nor use a different loss.
-        effective_coef = ExplorationController(
-            initial_target=exploration_target, adaptive=exploration_adaptive,
-        ).coefficient
+        if exploration_adaptive:
+            effective_coef = ExplorationController(initial_target=exploration_target, adaptive=True).coefficient
+        else:
+            maximum = float(np.mean(all_max_entropy))
+            entropy_norm = float(np.mean(all_entropy)) / maximum if maximum > 1e-8 else 0.0
+            effective_coef = entropy_coef_update(entropy_coef, entropy_norm, entropy_coef, entropy_min)
         actor_norms, critic_norms = [], []
         for episode, values in zip(episodes, returns):
             actor.zero_grad(set_to_none=True)
             if critic is not None:
                 critic.zero_grad(set_to_none=True)
-            logp, advantages, entropies, critic_losses = terms(episode, values)
+            result = terms(episode, values)
+            if exploration_adaptive:
+                logp, advantages, entropies, critic_losses = result
+            else:
+                logp, advantages, entropies, _, critic_losses = result
             if not logp:
                 raise ValueError("Gradient calibration candidate has no legal policy terms")
             advantages = torch.tensor(advantages, dtype=torch.float32, device=device)
@@ -196,5 +210,8 @@ def calibrate_pg_gradients(*, policy, value_net, episodes, scaler, elem_feats_sc
             controllers["critic"] = AdaptiveGradientClipper(critic_norms, network="critic")
         report = _report(controllers, flat_targets, started)
         report.update(actor_advantage_mean=float(mean), actor_advantage_std=float(std),
-                      actor_entropy_coefficient=effective_coef)
+                      actor_entropy_coefficient=effective_coef,
+                      exploration_adaptive=exploration_adaptive,
+                      actor_entropy_rule=("mean_normalized_entropy" if exploration_adaptive
+                                          else "legacy_raw_entropy_ratio_of_means_feedback"))
         return controllers, report

@@ -86,6 +86,11 @@ def _exploration_observation(episode) -> dict:
 
 def _flush_exploration(controller, pending, env) -> dict:
     """Apply outcome feedback after the behavior collection block has completed."""
+    if controller is None:
+        pending.clear()
+        env.exploration_state = None
+        env.exploration_seen_keys = []
+        return {}
     diagnostics = controller.observe_block(pending) if pending else controller.diagnostics()
     pending.clear()
     env.exploration_state = controller.state_dict()
@@ -94,6 +99,8 @@ def _flush_exploration(controller, pending, env) -> dict:
 
 
 def _exploration_metrics(controller):
+    if controller is None:
+        return {}
     return {"exploration_" + key: value for key, value in controller.diagnostics().items()}
 
 
@@ -105,12 +112,36 @@ def _exploration_failure(pending):
 
 
 def _restore_exploration(initial_target, adaptive, state, *, resuming=False):
-    controller = ExplorationController(initial_target=initial_target, adaptive=adaptive)
+    if not adaptive:
+        if state is not None:
+            raise ValueError("Historical exploration cannot resume a Step3 exploration state")
+        return None
+    controller = ExplorationController(initial_target=initial_target, adaptive=True)
     if resuming and state is None:
         raise ValueError("Exact resume requires exploration_state; old exploration checkpoints cannot be resumed")
     if state is not None:
         controller.load_state_dict(state)
     return controller
+
+
+def _validate_exploration_resume(adaptive, state, *, exact, legacy_fields):
+    """Reject mode changes or incomplete historical state before training resumes."""
+    if state is None:
+        return
+    if "exploration_adaptive" in state and state["exploration_adaptive"] is not bool(adaptive):
+        raise ValueError("Checkpoint exploration_adaptive does not match requested exploration_adaptive")
+    if exact and not adaptive:
+        missing = [name for name in legacy_fields if state.get(name) is None]
+        if missing:
+            raise ValueError("Exact legacy exploration resume requires " + ", ".join(missing))
+
+
+def _exploration_state(controller):
+    return controller.state_dict() if controller is not None else None
+
+
+def _exploration_target(controller):
+    return controller.target if controller is not None else None
 
 
 def _record_sampling_entropy(diagnostics, stage, probabilities):
@@ -714,6 +745,8 @@ def train_dqn_online(
     dqn_target_update_freq: int = 100,
     exploration_target: float = 0.7,
     exploration_adaptive: bool = True,
+    dqn_eps_anneal_eps: int = 10000,
+    dqn_eps_min: float = 0.05,
     gamma: float = 0.9,
     lr: float = 1e-3,
     loss_name: str = "smoothl1",
@@ -730,14 +763,21 @@ def train_dqn_online(
     gradient_clipping: str = "none",
     gradient_calibration_episodes=None,
 ) -> Tuple[torch.nn.Module, StandardScaler, List[dict]]:
-    """Online MC/bootstrap DQN with entropy-controlled legal-action sampling.
+    """Online MC/bootstrap DQN with adaptive entropy or historical epsilon sampling.
 
     Random rewarded warmup fits the feature scaler and fills replay. Online
     episodes retain the selected MC/TD target, replay and target-copy schedules.
-    The exploration controller observes completed scientific outcomes only after
-    each prefetched wave drains, and is restored exactly with optimizer/replay.
+    When enabled, the exploration controller observes completed scientific
+    outcomes after each prefetched wave drains. False restores the historical
+    epsilon schedule. Both modes restore their state with optimizer/replay.
     Unique budgets still learn from repeated episodes; attempts remain observable.
     """
+    if not exploration_adaptive and (dqn_eps_anneal_eps < 1 or not 0 <= dqn_eps_min <= 1):
+        raise ValueError("Legacy epsilon requires anneal episodes >= 1 and epsilon in [0, 1]")
+    exact_resume = resume_state is not None and resume_state.get("exact_resume", True) is not False
+    _validate_exploration_resume(
+        exploration_adaptive, resume_state, exact=exact_resume, legacy_fields=("eps",),
+    )
     if resume_state is None and n_warmup_eps < 1:
         raise ValueError("Fresh DQN training requires dqn_warmup_eps >= 1 to fit the state scaler")
     from .model import QRegressor
@@ -787,9 +827,9 @@ def train_dqn_online(
     exploration = _restore_exploration(
         exploration_target, exploration_adaptive,
         (resume_state or {}).get("exploration_state"),
-        resuming=resume_state is not None and resume_state.get("exact_resume", True),
+        resuming=exact_resume,
     )
-    if resume_state is None or not resume_state.get("exact_resume", True):
+    if exploration is not None and not exact_resume:
         exploration.seed_seen(repr(ep.terminal_key) for ep in gradient_calibration_episodes or ())
         exploration.seed_seen(getattr(env, "exploration_seen_keys", ()))
 
@@ -817,9 +857,11 @@ def train_dqn_online(
         buffer     = resume_state["buffer"]
         start_ep   = int(resume_state.get("start_ep", 0))
         train_attempts = int(resume_state.get("training_episodes_completed", start_ep))
+        saved_eps = resume_state.get("eps")
+        eps = float(saved_eps if saved_eps is not None else max(dqn_eps_min, 1.0 - start_ep / dqn_eps_anneal_eps))
         loss_fn    = _make_loss_fn(loss_name)
         print(
-            f"[INFO] DQN resume: start_ep={start_ep}, entropy_target={exploration.target:.4f}, "
+            f"[INFO] DQN resume: start_ep={start_ep}, exploration={_exploration_target(exploration) if exploration_adaptive else eps}, "
             f"buffer_rows={len(buffer)}",
             flush=True,
         )
@@ -854,7 +896,7 @@ def train_dqn_online(
                     "episode": warmup_attempts,
                     "return": float(episode.path[-1].reward),
                     "terminal_reward": float(episode.path[-1].reward),
-                    "exploration_target_used": 1.0,
+                    **({"exploration_target_used": 1.0} if exploration_adaptive else {"epsilon": 1.0}),
                     "terminal_comp_key": str(episode.terminal_key),
                     "budget_counted": counted,
                     "training_budget_history_complete": budget_history_complete,
@@ -902,7 +944,9 @@ def train_dqn_online(
         start_ep = 0
         train_attempts = 0
         # Random warmup is an archive seed, not an adaptive-policy observation.
-        exploration.seed_seen(repr(key) for key in budget.state_dict()["seen_keys"])
+        eps = 1.0
+        if exploration is not None:
+            exploration.seed_seen(repr(key) for key in budget.state_dict()["seen_keys"])
         exploration_pending.clear()
 
     gradient_clipper = None
@@ -951,7 +995,9 @@ def train_dqn_online(
             "target_net_state": target_net.state_dict() if target_net is not None else None, "opt_state": optimizer.state_dict(),
             "gradient_clipping_state": gradient_clipper.state_dict() if gradient_clipper else None,
             "buffer": list(buffer), "scaler": scaler,
-            "exploration_state": exploration.state_dict(),
+            "exploration_state": _exploration_state(exploration),
+            "exploration_adaptive": exploration_adaptive,
+            **({"eps": eps} if not exploration_adaptive else {}),
             "training_budget_state": budget.state_dict(),
         }
 
@@ -959,11 +1005,32 @@ def train_dqn_online(
     from .utils.td_target_cache import TDTargetCache
     target_cache = TDTargetCache() if dqn_target_mode == "bootstrap" else None
 
+    def _rollout_eps_greedy_episode() -> None:
+        # Collect one episode with epsilon-greedy policy.
+        env.initialize()
+        for _t in _episode_steps(env):
+            _allowed = _legal_actions(env)
+            _s_mat_sc = scaler.transform(
+                env.current_state_features().reshape(1, -1))[0]
+            _s_step = np.zeros(env.max_steps, dtype=float)
+            _s_step[env.counter] = 1.0
+            if float(np.random.rand()) < eps:
+                _a = random.choice(_allowed)
+            else:
+                _a = choose_action(
+                    model=qnet, device=device,
+                    s_material=_s_mat_sc, s_step=_s_step,
+                    allowed_actions=_allowed,
+                    elem_feats_scaled=elem_feats_scaled,
+                    action_values=action_values, exploration_adaptive=False,
+                )
+            env.step(_a)
+
     def _rollout_entropy_episode() -> None:
         _rollout_policy_episode(
             env=env, qnet=qnet, scaler=scaler, device=device,
             elem_feats_scaled=elem_feats_scaled, action_values=action_values,
-            exploration_target=exploration.target,
+            exploration_target=_exploration_target(exploration),
         )
 
     completed = start_ep
@@ -971,14 +1038,15 @@ def train_dqn_online(
         budget.check_can_sample()
         qnet.eval()
         episode = evaluator.next(
-            _rollout_entropy_episode,
+            _rollout_entropy_episode if exploration_adaptive else _rollout_eps_greedy_episode,
             limit=training_wave_limit(
                 budget, dqn_num_train_eps - completed,
                 checkpoint_freq=ckpt_freq if ckpt_path else 0,
                 completed_attempts=train_attempts,
             ),
             retry_scalar=_rollout_with_retry,
-            metadata={"exploration_target_used": exploration.target},
+            metadata=({"exploration_target_used": _exploration_target(exploration)}
+                      if exploration_adaptive else {"epsilon_used": eps}),
             phase="dqn_train",
         )
         counted = budget.record(episode.terminal_key)
@@ -1041,6 +1109,9 @@ def train_dqn_online(
             target_net.eval()
             target_cache.clear()
 
+        if not exploration_adaptive:
+            # Preserve the historical one-episode lag, including duplicate episodes.
+            eps = max(dqn_eps_min, 1.0 - (train_attempts - 1) / dqn_eps_anneal_eps)
         exploration_pending.append(_exploration_observation(episode))
         if not evaluator.pending:
             _flush_exploration(exploration, exploration_pending, env)
@@ -1063,7 +1134,8 @@ def train_dqn_online(
             "train_loss": mean_loss,
             "optimizer_steps": optimizer_steps,
             **_exploration_metrics(exploration),
-            "exploration_target_used": episode.metadata["exploration_target_used"],
+            **({"exploration_target_used": episode.metadata["exploration_target_used"]}
+               if exploration_adaptive else {"epsilon": eps, "epsilon_used": episode.metadata["epsilon_used"]}),
             "exploration_entropy": episode.metadata.get("exploration_entropy"),
             "exploration_entropy_by_stage": json.dumps(episode.metadata.get("exploration_entropy_by_stage", {}), sort_keys=True),
             "buffer_rows": len(buffer),
@@ -1092,7 +1164,7 @@ def train_dqn_online(
         _record_episode_timing(timer, _row)
         pbar.update(int(counted))
         pbar.set_postfix(
-            target=f"{exploration.target:.3f}",
+            **({"target": f"{_exploration_target(exploration):.3f}"} if exploration_adaptive else {"eps": f"{eps:.3f}"}),
             loss=f"{mean_loss:.4f}" if not math.isnan(mean_loss) else "warmup",
             ret=f"{episode_reward:.3f}",
         )
@@ -1127,7 +1199,9 @@ def train_dqn_online(
                     "gradient_clipping_state": gradient_clipper.state_dict() if gradient_clipper else None,
                     "buffer": list(buffer),
                     "dqn_buffer_size": dqn_buffer_size,
-                    "exploration_state": exploration.state_dict(),
+                    "exploration_state": _exploration_state(exploration),
+                    "exploration_adaptive": exploration_adaptive,
+                    **({"eps": eps} if not exploration_adaptive else {}),
                 }, numbered_path=_numbered)
             tqdm.write(f"[INFO] DQN checkpoint saved at episode {train_attempts} "
                        f"(budget {completed}/{dqn_num_train_eps}) → {_numbered or ckpt_path}")
@@ -1151,12 +1225,19 @@ def choose_action(
     elem_feats_scaled: np.ndarray,
     action_values: List[str],
     exploration_target: float = 0.7,
+    exploration_adaptive: bool = True,
+    gen_epsilon: float = 0.0,
+    gen_top_frac: float = 0.0,
+    gen_temperature: float = 0.0,
     sampling_diagnostics: Optional[dict] = None,
 ) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
     """Sample legal Q actions at the requested normalized entropy."""
     n = len(allowed_actions)
     if not n:
         raise InfeasibleEpisode("Cannot choose an action from an empty legal set")
+
+    if not exploration_adaptive and gen_epsilon > 0.0 and float(np.random.rand()) < gen_epsilon:
+        return allowed_actions[int(np.random.randint(n))]
 
     a_elem = np.asarray(
         [elem_feats_scaled[int(np.argmax(a[0]))] for a in allowed_actions], dtype=float
@@ -1172,6 +1253,21 @@ def choose_action(
             torch.tensor(a_elem,   dtype=torch.float32, device=device),
             torch.tensor(a_comp,   dtype=torch.float32, device=device),
         ).reshape(-1)
+
+    if not exploration_adaptive:
+        if gen_temperature > 0.0:
+            q_np = q.cpu().numpy().astype(float) / gen_temperature
+            q_np -= q_np.max()
+            probs = np.exp(q_np); probs /= probs.sum()
+            return allowed_actions[int(np.random.choice(n, p=probs))]
+
+        if gen_top_frac > 0.0:
+            k = max(1, int(round(gen_top_frac * n)))
+            topk = torch.argsort(q, descending=True).cpu().tolist()[:k]
+            return allowed_actions[int(np.random.choice(topk))]
+
+        # Pure greedy argmax (default for DQN training rollouts).
+        return allowed_actions[int(torch.argmax(q).item())]
 
     probs = _sampler_probabilities(q.cpu().numpy().astype(float), exploration_target, model)
     _record_sampling_entropy(sampling_diagnostics, int(np.argmax(s_step)), probs)
@@ -1229,6 +1325,10 @@ def _rollout_policy_episode(
     elem_feats_scaled: np.ndarray,
     action_values: List[str],
     exploration_target: float = 0.7,
+    exploration_adaptive: bool = True,
+    gen_epsilon: float = 0.0,
+    gen_top_frac: float = 0.0,
+    gen_temperature: float = 1.0,
 ) -> None:
     """Roll out one episode guided by a Q-network (used during generation)."""
     env.initialize()
@@ -1245,7 +1345,8 @@ def _rollout_policy_episode(
             allowed_actions=allowed,
             elem_feats_scaled=elem_feats_scaled,
             action_values=action_values,
-            exploration_target=exploration_target,
+            exploration_target=exploration_target, exploration_adaptive=exploration_adaptive,
+            gen_epsilon=gen_epsilon, gen_top_frac=gen_top_frac, gen_temperature=gen_temperature,
             sampling_diagnostics=env.exploration_diagnostics,
         )
         env.step(a)
@@ -1335,6 +1436,21 @@ def _rollout_pg_episode(
 # Policy gradient training (REINFORCE / A2C)
 # ---------------------------------------------------------------------------
 
+def entropy_coef_update(coef_eff: float, entropy_norm: float,
+                        base_coef: float, floor: float) -> float:
+    """One step of the entropy-floor controller.
+
+    ``entropy_norm`` is ``H / ln|A|`` in [0, 1]; ``floor`` is ``pg_entropy_min``.
+    Below the floor the weight grows, above it decays back toward ``base_coef``,
+    which acts as the lower clamp so the controller can only ever *add* pressure
+    to explore. ``floor <= 0`` disables it and pins the weight at ``base_coef``.
+    """
+    if floor <= 0.0:
+        return base_coef
+    coef_eff *= math.exp(2.0 * (floor - entropy_norm))
+    return min(max(coef_eff, base_coef), base_coef * 100.0)
+
+
 def _episode_pg_terms(
     *,
     path,
@@ -1345,10 +1461,13 @@ def _episode_pg_terms(
     elem_feats_scaled: np.ndarray,
     action_values: List[str],
     device: "torch.device",
+    exploration_adaptive: bool = True,
 ) -> tuple:
     """Build per-step policy-gradient *components* for one episode.
 
-    Returns ``(logp_taken, advantage_raw, normalized_entropy, critic_loss)``
+    Adaptive mode returns ``(logp_taken, advantage_raw, normalized_entropy, critic_loss)``.
+    Historical mode inserts the per-step maximum entropy before critic_loss and
+    uses raw float32 entropy, including forced decisions. Both return components
     rather than a finished actor loss. The advantage is deliberately left
     un-scaled and separate from ``logp`` so :func:`train_pg` can standardise it
     across the whole batch before forming ``-logp * adv`` — folding the two
@@ -1361,6 +1480,7 @@ def _episode_pg_terms(
     advantages_raw: List[float] = []
     entropy_terms: List[torch.Tensor] = []
     critic_losses: List[torch.Tensor] = []
+    max_entropies: List[float] = []
 
     value_normalizer = getattr(value_net, "value_normalizer", None)
     for step, G_t in zip(path, returns):
@@ -1421,7 +1541,11 @@ def _episode_pg_terms(
 
         logp_taken.append(log_probs[taken_idx])
         advantages_raw.append(float(advantage))
-        if n > 1:
+        if not exploration_adaptive:
+            probs = torch.softmax(logits, dim=0)
+            entropy_terms.append(-(probs * log_probs).sum())
+            max_entropies.append(math.log(n) if n > 1 else 0.0)
+        elif n > 1:
             # Compute this small entropy reduction in float64: finite float32
             # logit differences and H/log(n) gradients can otherwise overflow.
             entropy_log_probs = torch.log_softmax(logits.double(), dim=0)
@@ -1429,6 +1553,8 @@ def _episode_pg_terms(
             safe_logs = entropy_log_probs.clamp_min(torch.finfo(torch.float32).min)
             entropy_terms.append(-(entropy_probs * safe_logs).sum() / math.log(n))
 
+    if not exploration_adaptive:
+        return logp_taken, advantages_raw, entropy_terms, max_entropies, critic_losses
     return logp_taken, advantages_raw, entropy_terms, critic_losses
 
 
@@ -1448,6 +1574,10 @@ def train_pg(
     lr_critic: float = 1e-3,
     exploration_target: float = 0.7,
     exploration_adaptive: bool = True,
+    pg_entropy_coef: float = 0.01,
+    pg_entropy_min: float = 0.3,
+    pg_repeat_penalty_coef: float = 0.0,
+    pg_repeat_penalty_shape: str = "log",
     rl_method: str = "a2c",
     max_train_attempts: Optional[int] = None,
     train_count_duplicates: bool = False,
@@ -1461,8 +1591,9 @@ def train_pg(
     """On-policy actor/critic updates with normalized entropy feedback.
 
     Duplicate trajectories retain their scientific returns and participate in
-    learning without visit penalties. Fixed or adaptive entropy targets share
-    one controller; outcome feedback changes the target only between batches.
+    learning without visit penalties in adaptive mode. With exploration_adaptive=False,
+    historical raw-entropy feedback and optional repeat penalties are restored.
+    Adaptive outcome feedback changes the target only between batches.
     The actor samples its own softmax, and its loss uses the identical masked
     distribution. Forced decisions contribute no entropy observation or bonus.
     """
@@ -1472,6 +1603,10 @@ def train_pg(
         or checkpoint_cfg.get("start_episode", 0)
         or checkpoint_cfg.get("opt_actor_state") is not None
     ))
+    _validate_exploration_resume(
+        exploration_adaptive, checkpoint_cfg, exact=resuming,
+        legacy_fields=("entropy_coef_eff", "visit_counts"),
+    )
     if gradient_clipping not in ("none", "clipping"):
         raise ValueError("gradient_clipping must be none or clipping")
     if gradient_clipping == "clipping" and not resuming:
@@ -1505,7 +1640,7 @@ def train_pg(
         exploration_target, exploration_adaptive,
         (checkpoint_cfg or {}).get("exploration_state"), resuming=resuming,
     )
-    if not resuming:
+    if not resuming and exploration is not None:
         exploration.seed_seen(repr(ep.terminal_key) for ep in gradient_calibration_episodes or ())
         exploration.seed_seen(getattr(env, "exploration_seen_keys", ()))
 
@@ -1540,6 +1675,9 @@ def train_pg(
         if opt_critic is not None and checkpoint_cfg.get("opt_critic_state") is not None:
             opt_critic.load_state_dict(checkpoint_cfg["opt_critic_state"])
 
+    visit_counts = collections.Counter((checkpoint_cfg or {}).get("visit_counts") or {})
+    saved_coef = (checkpoint_cfg or {}).get("entropy_coef_eff")
+    coef_eff = float(saved_coef if saved_coef is not None else pg_entropy_coef)
     gradient_clippers = {}
     recorder = getattr(env, "hpo_recorder", None)
     if recorder is not None:
@@ -1550,10 +1688,14 @@ def train_pg(
             "gradient_clipping_state": {name: ctl.state_dict() for name, ctl in gradient_clippers.items()},
             "opt_critic_state": opt_critic.state_dict() if opt_critic is not None else None,
             "scaler": scaler, "training_budget_state": budget.state_dict(),
-            "exploration_state": exploration.state_dict(),
+            "exploration_state": _exploration_state(exploration),
+            "exploration_adaptive": exploration_adaptive,
+            **({"visit_counts": dict(visit_counts), "entropy_coef_eff": coef_eff}
+               if not exploration_adaptive else {}),
         }
 
-    coef_eff = exploration.coefficient
+    if exploration_adaptive:
+        coef_eff = exploration.coefficient
     _flush_exploration(exploration, exploration_pending, env)
 
     if gradient_clipping == "clipping":
@@ -1572,6 +1714,7 @@ def train_pg(
                 scaler=scaler, elem_feats_scaled=elem_feats_scaled, action_values=action_values,
                 device=device, gamma=gamma, exploration_target=exploration_target,
                 exploration_adaptive=exploration_adaptive,
+                entropy_coef=pg_entropy_coef, entropy_min=pg_entropy_min,
             )
             write_gradient_report(checkpoint_cfg, report)
     elif gradient_clipping != "none":
@@ -1622,7 +1765,9 @@ def train_pg(
         batch_paths: List[list] = []
         batch_returns: List[List[float]] = []
         batch_terminal_keys: List[tuple] = []
-        batch_target = exploration.target
+        batch_target = _exploration_target(exploration)
+        batch_repeat_penalties: List[float] = []
+        batch_visits_before: List[int] = []
         # One record per *sampled episode*, so the PG training-reward distribution is
         # comparable with DQN's (which logs every episode). The pg_train row below
         # only carries the batch mean, which hides the low-temperature tail entirely.
@@ -1674,11 +1819,29 @@ def train_pg(
             budget_counted = budget.record(terminal_key)
             if not train_count_duplicates and budget_counted:
                 outer_pbar.update(1)
+            n_visits_before = visit_counts[terminal_key]
+            if not exploration_adaptive and pg_repeat_penalty_coef > 0.0:
+                if pg_repeat_penalty_shape == "log":
+                    repeat_penalty = pg_repeat_penalty_coef * math.log1p(n_visits_before)
+                elif pg_repeat_penalty_shape == "sqrt":
+                    repeat_penalty = pg_repeat_penalty_coef * math.sqrt(n_visits_before)
+                else:
+                    repeat_penalty = pg_repeat_penalty_coef * float(n_visits_before)
+            else:
+                repeat_penalty = 0.0
+            visit_counts[terminal_key] += 1
+            # The penalty is applied *after* advantage standardisation (below), so
+            # the coefficient is in σ of batch return rather than in the property's
+            # own units. Subtracting it from the raw return here would make it a
+            # no-op: 0.1*ln(1+4472) = 0.84 against returns of ~436 is 0.2%.
+
             exploration_pending.append(_exploration_observation(episode))
 
             batch_paths.append(path)
             batch_returns.append(returns)
             batch_terminal_keys.append(terminal_key)
+            batch_repeat_penalties.append(repeat_penalty)
+            batch_visits_before.append(n_visits_before)
             collected += 1
             accepted += 1
             batch_ep_rows.append({
@@ -1693,6 +1856,8 @@ def train_pg(
                 # two are NOT comparable without this column. Log it explicitly
                 # rather than making every reader re-derive gamma from run_config.
                 "terminal_reward": float(path[-1].reward),
+                **({"repeat_penalty": repeat_penalty, "visit_count_before": n_visits_before}
+                   if not exploration_adaptive else {}),
                 "exploration_target_used": batch_target,
                 "exploration_entropy": episode.metadata.get("exploration_entropy"),
                 "exploration_entropy_by_stage": json.dumps(episode.metadata.get("exploration_entropy_by_stage", {}), sort_keys=True),
@@ -1725,8 +1890,10 @@ def train_pg(
         all_adv_raw: List[float] = []
         all_entropy: List[torch.Tensor] = []
         all_critic: List[torch.Tensor] = []
-        for path, returns in zip(batch_paths, batch_returns):
-            lp, adv, e_terms, c_terms = _episode_pg_terms(
+        all_penalty: List[float] = []
+        all_max_entropy: List[float] = []
+        for path, returns, penalty in zip(batch_paths, batch_returns, batch_repeat_penalties):
+            terms = _episode_pg_terms(
                 path=path,
                 returns=returns,
                 policy=policy,
@@ -1734,8 +1901,14 @@ def train_pg(
                 scaler=scaler,
                 elem_feats_scaled=elem_feats_scaled,
                 action_values=action_values,
-                device=device,
+                device=device, exploration_adaptive=exploration_adaptive,
             )
+            if exploration_adaptive:
+                lp, adv, e_terms, c_terms = terms
+            else:
+                lp, adv, e_terms, h_max, c_terms = terms
+                all_max_entropy.extend(h_max)
+            all_penalty.extend([penalty] * len(adv))
             all_logp.extend(lp)
             all_adv_raw.extend(adv)
             all_entropy.extend(e_terms)
@@ -1758,12 +1931,20 @@ def train_pg(
             # full-magnitude gradient, so emit a zero update instead.
             adv = torch.zeros_like(adv_raw)
 
+        if not exploration_adaptive:
+            adv = adv - torch.tensor(all_penalty, dtype=torch.float32, device=device)
         logp_t = torch.stack(all_logp)
         actor_loss = -(logp_t * adv).mean()
         entropy_bonus = (torch.stack(all_entropy).mean() if all_entropy
                          else actor_loss * 0.0)
-        entropy_norm = float(entropy_bonus.detach()) if all_entropy else None
-        coef_eff = exploration.coefficient
+        if exploration_adaptive:
+            entropy_norm = float(entropy_bonus.detach()) if all_entropy else None
+            coef_eff = exploration.coefficient
+        else:
+            mean_max_entropy = float(np.mean(all_max_entropy)) if all_max_entropy else 0.0
+            entropy_norm = float(entropy_bonus.item()) / mean_max_entropy if mean_max_entropy > 1e-8 else 0.0
+            # Historical feedback affects this very update, before backward.
+            coef_eff = entropy_coef_update(coef_eff, entropy_norm, pg_entropy_coef, pg_entropy_min)
         total_actor_loss = actor_loss - coef_eff * entropy_bonus
 
         clip_diagnostics = {}
@@ -1820,7 +2001,8 @@ def train_pg(
             _record_episode_timing(timer, row)
 
         # Coefficient and target changes affect only the next on-policy batch.
-        exploration.update_entropy(entropy_norm)
+        if exploration_adaptive:
+            exploration.update_entropy(entropy_norm)
         _flush_exploration(exploration, exploration_pending, env)
         update_idx += 1
         ep_actor_loss = float(actor_loss.item())
@@ -1851,7 +2033,13 @@ def train_pg(
             "entropy": ep_entropy,
             "entropy_norm": entropy_norm,
             "exploration_coefficient_used": coef_eff,
-            "exploration_coefficient": exploration.coefficient,
+            "exploration_coefficient": exploration.coefficient if exploration_adaptive else None,
+            **({"entropy_coef_eff": coef_eff,
+                "return_shaped": mean_return_raw - float(np.mean(all_penalty)) * adv_std,
+                "repeat_penalty": float(np.mean(batch_repeat_penalties)),
+                "visit_count_before": int(np.max(batch_visits_before)),
+                "max_visit_count": max(visit_counts.values()) if visit_counts else 0}
+               if not exploration_adaptive else {}),
             "adv_mean_raw": adv_mean,
             "adv_std_raw": adv_std,
             "critic_loss": critic_loss_val,
@@ -1903,7 +2091,10 @@ def train_pg(
                     "opt_actor_state": opt_actor.state_dict(),
                     "gradient_clipping_state": {name: ctl.state_dict() for name, ctl in gradient_clippers.items()},
                     "opt_critic_state": opt_critic.state_dict() if opt_critic is not None else None,
-                    "exploration_state": exploration.state_dict(),
+                    "exploration_state": _exploration_state(exploration),
+                    "exploration_adaptive": exploration_adaptive,
+                    **({"visit_counts": dict(visit_counts), "entropy_coef_eff": coef_eff}
+                       if not exploration_adaptive else {}),
                     "training_sample_session_id": training_samples.session_id if training_samples else None,
                     "training_budget_state": budget.state_dict(),
                     "hpo_state": env.hpo_recorder.checkpoint_state() if getattr(env, "hpo_recorder", None) is not None else None,
@@ -1935,6 +2126,10 @@ def _pg_single_episode_generate(
     action_values: List[str],
     device: torch.device,
     exploration_target: float = 0.7,
+    exploration_adaptive: bool = True,
+    gen_epsilon: float = 0.0,
+    gen_top_frac: float = 0.0,
+    gen_temperature: float = 1.0,
 ) -> None:
     """Generate with a frozen actor and entropy-controlled legal actions."""
     env.initialize()
@@ -1962,9 +2157,25 @@ def _pg_single_episode_generate(
                 torch.tensor(a_comp_batch, dtype=torch.float32, device=device),
             ).reshape(-1)
 
-        probs = _sampler_probabilities(logits.cpu().numpy().astype(float), exploration_target)
-        _record_sampling_entropy(env.exploration_diagnostics, env.counter, probs)
-        idx = int(np.random.choice(n, p=probs))
+        if not exploration_adaptive:
+            if gen_epsilon > 0.0 and float(np.random.rand()) < gen_epsilon:
+                idx = int(np.random.randint(n))
+            elif gen_temperature > 0.0:
+                lg = logits.cpu().numpy().astype(float) / gen_temperature
+                lg -= lg.max()
+                probs = np.exp(lg); probs /= probs.sum()
+                idx = int(np.random.choice(n, p=probs))
+            elif gen_top_frac > 0.0:
+                k = max(1, int(round(gen_top_frac * n)))
+                topk = torch.argsort(logits, descending=True).cpu().tolist()[:k]
+                idx = int(np.random.choice(topk))
+            else:
+                # Pure greedy argmax — default when no gen strategy is set.
+                idx = int(torch.argmax(logits).item())
+        else:
+            probs = _sampler_probabilities(logits.cpu().numpy().astype(float), exploration_target)
+            _record_sampling_entropy(env.exploration_diagnostics, env.counter, probs)
+            idx = int(np.random.choice(n, p=probs))
         env.step(allowed[idx])
 
 
@@ -1981,13 +2192,16 @@ def generate_candidates(
     num_gen_eps: int = 200,
     gen_exploration_target: float = 0.7,
     exploration_adaptive: bool = True,
+    gen_epsilon: float = 0.0,
+    gen_top_frac: float = 0.0,
+    gen_temperature: float = 1.0,
     exploration_seen_keys=None,
     k: float = 1.0,
     max_attempts: Optional[int] = None,
     charge_filter: bool = False,
     charge_use_pauling: bool = False,
 ) -> List[dict]:
-    """Generate unique candidates with a resumable entropy-target sampler.
+    """Generate unique candidates with adaptive entropy or historical sampling.
 
     Training-seen identities seed global novelty without removing them from the
     generation export. Scientific rewards and reporting remain unchanged.
@@ -2001,9 +2215,10 @@ def generate_candidates(
     else:
         qnet.eval()
 
-    exploration = ExplorationController(initial_target=gen_exploration_target, adaptive=exploration_adaptive)
-    exploration.seed_seen(exploration_seen_keys if exploration_seen_keys is not None
-                          else getattr(env, "exploration_seen_keys", ()))
+    exploration = _restore_exploration(gen_exploration_target, exploration_adaptive, None)
+    if exploration is not None:
+        exploration.seed_seen(exploration_seen_keys if exploration_seen_keys is not None
+                              else getattr(env, "exploration_seen_keys", ()))
     exploration_pending = []
     evaluator = EpisodeBatchEvaluator(
         env, max_retries=_MAX_CANDIDATE_RETRIES, timer=predictor,
@@ -2015,13 +2230,15 @@ def generate_candidates(
             _pg_single_episode_generate(
                 env=env, policy=policy, scaler=scaler,
                 elem_feats_scaled=elem_feats_scaled, action_values=action_values,
-                device=device, exploration_target=exploration.target,
+                device=device, exploration_target=_exploration_target(exploration), exploration_adaptive=exploration_adaptive,
+                gen_epsilon=gen_epsilon, gen_top_frac=gen_top_frac, gen_temperature=gen_temperature,
             )
         else:
             _rollout_policy_episode(
                 env=env, qnet=qnet, scaler=scaler, device=device,
                 elem_feats_scaled=elem_feats_scaled, action_values=action_values,
-                exploration_target=exploration.target,
+                exploration_target=_exploration_target(exploration), exploration_adaptive=exploration_adaptive,
+                gen_epsilon=gen_epsilon, gen_top_frac=gen_top_frac, gen_temperature=gen_temperature,
             )
 
     recorder = getattr(env, "hpo_recorder", None)
@@ -2035,9 +2252,12 @@ def generate_candidates(
         resumed = getattr(env, "hpo_generation_resume", None)
         if resumed is not None:
             restore_generation(predictor, resumed, contract)
-            if "exploration_state" not in resumed:
-                raise ValueError("Exact generation resume requires exploration_state")
-            exploration.load_state_dict(resumed["exploration_state"])
+            if exploration_adaptive:
+                if resumed.get("exploration_state") is None:
+                    raise ValueError("Exact generation resume requires exploration_state")
+                exploration.load_state_dict(resumed["exploration_state"])
+            elif resumed.get("exploration_state") is not None:
+                raise ValueError("Historical generation cannot resume a Step3 exploration state")
         checkpoint_path = str(recorder.path / "generation_checkpoint.pt")
 
         def checkpoint_generation():
@@ -2048,7 +2268,8 @@ def generate_candidates(
                 return  # Direct library callers may not expose a resumable predictor.
             _save_checkpoint(checkpoint_path, {
                 "type": "hpo_generation", "hpo_state": recorder.checkpoint_state(),
-                "exploration_state": exploration.state_dict(),
+                "exploration_state": _exploration_state(exploration),
+            "exploration_adaptive": exploration_adaptive,
                 "generation_contract": contract, "predictor_ledger": state["ledger"],
                 "predictor_caches": state["caches"], "predictor_extra": state["extra"],
             })
@@ -2060,7 +2281,7 @@ def generate_candidates(
                 episode = evaluator.next(
                     rollout_generation,
                     limit=max(1, recorder.budget.target_unique - recorder.budget.unique_evaluated),
-                    phase="generate", metadata={"exploration_target_used": exploration.target},
+                    phase="generate", metadata={"exploration_target_used": _exploration_target(exploration)},
                 )
             except (CandidateEvaluationFailed, InfeasibleEpisode):
                 if not evaluator.pending:
@@ -2108,7 +2329,7 @@ def generate_candidates(
             episode = evaluator.next(
                 rollout_generation,
                 limit=min(n_target - accepted, max_att - attempted + 1),
-                phase="generate", metadata={"exploration_target_used": exploration.target},
+                phase="generate", metadata={"exploration_target_used": _exploration_target(exploration)},
             )
         except (CandidateEvaluationFailed, InfeasibleEpisode) as exc:
             # Unlike training, generation already has a generous, separate

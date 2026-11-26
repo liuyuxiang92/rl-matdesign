@@ -57,15 +57,18 @@ def restore_generation(predictor, saved, contract):
 
     if not generation_contracts_equal(saved.get("generation_contract"), contract):
         raise ValueError("Generation resume changed its frozen weights, scenario, seed or sampling settings")
-    if not isinstance(saved.get("exploration_state"), dict):
-        raise ValueError("Generation resume requires exploration controller state")
-    from ..exploration import ExplorationController
     sampling = contract.get("sampling", {})
-    controller = ExplorationController(
-        sampling.get("gen_exploration_target", 0.7),
-        sampling.get("exploration_adaptive", True),
-    )
-    controller.load_state_dict(saved["exploration_state"])
+    if ("exploration_adaptive" in saved
+            and saved["exploration_adaptive"] is not sampling.get("exploration_adaptive", True)):
+        raise ValueError("Generation checkpoint exploration_adaptive differs from sampling settings")
+    if sampling.get("exploration_adaptive", True):
+        if not isinstance(saved.get("exploration_state"), dict):
+            raise ValueError("Generation resume requires exploration controller state")
+        from ..exploration import ExplorationController
+        controller = ExplorationController(sampling.get("gen_exploration_target", 0.7), True)
+        controller.load_state_dict(saved["exploration_state"])
+    elif saved.get("exploration_state") is not None:
+        raise ValueError("Legacy generation resume cannot contain adaptive exploration state")
     restore_predictor_state(predictor, saved)
     # Model/scaler loading and environment construction may draw randomness.
     # Restore only after all setup, immediately before resumed action sampling.

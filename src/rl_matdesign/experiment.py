@@ -195,9 +195,20 @@ def _validate_exploration_resume(saved, config):
     """Reject an incompatible controller before restoring any learner/oracle state."""
     from .exploration import ExplorationController
     state = saved.get("exploration_state")
+    if ("exploration_adaptive" in saved
+            and saved["exploration_adaptive"] is not config.get("exploration_adaptive", True)):
+        raise ValueError("Exploration configuration changed: checkpoint exploration_adaptive differs")
+    if not config.get("exploration_adaptive", True):
+        if state is not None:
+            raise ValueError("Exploration configuration changed: legacy resume cannot contain adaptive controller state")
+        if saved.get("type") == "dqn" and saved.get("eps") is None:
+            raise ValueError("Legacy DQN resume requires saved epsilon")
+        if saved.get("type") == "pg" and any(saved.get(key) is None for key in ("entropy_coef_eff", "visit_counts")):
+            raise ValueError("Legacy PG resume requires entropy coefficient and visit counts")
+        return
     if state is None:
         raise ValueError("Exact resume requires exploration controller state")
-    controller = ExplorationController(config["exploration_target"], config["exploration_adaptive"])
+    controller = ExplorationController(config.get("exploration_target", 0.7), True)
     controller.load_state_dict(state)
 
 
@@ -268,8 +279,10 @@ def _run_experiment(resources: ExitStack) -> None:
             if not os.path.exists(source):
                 raise ValueError("Generation resume requires generation_checkpoint.pt")
             hpo_generation_resume = torch.load(source, map_location="cpu", weights_only=False)
-            if not isinstance(hpo_generation_resume, dict) or hpo_generation_resume.get("type") != "hpo_generation" or any(hpo_generation_resume.get(key) is None for key in ("hpo_state", "rng_state", "predictor_ledger", "generation_contract", "exploration_state")):
+            if not isinstance(hpo_generation_resume, dict) or hpo_generation_resume.get("type") != "hpo_generation" or any(hpo_generation_resume.get(key) is None for key in ("hpo_state", "rng_state", "predictor_ledger", "generation_contract")):
                 raise ValueError("Generation checkpoint lacks synchronized accounting, RNG, predictor or sampling identity")
+            if cfg["exploration_adaptive"] and hpo_generation_resume.get("exploration_state") is None:
+                raise ValueError("Adaptive generation checkpoint lacks exploration controller state")
             hpo_resume = hpo_generation_resume["hpo_state"]
         hpo_recorder = CandidateRecorder(args.out, cfg["hpo_target_unique"], cfg["hpo_ratio_limit"], cfg["hpo_phase"], resume_state=hpo_resume)
         resources.callback(hpo_recorder.close)
@@ -407,8 +420,8 @@ def _run_experiment(resources: ExitStack) -> None:
                               total_iterations=cfg["pg_num_iters"])
 
     # Shared exploration semantics; training and generation keep separate state.
-    exploration_target = float(cfg["exploration_target"])
-    gen_exploration_target = float(cfg["gen_exploration_target"])
+    exploration_target = float(cfg.get("exploration_target", 0.7))
+    gen_exploration_target = float(cfg.get("gen_exploration_target", 0.7))
     exploration_adaptive = cfg["exploration_adaptive"]
 
     # Warn-and-ignore: augmentation only makes sense for off-policy DQN.
@@ -551,6 +564,7 @@ def _run_experiment(resources: ExitStack) -> None:
                     "buffer": buffer,
                     "start_ep": start_ep,
                     "exploration_state": _mid.get("exploration_state") if _mid else None,
+                    "eps": _mid.get("eps") if _mid else None,
                     "rng_state": _mid.get("rng_state") if _mid else None,
                     "training_episodes_completed": (
                         _mid.get("training_episodes_completed", start_ep) if _mid else start_ep
@@ -584,6 +598,8 @@ def _run_experiment(resources: ExitStack) -> None:
                     dqn_target_update_freq=int(cfg["dqn_target_update_freq"]),
                     exploration_target=exploration_target,
                     exploration_adaptive=exploration_adaptive,
+                    dqn_eps_min=cfg.get("dqn_eps_min", 0.05),
+                    dqn_eps_anneal_eps=cfg.get("dqn_eps_anneal_eps", 10000),
                     gamma=float(cfg["gamma"]),
                     hidden_dim=_hidden,
                     lr=_lr_dqn,
@@ -631,6 +647,9 @@ def _run_experiment(resources: ExitStack) -> None:
                     num_gen_eps=_num_gen_eps,
                     gen_exploration_target=gen_exploration_target,
                     exploration_adaptive=exploration_adaptive,
+                    gen_temperature=cfg.get("gen_temperature", 1.0),
+                    gen_top_frac=cfg.get("gen_top_frac", 0.0),
+                    gen_epsilon=cfg.get("gen_epsilon", 0.0),
                     k=float(cfg["k"]),
                     max_attempts=_max_attempts,
                     charge_filter=charge_check_enabled(cfg),
@@ -730,6 +749,8 @@ def _run_experiment(resources: ExitStack) -> None:
                 "gradient_clipping_state": _mid_ckpt.get("gradient_clipping_state") if _mid_ckpt else None,
                 "opt_critic_state": _mid_ckpt.get("opt_critic_state") if _mid_ckpt else None,
                 "exploration_state": _mid_ckpt.get("exploration_state") if _mid_ckpt else None,
+                "entropy_coef_eff": _mid_ckpt.get("entropy_coef_eff") if _mid_ckpt else None,
+                "visit_counts": _mid_ckpt.get("visit_counts") if _mid_ckpt else None,
                 "training_budget_state": _mid_ckpt.get("training_budget_state") if _mid_ckpt else None,
                 "training_sample_session_id": _mid_ckpt.get("training_sample_session_id") if _mid_ckpt else None,
                 "training_budget_history_complete": (
@@ -779,6 +800,10 @@ def _run_experiment(resources: ExitStack) -> None:
                     lr_critic=lr_critic,
                     exploration_target=exploration_target,
                     exploration_adaptive=exploration_adaptive,
+                    pg_entropy_coef=cfg.get("pg_entropy_coef", 0.01),
+                    pg_entropy_min=cfg.get("pg_entropy_min", 0.3),
+                    pg_repeat_penalty_coef=cfg.get("pg_repeat_penalty_coef", 0.0),
+                    pg_repeat_penalty_shape=cfg.get("pg_repeat_penalty_shape", "log"),
                     rl_method=method,
                     gradient_clipping=cfg["gradient_clipping"],
                     gradient_calibration_episodes=gradient_calibration_episodes,
@@ -809,6 +834,9 @@ def _run_experiment(resources: ExitStack) -> None:
                     num_gen_eps=_num_gen_eps,
                     gen_exploration_target=gen_exploration_target,
                     exploration_adaptive=exploration_adaptive,
+                    gen_temperature=cfg.get("gen_temperature", 1.0),
+                    gen_top_frac=cfg.get("gen_top_frac", 0.0),
+                    gen_epsilon=cfg.get("gen_epsilon", 0.0),
                     k=float(cfg["k"]),
                     max_attempts=_max_attempts,
                     charge_filter=charge_check_enabled(cfg),

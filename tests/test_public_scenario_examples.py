@@ -40,7 +40,7 @@ def test_synthetic_example_trains_and_generates(tmp_path, example, method, targe
         "dqn_grad_steps_per_ep": 1, "dqn_hidden_dim": 8,
         "dqn_target_update_freq": 2,
         "pg_warmup_eps": 2, "pg_num_iters": 1, "pg_batch_eps": 2,
-        "exploration_adaptive": False, "num_gen_eps": 2, "max_gen_attempts": 100,
+        "exploration_adaptive": True, "num_gen_eps": 2, "max_gen_attempts": 100,
         "gen_exploration_target": 1.0,
     }
     config_path = tmp_path / "synthetic.yaml"

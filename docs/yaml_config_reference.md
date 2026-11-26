@@ -350,7 +350,7 @@ A2C and REINFORCE keep on-policy softmax sampling and learn with a normalized
 entropy bonus. The entropy coefficient adapts internally; there is no repeat-visit
 reward or advantage penalty. Scientific gate violations still follow `reward`.
 
-Only three exploration fields are accepted, all optional:
+The default adaptive protocol accepts these three optional fields:
 
 ```yaml
 exploration_target: 0.7
@@ -360,8 +360,8 @@ exploration_adaptive: true
 
 Both targets lie in `[0, 1]` and support the same method maps as `train_budget`.
 They are fractions of maximum action entropy, not random-action percentages.
-`exploration_adaptive: false` freezes the targets for a controlled comparison;
-DQN still solves temperature and PG still adjusts its entropy coefficient.
+`exploration_adaptive: true` selects this protocol. The targets are initial
+values and can change as discoveries accumulate.
 The shared `adaptive_entropy_v1` profile owns numerical safeguards, response
 rates, observation windows and target-change limits; its complete values are
 persisted in execution contracts rather than exposed as scenario knobs.
@@ -391,12 +391,41 @@ seen. Scientific reward values are never rewritten by the controller.
 
 Training and HPO generation checkpoints include the archive, windows, target, entropy
 coefficient and pending trial. Exact resume rejects a missing state or changed
-profile/settings. Old exploration checkpoints require the archived code; there
-is no silent conversion into the new adaptive protocol.
+profile/settings. Exact resumes also bind the source implementation; archived
+checkpoints still require their archived code rather than a silent conversion.
 
-Remove `dqn_eps_anneal_eps`, `dqn_eps_min`, `pg_entropy_coef`, `pg_entropy_min`,
-`pg_repeat_penalty_coef`, `pg_repeat_penalty_shape`, `gen_temperature`,
-`gen_top_frac`, `gen_epsilon`, and `generation_selection` from existing YAMLs.
-They are rejected rather than ignored or translated. The old values have no
-one-to-one mapping to entropy targets. The default profile is a development
-recipe, not evidence that per-scenario HPO is unnecessary.
+### Historical exploration
+
+Set `exploration_adaptive: false` to use the algorithms from before Step3.
+This is the only alternative to the adaptive protocol; there is no public
+fixed-target mode. Remove `exploration_target` and `gen_exploration_target` in
+this configuration, since they are rejected when adaptation is disabled.
+
+```yaml
+exploration_adaptive: false
+dqn_eps_anneal_eps: 10000
+dqn_eps_min: 0.05
+pg_entropy_coef: 0.01
+pg_entropy_min: 0.3
+pg_repeat_penalty_coef: 0.0
+pg_repeat_penalty_shape: log
+gen_temperature: 1.0
+```
+
+DQN anneals epsilon for random-versus-greedy sampling. Policy gradients retain
+raw action entropy, the historical entropy-floor coefficient adjustment and
+the optional repeat-visit penalty. Disabling Step3 therefore does not disable
+that older coefficient adjustment. Existing HPO values can be used directly.
+
+Generation restores the historical `gen_temperature`, `gen_top_frac` and
+`gen_epsilon` controls. The last authored generation field selects the sampler;
+resolved configs include a `generation_selection` snapshot so sorting or
+reloading the YAML preserves that choice. The other two controls resolve to
+zero. `gen_temperature` also accepts method maps. All these legacy fields are
+rejected with `exploration_adaptive: true`; unused controls are never silently
+translated into entropy targets.
+
+Legacy checkpoints preserve epsilon or the PG entropy coefficient and visit
+counts. Resume rejects crossing between the two algorithms or using a Step3
+controller checkpoint as a legacy checkpoint. Neither protocol establishes
+that per-scenario HPO is unnecessary.

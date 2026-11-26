@@ -134,3 +134,24 @@ def test_shared_gamma_is_frozen_in_training_resume_contract(tmp_path, method):
     assert original["evaluation"] == changed["evaluation"]
     with pytest.raises(ValueError, match="learning.gamma"):
         require_execution_contract(original, changed)
+
+
+def test_legacy_generation_restores_only_when_selected_algorithm_matches(monkeypatch):
+    from rl_matdesign.utils import generation_resume
+    from rl_matdesign.exploration import ExplorationController
+
+    loaded, restored_rng = [], []
+    predictor = SimpleNamespace(load_state_dict=loaded.append)
+    monkeypatch.setattr(generation_resume, "restore_rng_state", restored_rng.append)
+    contract = generation()
+    contract["sampling"] = {"exploration_adaptive": False, "gen_temperature": .4}
+    saved = {"exploration_adaptive": False, "exploration_state": None,
+             "generation_contract": contract, "predictor_ledger": {"calls": 7},
+             "rng_state": {"state": "saved"}}
+    for corruption in ({"exploration_adaptive": True},
+                       {"exploration_state": ExplorationController(.7, False).state_dict()}):
+        with pytest.raises(ValueError):
+            generation_resume.restore_generation(predictor, {**saved, **corruption}, contract)
+        assert loaded == restored_rng == []
+    generation_resume.restore_generation(predictor, saved, contract)
+    assert loaded == [{"calls": 7}] and restored_rng == [{"state": "saved"}]

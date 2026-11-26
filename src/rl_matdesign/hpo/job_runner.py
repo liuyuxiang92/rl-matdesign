@@ -1,6 +1,8 @@
 """Isolated train/generate jobs with durable cost and complete raw records."""
 from __future__ import annotations
 
+from ..config_schema import with_generation_selection
+
 import copy
 from concurrent.futures import CancelledError
 from datetime import datetime, timezone
@@ -213,7 +215,7 @@ class JobRunner:
         cfg = copy.deepcopy(plan["base_config_data"])
         generation_parameter = plan["generation_search"]["parameter"]
         training_parameters = {name: value for name, value in parameters.items()
-                               if name != "gen_exploration_target"}
+                               if name not in {"gen_exploration_target", "gen_temperature", "gen_top_frac", "gen_epsilon"}}
         cfg.update(resolve_parameters(plan, training_parameters, train_budget))
         efficiency = phase_efficiency(plan, phase)
         cfg.update(hpo_recording=True, hpo_phase=phase, hpo_target_unique=budget,
@@ -223,9 +225,12 @@ class JobRunner:
         if phase == "generation":
             cfg.update(num_gen_eps=budget,
                        max_gen_attempts=max(1000, 10 * budget))
+            if not cfg["exploration_adaptive"]:
+                cfg.update(gen_temperature=0., gen_top_frac=0., gen_epsilon=0.)
             cfg[generation_parameter] = parameters[generation_parameter]
             if resume:
                 cfg["hpo_resume_generation"] = True
+        cfg = with_generation_selection(cfg, generation_parameter)
         config_path = directory / "config.yaml"
         config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
         atomic_json(directory / "job.json", key)

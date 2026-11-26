@@ -145,8 +145,8 @@ parallel_jobs: 3
 
 ## 基于熵目标的生成
 
-生成统一使用熵目标采样。场景中的 `gen_exploration_target` 是初始目标，
-范围为 `[0,1]`；`exploration_adaptive` 决定是否按候选发现结果缓慢调整目标。
+`exploration_adaptive: true` 使用 Step 3 自适应熵目标采样。场景中的
+`gen_exploration_target` 是初始目标，范围为 `[0,1]`，随后按候选发现结果调整。
 HPO 保留这一设置，不会在作业内切换成另一种采样器。
 
 ```yaml
@@ -165,16 +165,25 @@ generation:
   gen_exploration_target: [0, 0.25, 0.5, 0.7, 0.9, 1]
 ```
 
-显式旧协议的 `generation_search` 节也使用 `gen_exploration_target` 列表键。
-旧 HPO 列表字段不作为兼容别名接受。使用更新后的代码启动实验前，应修改
+在自适应模式中，显式旧协议的 `generation_search` 节也使用
+`gen_exploration_target` 列表键，且不接受 `initial_values`。使用更新后的代码启动实验前，应修改
 工作副本并使用新的 campaign 输出目录；不要改写已归档的历史配置来恢复旧实验。
 范围搜索只能扩展到合法边界 0 或 1；不再搜索原始分数温度、epsilon 或 top fraction。
 目标 0 在最高分并列动作中采样，目标 1 为均匀采样；相同分数不能强制达到低熵。
 目标值不是随机动作百分比。控制器会记录实际熵以及目标是否可达。
 
-旧的生成策略选择顺序和 `generation_selection` 快照已移除。配置中应删除
-旧采样字段；未知或废弃字段会明确报错。训练搜索空间也不再包含 epsilon
-衰减、固定熵系数或重复惩罚。控制器内部参数由固定版本的共享 profile 管理。
+`exploration_adaptive: false` 切换回历史采样器，不提供固定熵目标模式。
+此时训练 HPO 恢复 DQN 的 `dqn_eps_min`、`epsilon_anneal_budget_ratio`
+和 A2C 的 `pg_entropy_coef`、`pg_entropy_min` 搜索空间。DQN 衰减步数由
+所选训练预算减去 warmup 后乘以历史比例并取整；采样时仍按实际 episode 计时。
+历史 HPO 固定重复惩罚为零，普通实验可在 false 模式下设置旧重复惩罚参数。
+
+在 false 模式中，旧的生成策略选择顺序及 `generation_selection` 快照恢复。
+简化 HPO 使用 `generation.initial_values` 搜索场景选定的 `gen_temperature`、
+`gen_epsilon` 或 `gen_top_frac`；显式 v1 协议保持历史温度搜索及其固定参数。
+`exploration_target` 和 `gen_exploration_target` 在此模式下拒绝，旧采样参数
+在 true 模式下同样拒绝，避免无效设置被默默忽略。切换模式必须启动新实验，
+不能跨模式续训。
 
 训练与生成分别记账：生成第一次遇到训练中出现过的材料，仍计入生成预算；同一阶段再次重复只增加尝试。成功评价但不满足材料约束仍消耗有效预算；失败、无效候选和重新采样也消耗尝试。
 
