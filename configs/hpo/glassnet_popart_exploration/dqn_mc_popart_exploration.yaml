@@ -1,5 +1,5 @@
 # GlassNet coarse: Step 1 PopArt + Step 2 adaptive clipping + Step 3 exploration.
-# Scientific conditions and active learner settings come from the supplied base YAML.
+# Scientific conditions are preserved; paired HPO overrides the searchable learner settings.
 # Standalone train_budget remains 10000; the paired HPO YAML overrides it.
 # num_gen_eps: 0 is training-only; HPO searches generation at its separate budget.
 # The shared 100-candidate calibration pilot is outside the RL/HPO budget.

@@ -1,15 +1,15 @@
-# GlassNet coarse, all three upgrades: tune exploration only.
+# GlassNet coarse: joint learner and exploration HPO after all three upgrades.
 # Keep the six bundle YAMLs together; base_config is relative to this file.
-# Singleton choices are necessary: omitted dimensions retain built-in HPO ranges.
-# They preserve the supplied learner settings; they are not new search dimensions.
-# exploration_target is the initial normalized entropy; adaptation stays enabled.
-# Range diagnosis may expand 0.1--0.9 toward the legal endpoints 0 and 1.
-# Generation searches gen_exploration_target with built-in initial values
-# [0, 0.25, 0.5, 0.7, 0.9, 1]; controller constants stay internal.
-# Existing budgets, scoring, repeats, trial limits and random_seed are preserved.
-# Validation seeds select the final configuration; use fresh seeds for final comparison.
+# Training searches the requested learner settings together with exploration_target.
+# Exploration targets are initial normalized entropies; adaptation stays enabled.
+# Range diagnosis may expand initial ranges within their legal domains.
+# Generation searches gen_exploration_target on the selected frozen models.
+# Budgets, scoring, repeats, trial limits and random_seed are preserved.
+# Validation selects the final configuration; use fresh seeds for final comparison.
 # Run with: python -m rl_matdesign.hpo run --hpo-config <this-file> --out <new-output>
-# Fixed warmup fraction = 100/458, preserving exactly 100 warmup candidates.
+# DQN batch size stays fixed; a singleton prevents built-in HPO defaults from searching it.
+# HPO warmup overrides the base value: the initial range gives 9--92 of 458 candidates.
+# Target-network update frequency is fixed at 7 in both this plan and the base config.
 base_config: ./dqn_bootstrap_popart_exploration.yaml
 method: dqn-bootstrap
 random_seed: 42
@@ -33,21 +33,22 @@ training:
     max_unique: 458
   parameter_ranges:
     dqn_lr:
-      type: categorical
-      choices:
-      - 0.002584117593731318
+      type: float
+      low: 1.0e-05
+      high: 0.01
+      log: true
     dqn_batch_size:
       type: categorical
       choices:
       - 32
     warmup_budget_fraction:
-      type: categorical
-      choices:
-      - 0.2183406113537118
+      type: float
+      low: 0.02
+      high: 0.2
     dqn_target_update_freq:
       type: categorical
       choices:
-      - 50
+      - 7
     exploration_target:
       type: float
       low: 0.1
@@ -67,3 +68,10 @@ generation:
     qualified_fraction: 0.5
     best_fraction_quality: 0.4
     best_value_quality: 0.1
+  initial_values:
+  - 0.0
+  - 0.25
+  - 0.5
+  - 0.7
+  - 0.9
+  - 1.0
