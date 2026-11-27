@@ -78,7 +78,7 @@ def test_hpo_does_not_invent_a_shared_budget_or_allow_scaled_warmup_to_exceed_it
                              budget_scaling={"train_budget": .5}, method="a2c")
     with pytest.raises(ValueError, match="exceeds train_budget"):
         hpo._build_trial_yaml(base_cfg={"train_budget": 1000, "dqn_warmup_eps": 300},
-                             fixed_overrides={}, sampled={}, budget_scaling={"train_budget": .1}, method="a2c")
+                             fixed_overrides={}, sampled={}, budget_scaling={"train_budget": .1}, method="dqn")
 
 
 def test_hpo_full_warmup_budget_leaves_no_online_episodes():

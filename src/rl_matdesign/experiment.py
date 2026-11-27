@@ -235,7 +235,7 @@ def _run_experiment(resources: ExitStack) -> None:
     )
     run_configs = resolve_run_configs(raw_cfg, {key: getattr(args, key) for key in override_keys})
     if args.validate_config:
-        if run_configs.seed_list_keys:
+        if run_configs.is_sweep:
             report = {"run_count": len(run_configs.runs), "parallel_jobs": run_configs.parallel_jobs,
                       "runs": [{"index": index, "config": run.config, "sources": run.sources}
                                for index, run in enumerate(run_configs.runs, 1)]}
@@ -244,7 +244,7 @@ def _run_experiment(resources: ExitStack) -> None:
             report = {"config": resolved.config, "sources": resolved.sources}
         print(json.dumps(report, indent=2))
         return
-    if run_configs.seed_list_keys:
+    if run_configs.is_sweep:
         from .seed_sweep import run_seed_sweep
         code = run_seed_sweep(args, run_configs)
         if code:

@@ -93,7 +93,7 @@ def test_shared_budget_derives_both_algorithms_without_redundant_totals():
                                    {"dqn_warmup_eps": 102}])
 def test_shared_budget_rejects_conflicting_legacy_limits_or_excess_warmup(extra):
     with pytest.raises(ConfigError, match="train_budget"):
-        resolve_config({"train_budget": 101, "dqn_warmup_eps": 11, "pg_batch_eps": 16, **extra})
+        resolve_config({"method": "dqn", "train_budget": 101, "dqn_warmup_eps": 11, "pg_batch_eps": 16, **extra})
 
 
 @pytest.mark.parametrize("value", [True, 0, -1, 1.5, "100"])

@@ -436,15 +436,24 @@ class ResolvedRunConfigs:
     runs: tuple[ResolvedConfig, ...]
     parallel_jobs: int
     seed_list_keys: tuple[str, ...]
+    train_budget_values: tuple[int, ...] = ()
+
+    @property
+    def is_sweep(self) -> bool:
+        return bool(self.seed_list_keys or self.train_budget_values)
 
 
 def resolve_run_configs(raw: Mapping, overrides: Mapping | None = None) -> ResolvedRunConfigs:
-    """Expand paired seed lists before resolving each independent experiment.
+    """Expand training budgets across paired seed rows into scalar experiments.
 
     Explicit seed lists must be nonempty and have the same length. Scalars
     broadcast; scalar null training/generation seeds retain the usual fallback
     to that run's evaluation seed. List elements are non-null uint32 integers.
     Non-None overrides replace authored values before deciding the run count.
+    An authored top-level ``train_budget`` list contains positive, non-null
+    integers; each budget runs all paired seed rows in order. Method-specific
+    budget mappings still contain scalars only. A scalar CLI budget overrides
+    the entire authored list, and a one-item list remains an explicit sweep.
     ``parallel_jobs`` belongs only to the run request and never enters a scalar
     scientific configuration or its provenance.
     """
@@ -455,6 +464,17 @@ def resolve_run_configs(raw: Mapping, overrides: Mapping | None = None) -> Resol
     parallel_jobs = Parameter(int, 1, "Concurrent independent runs.", minimum=1).normalize(
         "parallel_jobs", effective.get("parallel_jobs", 1),
     )
+    if "train_budget" in cli:
+        PARAMETERS["train_budget"].normalize("train_budget", cli["train_budget"])
+    train_budget_values = ()
+    if isinstance(effective.get("train_budget"), list):
+        if not effective["train_budget"]:
+            raise ConfigError("train_budget must be a nonempty budget list")
+        budget_spec = Parameter(int, None, "Training candidates in one run.", minimum=1)
+        train_budget_values = tuple(
+            budget_spec.normalize(f"train_budget[{index}]", budget)
+            for index, budget in enumerate(effective["train_budget"])
+        )
     seed_list_keys = []
     lengths = {}
     for key in ("eval_seed", "train_seed", "gen_seed"):
@@ -476,14 +496,17 @@ def resolve_run_configs(raw: Mapping, overrides: Mapping | None = None) -> Resol
         raise ConfigError(f"Seed lists must have the same length; got {detail}. Use a scalar to broadcast.")
 
     runs = []
-    for index in range(next(iter(lengths.values()), 1)):
-        run_raw = {key: value for key, value in cfg.items() if key != "parallel_jobs"}
-        run_overrides = {key: value for key, value in cli.items() if key != "parallel_jobs"}
-        for key in seed_list_keys:
-            source = run_overrides if key in cli else run_raw
-            source[key] = source[key][index]
-        runs.append(resolve_config(run_raw, run_overrides))
-    return ResolvedRunConfigs(tuple(runs), parallel_jobs, tuple(seed_list_keys))
+    for budget in train_budget_values or (None,):
+        for index in range(next(iter(lengths.values()), 1)):
+            run_raw = {key: value for key, value in cfg.items() if key != "parallel_jobs"}
+            run_overrides = {key: value for key, value in cli.items() if key != "parallel_jobs"}
+            if train_budget_values:
+                run_raw["train_budget"] = budget
+            for key in seed_list_keys:
+                source = run_overrides if key in cli else run_raw
+                source[key] = source[key][index]
+            runs.append(resolve_config(run_raw, run_overrides))
+    return ResolvedRunConfigs(tuple(runs), parallel_jobs, tuple(seed_list_keys), train_budget_values)
 
 
 def resolve_config(raw: Mapping, overrides: Mapping | None = None) -> ResolvedConfig:
@@ -521,13 +544,19 @@ def resolve_config(raw: Mapping, overrides: Mapping | None = None) -> ResolvedCo
             sources[key] = "default"
     if cfg["train_budget"] is not None:
         budget = cfg["train_budget"]
-        if cfg["dqn_warmup_eps"] > budget:
+        dqn_budget_fits = cfg["dqn_warmup_eps"] <= budget
+        if cfg["method"] == "dqn" and not dqn_budget_fits:
             raise ConfigError("dqn_warmup_eps exceeds train_budget; reduce warmup or increase the shared budget")
         derived = {
-            "dqn_num_train_eps": (budget - cfg["dqn_warmup_eps"], "derived:train_budget-dqn_warmup_eps"),
             "pg_num_iters": ((budget + cfg["pg_batch_eps"] - 1) // cfg["pg_batch_eps"],
                              "derived:ceil(train_budget/pg_batch_eps)"),
         }
+        # Retain historically valid resolved values (including saved contracts),
+        # while small policy-gradient budgets leave dormant DQN settings alone.
+        if dqn_budget_fits:
+            derived["dqn_num_train_eps"] = (
+                budget - cfg["dqn_warmup_eps"], "derived:train_budget-dqn_warmup_eps",
+            )
         for key, (value, origin) in derived.items():
             if key in authored_keys and cfg[key] != value:
                 raise ConfigError(f"{key}={cfg[key]} conflicts with train_budget={budget}, which requires {value}; "

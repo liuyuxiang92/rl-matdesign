@@ -1,4 +1,4 @@
-"""Run paired seed configurations in bounded, isolated Python processes.
+"""Run paired seeds crossed with training budgets in isolated Python processes.
 
 The scheduler owns no scientific RNG or predictor. Each child executes the same
 single-run entry point with a frozen scalar configuration in its own directory.
@@ -141,8 +141,8 @@ def run_seed_sweep(args, plan: ResolvedRunConfigs) -> int:
                     if getattr(args, name, None)]
     if incompatible:
         flags = ", ".join("--" + name.replace("_", "-") for name in incompatible)
-        raise ConfigError(f"Seed-list runs do not support {flags}. Use the saved scalar config.yaml "
-                          "and --out for the individual seed to load or resume its artifacts.")
+        raise ConfigError(f"Seed/budget-list runs do not support {flags}. Use the saved scalar config.yaml "
+                          "and --out for the individual run to load or resume its artifacts.")
 
     output = Path(args.out).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -158,7 +158,7 @@ def run_seed_sweep(args, plan: ResolvedRunConfigs) -> int:
         reservation.flush()
         try:
             if any(path != lock for path in output.iterdir()):
-                raise ConfigError(f"Seed-list runs require an empty --out directory: {output}. "
+                raise ConfigError(f"Seed/budget-list runs require an empty --out directory: {output}. "
                                   "Choose a new directory; existing results are never overwritten.")
             rows = []
             for index, resolved in enumerate(plan.runs, 1):
@@ -166,22 +166,28 @@ def run_seed_sweep(args, plan: ResolvedRunConfigs) -> int:
                 seeds = {key: cfg[key + "_seed"] for key in ("eval", "train", "gen")}
                 name = (f"run_{index:03d}_eval_{seeds['eval']}_train_{seeds['train']}"
                         f"_gen_{seeds['gen']}")
-                directory = output / name
-                rows.append({"index": index, "seeds": seeds, "out": str(directory),
-                             "config": str(directory / "config.yaml"),
-                             "log": str(directory / "run.log"), "status": "pending",
-                             "returncode": None})
+                parent = output / f"budget_{cfg['train_budget']}" if plan.train_budget_values else output
+                directory = parent / name
+                row = {"index": index, "seeds": seeds, "out": str(directory),
+                       "config": str(directory / "config.yaml"),
+                       "log": str(directory / "run.log"), "status": "pending",
+                       "returncode": None}
+                if plan.train_budget_values:
+                    row["train_budget"] = cfg["train_budget"]
+                rows.append(row)
             manifest = {"version": 1, "status": "running", "run_count": len(rows),
                         "parallel_jobs": plan.parallel_jobs,
                         "source_config": str(Path(args.config).resolve()),
                         "seed_list_keys": list(plan.seed_list_keys), "runs": rows}
+            if plan.train_budget_values:
+                manifest["train_budget_values"] = list(plan.train_budget_values)
             summary = output / "seed_runs.json"
             _write_json(summary, manifest)
             # Freeze all effective settings before launching any child. Relative
             # scientific paths retain the caller's working-directory semantics.
             for row, resolved in zip(rows, plan.runs):
                 directory = Path(row["out"])
-                directory.mkdir()
+                directory.mkdir(parents=True)
                 Path(row["config"]).write_text(
                     yaml.safe_dump(resolved.config, sort_keys=False), encoding="utf-8")
                 _write_json(directory / "seed_config_sources.json", resolved.sources)
@@ -189,7 +195,8 @@ def run_seed_sweep(args, plan: ResolvedRunConfigs) -> int:
             source = str(Path(__file__).resolve().parents[1])
             env["PYTHONPATH"] = source + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
             next_index = 0
-            print(f"[SEEDS] {len(rows)} paired runs; at most {plan.parallel_jobs} simultaneously; "
+            label = "budget/seed combinations" if plan.train_budget_values else "paired runs"
+            print(f"[SEEDS] {len(rows)} {label}; at most {plan.parallel_jobs} simultaneously; "
                   f"summary={summary}", flush=True)
             while next_index < len(rows) or active:
                 while next_index < len(rows) and len(active) < plan.parallel_jobs:
