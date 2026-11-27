@@ -20,11 +20,19 @@ from .range_search import initial_reference, run_range_search
 from .scheduling import run_jobs
 
 STAGES = ("ranges", "train-budget", "train-search", "generation")
-SCOPES = {"all": STAGES, "search": STAGES[1:], **{s: (s,) for s in STAGES}}
+SCOPES = {"all": STAGES, "training": STAGES[:3], "search": STAGES[1:],
+          **{s: (s,) for s in STAGES}}
 
 
 class CampaignError(RuntimeError):
     pass
+
+
+def budget_phases(scope):
+    """Training is prerequisite; generation budgets matter only when requested."""
+    if scope not in SCOPES:
+        raise CampaignError(f"Unknown stage {scope}")
+    return ("train", "generation") if "generation" in SCOPES[scope] else ("train",)
 
 
 def aggregate_results(rows: list[dict], parameters: dict, budget: int) -> dict:
@@ -72,10 +80,12 @@ def unique_parameters(values) -> list[dict]:
 
 
 class Campaign:
-    def __init__(self, plan: dict, out: str | Path, *, runner=None, domain=None):
+    def __init__(self, plan: dict, out: str | Path, *, runner=None, domain=None, phases=None):
         self.plan = copy.deepcopy(plan)
         self.out = Path(out).resolve()
-        self.domain = domain if domain is not None else design_space_info(plan)
+        self.domain = domain if domain is not None else (
+            design_space_info(plan) if phases is None or tuple(phases) == ("train", "generation")
+            else design_space_info(plan, phases=phases))
         self.manifest_path = self.out / "manifest.json"
         contract = {"plan": plan, "domain": self.domain,
                     "software_digest": package_digest(), "assets": asset_fingerprints(plan)}

@@ -7,7 +7,11 @@ import sys
 from .artifacts import digest
 
 
-def design_space_info(plan: dict) -> dict:
+def design_space_info(plan: dict, *, phases=("train", "generation")) -> dict:
+    """Count the domain, requiring exactness only for the requested phases."""
+    phases = tuple(phases)
+    if not phases or any(phase not in ("train", "generation") for phase in phases):
+        raise ValueError("phases must contain train and/or generation")
     cfg = plan["base_config_data"]
     groups = cfg.get("groups", [])
     info = {"status": "unknown", "size": None, "episode_steps": 1,
@@ -33,7 +37,7 @@ def design_space_info(plan: dict) -> dict:
             except ValueError as exc:
                 info["reason"] = str(exc)
     fraction_required = any(plan["budget"][phase].get("mode", plan["budget"].get("mode")) == "fraction_of_space"
-                            for phase in ("train", "generation"))
+                            for phase in phases)
     if fraction_required and info["status"] != "exact":
         raise ValueError(f"fraction_of_space requires an exact canonical candidate count: {info['reason']}. "
                          "Select budget.mode=absolute_unique for this scenario.")

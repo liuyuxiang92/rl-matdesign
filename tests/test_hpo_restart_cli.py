@@ -17,7 +17,7 @@ def existing(tmp_path, monkeypatch):
     source = public_plan_path(tmp_path)
     plan = load_plan(source)
     domain = {"status": "unknown", "size": None, "episode_steps": 1}
-    monkeypatch.setattr("rl_matdesign.hpo.controller.design_space_info", lambda _: domain)
+    monkeypatch.setattr("rl_matdesign.hpo.controller.design_space_info", lambda _, **kwargs: domain)
     monkeypatch.setattr("rl_matdesign.hpo.controller.package_digest", lambda: "current-software")
     run = Campaign(plan, tmp_path / "campaign")
     atomic_json(run.out / "state.json", {"status": "INTERRUPTED", "requested_stage": "ranges"})

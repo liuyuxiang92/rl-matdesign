@@ -25,15 +25,18 @@ def _positive_int(value):
 
 
 def parser():
+    from .controller import SCOPES
+
     root = argparse.ArgumentParser(prog="rl-matdesign hpo", description="Two-part, YAML-configured material-design HPO")
     commands = root.add_subparsers(dest="command", required=True)
     for name in ("validate", "plan", "run"):
         command = commands.add_parser(name)
         command.add_argument("--hpo-config", required=True)
         command.add_argument("--method", choices=("a2c", "dqn-bootstrap", "dqn-mc"))
+        command.add_argument("--stage", choices=tuple(SCOPES), default="all",
+                             help="Use training for range, budget and parameter search without generation")
         if name == "run":
             command.add_argument("--out", required=True)
-            command.add_argument("--stage", choices=("all", "ranges", "search", "train-budget", "train-search", "generation"), default="all")
     for name in ("status", "resume", "restart"):
         command = commands.add_parser(name)
         command.add_argument("--out", required=True)
@@ -75,7 +78,7 @@ def main(argv=None) -> int:
 
 
 def _main(args) -> int:
-    from .controller import Campaign, CampaignError
+    from .controller import Campaign, CampaignError, SCOPES, budget_phases
     from .job_runner import JobError
     try:
         if args.command == "status":
@@ -89,7 +92,7 @@ def _main(args) -> int:
             manifest = read_json(Path(args.out) / "manifest.json")
             state = read_json(Path(args.out) / "state.json")
             plan = load_plan(manifest["plan"]["source_path"], method=manifest["plan"]["method"])
-            campaign = Campaign(plan, args.out)
+            campaign = Campaign(plan, args.out, phases=budget_phases(state["requested_stage"]))
             # Validate the original plan and manifest before changing execution-only options.
             if args.parallel_jobs is not None:
                 campaign.parallel_jobs = args.parallel_jobs
@@ -117,10 +120,11 @@ def _main(args) -> int:
         plan = load_plan(args.hpo_config, method=args.method)
         from .domain import design_space_info, minimum_training_budget
         from .budget_search import budget_grid, budget_schedule
-        domain = design_space_info(plan)
+        phases = budget_phases(args.stage)
+        domain = design_space_info(plan, phases=phases)
         minimum = minimum_training_budget(plan, domain)
         grids = {phase: budget_grid(plan, phase, domain.get("size"), minimum if phase == "train" else 1)
-                 for phase in ("train", "generation")}
+                 for phase in phases}
         budget_preflight = {
             "minimum_training_unique": minimum,
             "omitted_training_budgets": sorted(set(budget_grid(plan, "train", domain.get("size"), 1))
@@ -133,8 +137,8 @@ def _main(args) -> int:
             _print({"resolved_plan": plan, "domain": domain, "budget_grids": grids,
                     "budget_preflight": budget_preflight,
                     "schedule": {phase: budget_schedule(plan, phase, domain.get("size"), minimum if phase == "train" else 1)
-                                 for phase in ("train", "generation")},
-                    "stages": ["ranges", "train-budget", "train-search", "generation"],
+                                 for phase in phases},
+                    "stages": list(SCOPES[args.stage]),
                     "eta": "Available after measured jobs; adaptive range/budget additions remain bounded but conditional",
                     "predictor_evaluated": False})
         else:
